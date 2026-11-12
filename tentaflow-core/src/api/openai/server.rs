@@ -524,6 +524,14 @@ pub async fn handle_request(
             crate::api::bus_rest::handle_consume(req, router, instance, topic).await
         }
 
+        ("GET", p) if crate::api::bus_rest::parse_bus_record_schema_path(p).is_some() => {
+            let (instance, topic, schema_id) =
+                crate::api::bus_rest::parse_bus_record_schema_path(p).unwrap();
+            let (instance, topic) = (instance.to_string(), topic.to_string());
+            crate::api::bus_rest::handle_record_schema(req, router, instance, topic, schema_id)
+                .await
+        }
+
         // TentaBus schema registry REST (F3-REST) — same dynamic-segment
         // reason as the records routes above; the method is part of the route
         // (`GET`/`POST` on `.../versions` are list vs register).

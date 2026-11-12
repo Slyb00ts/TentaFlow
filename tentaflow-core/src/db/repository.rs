@@ -32835,12 +32835,16 @@ pub enum BusFieldPolicyWrite {
     TopicMissing,
     /// The stored rule is not what `BusFieldPolicyExpect` named (nothing written).
     Changed,
-    /// The topic is bound to an Avro, Protobuf or Thrift pattern, whose bytes
-    /// a rule cannot read (nothing written). Carries the pattern's name and kind.
+    /// The rule was checked as a rule on a topic of text messages, and the
+    /// topic is bound to an Avro, Protobuf or Thrift pattern (nothing
+    /// written). Carries the pattern's name and kind.
     BinaryPattern {
         subject: String,
         schema_type: String,
     },
+    /// The rule was checked against a binary pattern the topic is no longer
+    /// bound to, or that has been withdrawn since (nothing written).
+    PatternChanged,
 }
 
 /// Upsert — one row per `(instance_id, org_id, topic, subject_type,
@@ -32861,6 +32865,21 @@ pub fn bus_field_policy_set(
     row: &DbBusFieldPolicy,
     expect: BusFieldPolicyExpect,
 ) -> Result<BusFieldPolicyWrite> {
+    bus_field_policy_set_bound(pool, row, expect, None)
+}
+
+/// `bus_field_policy_set` for a rule checked against the topic's message
+/// pattern: `binary_pattern` is the Avro, Protobuf or Thrift subject the rule's
+/// field names were checked against (`None`: the rule is for text messages and
+/// the topic must not be bound to such a pattern). The binding is looked at in
+/// the transaction that writes the rule, so a pattern bound, unbound or
+/// withdrawn a moment ago cannot be missed.
+pub fn bus_field_policy_set_bound(
+    pool: &DbPool,
+    row: &DbBusFieldPolicy,
+    expect: BusFieldPolicyExpect,
+    binary_pattern: Option<&str>,
+) -> Result<BusFieldPolicyWrite> {
     let (outcome, stored) = with_writer_tx(pool, |tx| {
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM bus_topics \
@@ -32874,25 +32893,37 @@ pub fn bus_field_policy_set(
         // Looked at in the transaction that writes the rule, so a pattern
         // bound a moment ago cannot be missed (`bus_topic_update_checked`
         // refuses the opposite order the same way).
-        let binary: Option<(String, String)> = tx
+        let binary: Option<(String, String, bool)> = tx
             .query_row(
-                "SELECT s.subject, s.schema_type FROM bus_topics t \
+                "SELECT s.subject, s.schema_type, s.deprecated_at_ms IS NOT NULL \
+                 FROM bus_topics t \
                  JOIN bus_schema_subjects s \
                    ON s.instance_id = t.instance_id AND s.org_id = t.org_id AND s.subject = t.schema_id \
                  WHERE t.instance_id = ?1 AND t.org_id = ?2 AND t.name = ?3 \
                    AND s.schema_type IN ('avro','protobuf','thrift')",
                 rusqlite::params![row.instance_id, row.org_id, row.topic],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((subject, schema_type)) = binary {
-            return Ok((
-                BusFieldPolicyWrite::BinaryPattern {
-                    subject,
-                    schema_type,
-                },
-                row.clone(),
-            ));
+        match (binary_pattern, binary) {
+            (None, Some((subject, schema_type, _))) => {
+                return Ok((
+                    BusFieldPolicyWrite::BinaryPattern {
+                        subject,
+                        schema_type,
+                    },
+                    row.clone(),
+                ));
+            }
+            (Some(expected), bound) => {
+                let still_bound = bound
+                    .as_ref()
+                    .is_some_and(|(subject, _, withdrawn)| subject == expected && !withdrawn);
+                if !still_bound {
+                    return Ok((BusFieldPolicyWrite::PatternChanged, row.clone()));
+                }
+            }
+            (None, None) => {}
         }
         let current: Option<i64> = tx
             .query_row(
@@ -34244,6 +34275,29 @@ pub fn bus_schema_version_by_content_hash(
              WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND content_hash = ?4"
         ),
         rusqlite::params![instance_id, org_id, subject, content_hash],
+        map_bus_schema_version_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The version of `subject` that carries `schema_ref_id` — the id stamped
+/// into a record when it was validated (`bus::schema_registry::schema_ref_id_for`).
+/// `None` when the subject has no such version (never, or deleted since).
+pub fn bus_schema_version_by_ref_id(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    schema_ref_id: u32,
+) -> Result<Option<DbBusSchemaVersion>> {
+    let conn = acquire_read(pool)?;
+    conn.query_row(
+        &format!(
+            "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND schema_ref_id = ?4"
+        ),
+        rusqlite::params![instance_id, org_id, subject, schema_ref_id],
         map_bus_schema_version_row,
     )
     .optional()

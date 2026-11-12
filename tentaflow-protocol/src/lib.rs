@@ -65,10 +65,10 @@ pub use bus::{
     BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire,
     BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire,
     BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire,
-    BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
-    BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire, BusTopicAccessWire,
-    BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
-    BusTopicSummaryWire,
+    BusPayload, BusQuotaWire, BusRecordSchemaWire, BusReplicaLagWire, BusReplicaNodeWire,
+    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire,
+    BusTopicAccessWire, BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire,
+    BusTopicStatsWire, BusTopicSummaryWire,
 };
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,

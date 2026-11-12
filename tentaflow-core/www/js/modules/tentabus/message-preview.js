@@ -11,6 +11,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { bytesToPreviewText, headerText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
 import { payloadHtml } from '/js/modules/tentabus/payload-view.js';
+import { recordSchemaHtml, wireRecordSchema } from '/js/modules/tentabus/record-schema.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -77,9 +78,10 @@ export function pageNote(info) {
  * Opens the window. `browse(request)` sends one `MessagesBrowseRequest`;
  * `loadPartitions()` resolves the topic's partitions with their oldest kept
  * message and next number (may reject: the window then starts at the oldest
- * message of partition 0); `describeError(err)` words a failure.
+ * message of partition 0); `describeError(err)` words a failure;
+ * `loadRecordSchema(topic, schemaRefId)` (optional) answers the schema a binary record was encoded under; `binaryTopic` = the topic is checked with a binary pattern.
  */
-export function openMessagePreview({ instanceId, topic, partitionCount, browse, loadPartitions, describeError = (e) => String(e?.message || e) }) {
+export function openMessagePreview({ instanceId, topic, partitionCount, browse, loadPartitions, loadRecordSchema = null, binaryTopic = false, describeError = (e) => String(e?.message || e) }) {
   const state = {
     partition: 0,
     from: null,
@@ -139,6 +141,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       <tf-button variant="secondary" size="sm" data-role="more" hidden>${escapeHtml(T('topics.preview.load_more'))}</tf-button>
     </div>`;
   const table = listHost.querySelector('[data-role="table"]');
+  if (loadRecordSchema) wireRecordSchema(win.querySelector('[data-role="detail"]'), { load: (id) => loadRecordSchema(topic, id), describeError });
   table.addEventListener('row-click', (e) => { state.selected = e.detail.index ?? state.records.findIndex((r) => r.offset === e.detail.row._offset); paint(); });
 
   const paintDetail = () => {
@@ -159,6 +162,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
         ${blob
           ? `<div class="tb-kv-grid"><div class="k">${escapeHtml(T('topics.preview.blob_title'))}</div><div class="v">${escapeHtml(T('topics.preview.blob_text', { size: fmtBytes(blob.size_bytes), mime: blob.mime }))}</div></div>`
           : payloadHtml(r.payloadPreview, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('topics.preview.payload_empty'), truncated: Boolean(r.truncated) })}
+        ${loadRecordSchema ? recordSchemaHtml(r, { empty: !r.payloadPreview?.length, binary: binaryTopic }) : ''}
       </div>`;
   };
 

@@ -38,8 +38,8 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtDate, fmtDayTime, contentKind } from '/js/modules/tentabus/format.js';
-import { schemaKind } from '/js/modules/tentabus/schemas.js';
+import { T, fmtCount, fmtDate, fmtDayTime, contentKind, declaresBinary } from '/js/modules/tentabus/format.js';
+import { schemaKind, schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import { sentenceHtml } from '/js/modules/tentabus/hidden-notice.js';
 import { subjectTitle, subjectSub } from '/js/modules/tentabus/topic-access.js';
@@ -293,8 +293,12 @@ export function readXsdFields(text) {
 /**
  * Where a topic's known fields come from. `schema` = `{ subject, version,
  * text }` of the pattern the topic checks with, `{ failed: true }` when it
- * could not be read, or `null`. Returns `{ mode, fields, complete, implicit,
- * subject, version, failed, complex }` with `mode`:
+ * could not be read, or `null`; for an Avro, Protobuf or Thrift pattern
+ * `{ subject, schemaType, withdrawn, fields (the server's list of top-level
+ * names), types ([{ name, type, alwaysSet }]) }`. `binaryActions` =
+ * `capabilities.binaryFieldActions` (an older server does not send it).
+ * Returns `{ mode, fields, complete, implicit, subject, version, failed,
+ * complex }` with `mode`:
  *   - `schema`: the pattern's properties;
  *   - `dictionary`: HL7 v2's common fields (any other address can be typed),
  *     with `implicit` = the unnamed positions of the same segments, which a
@@ -302,15 +306,38 @@ export function readXsdFields(text) {
  *     them like any other field it does not list);
  *   - `manual`: no list — the fields to keep are typed in (`complex` = the
  *     pattern is there but names fields the screen cannot list);
- *   - `blocked`: the topic is checked with an Avro, Protobuf or Thrift pattern
- *     (`schema.schemaType`), whose bytes a rule cannot read: the server
- *     refuses rules there (`bus_field_policy_set`), so the screen does too.
+ *   - `binary`: the topic is checked with an Avro, Protobuf or Thrift pattern
+ *     that is not withdrawn: a rule names its top-level fields (`binaryFormat`,
+ *     `alwaysSet` = Avro fields every message sets), only "Ukryj" exists on
+ *     reading and nothing is typed in;
+ *   - `blocked`: no rule can be made or changed (`reason`: `unbound` = binary
+ *     messages with no pattern, `withdrawn`, `unreadable` = the field list
+ *     could not be read, `unsupported` = the server predates rules on binary
+ *     topics); a rule that exists can only be removed.
  * `complete` says the list is every field a message can carry (a closed
  * pattern): only then can a rule that leaves every listed field alone be a
- * rule that does nothing.
+ * rule that does nothing. A binary list is not complete in that sense: a field
+ * a later version adds is not in a stored rule, so the rule hides it.
  */
-export function fieldSource({ format, schema }) {
-  if (schemaKind(schema?.schemaType) === 'binary') return { mode: 'blocked', fields: [], implicit: [], complete: false };
+export function fieldSource({ format, schema, contentType = '', binaryActions }) {
+  const blocked = (reason, extra = {}) => ({ mode: 'blocked', reason, fields: [], implicit: [], complete: false, ...extra });
+  if (schemaKind(schema?.schemaType) === 'binary') {
+    const named = { subject: schema.subject, binaryFormat: schema.schemaType };
+    if (!Array.isArray(binaryActions) || !binaryActions.includes('hide')) return blocked('unsupported', named);
+    if (schema.withdrawn) return blocked('withdrawn', named);
+    if (!Array.isArray(schema.fields)) return blocked('unreadable', named);
+    const typed = new Map((schema.types || []).map((t) => [t.name, t]));
+    return {
+      mode: 'binary',
+      ...named,
+      version: schema.version ?? null,
+      fields: schema.fields.map((name) => ({ name, label: typed.get(name)?.type || '' })),
+      implicit: [],
+      complete: false,
+      alwaysSet: schema.fields.filter((name) => typed.get(name)?.alwaysSet),
+    };
+  }
+  if (declaresBinary(contentType)) return blocked('unbound');
   if (format === 'hl7v2') {
     return { mode: 'dictionary', fields: HL7_FIELDS.map((name) => ({ name, label: hl7FieldLabel(name) })), implicit: HL7_IMPLICIT_FIELDS, complete: false };
   }
@@ -390,6 +417,16 @@ export function typedProblems(format, names) {
 // What a rule does, in words
 // ---------------------------------------------------------------------------
 
+/**
+ * A rule as a binary topic applies it: masking and hashing do not exist there,
+ * so a masked or hashed field (a rule an older node stored) is a hidden one.
+ */
+function binaryRow(row, source) {
+  if (source.mode !== 'binary') return row;
+  const changed = new Set([...row.maskedFields, ...row.hashedFields]);
+  return { ...row, fields: row.fields.filter((n) => !changed.has(n)), maskedFields: [], hashedFields: [] };
+}
+
 /** The unnamed positions a rule of `direction` allows without a row: only a writing rule does. */
 const implicitFor = (source, direction) => (direction === 'write' ? source.implicit : []);
 
@@ -406,6 +443,7 @@ const implicitFor = (source, direction) => (direction === 'write' ? source.impli
  * window has no row for them.
  */
 export function ruleFacts(row, source) {
+  row = binaryRow(row, source);
   const listed = source.fields.map((f) => f.name);
   const names = [...listed, ...implicitFor(source, row.direction)];
   const allowed = new Set(row.fields);
@@ -501,11 +539,17 @@ export function readActionList(fieldActions) {
   return ['show', ...READ_HIDING_ACTIONS.filter((a) => a === 'hide' || offered.has(a))];
 }
 
-/** The segmented options of one field in a window: reading offers "Pokaż" and the hiding actions, writing allowed / required / not allowed. */
-export function actionOptions(direction, fieldActions) {
+/**
+ * The segmented options of one field in a window: reading offers "Pokaż" and the hiding actions, writing allowed / required / not allowed.
+ * On a binary topic "Zamaskuj" and "Zahaszuj" are still drawn, but cannot be chosen (`binary`).
+ */
+export function actionOptions(direction, fieldActions, binary = false) {
   const variants = { show: 'ok', hide: 'warn', mask: 'info', hash: 'accent' };
   if (direction === 'read') {
-    return readActionList(fieldActions).map((value) => ({ value, label: T(`hiding.action.${value}`), variant: variants[value] }));
+    const values = binary ? ['show', ...READ_HIDING_ACTIONS] : readActionList(fieldActions);
+    return values.map((value) => ({
+      value, label: T(`hiding.action.${value}`), variant: variants[value], disabled: binary && (value === 'mask' || value === 'hash'),
+    }));
   }
   return [['allow', 'ok'], ['require', 'accent'], ['forbid', 'err']].map(([value, variant]) => ({ value, label: T(`hiding.write.${value}`), variant }));
 }
@@ -552,6 +596,7 @@ export function blankForm(direction, source) {
  * administrator must see it to take it out.
  */
 export function formFromRule(row, source) {
+  row = binaryRow(row, source);
   const names = source.fields.map((f) => f.name);
   const known = new Set(names);
   const write = row.direction === 'write';
@@ -565,7 +610,8 @@ export function formFromRule(row, source) {
     if (row.direction === 'read') actions[n] = !allowed.has(n) ? 'hide' : hashed.has(n) ? 'hash' : masked.has(n) ? 'mask' : 'show';
     else actions[n] = required.has(n) ? 'require' : allowed.has(n) ? 'allow' : 'forbid';
   }
-  const typed = (n) => !known.has(n) && !implicit.has(n);
+  // A binary pattern lists every field a rule may name: the others are gone from the pattern and are dropped on saving.
+  const typed = (n) => source.mode !== 'binary' && !known.has(n) && !implicit.has(n);
   return {
     actions,
     extraShown: sortedUnique(row.fields.filter((n) => typed(n) && !masked.has(n) && !hashed.has(n) && !(write && required.has(n)))),
@@ -619,6 +665,10 @@ export function parseForm(text, source) {
 function effectiveForm(form, source, direction) {
   const known = new Set(source.fields.map((f) => f.name));
   const read = direction === 'read';
+  if (source.mode === 'binary') {
+    const actions = Object.assign(Object.create(null), form.actions);
+    return { actions, extraShown: [], extraMasked: [], extraHashed: [], extraRequired: [], hiddenImplicit: [] };
+  }
   const typed = (list) => sortedUnique((list || []).map((n) => n.trim()).filter(Boolean));
   const required = read ? [] : typed(form.extraRequired);
   const masked = read ? typed(form.extraMasked) : [];
@@ -721,6 +771,25 @@ export function formProblem({ direction, form, source, format }) {
   return eff.extraShown.length || eff.extraRequired.length ? null : T('hiding.need.write_typed');
 }
 
+/**
+ * What a writing rule on an Avro topic would do that its author may not mean:
+ * every Avro field is on the wire, and one with neither a default nor `null`
+ * is always "set", so "Niedozwolone" on it refuses every message. Sentences,
+ * not a refusal: the server stores such a rule.
+ */
+export function binaryWarnings({ direction, form, source }) {
+  if (source.mode !== 'binary' || source.binaryFormat !== 'avro' || direction !== 'write') return [];
+  const stuck = source.alwaysSet.filter((n) => form.actions[n] === 'forbid');
+  return stuck.length ? [T('hiding.binary.avro_always_forbidden', { fields: stuck.map(showHidden).join(', '), n: stuck.length })] : [];
+}
+
+/** The names a stored rule keeps that the pattern no longer has: saving the rule again drops them. */
+export function staleFields(row, source) {
+  if (source.mode !== 'binary') return [];
+  const known = new Set(source.fields.map((f) => f.name));
+  return [...new Set([...row.fields, ...row.requiredFields])].filter((n) => !known.has(n)).sort();
+}
+
 const phrases = (source, names) => names.map((n) => fieldPhrase(source, n)).join(', ');
 const minus = (list, other) => list.filter((n) => !other.includes(n));
 
@@ -753,7 +822,8 @@ export function ruleImpact({ who, everyone = false, saved = false, direction, fo
   const whoFrom = everyone ? T('hiding.who.everyone_from') : named;
   const t = (key, params = {}) => T(key, { who: whoFor, whoFrom, ...params });
   // A pattern that lists every field a message can carry has no "other" fields to speak of.
-  const unlisted = (key) => (source.complete ? [] : [t(`hiding.impact.${key}${saved ? '_saved' : ''}`)]);
+  const binary = source.mode === 'binary' ? '_binary' : '';
+  const unlisted = (key) => (source.complete ? [] : [t(`hiding.impact.${key}${saved ? '_saved' : ''}${binary}`)]);
   const hl7 = source.implicit.length > 0;
   const lines = [];
   if (direction === 'read') {
@@ -785,7 +855,8 @@ export function ruleImpact({ who, everyone = false, saved = false, direction, fo
     const shownMore = current ? became('show') : [];
     if (shownMore.length) lines.push(t('hiding.impact.read_shown', { fields: phrases(source, shownMore) }));
     if (lines.length) lines.push(T('hiding.impact.rest'), ...unlisted('read_unlisted'));
-    else if (!current && !source.complete) lines.push(t('hiding.impact.read_unlisted_only'));
+    else if (!current && !source.complete) lines.push(t(`hiding.impact.read_unlisted_only${binary}`));
+    if (binary && hiddenMore.length) lines.push(T('hiding.binary.impact_read'));
     return lines;
   }
   const forbidden = (f) => names.filter((n) => f?.actions[n] === 'forbid');
@@ -802,7 +873,7 @@ export function ruleImpact({ who, everyone = false, saved = false, direction, fo
     if (forbidden(eff).length) lines.push(t('hiding.impact.write_forbidden', { fields: phrases(source, forbidden(eff)) }));
     if (required(eff).length) lines.push(t('hiding.impact.write_required', { fields: phrases(source, required(eff)) }));
     if (lines.length) lines.push(T('hiding.impact.write_rest'), ...unlisted(unlistedKey));
-    else if (!source.complete) lines.push(t(`hiding.impact.write_unlisted_only${hl7 ? '_hl7' : ''}`));
+    else if (!source.complete) lines.push(t(`hiding.impact.write_unlisted_only${hl7 ? '_hl7' : binary}`));
     return lines;
   }
   const refusedMore = [...minus(forbidden(eff), forbidden(was)), ...minus(typedAllowed(was), typedAllowed(eff))];
@@ -837,6 +908,7 @@ function skeleton() {
       <div data-role="state"></div>
       <div data-role="keys-note"></div>
       <div data-role="blocked-note"></div>
+      <div data-role="binary-note"></div>
       <tf-table data-role="rules">
         <tf-column key="who" label="${escapeAttr(T('hiding.col_who'))}" renderer="html"></tf-column>
         <tf-column key="what" label="${escapeAttr(T('hiding.col_what'))}" renderer="html" fill></tf-column>
@@ -968,13 +1040,36 @@ function paintKeyCard(host, view, data, blocked) {
  * 'hiding-key' | 'hiding-reload' })` and `{ kind: 'hiding-change' |
  * 'hiding-remove', rule }`.
  */
+/** Whether "Podgląd, jak widzi…" can be used: not on a topic whose rules cannot be read as fields (a withdrawn pattern still reads and projects). */
+export const previewAvailable = (source) => source.mode !== 'blocked' || source.reason === 'withdrawn';
+
+/** The texts of a topic where no rule can be made: `{ title, text, rules, preview }` (`rules` = what is said when rules already exist). */
+export function blockedTexts(source) {
+  const params = { name: source.subject ?? '', format: source.binaryFormat ? schemaFormatLabel(source.binaryFormat) : '' };
+  const key = (part) => T(`hiding.block.${source.reason}.${part}`, params);
+  return { title: key('title'), text: key('text'), rules: key('rules'), preview: previewAvailable(source) ? '' : key('preview') };
+}
+
+/** The line that says what a rule does on a binary topic (shown above the table). */
+export function binaryNote(source) {
+  return {
+    title: T('hiding.binary.note_title', { format: schemaFormatLabel(source.binaryFormat) }),
+    text: T('hiding.binary.note_text', { name: source.subject, version: source.version ?? '' }),
+  };
+}
+
 export function paintHidingSection(host, view, ctx) {
   if (host.__tbHiding !== 'built') {
     host.__tbHiding = 'built';
     patchHtml(host, skeleton());
   }
   const data = view.hidingData || {};
-  const source = fieldSource({ format: topicFormat(view.topic.contentType), schema: data.schema ?? null });
+  const source = fieldSource({
+    format: topicFormat(view.topic.contentType),
+    schema: data.schema ?? null,
+    contentType: view.topic.contentType,
+    binaryActions: view.capabilities?.binaryFieldActions,
+  });
   const rows = data.policies ? policyRows(data.policies) : [];
   const loaded = Boolean(data.policies);
   const ready = loaded && data.schemaSettled !== false;
@@ -991,11 +1086,17 @@ export function paintHidingSection(host, view, ctx) {
   }
 
   const blocked = source.mode === 'blocked';
+  const texts = blocked ? blockedTexts(source) : null;
   let state = stateHtml({ loading: !loaded && !data.policiesError, error: loaded ? null : data.policiesError });
   if (loaded && !rows.length) {
-    state = blocked
-      ? `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.blocked_title'))}" message="${escapeAttr(T('hiding.blocked_text'))}"><tf-button variant="secondary" icon="settings" data-go="section" data-section="settings">${escapeHtml(T('hiding.blocked_settings'))}</tf-button></tf-empty-state>`
-      : `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.empty_title'))}" message="${escapeAttr(T('hiding.empty_text'))}"><tf-button variant="primary" icon="plus" data-go="hiding-add"${ready ? '' : ' disabled'}>${escapeHtml(T('hiding.add.button'))}</tf-button></tf-empty-state>`;
+    if (blocked) {
+      const button = source.reason === 'unreadable'
+        ? `<tf-button variant="secondary" icon="refresh" data-go="hiding-reload">${escapeHtml(T('shell.retry'))}</tf-button>`
+        : source.reason === 'unsupported' ? '' : `<tf-button variant="secondary" icon="settings" data-go="section" data-section="settings">${escapeHtml(T('hiding.blocked_settings'))}</tf-button>`;
+      state = `<tf-empty-state badge icon="shield" title="${escapeAttr(texts.title)}" message="${escapeAttr(texts.text)}">${button}</tf-empty-state>`;
+    } else {
+      state = `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.empty_title'))}" message="${escapeAttr(T('hiding.empty_text'))}"><tf-button variant="primary" icon="plus" data-go="hiding-add"${ready ? '' : ' disabled'}>${escapeHtml(T('hiding.add.button'))}</tf-button></tf-empty-state>`;
+    }
   }
   patchHtml(host.querySelector('[data-role="state"]'), state);
 
@@ -1004,17 +1105,22 @@ export function paintHidingSection(host, view, ctx) {
     ? `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(T('hiding.keys_closed', { directions: listFormat(closed.map((d) => T(`hiding.direction_of.${d}`))) }))}</span></div>`
     : '');
 
-  // Rules that an older topic already has, on content they cannot read: said plainly, and only "Usuń" is left.
+  // Rules a topic already has where none can be made or changed: said plainly, and only "Usuń" is left.
   patchHtml(host.querySelector('[data-role="blocked-note"]'), blocked && rows.length
-    ? `<tf-alert tone="warning" title="${escapeAttr(T('hiding.blocked_title'))}" message="${escapeAttr(T('hiding.blocked_with_rules'))}"></tf-alert>`
+    ? `<tf-alert tone="warning" title="${escapeAttr(texts.title)}" message="${escapeAttr(texts.rules)}"></tf-alert>`
+    : '');
+  const binary = source.mode === 'binary' ? binaryNote(source) : null;
+  patchHtml(host.querySelector('[data-role="binary-note"]'), binary
+    ? `<tf-alert tone="info" title="${escapeAttr(binary.title)}" message="${escapeAttr(binary.text)}"></tf-alert>`
     : '');
   host.querySelector('[data-role="rules"]').__tbBlocked = blocked;
   const add = host.querySelector('[data-role="add"]');
   setAttr(add, 'disabled', !ready || blocked);
-  setAttr(add, 'title', blocked ? T('hiding.blocked_text') : null);
+  setAttr(add, 'title', blocked ? texts.text : null);
   const preview = host.querySelector('[data-role="preview"]');
-  setAttr(preview, 'disabled', !view.access?.canRead || !loaded || blocked);
-  setAttr(preview, 'title', !view.access?.canRead ? T('detail.preview_no_read', { name: view.topic.name }) : blocked ? T('hiding.blocked_preview') : null);
+  const previewOff = !previewAvailable(source);
+  setAttr(preview, 'disabled', !view.access?.canRead || !loaded || previewOff);
+  setAttr(preview, 'title', !view.access?.canRead ? T('detail.preview_no_read', { name: view.topic.name }) : previewOff ? texts.preview : null);
 
   const table = host.querySelector('[data-role="rules"]');
   table.hidden = rows.length === 0;
@@ -1030,7 +1136,7 @@ export function paintHidingSection(host, view, ctx) {
       return rowButtons(pairs);
     };
   }
-  patchHtml(host.querySelector('[data-role="legend"]'), legendHtml(view.capabilities?.fieldActions));
-  paintKeyCard(host, view, data, blocked);
+  patchHtml(host.querySelector('[data-role="legend"]'), legendHtml(source.mode === 'binary' ? view.capabilities?.binaryFieldActions : view.capabilities?.fieldActions));
+  paintKeyCard(host, view, data, blocked || source.mode === 'binary');
   setRowsIfChanged(table, rows.map((r) => ruleTableRow(r, source, view.nowMs ?? Date.now())));
 }

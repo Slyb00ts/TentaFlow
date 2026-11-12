@@ -138,7 +138,7 @@ test('the stable server sentences about a stored pattern and a rule on a binary 
   );
   assert.equal(
     busRefusalText("bus.invalid_argument: field policies cannot apply to a topic whose messages are binary: topic 'zamowienia' is checked with the thrift pattern 'zamowienie'"),
-    'Topik zamowienia przyjmuje wiadomości binarne (wzór zamowienie, Thrift). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc nie można ich dodać.',
+    'Zasada tekstowa nie może obowiązywać na topiku zamowienia: ma on wzór binarny zamowienie (Thrift). Odśwież stronę i dodaj zasadę jeszcze raz.',
   );
   assert.equal(busRefusalText('bus.invalid_argument: something else'), '');
   assert.equal(
@@ -160,4 +160,35 @@ test('binding a binary pattern under existing rules and the compile error behind
 test('the bind refusal without a kind (the pattern vanished meanwhile) still reads in words', () => {
   const text = busRefusalText("bus.invalid_topic_config: field policies cannot apply to a topic whose messages are binary: cannot bind the binary pattern 'z' to topic 'zamowienia' while field policies exist for it; delete its field policies first");
   assert.match(text, /\(binarny\)/);
+});
+
+test('the refusals of rules on a binary topic, of changing its pattern and of a version that drops a required field are put in plain words', () => {
+  assert.equal(
+    busRefusalText("protocol error BadRequest: bus.invalid_argument: masking and hashing do not apply to a topic whose messages are binary: topic 'zamowienia' is checked with the avro pattern 'zamowienie'"),
+    'Zamaskować ani zahaszować pola nie można: topik zamowienia ma wiadomości binarne (wzór zamowienie, Avro). Pole można tylko pokazać albo ukryć.',
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: topic 'zamowienia' declares binary messages (content_type 'application/avro') but no message pattern is linked to it"),
+    'Topik zamowienia ma wiadomości binarne, ale nie ma przypiętego wzoru. Przypnij wzór w ustawieniach topiku, a potem dodaj zasadę.',
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: the protobuf pattern 'zam' of topic 'zamowienia' is withdrawn"),
+    'Wzór zam (Protobuf) topiku zamowienia jest wycofany, więc nie można dodać ani zmienić zasady. Zasady ukrywania pól w wiadomościach binarnych wymagają wzoru, który nie jest wycofany.',
+  );
+  assert.match(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: the message pattern of topic 'zamowienia' was changed or withdrawn while the rule was being saved; try again"),
+    /^Wzór topiku zamowienia zmienił się albo został wycofany, zanim zasada się zapisała/,
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field 'sekret' is not a field of the message pattern 'zam' of topic 'zamowienia'"),
+    'Pole „sekret” nie należy do wzoru zam topiku zamowienia. Zasada może wymieniać tylko pola najwyższego poziomu tego wzoru.',
+  );
+  assert.match(
+    busRefusalText("bus.invalid_topic_config: cannot change the message pattern of topic 'zamowienia' while field policies exist for it (they name fields of the pattern 'zam'); delete its field policies first"),
+    /^Nie można zmienić ani odpiąć wzoru zam topiku zamowienia, dopóki topik ma zasady ukrywania pól.*Usuń najpierw zasady w sekcji Ukrywanie danych\.$/,
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: the new version lacks a field that a write rule of a topic bound to this pattern requires: field 'numer' is required by a write rule of topic 'zamowienia'; change the rule first"),
+    'Nowa wersja wzoru nie ma pola „numer”, a zasada zapisu topiku zamowienia wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku zamowienia), a potem dodaj wersję.',
+  );
 });

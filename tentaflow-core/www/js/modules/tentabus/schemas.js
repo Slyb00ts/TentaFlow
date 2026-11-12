@@ -60,8 +60,8 @@ export function schemaKindMismatchText(message) {
 
 /**
  * Refusals the server words with a stable sentence (`bus/mod.rs`
- * `STORED_SCHEMA_UNREADABLE`, `field_policies.rs` `BINARY_TOPIC_NO_POLICY`,
- * `MASK_HASH_*`),
+ * `STORED_SCHEMA_UNREADABLE`, `field_policies.rs` `BINARY_TOPIC_*`,
+ * `FIELD_NOT_IN_PATTERN`, `MASK_HASH_*`, `registry.rs` `VERSION_DROPS_REQUIRED_FIELD`),
  * in plain words; `''` for any other message.
  */
 export function busRefusalText(message) {
@@ -72,6 +72,23 @@ export function busRefusalText(message) {
   if (binary) return T('errors.field_policy_binary_topic', { topic: binary[1], format: schemaFormatLabel(binary[2]), name: binary[3] });
   const bind = /field policies cannot apply to a topic whose messages are binary: cannot bind the (\w+) pattern '([^']*)' to topic '([^']*)' while field policies exist/.exec(text);
   if (bind) return T('errors.field_policy_binary_bind', { topic: bind[3], format: schemaFormatLabel(bind[1]), name: bind[2] });
+  // `field_policies.rs` BINARY_TOPIC_NO_MASK_HASH / BINARY_TOPIC_NEEDS_PATTERN / FIELD_NOT_IN_PATTERN, `topics.rs` and `registry.rs`.
+  const noMaskHash = /masking and hashing do not apply to a topic whose messages are binary: topic '([^']*)' is checked with the (\w+) pattern '([^']*)'/.exec(text);
+  if (noMaskHash) return T('errors.binary_no_mask_hash', { topic: noMaskHash[1], format: schemaFormatLabel(noMaskHash[2]), name: noMaskHash[3] });
+  if (/field policies on a topic whose messages are binary need a linked message pattern/.test(text)) {
+    const withdrawn = /need a linked message pattern that is not withdrawn: the (\w+) pattern '([^']*)' of topic '([^']*)' is withdrawn/.exec(text);
+    if (withdrawn) return T('errors.binary_needs_pattern_withdrawn', { topic: withdrawn[3], format: schemaFormatLabel(withdrawn[1]), name: withdrawn[2] });
+    const unbound = /: topic '([^']*)' declares binary messages/.exec(text);
+    if (unbound) return T('errors.binary_needs_pattern_unbound', { topic: unbound[1] });
+    const changed = /: the message pattern of topic '([^']*)' was changed or withdrawn while the rule was being saved/.exec(text);
+    if (changed) return T('errors.binary_pattern_changed', { topic: changed[1] });
+  }
+  const notInPattern = /field '([^']*)' is not a field of the message pattern '([^']*)' of topic '([^']*)'/.exec(text);
+  if (notInPattern) return T('errors.field_not_in_pattern', { field: notInPattern[1], name: notInPattern[2], topic: notInPattern[3] });
+  const keepPattern = /cannot change the message pattern of topic '([^']*)' while field policies exist for it \(they name fields of the pattern '([^']*)'\)/.exec(text);
+  if (keepPattern) return T('errors.pattern_change_under_rules', { topic: keepPattern[1], name: keepPattern[2] });
+  const dropsField = /the new version lacks a field that a write rule of a topic bound to this pattern requires: field '([^']*)' is required by a write rule of topic '([^']*)'/.exec(text);
+  if (dropsField) return T('errors.version_drops_required_field', { field: dropsField[1], topic: dropsField[2] });
   // `field_policies.rs` MASK_HASH_READ_ONLY / MASK_HASH_NOT_SHOWN / MASK_HASH_OVERLAP.
   if (/masking and hashing apply to read rules only/.test(text)) return T('errors.mask_hash_read_only');
   if (/masked_fields and hashed_fields must be subsets of fields/.test(text)) return T('errors.mask_hash_not_shown');

@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
 const {
+  binaryWarnings, staleFields, blockedTexts, previewAvailable,
   policyRows, policyKey, whoTitle, whoSub, hidingCount, topicFormat, readJsonSchema, fieldSource, fieldLabel, fieldPhrase, fieldNameProblem, hl7Suggestion,
   ruleFacts, ruleTableRow, typedProblems, actionOptions, blankForm, formFromRule, serializeForm, parseForm, buildPolicyRequest, formProblem,
   ruleImpact, legendHtml, directionsClosedToKeys, closesTopicToKeys, paintHidingSection, readXsdFields, keyNote, keyAwaited, keyButtonProblem,
@@ -198,7 +199,9 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(fieldSource({ format: 'json', schema: { failed: true } }).failed, true, 'a pattern that could not be read is said so');
   assert.equal(fieldSource({ format: 'json', schema: { subject: 's', version: 1, text: '{"type":"object"}' } }).mode, 'manual', 'a pattern without properties lists nothing');
   for (const schemaType of ['avro', 'protobuf', 'thrift']) {
-    assert.equal(fieldSource({ format: 'json', schema: { subject: 's', schemaType } }).mode, 'blocked', `${schemaType} pattern: the server refuses rules`);
+    const older = fieldSource({ format: 'json', schema: { subject: 's', schemaType, fields: ['a'] } });
+    assert.deepEqual([older.mode, older.reason], ['blocked', 'unsupported'], `${schemaType} pattern on a server that does not say it takes rules`);
+    assert.equal(fieldSource({ format: 'json', schema: { subject: 's', schemaType, fields: ['a'] }, binaryActions: ['hide'] }).mode, 'binary');
   }
   assert.equal(fieldSource({ format: 'json', schema: { subject: 's', schemaType: 'json_schema', version: 1, text: '{"type":"object","properties":{"a":{"type":"string"}}}' } }).mode, 'schema');
   assert.equal(fieldSource({ format: 'json', schema: null }).mode, 'manual', 'no pattern, no block: octet-stream alone never closes the screen');
@@ -705,21 +708,55 @@ test('a topic without rules shows the empty state (T11) whose action opens the a
 });
 
 const THRIFT = { subject: 'zamowienie', schemaType: 'thrift' };
+const BINARY_CAPS = { binaryFieldActions: ['hide'], fieldActions: ['hide', 'mask', 'hash'] };
+const ORDER = {
+  subject: 'zamowienie',
+  schemaType: 'avro',
+  version: 3,
+  fields: ['numer', 'klient', 'uwagi'],
+  types: [{ name: 'numer', type: 'string', alwaysSet: true }, { name: 'klient', type: 'string', alwaysSet: true }, { name: 'uwagi', type: 'union<null, string>', alwaysSet: false }],
+};
 
-test('a topic checked with a binary pattern has no fields to name: the section says so and "Dodaj zasadę" is closed', () => {
-  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: THRIFT, schemaSettled: true } });
+test('a topic that declares binary messages and has no pattern cannot have rules: the section says so and offers the settings', () => {
+  const { host } = paint({ contentType: 'application/x-thrift', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
   const empty = host.querySelector('[data-role="state"] tf-empty-state');
-  assert.equal(empty.getAttribute('title'), 'Treść binarna nie ma ukrywania danych');
-  assert.match(empty.getAttribute('message'), /nie podlega ukrywaniu pól.*każdy, kto ma prawo czytania topiku, widzi ją w całości/);
-  assert.doesNotMatch(empty.getAttribute('message'), /na tym ekranie/, 'there is no other screen where it could be done');
+  assert.equal(empty.getAttribute('title'), 'Ten topik czeka na wzór wiadomości');
+  assert.match(empty.getAttribute('message'), /Wiadomości tego topiku są binarne.*nie ma on przypiętego wzoru.*Przypnij wzór w ustawieniach topiku\./);
   const open = empty.querySelector('[data-go="section"]');
   assert.equal(open.getAttribute('data-section'), 'settings');
   assert.equal(open.textContent, 'Otwórz ustawienia topiku', 'the button opens the settings, it does not promise a change of content type');
   assert.ok(host.querySelector('[data-role="add"]').hasAttribute('disabled'));
   assert.equal(host.querySelector('[data-role="add"]').getAttribute('title'), empty.getAttribute('message'));
   const preview = host.querySelector('[data-role="preview"]');
-  assert.ok(preview.hasAttribute('disabled'), 'a binary message has no fields to preview');
-  assert.equal(preview.getAttribute('title'), 'Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.');
+  assert.ok(preview.hasAttribute('disabled'), 'with no pattern there are no fields to preview');
+  assert.equal(preview.getAttribute('title'), 'Podgląd jest niedostępny: topik z wiadomościami binarnymi nie ma przypiętego wzoru, więc nie ma pól do pokazania.');
+});
+
+test('a pattern on a server that predates rules on binary topics: said so, no button, nothing to do', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: { ...THRIFT, fields: ['a'] }, schemaSettled: true } });
+  const empty = host.querySelector('[data-role="state"] tf-empty-state');
+  assert.equal(empty.getAttribute('title'), 'Ten node nie obsługuje ukrywania pól w treści binarnej');
+  assert.equal(empty.querySelector('tf-button'), null);
+  assert.ok(host.querySelector('[data-role="add"]').hasAttribute('disabled'));
+});
+
+test('a binary pattern that could not be read to its fields offers a retry, not the settings', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', capabilities: BINARY_CAPS, hidingData: { policies: [], policiesError: null, schema: THRIFT, schemaSettled: true } });
+  const empty = host.querySelector('[data-role="state"] tf-empty-state');
+  assert.equal(empty.getAttribute('title'), 'Nie udało się wczytać pól wzoru');
+  assert.ok(empty.querySelector('[data-go="hiding-reload"]'));
+  assert.equal(empty.querySelector('[data-go="section"]'), null);
+});
+
+test('a binary pattern with its fields: rules can be added, the note says what a rule does, only "Ukryj" is on the legend and there is no hash key card', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', capabilities: BINARY_CAPS, hidingData: { policies: [], policiesError: null, schema: ORDER, schemaSettled: true } });
+  assert.equal(host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
+  assert.equal(host.querySelector('[data-role="state"] tf-empty-state').getAttribute('title'), 'Ten topik nie ma zasad ukrywania danych');
+  const note = host.querySelector('[data-role="binary-note"] tf-alert');
+  assert.equal(note.getAttribute('title'), 'Wiadomości binarne (Avro): zasady działają na polach najwyższego poziomu');
+  assert.match(note.getAttribute('message'), /Pola pochodzą ze wzoru zamowienie, wersja 3\. Odbiorca z zasadą odczytu dostaje wiadomość zakodowaną pod-schematem/);
+  assert.equal(host.querySelector('[data-role="key-card"]').hidden, true, 'nothing is hashed on a binary topic');
+  assert.equal(host.querySelector('[data-role="preview"]').hasAttribute('disabled'), false);
 });
 
 test('the filled section: count, columns, one row per rule with Zmień and Usuń, the legend, who the keys cannot reach', () => {
@@ -811,17 +848,18 @@ test('previewing is closed with its reason to an administrator who may not read 
   assert.equal(host.querySelector('[data-role="add"]').hasAttribute('disabled'), false, 'managing rules needs administration only');
 });
 
-test('a topic checked with a binary pattern that already has rules says they will not work and leaves only "Usuń"', () => {
-  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: POLICIES, policiesError: null, schema: THRIFT, schemaSettled: true } });
+test('a topic whose binary pattern is withdrawn keeps its rules, says they cannot be changed and leaves only "Usuń"; the preview still works', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', capabilities: BINARY_CAPS, hidingData: { policies: POLICIES, policiesError: null, schema: { ...ORDER, withdrawn: true }, schemaSettled: true } });
   const note = host.querySelector('[data-role="blocked-note"] tf-alert');
-  assert.equal(note.getAttribute('message'), 'Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.');
+  assert.match(note.getAttribute('message'), /^Wzór zamowienie jest wycofany: zasady, które już są, działają dalej, ale nie można dodać nowej ani zmienić tej — można ją tylko usunąć\./);
+  assert.equal(host.querySelector('[data-role="preview"]').hasAttribute('disabled'), false, 'a withdrawn pattern still reads and projects');
   assert.equal(host.querySelector('[data-role="rules"]').hidden, false, 'the rules are listed');
   const table = host.querySelector('[data-role="rules"]');
   const actions = table.rowActions(table.rows[0], 0, () => table.rows[0]);
   assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act || b.getAttribute('data-act')), ['remove']);
   const add = host.querySelector('[data-role="add"]');
   assert.ok(add.hasAttribute('disabled'));
-  assert.match(add.getAttribute('title'), /binarna/, 'the disabled button says why');
+  assert.match(add.getAttribute('title'), /wycofany/, 'the disabled button says why');
   // The same rules on a JSON topic: no note, and both "Zmień" and "Usuń".
   const json = paint({ hidingData: { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true } });
   assert.equal(json.host.querySelector('[data-role="blocked-note"]').children.length, 0);
@@ -842,12 +880,14 @@ test('the content type alone never closes the screen: an octet-stream topic with
   assert.equal(host.querySelector('[data-role="preview"]').hasAttribute('disabled'), false);
 });
 
-test('a topic with Avro content and an Avro pattern is blocked; the same content type with a JSON pattern is not', () => {
-  const avro = paint({ contentType: 'avro/binary', hidingData: { policies: [], policiesError: null, schema: { subject: 'a', schemaType: 'avro' }, schemaSettled: true } });
-  assert.ok(avro.host.querySelector('[data-role="add"]').hasAttribute('disabled'));
-  assert.match(avro.host.querySelector('[data-role="add"]').getAttribute('title'), /binarna/);
-  const json = paint({ contentType: 'avro/binary', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
-  assert.equal(json.host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
+test('a topic with Avro content: an Avro pattern lets rules in, no pattern (or a JSON one) does not', () => {
+  const avro = paint({ contentType: 'avro/binary', capabilities: BINARY_CAPS, hidingData: { policies: [], policiesError: null, schema: ORDER, schemaSettled: true } });
+  assert.equal(avro.host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
+  for (const schema of [null, { subject: 'w', version: 1, text: '{"properties":{"a":{}}}' }]) {
+    const bare = paint({ contentType: 'avro/binary', capabilities: BINARY_CAPS, hidingData: { policies: [], policiesError: null, schema, schemaSettled: true } });
+    assert.ok(bare.host.querySelector('[data-role="add"]').hasAttribute('disabled'));
+    assert.match(bare.host.querySelector('[data-role="add"]').getAttribute('title'), /nie ma on przypiętego wzoru/);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -949,4 +989,100 @@ test('one masked or hashed field is "pole … będzie", several are "pola … b�
   assert.match(lines({ pacjent: 'mask', termin: 'mask' })[0], /^Dla „Księgowość” pola dane pacjenta \(pacjent\), termin będą widoczne tylko jako gwiazdki/);
   assert.match(lines({ pacjent: 'hash' })[0], /zamiast wartości pola dane pacjenta \(pacjent\) pojawi się hasz/);
   assert.match(lines({ pacjent: 'hash', lekarz: 'hash' })[0], /zamiast wartości pól dane pacjenta \(pacjent\), Lekarz prowadzący wizytę \(lekarz\) pojawi się hasz/);
+});
+
+// ---------------------------------------------------------------------------
+// F4 B6: rules on topics of Avro, Protobuf and Thrift messages
+// ---------------------------------------------------------------------------
+
+const binarySource = fieldSource({ format: 'json', schema: ORDER, binaryActions: ['hide'] });
+const rule = (direction, fields, extra = {}) => ({
+  key: `user:u1:${direction}`, subjectType: 'user', subjectId: 'u1', direction, label: 'Ala', memberCount: null,
+  fields, requiredFields: [], maskedFields: [], hashedFields: [], updatedAtMs: NOW, ...extra,
+});
+
+test('a binary pattern gives the top-level fields the server listed, each labelled with its type, and the fields Avro always sets', () => {
+  assert.equal(binarySource.mode, 'binary');
+  assert.deepEqual(binarySource.fields, [{ name: 'numer', label: 'string' }, { name: 'klient', label: 'string' }, { name: 'uwagi', label: 'union<null, string>' }]);
+  assert.deepEqual(binarySource.alwaysSet, ['numer', 'klient']);
+  assert.deepEqual([binarySource.binaryFormat, binarySource.subject, binarySource.version, binarySource.complete, binarySource.implicit], ['avro', 'zamowienie', 3, false, []]);
+  const noTypes = fieldSource({ format: 'json', schema: { ...ORDER, types: undefined }, binaryActions: ['hide'] });
+  assert.deepEqual(noTypes.fields.map((f) => f.label), ['', '', ''], 'without the pattern text the names stand alone');
+});
+
+test('why a binary topic is blocked: no pattern, a withdrawn one, fields the server did not give, a server that does not know rules', () => {
+  const reason = (args) => fieldSource({ format: 'json', ...args });
+  assert.equal(reason({ contentType: 'application/x-protobuf', schema: null, binaryActions: ['hide'] }).reason, 'unbound');
+  assert.equal(reason({ contentType: 'application/octet-stream', schema: null, binaryActions: ['hide'] }).mode, 'manual', 'octet-stream alone is a JSON topic');
+  assert.equal(reason({ schema: { ...ORDER, withdrawn: true }, binaryActions: ['hide'] }).reason, 'withdrawn');
+  assert.equal(reason({ schema: { ...ORDER, fields: undefined }, binaryActions: ['hide'] }).reason, 'unreadable');
+  assert.equal(reason({ schema: ORDER }).reason, 'unsupported');
+  assert.equal(reason({ schema: ORDER, binaryActions: [] }).reason, 'unsupported');
+  assert.equal(previewAvailable(reason({ schema: { ...ORDER, withdrawn: true }, binaryActions: ['hide'] })), true);
+  assert.equal(previewAvailable(reason({ contentType: 'avro/binary', schema: null, binaryActions: ['hide'] })), false);
+  const texts = blockedTexts(reason({ schema: { ...ORDER, withdrawn: true }, binaryActions: ['hide'] }));
+  assert.match(texts.text, /^Wzór zamowienie \(Avro\) jest wycofany/);
+  assert.equal(texts.preview, '');
+});
+
+test('reading a binary field is shown or hidden; "Zamaskuj" and "Zahaszuj" are drawn but cannot be chosen', () => {
+  assert.deepEqual(actionOptions('read', ['hide'], true).map((o) => [o.value, Boolean(o.disabled)]), [['show', false], ['hide', false], ['mask', true], ['hash', true]]);
+  assert.deepEqual(actionOptions('read', ['hide', 'mask', 'hash']).map((o) => o.value), ['show', 'hide', 'mask', 'hash'], 'a text topic is untouched');
+  assert.deepEqual(actionOptions('write', ['hide'], true).map((o) => [o.value, Boolean(o.disabled)]), [['allow', false], ['require', false], ['forbid', false]]);
+});
+
+test('a binary rule: hidden fields are the ones not allowed, a mask an older node stored is a hide, names the pattern lost are dropped on saving', () => {
+  const stored = rule('read', ['numer', 'uwagi', 'stare'], { maskedFields: ['uwagi'] });
+  const facts = ruleFacts(stored, binarySource);
+  assert.deepEqual(facts.hidden, ['klient', 'uwagi']);
+  assert.deepEqual(facts.marks, [['klient', 'hide'], ['uwagi', 'hide']]);
+  const form = formFromRule(stored, binarySource);
+  assert.deepEqual({ ...form.actions }, { numer: 'show', klient: 'hide', uwagi: 'hide' });
+  assert.deepEqual([form.extraShown, form.extraMasked, form.extraHashed], [[], [], []], 'nothing is typed in on a binary topic');
+  assert.deepEqual(staleFields(stored, binarySource), ['stare']);
+  assert.deepEqual(staleFields(rule('read', ['numer']), binarySource), []);
+  const request = buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: stored, direction: 'read', form, source: binarySource });
+  assert.deepEqual([request.fields, request.maskedFields, request.hashedFields, request.requiredFields], [['numer'], [], [], []]);
+});
+
+test('a binary writing rule: allowed, required, forbidden; a required field is allowed too', () => {
+  const form = { ...blankForm('write', binarySource), actions: Object.assign(Object.create(null), { numer: 'require', klient: 'allow', uwagi: 'forbid' }) };
+  const request = buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: rule('write', []), direction: 'write', form, source: binarySource });
+  assert.deepEqual([request.fields, request.requiredFields, request.maskedFields], [['klient', 'numer'], ['numer'], []]);
+  assert.equal(formProblem({ direction: 'write', form: blankForm('write', binarySource), source: binarySource, format: 'binary' }), null, 'a rule that allows every field still closes the door on later ones');
+});
+
+test('Avro warns when "Niedozwolone" is set on a field that is always set; Protobuf and Thrift, and reading, never do', () => {
+  const actions = (map) => ({ actions: Object.assign(Object.create(null), map) });
+  const warn = binaryWarnings({ direction: 'write', form: actions({ numer: 'forbid', klient: 'forbid', uwagi: 'forbid' }), source: binarySource });
+  assert.equal(warn.length, 1);
+  assert.match(warn[0], /^Pola numer, klient w Avro nie mają wartości domyślnej ani null, więc są ustawione w każdej wiadomości\. Przy „Niedozwolone” każda wiadomość zostanie odrzucona\.$/);
+  assert.match(binaryWarnings({ direction: 'write', form: actions({ numer: 'forbid' }), source: binarySource })[0], /^Pole numer w Avro nie ma /);
+  assert.deepEqual(binaryWarnings({ direction: 'write', form: actions({ uwagi: 'forbid', numer: 'allow' }), source: binarySource }), [], 'a field with null or a default can be forbidden');
+  assert.deepEqual(binaryWarnings({ direction: 'read', form: actions({ numer: 'hide' }), source: binarySource }), []);
+  const proto = fieldSource({ format: 'json', schema: { subject: 'p', schemaType: 'protobuf', fields: ['a'], types: [{ name: 'a', type: 'string', alwaysSet: false }] }, binaryActions: ['hide'] });
+  assert.deepEqual(binaryWarnings({ direction: 'write', form: actions({ a: 'forbid' }), source: proto }), []);
+});
+
+test('the sentences of a binary rule say the reader gets a sub-schema, and name the fields a later version adds as hidden or refused', () => {
+  const form = { ...blankForm('read', binarySource), actions: Object.assign(Object.create(null), { numer: 'show', klient: 'hide', uwagi: 'show' }) };
+  const lines = ruleImpact({ who: 'Ala', direction: 'read', form, current: null, source: binarySource });
+  assert.deepEqual(lines, [
+    'Dla „Ala” znikną z wiadomości pola: string (klient).',
+    'Pozostałe pola z listy bez zmian.',
+    'Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte.',
+    'Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma.',
+  ]);
+  const write = { ...blankForm('write', binarySource), actions: Object.assign(Object.create(null), { numer: 'require', klient: 'allow', uwagi: 'forbid' }) };
+  const wrote = ruleImpact({ who: 'Ala', direction: 'write', form: write, current: null, source: binarySource });
+  assert.ok(wrote.some((l) => /pod-schemat/.test(l)) === false);
+  assert.ok(wrote.some((l) => /dodanym dopiero przez nową wersję wzoru/.test(l)), 'a field outside the list is refused, a later version included');
+  const none = ruleImpact({ who: 'Ala', direction: 'read', form: blankForm('read', binarySource), current: null, source: binarySource });
+  assert.deepEqual(none, ['Dla „Ala” wszystkie pola z listy zostają widoczne; ukryte będzie tylko pole, które doda dopiero nowa wersja wzoru.']);
+});
+
+test('the legend of a binary topic lists "Ukryj" only', () => {
+  const text = norm(paint({ contentType: 'application/octet-stream', capabilities: BINARY_CAPS, hidingData: { policies: [rule('read', ['numer'])], policiesError: null, schema: ORDER, schemaSettled: true } }).host.querySelector('[data-role="legend"]').textContent);
+  assert.match(text, /Ukryj — /);
+  assert.doesNotMatch(text, /Zamaskuj|Zahaszuj/);
 });

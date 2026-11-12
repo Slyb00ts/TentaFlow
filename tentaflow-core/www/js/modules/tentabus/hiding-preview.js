@@ -22,6 +22,8 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtWhen } from '/js/modules/tentabus/format.js';
 import { windowEl } from '/js/modules/tentabus/windows.js';
 import { bytesToPreviewText } from '/js/modules/tentabus/payload.js';
+import { payloadHtml as bodyHtml } from '/js/modules/tentabus/payload-view.js';
+import { recordSchemaHtml, wireRecordSchema } from '/js/modules/tentabus/record-schema.js';
 import { pickPartition, newestOffset, rangeText } from '/js/modules/tentabus/message-preview.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import { SUBJECT_KINDS, ANY_ID, fieldLabel, compareFieldNames } from '/js/modules/tentabus/topic-hiding.js';
@@ -127,11 +129,13 @@ export function payloadHtml(bytes, cut, applied, format) {
 /**
  * The answer of one preview as markup. `resp` = `{ record, applied,
  * limitedByCaller }`, `subject` = `{ subjectType, label }`, `source` as in
- * `fieldSource` (names the fields), `format` = `json` / `xml` / `hl7v2`. The
+ * `fieldSource` (names the fields), `format` = `json` / `xml` / `hl7v2` /
+ * `binary` (the body is shown as bytes, with the schema it was encoded under
+ * on request: `withSchema`). The
  * fields the rules hid, masked or hashed are named and counted; a limit set
  * by the administrator's own rule is explained.
  */
-export function previewResultHtml({ resp, subject, source, format = 'json', nowMs = Date.now() }) {
+export function previewResultHtml({ resp, subject, source, format = 'json', withSchema = false, nowMs = Date.now() }) {
   const { record, applied } = resp;
   const named = (action) => (applied || []).filter((a) => a.action === action).map((a) => a.field).sort(compareFieldNames);
   const title = T('hiding.preview.record_title', { number: fmtCount(record.offset), partition: fmtCount(record.partition), when: fmtWhen(record.timestampMs, nowMs) });
@@ -164,7 +168,9 @@ export function previewResultHtml({ resp, subject, source, format = 'json', nowM
     ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(limitedText)}"></tf-alert>` : ''}
     <div class="tb-preview-record">
       <div class="tb-preview-record-head"><span>${escapeHtml(T('hiding.preview.sees', { who: whoPhrase(subject) }))}</span> <span class="muted">${escapeHtml(title)}</span></div>
-      <pre class="tb-payload" data-role="payload">${payloadHtml(record.payloadPreview, Boolean(record.truncated), applied, format) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
+      ${format === 'binary'
+    ? `<div class="muted" data-role="binary-note">${escapeHtml(T('hiding.preview.binary_note'))}</div>${bodyHtml(record.payloadPreview, { textBytes: PAYLOAD_BYTES, emptyText: T('topics.preview.payload_empty'), role: 'payload', truncated: Boolean(record.truncated) })}${withSchema ? recordSchemaHtml(record, { empty: !record.payloadPreview?.length, binary: true }) : ''}`
+    : `<pre class="tb-payload" data-role="payload">${payloadHtml(record.payloadPreview, Boolean(record.truncated), applied, format) || escapeHtml(T('topics.preview.payload_empty'))}</pre>`}
     </div>
     <div class="field">
       <label>${escapeHtml(T('hiding.preview.rules_title'))}</label>
@@ -176,7 +182,8 @@ export function previewResultHtml({ resp, subject, source, format = 'json', nowM
 
 /**
  * Opens the window. `ctx` = `{ instanceId, topic, partitionCount, source,
- * format (`json` / `xml` / `hl7v2`), directory({ kind, query }), loadPartitions(), preview(request),
+ * format (`json` / `xml` / `hl7v2` / `binary`), directory({ kind, query }), loadPartitions(), preview(request),
+ * loadRecordSchema(topic, schemaRefId) (optional),
  * describeError }`; `loadPartitions` may reject (the window then starts on
  * partition 0 without a number).
  */
@@ -212,6 +219,9 @@ export function openHidingPreview(ctx) {
       <tf-button variant="primary" icon="eye" data-act="show" disabled>${escapeHtml(T('hiding.preview.show'))}</tf-button>
     </div>`;
   document.body.appendChild(win);
+  if (ctx.loadRecordSchema) {
+    wireRecordSchema(win.querySelector('[data-role="result"]'), { load: (id) => ctx.loadRecordSchema(topic, id), describeError: ctx.describeError });
+  }
   const $ = (role) => win.querySelector(`[data-role="${role}"]`);
   const kindSeg = $('kind');
   const select = $('subject');
@@ -302,7 +312,7 @@ export function openHidingPreview(ctx) {
     $('result').innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('shell.loading'))}</div>`;
     try {
       const resp = await ctx.preview({ instanceId: ctx.instanceId, topic, partition: state.partition, offset, subjectType: subject.subjectType, subjectId: subject.subjectId });
-      if (turn === state.turn && win.isConnected) $('result').innerHTML = previewResultHtml({ resp, subject, source, format: ctx.format });
+      if (turn === state.turn && win.isConnected) $('result').innerHTML = previewResultHtml({ resp, subject, source, format: ctx.format, withSchema: Boolean(ctx.loadRecordSchema) });
     } catch (err) {
       if (turn === state.turn && win.isConnected) {
         $('result').innerHTML = '';

@@ -86,16 +86,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use apache_avro::schema::{
-    Alias, ArraySchema, FixedSchema, InnerDecimalSchema, MapSchema, Name, RecordField,
+    Alias, ArraySchema, EnumSchema, FixedSchema, InnerDecimalSchema, MapSchema, Name, RecordField,
     RecordSchema, Schema, UnionSchema, UuidSchema,
 };
 use serde_json::Value;
 
 use super::{
-    shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    leaking_field, leaking_field_refusal, shorten_path, Budget, Compatibility, CompiledSchema,
+    LimitExceeded, SchemaAwareFieldFormat, SchemaError, SchemaKindOps, Screened, ValidationBudget,
+    MAX_SCHEMA_TEXT_BYTES,
 };
 
 const MAX_SCHEMA_NODES: usize = 4096;
@@ -237,10 +239,37 @@ struct Field {
     node: NodeId,
 }
 
+/// What "the field is not set" is for one top-level field of a record root.
+#[derive(Debug)]
+enum Empty {
+    /// The binary encoding of the field's empty value: its declared default,
+    /// else the `null` branch of a nullable union.
+    Bytes(Vec<u8>),
+    /// The field has no empty value (no default, not nullable): always set.
+    Always,
+    /// The declared default expands past the budget of `DefaultEncoder`, so
+    /// its encoding is not known; treated like `Always` (the safe side).
+    TooLarge,
+}
+
 #[derive(Debug)]
 pub struct Compiled {
     nodes: Vec<Node>,
     root: NodeId,
+    /// The parsed schema, kept for what only a write rule needs: the defaults
+    /// the lowered nodes dropped (`empties`) — and the projection.
+    schema: Schema,
+    /// For a record root, one entry per field, computed the first time a
+    /// write rule asks (`empties`): a schema nobody writes a rule for never
+    /// pays for evaluating its defaults, and a schema whose defaults expand
+    /// without bound costs nothing at compile time.
+    empty: OnceLock<Vec<Empty>>,
+}
+
+impl Compiled {
+    fn empties(&self) -> &[Empty] {
+        self.empty.get_or_init(|| root_empties(&self.schema))
+    }
 }
 
 struct Lowerer<'s> {
@@ -903,7 +932,7 @@ impl Prescan {
     }
 }
 
-fn parse_text(schema_text: &str) -> Result<(Schema, Compiled), SchemaError> {
+fn parse_text(schema_text: &str) -> Result<Compiled, SchemaError> {
     if schema_text.len() > MAX_SCHEMA_TEXT_BYTES {
         return Err(invalid(format!(
             "schema text is {} bytes, exceeding the {MAX_SCHEMA_TEXT_BYTES}-byte limit",
@@ -935,7 +964,304 @@ fn parse_text(schema_text: &str) -> Result<(Schema, Compiled), SchemaError> {
              branch (a union with null, an array or a map)",
         ));
     }
-    Ok((schema, Compiled { nodes, root }))
+    Ok(Compiled {
+        nodes,
+        root,
+        schema,
+        empty: OnceLock::new(),
+    })
+}
+
+// =============================================================================
+// Empty values (what "the field is not set" means in Avro)
+// =============================================================================
+
+fn put_long(out: &mut Vec<u8>, value: i64) {
+    let mut n = ((value << 1) ^ (value >> 63)) as u64;
+    while n >= 0x80 {
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_long(out, bytes.len() as i64);
+    out.extend_from_slice(bytes);
+}
+
+/// A JSON string of code points 0-255 as the bytes they stand for (the Avro
+/// JSON form of `bytes` and `fixed`).
+fn latin1_bytes(text: &str) -> Option<Vec<u8>> {
+    text.chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect()
+}
+
+/// Work one top-level field's default may cost to evaluate before the field
+/// is given up on as `Empty::TooLarge`: encoding steps and bytes of output.
+/// A default that is legitimately larger than 64 KiB of Avro is not a default
+/// a write rule can compare a record's bytes with.
+const MAX_DEFAULT_STEPS: usize = 20_000;
+const MAX_DEFAULT_BYTES: usize = 64 * 1024;
+/// The same for all the fields of a root together.
+const MAX_DEFAULT_STEPS_TOTAL: usize = 500_000;
+
+/// Encodes JSON defaults. Filling a record default with its fields' OWN
+/// defaults can multiply: `R0{a: R1 default {}, b: R1 default {}}` and so on
+/// down a chain encodes every level twice, `2^depth` leaves from a text of a
+/// few kilobytes. The budget bounds steps and output; the memo makes a field's
+/// own default cost one encoding however many times a type is reached.
+struct DefaultEncoder<'s> {
+    definitions: &'s HashMap<String, &'s Schema>,
+    /// Steps and output allowed for the field being evaluated.
+    steps_left: usize,
+    total_left: usize,
+    /// Set when a budget ran out: the answer of the field is `TooLarge`, not
+    /// "the default does not fit".
+    exceeded: bool,
+    /// Encoding of the own default of a record field, by the address of the
+    /// field in the (immutable, borrowed) schema.
+    memo: HashMap<usize, Vec<u8>>,
+}
+
+impl<'s> DefaultEncoder<'s> {
+    fn new(definitions: &'s HashMap<String, &'s Schema>) -> Self {
+        DefaultEncoder {
+            definitions,
+            steps_left: 0,
+            total_left: MAX_DEFAULT_STEPS_TOTAL,
+            exceeded: false,
+            memo: HashMap::new(),
+        }
+    }
+
+    /// The encoding of `default` as a value of `schema`: `Ok` when it fits,
+    /// `Err(true)` when a budget ran out, `Err(false)` when it does not fit.
+    fn field_default(&mut self, schema: &Schema, default: &Value) -> Result<Vec<u8>, bool> {
+        self.steps_left = MAX_DEFAULT_STEPS.min(self.total_left);
+        self.exceeded = self.total_left == 0;
+        let before = self.steps_left;
+        let mut out = Vec::new();
+        let fits = !self.exceeded && self.encode(schema, default, &mut out, 0);
+        self.total_left = self.total_left.saturating_sub(before - self.steps_left);
+        match (fits, self.exceeded) {
+            (true, _) => Ok(out),
+            (false, exceeded) => Err(exceeded),
+        }
+    }
+
+    fn charge(&mut self, out_len: usize) -> bool {
+        if self.steps_left == 0 || out_len > MAX_DEFAULT_BYTES {
+            self.exceeded = true;
+            return false;
+        }
+        self.steps_left -= 1;
+        true
+    }
+
+    /// The binary encoding of a JSON default under `schema` (a union: under
+    /// its first branch). `false` when the default does not fit or a budget ran
+    /// out (`exceeded` tells which); validated defaults always fit, so the
+    /// first is only the guard of a function that must not panic.
+    fn encode(&mut self, schema: &Schema, value: &Value, out: &mut Vec<u8>, depth: usize) -> bool {
+        if depth > MAX_SCHEMA_DEPTH * 2 || !self.charge(out.len()) {
+            return false;
+        }
+        match schema {
+            Schema::Null => value.is_null(),
+            Schema::Boolean => match value.as_bool() {
+                Some(b) => {
+                    out.push(u8::from(b));
+                    true
+                }
+                None => false,
+            },
+            Schema::Int
+            | Schema::Date
+            | Schema::TimeMillis
+            | Schema::Long
+            | Schema::TimeMicros
+            | Schema::TimestampMillis
+            | Schema::TimestampMicros
+            | Schema::TimestampNanos
+            | Schema::LocalTimestampMillis
+            | Schema::LocalTimestampMicros
+            | Schema::LocalTimestampNanos => match value.as_i64() {
+                Some(n) => {
+                    put_long(out, n);
+                    true
+                }
+                None => false,
+            },
+            Schema::Float => match value.as_f64() {
+                Some(n) => {
+                    out.extend_from_slice(&(n as f32).to_le_bytes());
+                    true
+                }
+                None => false,
+            },
+            Schema::Double => match value.as_f64() {
+                Some(n) => {
+                    out.extend_from_slice(&n.to_le_bytes());
+                    true
+                }
+                None => false,
+            },
+            Schema::Bytes
+            | Schema::BigDecimal
+            | Schema::Uuid(UuidSchema::Bytes)
+            | Schema::Decimal(apache_avro::schema::DecimalSchema {
+                inner: InnerDecimalSchema::Bytes,
+                ..
+            }) => match value.as_str().and_then(latin1_bytes) {
+                Some(bytes) => {
+                    put_bytes(out, &bytes);
+                    true
+                }
+                None => false,
+            },
+            Schema::String | Schema::Uuid(UuidSchema::String) => match value.as_str() {
+                Some(text) => {
+                    put_bytes(out, text.as_bytes());
+                    true
+                }
+                None => false,
+            },
+            Schema::Fixed(f)
+            | Schema::Uuid(UuidSchema::Fixed(f))
+            | Schema::Duration(f)
+            | Schema::Decimal(apache_avro::schema::DecimalSchema {
+                inner: InnerDecimalSchema::Fixed(f),
+                ..
+            }) => match value.as_str().and_then(latin1_bytes) {
+                Some(bytes) if bytes.len() == f.size => {
+                    out.extend_from_slice(&bytes);
+                    true
+                }
+                _ => false,
+            },
+            Schema::Enum(e) => match value
+                .as_str()
+                .and_then(|s| e.symbols.iter().position(|symbol| symbol == s))
+            {
+                Some(index) => {
+                    put_long(out, index as i64);
+                    true
+                }
+                None => false,
+            },
+            Schema::Array(a) => match value.as_array() {
+                Some(items) => {
+                    if !items.is_empty() {
+                        put_long(out, items.len() as i64);
+                        for item in items {
+                            if !self.encode(&a.items, item, out, depth + 1) {
+                                return false;
+                            }
+                        }
+                    }
+                    put_long(out, 0);
+                    true
+                }
+                None => false,
+            },
+            Schema::Map(m) => match value.as_object() {
+                Some(entries) => {
+                    if !entries.is_empty() {
+                        put_long(out, entries.len() as i64);
+                        for (key, item) in entries {
+                            put_bytes(out, key.as_bytes());
+                            if !self.encode(&m.types, item, out, depth + 1) {
+                                return false;
+                            }
+                        }
+                    }
+                    put_long(out, 0);
+                    true
+                }
+                None => false,
+            },
+            Schema::Union(u) => match u.variants().first() {
+                Some(first) => {
+                    put_long(out, 0);
+                    self.encode(first, value, out, depth)
+                }
+                None => false,
+            },
+            Schema::Record(r) => match value.as_object() {
+                Some(entries) => r.fields.iter().all(|field| {
+                    match entries.get(&field.name) {
+                        Some(item) => self.encode(&field.schema, item, out, depth + 1),
+                        None => self.own_default(field, out, depth + 1),
+                    }
+                }),
+                None => false,
+            },
+            Schema::Ref { name } => match self.definitions.get(&name.fullname(None)) {
+                Some(definition) => self.encode(definition, value, out, depth + 1),
+                None => false,
+            },
+        }
+    }
+
+    /// A record field the default object leaves out takes its own default,
+    /// encoded once and appended from the memo afterwards.
+    fn own_default(&mut self, field: &RecordField, out: &mut Vec<u8>, depth: usize) -> bool {
+        let Some(default) = field.custom_attributes.get(STASHED_DEFAULT) else {
+            return false;
+        };
+        let key = std::ptr::from_ref(field) as usize;
+        if let Some(known) = self.memo.get(&key) {
+            if out.len() + known.len() > MAX_DEFAULT_BYTES {
+                self.exceeded = true;
+                return false;
+            }
+            out.extend_from_slice(known);
+            return true;
+        }
+        let mut sub = Vec::new();
+        if !self.encode(&field.schema, default, &mut sub, depth) {
+            return false;
+        }
+        if out.len() + sub.len() > MAX_DEFAULT_BYTES {
+            self.exceeded = true;
+            return false;
+        }
+        out.extend_from_slice(&sub);
+        self.memo.insert(key, sub);
+        true
+    }
+}
+
+/// `Compiled::empty` of the root record of `schema` (nothing for another root).
+fn root_empties(schema: &Schema) -> Vec<Empty> {
+    let Schema::Record(root) = schema else {
+        return Vec::new();
+    };
+    let mut definitions = HashMap::new();
+    collect_definitions(schema, &mut definitions);
+    let mut encoder = DefaultEncoder::new(&definitions);
+    root.fields
+        .iter()
+        .map(|field| {
+            if let Some(default) = field.custom_attributes.get(STASHED_DEFAULT) {
+                return match encoder.field_default(&field.schema, default) {
+                    Ok(bytes) => Empty::Bytes(bytes),
+                    Err(true) => Empty::TooLarge,
+                    Err(false) => Empty::Always,
+                };
+            }
+            if let Schema::Union(u) = &field.schema {
+                if let Some(null) = u.variants().iter().position(|b| matches!(b, Schema::Null)) {
+                    let mut out = Vec::new();
+                    put_long(&mut out, null as i64);
+                    return Empty::Bytes(out);
+                }
+            }
+            Empty::Always
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -1748,11 +2074,11 @@ fn rebuild(
         }
         Schema::Array(a) => Schema::Array(ArraySchema {
             items: Box::new(rebuild(&a.items, definitions, written)?),
-            attributes: a.attributes.clone(),
+            attributes: BTreeMap::new(),
         }),
         Schema::Map(m) => Schema::Map(MapSchema {
             types: Box::new(rebuild(&m.types, definitions, written)?),
-            attributes: m.attributes.clone(),
+            attributes: BTreeMap::new(),
         }),
         Schema::Union(u) => {
             let branches = u
@@ -1765,6 +2091,16 @@ fn rebuild(
                     .map_err(|e| invalid(format!("not a valid Avro schema: {e}")))?,
             )
         }
+        Schema::Enum(e) => Schema::Enum(EnumSchema {
+            doc: None,
+            attributes: BTreeMap::new(),
+            ..e.clone()
+        }),
+        Schema::Fixed(f) => Schema::Fixed(FixedSchema {
+            doc: None,
+            attributes: BTreeMap::new(),
+            ..f.clone()
+        }),
         other => other.clone(),
     })
 }
@@ -1776,11 +2112,17 @@ fn rebuild_field(
 ) -> Result<RecordField, SchemaError> {
     Ok(RecordField {
         name: field.name.clone(),
-        doc: field.doc.clone(),
+        doc: None,
         aliases: field.aliases.clone(),
         default: field.default.clone(),
         schema: rebuild(&field.schema, definitions, written)?,
-        custom_attributes: field.custom_attributes.clone(),
+        // The stashed default is the one attribute that is data.
+        custom_attributes: field
+            .custom_attributes
+            .iter()
+            .filter(|(key, _)| key.as_str() == STASHED_DEFAULT)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     })
 }
 
@@ -1792,13 +2134,16 @@ fn record_with(record: &RecordSchema, fields: Vec<RecordField>) -> Schema {
             lookup.insert(alias.clone(), position);
         }
     }
+    // The projection is what the READER sees: the author's `doc` and custom
+    // attributes are prose and metadata that may describe the fields the rule
+    // hides, and nothing about resolution or decoding depends on them.
     Schema::Record(RecordSchema {
         name: record.name.clone(),
         aliases: record.aliases.clone(),
-        doc: record.doc.clone(),
+        doc: None,
         fields,
         lookup,
-        attributes: record.attributes.clone(),
+        attributes: BTreeMap::new(),
     })
 }
 
@@ -1811,7 +2156,7 @@ pub struct AvroOps;
 impl SchemaKindOps for AvroOps {
     fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
         let schema_text = schema_text.as_str();
-        parse_text(schema_text).map(|(_, compiled)| CompiledSchema::Avro(compiled))
+        parse_text(schema_text).map(CompiledSchema::Avro)
     }
 
     fn validate_metered(
@@ -1835,14 +2180,18 @@ impl SchemaKindOps for AvroOps {
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
         let schema_text = schema_text.as_str();
-        let (schema, _) = parse_text(schema_text)?;
-        let Schema::Record(root) = &schema else {
+        let compiled = CompiledSchema::Avro(parse_text(schema_text)?);
+        let schema = &avro_compiled(&compiled)?.schema;
+        let Schema::Record(root) = schema else {
             return Err(invalid(
                 "root schema must be a record to derive a projection",
             ));
         };
+        if let Some(field) = leaking_field(self, &compiled, allowed)? {
+            return Err(invalid(leaking_field_refusal(&field)));
+        }
         let mut definitions = HashMap::new();
-        collect_definitions(&schema, &mut definitions);
+        collect_definitions(schema, &mut definitions);
         let mut written = HashSet::new();
         written.extend(answers_to(&root.name, &root.aliases));
         let fields = root
@@ -1871,8 +2220,8 @@ impl SchemaKindOps for AvroOps {
         if mode == Compatibility::None {
             return Ok(());
         }
-        let (_, old) = parse_text(old_schema_text)?;
-        let (_, new) = parse_text(new_schema_text)?;
+        let old = parse_text(old_schema_text)?;
+        let new = parse_text(new_schema_text)?;
         let check =
             |writer: &Compiled, reader: &Compiled, lead: &str, labels: (&str, &str)| match reads(
                 writer, reader,
@@ -1910,6 +2259,210 @@ impl SchemaKindOps for AvroOps {
 }
 
 pub(super) static AVRO_OPS: AvroOps = AvroOps;
+
+// =============================================================================
+// Field policies on Avro records (F4 B6)
+// =============================================================================
+// An Avro datum has no field markers: a field is exactly the bytes its type
+// takes, one after another in schema order. The strict walker above finds those
+// bytes, so a read projection is a splice — the byte ranges of the kept fields
+// in their original order — which is exactly what the datum looks like under
+// the schema `derive_subschema` writes (same field order, same types, a union
+// keeps its branch order, so a kept field's bytes mean the same thing there).
+// Nothing is decoded or re-encoded, so nothing is lost: a float keeps its bit
+// pattern, a map its entry order.
+
+/// The byte range of every top-level field of the root record, in schema
+/// order, after the WHOLE datum has been walked: a datum that is not valid
+/// under the schema (truncated, trailing bytes, a bad union index) is an
+/// error, never a partial answer.
+fn root_spans(
+    c: &Compiled,
+    payload: &[u8],
+    shared: &mut ValidationBudget,
+) -> Result<Vec<std::ops::Range<usize>>, SchemaError> {
+    let Kind::Record { fields, .. } = &c.nodes[c.root].kind else {
+        return Err(invalid("the root of the schema is not a record"));
+    };
+    let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_UNITS));
+    let mut walker = Walker {
+        nodes: &c.nodes,
+        data: payload,
+        pos: 0,
+        budget: &mut budget,
+        path: Vec::new(),
+    };
+    let mut spans = Vec::with_capacity(fields.len());
+    let outcome: Walk<()> = (|| {
+        walker.budget.charge(1)?;
+        for field in fields {
+            let start = walker.pos;
+            walker.path.push(Seg::Field(&field.name));
+            walker.value(field.node, 1)?;
+            walker.path.pop();
+            spans.push(start..walker.pos);
+        }
+        if walker.pos == payload.len() {
+            Ok(())
+        } else {
+            walker.path.clear();
+            Err(Fail::Violation(TRAILING))
+        }
+    })();
+    let path = shorten_path(&render_path(&walker.path));
+    drop(walker);
+    shared.spend(budget.used);
+    match outcome {
+        Ok(()) => Ok(spans),
+        Err(Fail::Violation(msg)) => Err(SchemaError::Violation(format!("{path}: {msg}"))),
+        Err(Fail::Limit(msg)) => Err(SchemaError::LimitExceeded(format!("{path}: {msg}"))),
+    }
+}
+
+fn avro_compiled(compiled: &CompiledSchema) -> Result<&Compiled, SchemaError> {
+    match compiled {
+        CompiledSchema::Avro(c) => Ok(c),
+        _ => Err(invalid("called with a non-avro compiled schema")),
+    }
+}
+
+impl SchemaAwareFieldFormat for AvroOps {
+    fn declared_fields(&self, compiled: &CompiledSchema) -> Result<Vec<String>, SchemaError> {
+        let c = avro_compiled(compiled)?;
+        match &c.nodes[c.root].kind {
+            Kind::Record { fields, .. } => Ok(fields.iter().map(|f| f.name.clone()).collect()),
+            _ => Err(invalid("the root of the schema is not a record")),
+        }
+    }
+
+    /// A field is SET when its value is not its empty value (`Compiled::empty`):
+    /// the declared default, else the `null` of a nullable union; a field with
+    /// neither can never be unset and is always listed. A "forbidden" field
+    /// of a write rule is therefore one the producer must leave at its default
+    /// (or null), a "required" one is satisfied only by a different value.
+    fn list_fields(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        budget: &mut ValidationBudget,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = avro_compiled(compiled)?;
+        let Kind::Record { fields, .. } = &c.nodes[c.root].kind else {
+            return Err(invalid("the root of the schema is not a record"));
+        };
+        let spans = root_spans(c, payload, budget)?;
+        let empties = c.empties();
+        Ok(fields
+            .iter()
+            .zip(&spans)
+            .enumerate()
+            .filter(|(i, (_, span))| match empties.get(*i) {
+                Some(Empty::Bytes(empty)) => payload[(*span).clone()] != empty[..],
+                _ => true,
+            })
+            .map(|(_, (field, _))| field.name.clone())
+            .collect())
+    }
+
+    fn project(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        budget: &mut ValidationBudget,
+    ) -> Result<Vec<u8>, SchemaError> {
+        let c = avro_compiled(compiled)?;
+        let Kind::Record { fields, .. } = &c.nodes[c.root].kind else {
+            return Err(invalid("the root of the schema is not a record"));
+        };
+        let spans = root_spans(c, payload, budget)?;
+        let mut out = Vec::new();
+        for (field, span) in fields.iter().zip(spans) {
+            if visible.contains(&field.name) {
+                out.extend_from_slice(&payload[span]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn self_referencing_fields(
+        &self,
+        compiled: &CompiledSchema,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = avro_compiled(compiled)?;
+        let Kind::Record { fields, .. } = &c.nodes[c.root].kind else {
+            return Err(invalid("the root of the schema is not a record"));
+        };
+        // Types that reach the root: the root, and everything that contains
+        // one of them (walked from the root along the edges backwards).
+        let mut parents: Vec<Vec<NodeId>> = vec![Vec::new(); c.nodes.len()];
+        for (id, node) in c.nodes.iter().enumerate() {
+            match &node.kind {
+                Kind::Array(item) | Kind::Map(item) => parents[*item].push(id),
+                Kind::Union(branches) => branches.iter().for_each(|b| parents[*b].push(id)),
+                Kind::Record { fields, .. } => fields.iter().for_each(|f| parents[f.node].push(id)),
+                _ => {}
+            }
+        }
+        let mut reaches = vec![false; c.nodes.len()];
+        reaches[c.root] = true;
+        let mut work = vec![c.root];
+        while let Some(id) = work.pop() {
+            for &parent in &parents[id] {
+                if !reaches[parent] {
+                    reaches[parent] = true;
+                    work.push(parent);
+                }
+            }
+        }
+        Ok(fields
+            .iter()
+            .filter(|f| reaches[f.node])
+            .map(|f| f.name.clone())
+            .collect())
+    }
+
+    /// Avro puts every field on the wire, so a write rule judges a field by
+    /// comparing its bytes with the empty value (`Compiled::empty`). A field
+    /// with no empty value is always "set": a rule that does not allow it
+    /// refuses every record.
+    fn write_rule_obstacle(
+        &self,
+        compiled: &CompiledSchema,
+        allowed: &BTreeSet<String>,
+    ) -> Result<Option<String>, SchemaError> {
+        let c = avro_compiled(compiled)?;
+        let Kind::Record { fields, .. } = &c.nodes[c.root].kind else {
+            return Err(invalid("the root of the schema is not a record"));
+        };
+        let empties = c.empties();
+        for (field, empty) in fields.iter().zip(empties) {
+            if allowed.contains(&field.name) {
+                continue;
+            }
+            match empty {
+                Empty::Bytes(_) => {}
+                Empty::Always => {
+                    return Ok(Some(format!(
+                        "field '{}' has no default value and is not nullable, so every record sets \
+                         it and a write rule has to allow it",
+                        field.name
+                    )));
+                }
+                Empty::TooLarge => {
+                    return Ok(Some(format!(
+                        "the default value of field '{}' is too large to evaluate (more than \
+                         {MAX_DEFAULT_BYTES} bytes or {MAX_DEFAULT_STEPS} steps once its nested \
+                         defaults are filled in), so a write rule cannot tell whether the field \
+                         is set and has to allow it",
+                        field.name
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2792,8 +3345,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn reads_text(writer: &str, reader: &str) -> Result<(), String> {
-        let (_, w) = parse_text(writer).unwrap();
-        let (_, r) = parse_text(reader).unwrap();
+        let w = parse_text(writer).unwrap();
+        let r = parse_text(reader).unwrap();
         match reads(&w, &r) {
             Ok(()) => Ok(()),
             Err(Stop::No(why)) => Err(why.render((&w.nodes, &r.nodes), "writer", "reader")),
@@ -3186,7 +3739,8 @@ mod tests {
         );
         assert_eq!(value["name"], "Order");
         assert_eq!(value["namespace"], "shop");
-        assert_eq!(value["doc"], "A shop order");
+        // The author's prose may describe the fields the rule hides.
+        assert!(value.get("doc").is_none(), "{derived}");
         // Deterministic.
         assert_eq!(
             derived,
@@ -3723,6 +4277,132 @@ mod tests {
         assert!(reason.contains("may not use the key"), "{reason}");
     }
 
+    /// `Root{f: R0 default {}}` where `Ri{a: R(i+1) default {}, b: R(i+1)
+    /// default {}}` down to `R{depth}{x: int default 0}`: filling every default
+    /// with its fields' own defaults writes `2^depth` leaves. `b` names the
+    /// type `a` defines.
+    fn doubling_defaults(depth: usize) -> String {
+        fn level(i: usize, depth: usize) -> String {
+            if i == depth {
+                return format!(
+                    r#"{{"type":"record","name":"R{i}","fields":[{{"name":"x","type":"int","default":0}}]}}"#
+                );
+            }
+            format!(
+                r#"{{"type":"record","name":"R{i}","fields":[{{"name":"a","type":{},"default":{{}}}},{{"name":"b","type":"R{}","default":{{}}}}]}}"#,
+                level(i + 1, depth),
+                i + 1
+            )
+        }
+        format!(
+            r#"{{"type":"record","name":"Root","fields":[{{"name":"f","type":{},"default":{{}}}},{{"name":"g","type":"int"}}]}}"#,
+            level(0, depth)
+        )
+    }
+
+    fn within<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: did not finish in 10 s"))
+    }
+
+    #[test]
+    fn defaults_that_multiply_through_nested_records_are_bounded_not_expanded() {
+        // 2^20 leaves are a megabyte of defaults, 2^40 more than a machine
+        // holds; both are a few kilobytes of schema text.
+        for depth in [20, 40] {
+            let schema = doubling_defaults(depth);
+            assert!(schema.len() < 8 * 1024, "{}", schema.len());
+            // Compiling (every publish to a topic with this pattern does) and
+            // asking a write rule what it cannot live with take milliseconds,
+            // and the default is given up on instead of being expanded.
+            let (obstacle, took) = within("a doubling default", move || {
+                let started = Instant::now();
+                let compiled = AVRO_OPS.compile(&schema).unwrap();
+                let obstacle = AVRO_OPS
+                    .write_rule_obstacle(&compiled, &allowed(&["g"]))
+                    .unwrap();
+                (obstacle, started.elapsed())
+            });
+            assert!(took < Duration::from_secs(5), "{depth}: {took:?}");
+            let obstacle = obstacle.expect("the default is too large to compare with");
+            assert!(
+                obstacle.contains("field 'f'") && obstacle.contains("too large"),
+                "{depth}: {obstacle}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_rule_cannot_leave_out_a_field_every_record_sets() {
+        let schema = rec(
+            r#"{"name":"a","type":"int"},{"name":"b","type":"int","default":0},{"name":"c","type":["null","int"]}"#,
+        );
+        let compiled = compiled(&schema);
+        let obstacle = AVRO_OPS
+            .write_rule_obstacle(&compiled, &allowed(&["b", "c"]))
+            .unwrap()
+            .expect("`a` has no default and is not nullable");
+        assert!(obstacle.contains("field 'a'"), "{obstacle}");
+        assert_eq!(
+            AVRO_OPS
+                .write_rule_obstacle(&compiled, &allowed(&["a"]))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_field_that_reaches_the_root_again_cannot_be_shown_without_the_fields_left_out() {
+        // Directly: `next` holds a whole `R`, `secret` included.
+        let direct = rec(
+            r#"{"name":"secret","type":"string"},{"name":"next","type":["null","R"],"default":null}"#,
+        );
+        let compiled_direct = compiled(&direct);
+        assert_eq!(
+            AVRO_OPS.self_referencing_fields(&compiled_direct).unwrap(),
+            allowed(&["next"])
+        );
+        let refusal = AVRO_OPS
+            .derive_subschema(&direct, &allowed(&["next"]))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("field 'next' refers back"), "{refusal}");
+        // Nothing left out, or the recursive field left out too: fine.
+        AVRO_OPS
+            .derive_subschema(&direct, &allowed(&["secret", "next"]))
+            .unwrap();
+        AVRO_OPS
+            .derive_subschema(&direct, &allowed(&["secret"]))
+            .unwrap();
+        assert_eq!(
+            leaking_field(&AVRO_OPS, &compiled_direct, &allowed(&["next"])).unwrap(),
+            Some("next".to_string())
+        );
+
+        // Through another type, a list and a map.
+        let fields = r#"{"name":"secret","type":"string"},
+            {"name":"child","type":{"type":"record","name":"Other","fields":[
+                {"name":"back","type":{"type":"array","items":{"type":"map","values":"R"}}}]}},
+            {"name":"plain","type":{"type":"record","name":"Leaf","fields":[{"name":"v","type":"int"}]}}"#;
+        let indirect = rec(fields);
+        assert_eq!(
+            AVRO_OPS
+                .self_referencing_fields(&compiled(&indirect))
+                .unwrap(),
+            allowed(&["child"])
+        );
+        assert!(AVRO_OPS
+            .derive_subschema(&indirect, &allowed(&["child", "plain"]))
+            .is_err());
+        AVRO_OPS
+            .derive_subschema(&indirect, &allowed(&["plain"]))
+            .unwrap();
+    }
+
     #[test]
     fn a_projection_keeps_field_defaults() {
         let schema = rec(
@@ -3824,7 +4504,7 @@ mod tests {
     #[test]
     fn a_truncated_fixed_is_a_violation_not_a_limit() {
         let big = rec(r#"{"name":"f","type":{"type":"fixed","name":"F","size":16777216}}"#);
-        let (_, c) = parse_text(&big).unwrap();
+        let c = parse_text(&big).unwrap();
         // The charge for 16 MiB (2M units) would not fit this budget, but the
         // payload is simply too short, which is the more useful answer.
         let outcome = validate_with(&c, b"", &mut Budget::new(100));
@@ -3844,5 +4524,271 @@ mod tests {
         assert_eq!(SchemaType::Avro.required_payload_format(), None);
         let foreign = AVRO_OPS.validate(&SchemaType::JsonSchema.ops().compile("{}").unwrap(), b"");
         assert!(matches!(foreign, Err(SchemaError::Invalid(_))));
+    }
+
+    // -------------------------------------------------------------------------
+    // Field policies (F4 B6): the library is the oracle
+    // -------------------------------------------------------------------------
+
+    mod field_policy {
+        use apache_avro::types::Value;
+        use apache_avro::writer::datum::GenericDatumWriter;
+
+        use super::*;
+
+        const PATIENT: &str = r#"{"type":"record","name":"Patient","fields":[
+            {"name":"id","type":"long"},
+            {"name":"name","type":"string"},
+            {"name":"ssn","type":["null","string"],"default":null},
+            {"name":"tags","type":{"type":"array","items":"string"}},
+            {"name":"status","type":{"type":"enum","name":"Status","symbols":["NEW","OLD"]}},
+            {"name":"prev","type":["null","Status"],"default":null},
+            {"name":"note","type":"string","default":"n/a"},
+            {"name":"score","type":"double","default":0.5},
+            {"name":"code","type":"int"}
+        ]}"#;
+
+        fn names(of: &[&str]) -> BTreeSet<String> {
+            of.iter().map(|n| n.to_string()).collect()
+        }
+
+        fn patient(ssn: Option<&str>, note: &str) -> Value {
+            Value::Record(vec![
+                ("id".into(), Value::Long(7)),
+                ("name".into(), Value::String("Anna".into())),
+                (
+                    "ssn".into(),
+                    match ssn {
+                        Some(s) => Value::Union(1, Box::new(Value::String(s.into()))),
+                        None => Value::Union(0, Box::new(Value::Null)),
+                    },
+                ),
+                (
+                    "tags".into(),
+                    Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+                ),
+                ("status".into(), Value::Enum(1, "OLD".into())),
+                (
+                    "prev".into(),
+                    Value::Union(1, Box::new(Value::Enum(0, "NEW".into()))),
+                ),
+                ("note".into(), Value::String(note.into())),
+                ("score".into(), Value::Double(0.5)),
+                ("code".into(), Value::Int(42)),
+            ])
+        }
+
+        fn encode(schema: &str, value: Value) -> Vec<u8> {
+            let schema = Schema::parse_str(schema).unwrap();
+            GenericDatumWriter::builder(&schema)
+                .build()
+                .unwrap()
+                .write_value_to_vec(value)
+                .unwrap()
+        }
+
+        fn decode(schema: &str, bytes: &[u8]) -> Value {
+            let schema = Schema::parse_str(schema).unwrap();
+            let mut rest = bytes;
+            let value = GenericDatumReader::builder(&schema)
+                .build()
+                .unwrap()
+                .read_value(&mut rest)
+                .expect("the library reads the projection under the derived schema");
+            assert!(rest.is_empty(), "the projection has no bytes left over");
+            value
+        }
+
+        fn project(payload: &[u8], visible: &BTreeSet<String>) -> Result<Vec<u8>, SchemaError> {
+            let compiled = compiled(PATIENT);
+            AVRO_OPS.project(&compiled, payload, visible, &mut ValidationBudget::unshared())
+        }
+
+        fn fields_of(value: &Value) -> Vec<(String, Value)> {
+            match value {
+                Value::Record(fields) => fields.clone(),
+                other => panic!("not a record: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_projection_decodes_with_the_library_under_the_derived_schema() {
+            let full = patient(Some("90010112345"), "hello");
+            let payload = encode(PATIENT, full.clone());
+            let all = fields_of(&full);
+            for visible in [
+                names(&["id", "name"]),
+                names(&["id", "prev", "tags"]),
+                names(&["status", "prev"]),
+                names(&["code", "score", "note", "ssn"]),
+                names(&[]),
+                names(&["id", "name", "ssn", "tags", "status", "prev", "note", "score", "code"]),
+                names(&["id", "not-a-field"]),
+            ] {
+                let projected = project(&payload, &visible).unwrap();
+                let derived = AVRO_OPS
+                    .derive_subschema(PATIENT, &visible)
+                    .expect("a projection of any field set derives");
+                let decoded = fields_of(&decode(&derived, &projected));
+                let expected: Vec<(String, Value)> = all
+                    .iter()
+                    .filter(|(name, _)| visible.contains(name))
+                    .cloned()
+                    .collect();
+                assert_eq!(decoded, expected, "visible {visible:?}");
+            }
+        }
+
+        #[test]
+        fn a_type_defined_in_a_dropped_field_is_hoisted_into_the_kept_one() {
+            let payload = encode(PATIENT, patient(None, "n/a"));
+            let visible = names(&["prev"]);
+            let derived = AVRO_OPS.derive_subschema(PATIENT, &visible).unwrap();
+            let decoded = fields_of(&decode(&derived, &project(&payload, &visible).unwrap()));
+            assert_eq!(
+                decoded,
+                vec![("prev".to_string(), Value::Union(1, Box::new(Value::Enum(0, "NEW".into()))))]
+            );
+        }
+
+        #[test]
+        fn a_projection_keeps_the_bytes_of_a_field_exactly() {
+            // Nothing is decoded and written again: a float keeps its bit
+            // pattern, an array its block layout.
+            let payload = encode(PATIENT, patient(Some("x"), "hello"));
+            let one = project(&payload, &names(&["score"])).unwrap();
+            assert_eq!(one, 0.5f64.to_le_bytes());
+            let whole = project(&payload, &names(&PATIENT_FIELDS)).unwrap();
+            assert_eq!(whole, payload, "showing every field changes nothing");
+        }
+
+        const PATIENT_FIELDS: [&str; 9] = [
+            "id", "name", "ssn", "tags", "status", "prev", "note", "score", "code",
+        ];
+
+        #[test]
+        fn a_datum_that_is_not_valid_under_the_schema_is_never_projected() {
+            let payload = encode(PATIENT, patient(None, "n/a"));
+            let visible = names(&["id"]);
+            // Truncated, trailing bytes, an empty payload, a bad union index.
+            assert!(project(&payload[..payload.len() - 1], &visible).is_err());
+            let mut longer = payload.clone();
+            longer.push(0);
+            assert!(project(&longer, &visible).is_err());
+            assert!(project(&[], &visible).is_err());
+            let mut bad_union = payload.clone();
+            // id (1 byte), name (1 + 4), then the ssn union index.
+            bad_union[6] = 0x08;
+            assert!(project(&bad_union, &visible).is_err());
+            // The error names a path and a constraint, never a value.
+            let message = project(&longer, &visible).unwrap_err().to_string();
+            assert!(!message.contains("Anna"), "{message}");
+        }
+
+        #[test]
+        fn a_root_that_is_not_a_record_cannot_be_projected() {
+            let compiled = compiled(r#""long""#);
+            let projected =
+                AVRO_OPS.project(&compiled, &[2], &names(&["id"]), &mut ValidationBudget::unshared());
+            assert!(projected.is_err());
+            assert!(AVRO_OPS.declared_fields(&compiled).is_err());
+        }
+
+        #[test]
+        fn the_declared_fields_are_the_top_level_names_in_order() {
+            assert_eq!(
+                AVRO_OPS.declared_fields(&compiled(PATIENT)).unwrap(),
+                PATIENT_FIELDS.map(String::from).to_vec()
+            );
+        }
+
+        fn present(payload: &[u8]) -> BTreeSet<String> {
+            AVRO_OPS
+                .list_fields(&compiled(PATIENT), payload, &mut ValidationBudget::unshared())
+                .unwrap()
+        }
+
+        #[test]
+        fn a_field_is_set_when_it_is_not_at_its_default_or_null() {
+            // `id`, `name`, `tags`, `status`, `code` have neither a default nor
+            // a null: always set. `ssn` is null, `prev` is set, `note` is its
+            // default "n/a", `score` is its default 0.5.
+            let at_rest = encode(PATIENT, patient(None, "n/a"));
+            assert_eq!(
+                present(&at_rest),
+                names(&["id", "name", "tags", "status", "prev", "code"])
+            );
+            // A value other than the default or null sets the field (`score`
+            // is written at its default 0.5 in both).
+            let filled = encode(PATIENT, patient(Some("90010112345"), "other"));
+            assert_eq!(
+                present(&filled),
+                names(&["id", "name", "ssn", "tags", "status", "prev", "note", "code"])
+            );
+        }
+
+        #[test]
+        fn nested_record_defaults_complete_from_the_inner_fields_own_defaults() {
+            let schema = r#"{"type":"record","name":"R","fields":[
+                {"name":"point","type":{"type":"record","name":"P","fields":[
+                    {"name":"x","type":"int","default":1},
+                    {"name":"y","type":"int","default":2}]},"default":{"x":5}},
+                {"name":"tags","type":{"type":"array","items":"string"},"default":["a"]},
+                {"name":"counts","type":{"type":"map","values":"long"},"default":{"k":3}},
+                {"name":"flag","type":"boolean","default":true},
+                {"name":"raw","type":"bytes","default":"\u00ff\u0001"},
+                {"name":"tag","type":{"type":"fixed","name":"T","size":2},"default":"ab"}
+            ]}"#;
+            let compiled = compiled(schema);
+            let write = |point: (i32, i32), tags: &[&str], k: i64, flag: bool, raw: &[u8], tag: &[u8]| {
+                encode(
+                    schema,
+                    Value::Record(vec![
+                        (
+                            "point".into(),
+                            Value::Record(vec![
+                                ("x".into(), Value::Int(point.0)),
+                                ("y".into(), Value::Int(point.1)),
+                            ]),
+                        ),
+                        (
+                            "tags".into(),
+                            Value::Array(tags.iter().map(|t| Value::String((*t).into())).collect()),
+                        ),
+                        (
+                            "counts".into(),
+                            Value::Map([("k".to_string(), Value::Long(k))].into_iter().collect()),
+                        ),
+                        ("flag".into(), Value::Boolean(flag)),
+                        ("raw".into(), Value::Bytes(raw.to_vec())),
+                        ("tag".into(), Value::Fixed(2, tag.to_vec())),
+                    ]),
+                )
+            };
+            let list = |payload: &[u8]| {
+                AVRO_OPS
+                    .list_fields(&compiled, payload, &mut ValidationBudget::unshared())
+                    .unwrap()
+            };
+            let at_default = write((5, 2), &["a"], 3, true, &[0xff, 1], b"ab");
+            assert!(list(&at_default).is_empty(), "{:?}", list(&at_default));
+            let changed = write((5, 3), &["b"], 4, false, &[0xfe, 1], b"ac");
+            assert_eq!(
+                list(&changed),
+                names(&["point", "tags", "counts", "flag", "raw", "tag"])
+            );
+        }
+
+        #[test]
+        fn a_walk_is_charged_to_the_shared_budget() {
+            let payload = encode(PATIENT, patient(None, "n/a"));
+            let compiled = compiled(PATIENT);
+            let mut budget = ValidationBudget::for_batch("org-1", 0);
+            let before = budget.allowance(u64::MAX);
+            AVRO_OPS
+                .project(&compiled, &payload, &names(&["id"]), &mut budget)
+                .unwrap();
+            assert!(budget.allowance(u64::MAX) < before);
+        }
     }
 }

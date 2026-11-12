@@ -18,6 +18,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { parseBlobRefJson } from '/js/modules/tentabus/payload.js';
 import { payloadHtml } from '/js/modules/tentabus/payload-view.js';
+import { recordSchemaHtml, wireRecordSchema } from '/js/modules/tentabus/record-schema.js';
 import { reasonLabel, sourceText, attemptsText, receiversText, plainCheckError, RETRY_ALL_MAX } from '/js/modules/tentabus/unprocessed.js';
 import { windowEl, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
@@ -82,13 +83,14 @@ function recordPayloadHtml(rec) {
  * this reader may see it. `onRetry`/`onDiscard` (an administrator's) open
  * the matching window in its place; `null` leaves the button out.
  */
-export function openUnprocessedView({ rec, maxAttempts, onRetry = null, onDiscard = null, nowMs = Date.now() }) {
+export function openUnprocessedView({ rec, maxAttempts, onRetry = null, onDiscard = null, loadRecordSchema = null, binaryTopic = false, describeError = (e) => String(e?.message || e), nowMs = Date.now() }) {
   const win = windowEl({ title: recordTitle(rec, nowMs), icon: 'eye', width: 720, cls: 'tb-unp-view' });
   win.innerHTML = `
     <div slot="body" class="stack">
       ${kv(recordFacts(rec, maxAttempts, nowMs))}
       <div class="tb-unp-body-head"><b>${escapeHtml(T('unprocessed.view.k_body'))}</b>${rec.truncated ? ` <tf-chip size="sm" variant="outline" status="warn" label="${escapeAttr(T('unprocessed.view.truncated'))}"></tf-chip>` : ''}</div>
       ${recordPayloadHtml(rec)}
+      ${loadRecordSchema && !rec.isBlobRef ? recordSchemaHtml(rec, { empty: !rec.payload?.length, binary: binaryTopic }) : ''}
       <div class="tb-audit-banner">${sprite('shield')}<span>${escapeHtml(T('unprocessed.view.rules'))} ${escapeHtml(T('unprocessed.view.audit'))}</span></div>
     </div>
     <div slot="footer">
@@ -97,8 +99,9 @@ export function openUnprocessedView({ rec, maxAttempts, onRetry = null, onDiscar
       <tf-button variant="primary" data-act="close">${escapeHtml(T('unprocessed.view.close'))}</tf-button>
     </div>`;
   document.body.appendChild(win);
+  if (loadRecordSchema) wireRecordSchema(win, { load: (id) => loadRecordSchema(`__dlq.${rec.topic}`, id), describeError });
   win.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-act]');
+    const btn = e.target.closest('[data-act="retry"], [data-act="discard"], [data-act="close"]');
     if (!btn) return;
     win.close(true);
     if (btn.dataset.act === 'retry') onRetry?.();

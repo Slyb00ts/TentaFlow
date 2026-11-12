@@ -31,7 +31,7 @@ import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
-import { drawSchemaDetail, shareShownText, dismissCopyToast } from '/js/modules/tentabus/schema-detail.js';
+import { drawSchemaDetail, shareShownText, dismissCopyToast, binaryFieldTypes } from '/js/modules/tentabus/schema-detail.js';
 import { judgedSchema } from '/js/modules/tentabus/hidden-notice.js';
 import { addedNotice, keptSpellingsText, noticeToast, renameOutcome, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
@@ -41,7 +41,7 @@ import { openMessagePreview } from '/js/modules/tentabus/message-preview.js';
 import { drawTopicDetail, effectiveSection, topicDetailLoader } from '/js/modules/tentabus/topic-detail.js';
 import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
 import { subjectRows, keyRows, openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyRights, openKeyRevoke, openGoneKeyClear } from '/js/modules/tentabus/topic-access.js';
-import { policyRows, topicFormat, fieldSource } from '/js/modules/tentabus/topic-hiding.js';
+import { policyRows, topicFormat, fieldSource, previewAvailable } from '/js/modules/tentabus/topic-hiding.js';
 import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
 import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
@@ -1141,10 +1141,24 @@ function openCreator() {
   });
 }
 
+// The schema a record of a binary topic was encoded under (`schemaRefId` of the record), for the topic or its `__dlq.` topic: the
+// sub-schema of the reader's own rule when it has one.
+// Whether the topic is checked with an Avro, Protobuf or Thrift pattern, as far as the loaded pattern list says.
+function topicIsBinary(name) {
+  const schemaId = (topicByName(name) || state.detail?.topic)?.schemaId;
+  return Boolean(schemaId) && schemaKind((state.shell.subjects || []).find((s) => s.subject === schemaId)?.schemaType) === 'binary';
+}
+
+function recordSchemaLoader(instanceId) {
+  return async (topic, schemaRefId) => (await busCall('busSchemaForRecordGetRequest', { instanceId, topic, schemaRefId })).schema;
+}
+
 function openTopicPreview(name) {
   const instanceId = state.instanceId;
   const topic = topicByName(name);
   openMessagePreview({
+    loadRecordSchema: recordSchemaLoader(requireInstanceId(instanceId)),
+    binaryTopic: topicIsBinary(name),
     instanceId: requireInstanceId(instanceId),
     topic: name,
     partitionCount: topic?.partitions ?? state.detail?.topic?.partitions ?? 1,
@@ -1497,15 +1511,17 @@ let hidingTurn = 0;
 // refuses them), the content type only which fields they name.
 async function fetchFieldSchema(instanceId, topic) {
   if (!topic?.schemaId) return null;
-  let schemaType = null;
+  let row = null;
   try {
-    const subjects = state.shell.subjects
-      || (await busCall('busSchemaSubjectListRequest', { instanceId })).subjects;
-    schemaType = (subjects || []).find((s) => s.subject === topic.schemaId)?.schemaType ?? null;
+    const named = (list) => (list || []).find((s) => s.subject === topic.schemaId) ?? null;
+    row = named(state.shell.subjects);
+    // A binary pattern is read fresh: whether it was withdrawn since decides if a rule can be made.
+    if (!row || schemaKind(row.schemaType) === 'binary') row = named((await busCall('busSchemaSubjectListRequest', { instanceId })).subjects) ?? row;
   } catch {
     // The server still refuses a rule it cannot apply.
   }
-  if (schemaKind(schemaType) === 'binary') return { subject: topic.schemaId, schemaType };
+  const schemaType = row?.schemaType ?? null;
+  if (schemaKind(schemaType) === 'binary') return fetchBinaryFieldSchema(instanceId, topic.schemaId, row);
   // A JSON pattern names the fields; so does an XSD of an XML topic (its root's children, `readXsdFields`).
   const format = topicFormat(topic.contentType);
   if (format !== 'json' && !(format === 'xml' && schemaType === 'xsd')) return null;
@@ -1517,6 +1533,27 @@ async function fetchFieldSchema(instanceId, topic) {
   }
 }
 
+// The top-level fields of an Avro, Protobuf or Thrift pattern, as the server lists them (the names a rule may use), with the
+// type of each read from the text when it can be: the text only labels, it never decides which names exist.
+async function fetchBinaryFieldSchema(instanceId, subject, row) {
+  const named = { subject, schemaType: row.schemaType };
+  if (row.deprecatedAtMs != null) return { ...named, withdrawn: true };
+  if (!state.capabilities?.binaryFieldActions?.includes('hide')) return named;
+  try {
+    const got = await busCall('busSchemaFieldsGetRequest', { instanceId, subject });
+    let types = [];
+    try {
+      const text = (await busCall('busSchemaGetRequest', { instanceId, subject, version: got.version }))?.schemaText ?? '';
+      types = binaryFieldTypes(row.schemaType, text);
+    } catch {
+      // Without the text the fields are listed by name only.
+    }
+    return { ...named, version: got.version ?? null, fields: got.fields || [], types };
+  } catch {
+    return named;
+  }
+}
+
 // Only the newest answer for the open topic lands, like `loadTopicAccess`.
 // The pattern is read once per pattern the topic uses.
 async function loadTopicHiding(name) {
@@ -1525,7 +1562,8 @@ async function loadTopicHiding(name) {
   const current = () => hidingTurn === turn && state.instanceId === instanceId && state.view?.name === name;
   const topic = state.detail?.topic;
   const schemaFor = topic?.schemaId || '';
-  const kept = state.hiding.topic === name && state.hiding.schemaSettled && state.hiding.schemaFor === schemaFor;
+  const kept = state.hiding.topic === name && state.hiding.schemaSettled && state.hiding.schemaFor === schemaFor
+    && schemaKind(state.hiding.schema?.schemaType) !== 'binary';
   const iid = requireInstanceId(instanceId);
   const [policies, schema, key] = await Promise.allSettled([
     busCall('busFieldPolicyListRequest', { instanceId: iid, topic: name }),
@@ -1557,12 +1595,19 @@ function openHidingWindow(name, action) {
   const hiding = state.hiding;
   if (!detail?.access?.canAdmin || !hiding.policies || hiding.topic !== name) return;
   const instanceId = requireInstanceId(state.instanceId);
-  const format = topicFormat(detail.topic.contentType);
-  const source = fieldSource({ format, schema: hiding.schema });
+  const source = fieldSource({
+    format: topicFormat(detail.topic.contentType),
+    schema: hiding.schema,
+    contentType: detail.topic.contentType,
+    binaryActions: state.capabilities?.binaryFieldActions,
+  });
+  // The messages of a topic with a binary pattern are bytes whatever its content type says.
+  const format = source.mode === 'binary' || source.reason === 'withdrawn' ? 'binary' : topicFormat(detail.topic.contentType);
   const still = () => state.instanceId === instanceId && state.view?.name === name;
   const directory = ({ kind, query }) => busCall('busSubjectDirectoryRequest', { instanceId, kind, query });
+  const loadRecordSchema = recordSchemaLoader(instanceId);
   if (action.kind === 'hiding-preview') {
-    if (!detail.access.canRead || source.mode === 'blocked') return;
+    if (!detail.access.canRead || !previewAvailable(source)) return;
     openHidingPreview({
       instanceId,
       topic: name,
@@ -1571,6 +1616,7 @@ function openHidingWindow(name, action) {
       directory,
       loadPartitions: async () => (await busCall('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
       preview: (request) => busCall('busFieldPolicyPreviewRequest', request),
+      loadRecordSchema,
       format,
       describeError: describeBusError,
     });
@@ -2173,6 +2219,9 @@ function openUnprocessedWindow(kind, topic, key) {
   if (kind === 'view') {
     openUnprocessedView({
       rec,
+      loadRecordSchema: recordSchemaLoader(requireInstanceId(instanceId)),
+      binaryTopic: topicIsBinary(topic),
+      describeError: describeBusError,
       maxAttempts,
       nowMs,
       onRetry: canAdmin && !rec.atWrite ? () => openUnprocessedWindow('retry', topic, key) : null,

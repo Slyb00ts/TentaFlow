@@ -416,6 +416,13 @@ pub struct BusMessagePreviewWire {
     /// `true` when `payload_preview` was cut short of the record's real
     /// payload length (never true when `is_blob_ref`).
     pub truncated: bool,
+    /// Id of the schema the record's bytes are written under (the record's
+    /// `schema_id`; `0` = none). For a binary topic a reader whose rule hides
+    /// fields gets the id of ITS sub-schema, which `SchemaForRecordGetRequest`
+    /// resolves to the text; `0` with an empty payload there means the record
+    /// was withheld. `0` on a peer built before this field existed.
+    #[serde(default)]
+    pub schema_ref_id: u32,
 }
 
 /// Per-partition `MessagesBrowse`/`DlqList` metadata (follow-up toru P,
@@ -485,6 +492,9 @@ pub struct BusDlqRecordWire {
     pub payload_preview: Vec<u8>,
     pub is_blob_ref: bool,
     pub truncated: bool,
+    /// See `BusMessagePreviewWire::schema_ref_id`.
+    #[serde(default)]
+    pub schema_ref_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -571,6 +581,24 @@ pub struct BusFieldPolicyWire {
     /// See `BusAclEntryWire::member_count`'s doc.
     #[serde(default)]
     pub member_count: Option<u32>,
+}
+
+/// A schema a reader asked for to decode a record (`SchemaForRecordGetResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusRecordSchemaWire {
+    pub subject: String,
+    /// 'avro' | 'protobuf' | 'thrift'.
+    pub schema_type: String,
+    /// The version the record was written under; for a sub-schema, the
+    /// version it was derived from.
+    pub version: u32,
+    /// The id the record carries and this schema answers to.
+    pub schema_ref_id: u32,
+    /// `true` for the sub-schema of a reader whose rule hides fields (the
+    /// pattern restricted to the fields the reader sees); `false` for a
+    /// registered version served to a reader no rule restricts.
+    pub derived: bool,
+    pub schema_text: String,
 }
 
 /// One pickable subject of the topic access / data-hiding windows
@@ -869,6 +897,11 @@ pub struct BusCapabilitiesWire {
     /// field as it is: 'hide', 'mask' and 'hash'.
     #[serde(default)]
     pub field_actions: Vec<String>,
+    /// The subset of `field_actions` a rule on a topic of Avro, Protobuf or
+    /// Thrift messages may use: 'hide' only (a binary record shows a field
+    /// whole or not at all). Empty on a peer built before this field existed.
+    #[serde(default)]
+    pub binary_field_actions: Vec<String>,
     /// The caller's organisation every call of this session runs in — the
     /// middle part of a topic right's id and the `?org_id=` of the REST
     /// address a system is given with its key. Empty on a peer built before
@@ -1570,6 +1603,35 @@ pub enum BusPayload {
         /// The new key, with the counters as they were when it replaced the old.
         key: BusFieldHashKeyWire,
     },
+    /// F4 B6: the schema to decode a record of a binary topic with, as the
+    /// CALLER reads it (read tier, same right as reading the topic). `topic` is
+    /// the topic read, or its `__dlq.` topic; `schema_ref_id` is the `schema_id`
+    /// the record carried. A caller whose read rule hides fields is served the
+    /// sub-schema of what it sees, never the full pattern; the id of a rule
+    /// that changed since answers `bus.schema_not_found`.
+    SchemaForRecordGetRequest {
+        topic: String,
+        schema_ref_id: u32,
+    },
+    SchemaForRecordGetResponse {
+        schema: BusRecordSchemaWire,
+    },
+    /// F4 B6: the top-level field names of a binary pattern (read tier) — what
+    /// a data-hiding rule on a topic checked with it may name. `version`
+    /// `None` = the version the topic validates with.
+    SchemaFieldsGetRequest {
+        subject: String,
+        #[serde(default)]
+        version: Option<u32>,
+    },
+    SchemaFieldsGetResponse {
+        subject: String,
+        /// 'avro' | 'protobuf' | 'thrift'.
+        schema_type: String,
+        version: u32,
+        /// In the order the pattern declares them.
+        fields: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -1944,6 +2006,7 @@ mod tests {
                     payload_preview: vec![0xde, 0xad, 0xbe, 0xef],
                     is_blob_ref: false,
                     truncated: false,
+                    schema_ref_id: 77,
                 }],
                 has_more: true,
                 next_offset: 11,
@@ -1982,6 +2045,7 @@ mod tests {
                     payload_preview: vec![1, 2, 3],
                     is_blob_ref: false,
                     truncated: true,
+                    schema_ref_id: 0,
                 }],
                 has_more: false,
                 next_offset: 6,
@@ -2402,6 +2466,7 @@ mod tests {
                 ],
                 schema_types: vec!["json_schema".to_string()],
                 field_actions: vec!["hide".to_string(), "mask".to_string(), "hash".to_string()],
+                binary_field_actions: vec!["hide".to_string()],
                 org_id: "org-default".to_string(),
                 org_name: Some("Przychodnia Zdrowie".to_string()),
             },
@@ -3010,6 +3075,66 @@ mod tests {
     }
 
     #[test]
+    fn binary_record_schema_variants_round_trip() {
+        round_trip(BusPayload::SchemaForRecordGetRequest {
+            topic: "wyniki".to_string(),
+            schema_ref_id: 4242,
+        });
+        round_trip(BusPayload::SchemaForRecordGetResponse {
+            schema: BusRecordSchemaWire {
+                subject: "wynik.proto".to_string(),
+                schema_type: "protobuf".to_string(),
+                version: 2,
+                schema_ref_id: 4242,
+                derived: true,
+                schema_text: "syntax = \"proto3\";".to_string(),
+            },
+        });
+        round_trip(BusPayload::SchemaFieldsGetRequest {
+            subject: "wynik.proto".to_string(),
+            version: Some(2),
+        });
+        round_trip(BusPayload::SchemaFieldsGetRequest {
+            subject: "wynik.proto".to_string(),
+            version: None,
+        });
+        round_trip(BusPayload::SchemaFieldsGetResponse {
+            subject: "wynik.proto".to_string(),
+            schema_type: "protobuf".to_string(),
+            version: 2,
+            fields: vec!["id".to_string(), "pesel".to_string()],
+        });
+    }
+
+    #[test]
+    fn a_preview_from_a_peer_without_schema_ref_id_decodes_with_none() {
+        let preview = BusMessagePreviewWire {
+            partition: 1,
+            offset: 2,
+            timestamp_ms: 3,
+            key: vec![],
+            headers: vec![],
+            payload_preview: vec![8, 5],
+            is_blob_ref: false,
+            truncated: false,
+            schema_ref_id: 99,
+        };
+        assert_eq!(decode_without(&preview, &["schema_ref_id"]).schema_ref_id, 0);
+        let dlq = BusDlqRecordWire {
+            partition: 1,
+            offset: 2,
+            timestamp_ms: 3,
+            key: vec![],
+            headers: vec![],
+            payload_preview: vec![],
+            is_blob_ref: false,
+            truncated: false,
+            schema_ref_id: 99,
+        };
+        assert_eq!(decode_without(&dlq, &["schema_ref_id"]).schema_ref_id, 0);
+    }
+
+    #[test]
     fn schema_version_without_deprecated_at_decodes_as_active() {
         let version = BusSchemaVersionWire {
             subject: "orders".to_string(),
@@ -3175,6 +3300,7 @@ mod tests {
                 payload_preview: br#"{"id":1}"#.to_vec(),
                 is_blob_ref: false,
                 truncated: false,
+                schema_ref_id: 0,
             },
             applied: vec![
                 BusFieldActionWire {
@@ -3295,6 +3421,7 @@ mod tests {
                     content_types: vec![],
                     schema_types: vec![],
                     field_actions: vec![],
+                    binary_field_actions: vec![],
                     org_id: String::new(),
                     org_name: None,
                 },
@@ -3638,6 +3765,10 @@ mod tests {
             "FieldHashKeyInfoResponse",
             "FieldHashKeyRotateRequest",
             "FieldHashKeyRotateResponse",
+            "SchemaForRecordGetRequest",
+            "SchemaForRecordGetResponse",
+            "SchemaFieldsGetRequest",
+            "SchemaFieldsGetResponse",
         ];
         assert_eq!(
             live, pinned,

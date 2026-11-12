@@ -178,6 +178,25 @@ export function contentTypeLabel(contentType) {
   return key ? T(`fmt.content.${key}`) : '';
 }
 
+// The content types that declare Avro, Protobuf or Thrift messages (`field_policies.rs` BINARY_CONTENT_TYPES).
+// `application/octet-stream` is not among them: it is also the default of every topic made before content types
+// existed, and those hold JSON.
+const BINARY_CONTENT_TYPES = new Set([
+  'application/avro',
+  'avro/binary',
+  'application/x-protobuf',
+  'application/protobuf',
+  'application/vnd.google.protobuf',
+  'application/x-thrift',
+  'application/vnd.apache.thrift.binary',
+  'application/vnd.apache.thrift.compact',
+]);
+
+/** Whether the content type itself says the messages are Avro, Protobuf or Thrift. */
+export function declaresBinary(contentType) {
+  return BINARY_CONTENT_TYPES.has(String(contentType || '').trim().toLowerCase());
+}
+
 /** The payload kind of a content type (`json` / `xml` / `hl7v2` / `binary`), or '' when unknown. */
 export function contentKind(contentType) {
   return CONTENT_TYPE_KEYS[String(contentType || '').trim().toLowerCase()] || '';

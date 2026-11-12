@@ -2080,6 +2080,49 @@ fn allowed(names: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
+fn a_field_that_reaches_the_root_again_cannot_be_shown_without_the_fields_left_out() {
+    // Directly: `next` holds a whole `R`, `secret` included.
+    let direct = "struct R { 1: string secret, 2: optional R next }";
+    assert_eq!(
+        THRIFT_OPS.self_referencing_fields(&compile(direct)).unwrap(),
+        allowed(&["next"])
+    );
+    let refusal = THRIFT_OPS
+        .derive_subschema(direct, &allowed(&["next"]))
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("field 'next' refers back"), "{refusal}");
+    // Even every declared field: a record stamped with this version may carry
+    // an id a newer version added, kept verbatim in the nested copy while the
+    // projection strips it at the root.
+    let refusal = THRIFT_OPS
+        .derive_subschema(direct, &allowed(&["secret", "next"]))
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("field 'next' refers back"), "{refusal}");
+    // The recursive field left out: fine.
+    THRIFT_OPS
+        .derive_subschema(direct, &allowed(&["secret"]))
+        .unwrap();
+
+    // Through another struct, a list, a map and a typedef.
+    let indirect = "typedef list<Other> Others\n\
+                    struct R { 1: string secret, 2: Others child, 3: Leaf plain }\n\
+                    struct Other { 1: map<string, R> back }\n\
+                    struct Leaf { 1: i32 v }";
+    assert_eq!(
+        THRIFT_OPS.self_referencing_fields(&compile(indirect)).unwrap(),
+        allowed(&["child"])
+    );
+    assert!(THRIFT_OPS
+        .derive_subschema(indirect, &allowed(&["child", "plain"]))
+        .is_err());
+    THRIFT_OPS
+        .derive_subschema(indirect, &allowed(&["plain"]))
+        .unwrap();
+}
+
+#[test]
 fn a_projection_keeps_the_allowed_fields_and_the_types_they_reach() {
     let derived = THRIFT_OPS
         .derive_subschema(
@@ -2366,4 +2409,210 @@ fn directives_survive_line_endings_nested_looking_comments_and_slashes_in_string
     assert!(!b_root(
         "struct A { 1: i32 a }\nstruct B { 1: string b = \"// tentabus:struct B\" }\n"
     ));
+}
+
+// -----------------------------------------------------------------------------
+// Field policies (F4 B6)
+// -----------------------------------------------------------------------------
+
+mod field_policy {
+    use super::*;
+    use crate::bus::schema_registry::{SchemaAwareFieldFormat, ValidationBudget};
+
+    fn names(of: &[&str]) -> BTreeSet<String> {
+        of.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn order_fields() -> Vec<(i16, &'static str, V)> {
+        vec![
+            (1, "id", V::I64(7)),
+            (2, "customer", s("Anna")),
+            (3, "status", V::I32(5)),
+            (
+                4,
+                "lines",
+                V::List(Wt::Struct, vec![st(vec![(1, s("a")), (2, V::I32(3))])]),
+            ),
+            (5, "tags", V::Map(Wt::Binary, Wt::I32, vec![(s("k"), V::I32(9))])),
+            (6, "flags", V::Set(Wt::I16, vec![V::I16(1), V::I16(2)])),
+            (7, "urgent", V::Bool(true)),
+            (8, "total", V::Double(12.5)),
+            (9, "note", V::Bin(vec![0, 1, 2, 255])),
+            (10, "ref", V::Uuid),
+            (11, "payment", st(vec![(1, s("4111"))])),
+            (12, "grade", V::Byte(-3)),
+            (13, "checks", V::List(Wt::Bool, vec![V::Bool(true), V::Bool(false)])),
+        ]
+    }
+
+    fn order_struct(fields: &[(i16, &str, V)], visible: Option<&BTreeSet<String>>) -> V {
+        st(fields
+            .iter()
+            .filter(|(_, name, _)| visible.is_none_or(|v| v.contains(*name)))
+            .map(|(id, _, value)| (*id, value.clone()))
+            .collect())
+    }
+
+    #[test]
+    fn a_projection_is_exactly_the_struct_without_the_hidden_fields_in_both_protocols() {
+        let fields = order_fields();
+        for (compiled, encode) in both(ORDER) {
+            let payload = encode(&order_struct(&fields, None));
+            for visible in [
+                names(&["id"]),
+                names(&["customer", "urgent", "checks"]),
+                names(&["urgent"]),
+                names(&["id", "status", "lines", "payment", "grade"]),
+                names(&["tags", "flags", "total", "note", "ref"]),
+                names(&[]),
+                names(&[
+                    "id", "customer", "status", "lines", "tags", "flags", "urgent", "total", "note",
+                    "ref", "payment", "grade", "checks",
+                ]),
+                names(&["id", "no-such-field"]),
+            ] {
+                let projected = THRIFT_OPS
+                    .project(&compiled, &payload, &visible, &mut ValidationBudget::unshared())
+                    .unwrap();
+                // The same bytes the same encoder writes for the kept fields.
+                assert_eq!(
+                    projected,
+                    encode(&order_struct(&fields, Some(&visible))),
+                    "visible {visible:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_projection_is_valid_under_the_derived_schema_in_both_protocols() {
+        let fields = order_fields();
+        for (body, encode) in [(ORDER.to_string(), bin as Encoder), (format!("{COMPACT}{ORDER}"), cmp as Encoder)] {
+            let compiled = compile(&body);
+            let payload = encode(&order_struct(&fields, None));
+            for visible in [
+                names(&["id", "lines"]),
+                names(&["customer", "payment", "status"]),
+                names(&["urgent", "checks"]),
+                names(&[]),
+            ] {
+                let projected = THRIFT_OPS
+                    .project(&compiled, &payload, &visible, &mut ValidationBudget::unshared())
+                    .unwrap();
+                let derived = THRIFT_OPS.derive_subschema(&body, &visible).unwrap();
+                let sub = compile(&derived);
+                assert_eq!(check(&sub, &projected), Ok(()), "{visible:?}\n{derived}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_compact_projection_rewrites_the_id_deltas_of_the_fields_it_keeps() {
+        let text = format!(
+            "{COMPACT}struct S {{ 1: i32 a, 3: i32 b, 20: i32 c, 21: string d, 40: bool e, 41: i64 f }}"
+        );
+        let compiled = compile(&text);
+        let full = st(vec![
+            (1, V::I32(1)),
+            (3, V::I32(2)),
+            (20, V::I32(3)),
+            (21, s("x")),
+            (40, V::Bool(true)),
+            (41, V::I64(9)),
+        ]);
+        let payload = cmp(&full);
+        let project = |visible: &[&str]| {
+            THRIFT_OPS
+                .project(&compiled, &payload, &names(visible), &mut ValidationBudget::unshared())
+                .unwrap()
+        };
+        // Dropping the middle: the delta of `f` was 1 from `e`, it is 38 now
+        // (the long form), and a bool keeps its value in the type nibble.
+        assert_eq!(
+            project(&["a", "e", "f"]),
+            cmp(&st(vec![(1, V::I32(1)), (40, V::Bool(true)), (41, V::I64(9))]))
+        );
+        assert_eq!(
+            project(&["d", "f"]),
+            cmp(&st(vec![(21, s("x")), (41, V::I64(9))]))
+        );
+        assert_eq!(project(&["e"]), cmp(&st(vec![(40, V::Bool(true))])));
+        assert_eq!(project(&[]), vec![0]);
+    }
+
+    #[test]
+    fn a_field_the_schema_does_not_declare_is_never_kept_and_is_listed_as_unknown() {
+        for (compiled, encode) in both("struct S { 1: i32 a, 2: string b }") {
+            let payload = encode(&st(vec![
+                (1, V::I32(1)),
+                (2, s("x")),
+                (9, st(vec![(1, s("nested"))])),
+            ]));
+            let projected = THRIFT_OPS
+                .project(&compiled, &payload, &names(&["a", "b", "#9"]), &mut ValidationBudget::unshared())
+                .unwrap();
+            assert_eq!(projected, encode(&st(vec![(1, V::I32(1)), (2, s("x"))])));
+            let present = THRIFT_OPS
+                .list_fields(&compiled, &payload, &mut ValidationBudget::unshared())
+                .unwrap();
+            assert_eq!(present, names(&["a", "b", "#9"]));
+        }
+    }
+
+    #[test]
+    fn the_fields_a_write_sets_are_the_ids_on_the_wire() {
+        for (compiled, encode) in both(ORDER) {
+            let payload = encode(&st(vec![(1, V::I64(1)), (7, V::Bool(false)), (12, V::Byte(0))]));
+            assert_eq!(
+                THRIFT_OPS
+                    .list_fields(&compiled, &payload, &mut ValidationBudget::unshared())
+                    .unwrap(),
+                names(&["id", "urgent", "grade"])
+            );
+        }
+    }
+
+    #[test]
+    fn a_struct_that_is_not_valid_under_the_schema_is_never_projected() {
+        for (compiled, encode) in both(ORDER) {
+            let good = encode(&order_struct(&order_fields(), None));
+            let visible = names(&["id"]);
+            let project = |bytes: &[u8]| {
+                THRIFT_OPS.project(&compiled, bytes, &visible, &mut ValidationBudget::unshared())
+            };
+            assert!(project(&good[..good.len() - 1]).is_err(), "truncated");
+            let mut trailing = good.clone();
+            trailing.push(0);
+            assert!(project(&trailing).is_err(), "trailing");
+            assert!(project(&[]).is_err(), "empty");
+            // A required field missing.
+            assert!(project(&encode(&st(vec![(2, s("x"))]))).is_err(), "no id");
+            // A wrong wire type for a declared field.
+            assert!(project(&encode(&st(vec![(1, s("not an i64"))]))).is_err());
+            let message = project(&trailing).unwrap_err().to_string();
+            assert!(!message.contains("Anna"), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_declared_fields_are_the_root_structs_in_order() {
+        assert_eq!(
+            THRIFT_OPS.declared_fields(&compile(ORDER)).unwrap(),
+            order_fields().iter().map(|(_, n, _)| n.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_required_field_that_stays_visible_stays_required_in_the_derived_schema() {
+        let derived = THRIFT_OPS.derive_subschema(ORDER, &names(&["id", "customer"])).unwrap();
+        assert!(derived.contains("1: required i64 id"), "{derived}");
+        let sub = compile(&derived);
+        // `id` is on the wire in every projection that keeps it.
+        assert!(check(&sub, &bin(&st(vec![(2, s("x"))]))).is_err());
+        assert!(check(&sub, &bin(&st(vec![(1, V::I64(1))]))).is_ok());
+        // A hidden required field is simply not listed: the projection without it is valid.
+        let hidden = THRIFT_OPS.derive_subschema(ORDER, &names(&["customer"])).unwrap();
+        assert!(!hidden.contains("required"), "{hidden}");
+        assert!(check(&compile(&hidden), &bin(&st(vec![(2, s("x"))]))).is_ok());
+    }
 }

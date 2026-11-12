@@ -10165,7 +10165,7 @@
       "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification.",
       "schema_kind_mismatch": "Le modèle {name} est destiné à un contenu {schemaKind}, mais ce topic accepte un contenu {topicKind}.",
       "stored_schema_unreadable": "Le modèle {name}, version {version}, a été enregistré selon des règles plus souples et le registre ne peut plus le lire ; le topic ne peut donc plus vérifier de messages avec lui. Ajoutez une version corrigée du modèle.",
-      "field_policy_binary_topic": "Le topic {topic} contient des messages binaires (modèle {name}, {format}). Les règles de dissimulation fonctionnent sur JSON, XML et HL7 v2 ; on ne peut donc pas en ajouter.",
+      "field_policy_binary_topic": "Une règle de texte ne peut pas s’appliquer au topic {topic} : il a le modèle binaire {name} ({format}). Actualisez la page et ajoutez de nouveau la règle.",
       "field_policy_binary_bind": "Le topic {topic} a des règles de dissimulation, on ne peut donc pas lui associer le modèle binaire {name} ({format}). Les règles fonctionnent sur JSON, XML et HL7 v2 — supprimez-les d’abord.",
       "mask_hash_read_only": "Seule une règle de lecture peut caviarder ou hacher un champ : une règle d’écriture peut seulement l’autoriser, l’exiger ou l’interdire.",
       "mask_hash_not_shown": "Un champ caviardé ou haché doit aussi figurer parmi les champs que la règle montre.",
@@ -10173,7 +10173,14 @@
       "field_hash_key_not_found": "L’organisation n’a pas encore de clé de hachage : elle est créée avec la première règle « Hacher », il n’y a donc rien à changer.",
       "field_hash_key_changed": "La clé de hachage a changé entre-temps (quelqu’un l’a changée avant vous), rien n’a donc été modifié. Fermez cette fenêtre et rouvrez-la pour voir la version actuelle de la clé.",
       "operator_node_required": "Seul un node opérateur de l’organisation peut le faire, et ce node n’en est pas un. Faites-le sur un node opérateur (liste : nodes du mesh).",
-      "hash_key_not_synced": "L’organisation hache déjà des champs avec une clé qui n’est pas encore arrivée sur ce node ; on ne peut donc pas ajouter maintenant un autre champ « Hacher ». Attendez la synchronisation avec le node opérateur ou vérifiez la connexion avec lui."
+      "hash_key_not_synced": "L’organisation hache déjà des champs avec une clé qui n’est pas encore arrivée sur ce node ; on ne peut donc pas ajouter maintenant un autre champ « Hacher ». Attendez la synchronisation avec le node opérateur ou vérifiez la connexion avec lui.",
+      "binary_no_mask_hash": "Un champ ne peut être ni caviardé ni haché : le topic {topic} contient des messages binaires (modèle {name}, {format}). Un champ peut seulement être affiché ou dissimulé.",
+      "binary_needs_pattern_unbound": "Le topic {topic} contient des messages binaires mais n’a pas de modèle de message lié. Liez un modèle dans les paramètres du topic, puis ajoutez la règle.",
+      "binary_needs_pattern_withdrawn": "Le modèle {name} ({format}) du topic {topic} est retiré : on ne peut ni ajouter ni modifier de règle. Les règles sur des messages binaires exigent un modèle qui n’est pas retiré.",
+      "binary_pattern_changed": "Le modèle du topic {topic} a changé ou a été retiré avant l’enregistrement de la règle : rien n’a été enregistré. Actualisez la page et réessayez.",
+      "field_not_in_pattern": "Le champ « {field} » n’appartient pas au modèle {name} du topic {topic}. Une règle ne peut nommer que des champs de premier niveau de ce modèle.",
+      "pattern_change_under_rules": "On ne peut ni modifier ni délier le modèle {name} du topic {topic} tant que le topic a des règles de champs : elles nomment des champs de ce modèle. Supprimez d’abord les règles dans la section Dissimulation des données.",
+      "version_drops_required_field": "La nouvelle version du modèle n’a pas le champ « {field} », que la règle d’écriture du topic {topic} exige : chaque écriture dans le topic serait refusée. Modifiez d’abord cette règle (Dissimulation des données du topic {topic}), puis ajoutez la version."
     },
     "shell": {
       "instance": "Instance",
@@ -11886,9 +11893,6 @@
       "col_changed": "Modifié",
       "empty_title": "Ce topic n'a aucune règle de dissimulation des données",
       "empty_text": "Toute personne qui peut lire ce topic voit les messages entiers. Ajoutez une règle pour dissimuler certains champs.",
-      "blocked_title": "Un contenu binaire n’a pas de dissimulation des données",
-      "blocked_text": "Dans un contenu binaire, on ne peut pas dissimuler de champs : il ne se lit pas comme des champs, donc toute personne qui peut lire le topic le voit en entier. La dissimulation des données fonctionne pour les messages JSON, XML et HL7 v2. Le type de contenu est fixé à la création du topic.",
-      "blocked_with_rules": "Ce topic a des règles de dissimulation, mais son contenu est binaire — les règles ne fonctionneront pas. Supprimez-les ou créez un topic JSON/XML/HL7.",
       "keys_closed": "Les systèmes externes avec une clé d’API n’ont pas accès à ce topic en {directions} : il n’a de règles que pour des personnes, groupes ou addons choisis et aucune pour tout le monde.",
       "sees_only": "Voit seulement : {fields}",
       "sees_nothing": "Ne voit aucun champ",
@@ -11942,7 +11946,13 @@
         "read_unlisted_saved": "Les champs absents de la liste disparaissent aussi.",
         "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté.",
         "read_masked": "Pour {who}, {n|le champ|les champs} {fields} n’apparaîtr{n|a|ont} que sous forme d’astérisques, avec les 3 derniers caractères visibles.",
-        "read_hashed": "Pour {who}, {n|le champ|les champs} {fields} afficher{n|a|ont} un hash à la place de la valeur : une chaîne fixe, identique pour la même valeur dans toute l’organisation."
+        "read_hashed": "Pour {who}, {n|le champ|les champs} {fields} afficher{n|a|ont} un hash à la place de la valeur : une chaîne fixe, identique pour la même valeur dans toute l’organisation.",
+        "read_unlisted_binary": "Un champ qu’une nouvelle version du modèle ajoutera sera aussi dissimulé.",
+        "read_unlisted_saved_binary": "Un champ qu’une nouvelle version du modèle ajoutera sera aussi dissimulé.",
+        "write_unlisted_binary": "Un message avec un champ hors de la liste, par ex. un champ qu’une nouvelle version du modèle ajoutera, sera aussi refusé.",
+        "write_unlisted_saved_binary": "Un message avec un champ hors de la liste, par ex. un champ qu’une nouvelle version du modèle ajoutera, sera aussi refusé.",
+        "read_unlisted_only_binary": "Pour {who}, tous les champs de la liste restent visibles ; seul sera dissimulé un champ qu’une nouvelle version du modèle ajoutera.",
+        "write_unlisted_only_binary": "De {whoFrom}, seul un message avec des champs de la liste sera accepté. Un message avec un autre champ, par ex. un champ qu’une nouvelle version du modèle ajoutera, sera refusé."
       },
       "fields_label": "Champs",
       "source": {
@@ -11951,7 +11961,8 @@
         "failed": "Le modèle de message de ce topic n'a pas pu être lu, ses champs ne sont donc pas connus. Saisissez ci-dessous les champs qui restent visibles.",
         "manual": "Les champs de ce topic ne sont pas connus — aucun modèle de message ne les énumère. Saisissez ci-dessous les champs qui restent visibles.",
         "complex": "Le modèle de message de ce topic contient des champs qu’on ne peut pas en extraire (renvoi vers un autre fichier ou noms de champs libres), la liste complète n’est donc pas connue. Saisissez ci-dessous les champs qui restent visibles.",
-        "xsd": "Les champs de ce topic se saisissent à la main : on ne peut pas les lister à partir de son modèle XSD. Saisissez ci-dessous les champs qui restent visibles."
+        "xsd": "Les champs de ce topic se saisissent à la main : on ne peut pas les lister à partir de son modèle XSD. Saisissez ci-dessous les champs qui restent visibles.",
+        "binary": "Les champs proviennent du modèle {name} ({format}), version {version} — ce sont les champs de premier niveau."
       },
       "extra": {
         "shown": "Autres champs qui restent visibles",
@@ -11970,7 +11981,9 @@
       "unlisted": {
         "read": "Les champs absents de la liste sont dissimulés aussi (y compris ceux qui apparaîtront plus tard), sauf si vous les saisissez ci-dessous.",
         "write": "Un message avec un champ hors de la liste est rejeté, sauf si vous saisissez ce champ ci-dessous.",
-        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous."
+        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous.",
+        "read_binary": "Un champ qu’une nouvelle version du modèle ajoutera sera aussi dissimulé, tant que vous ne l’affichez pas ici.",
+        "write_binary": "Un message avec un champ qu’une nouvelle version du modèle ajoutera (ou avec un numéro de champ inconnu) sera refusé, tant que vous ne l’autorisez pas ici."
       },
       "add": {
         "button": "Ajouter une règle",
@@ -12064,7 +12077,8 @@
         "summary_hash": "Les règles ont haché {count} {n|champ|champs} : {fields}.",
         "key_missing_title": "Ce node n’a pas encore la clé de hachage de l’organisation",
         "key_missing_text": "Une règle hache des champs, mais la clé de l’organisation n’est pas encore arrivée sur ce node (elle vient d’un node opérateur) : dans l’aperçu, les champs hachés sont dissimulés au lieu d’être hachés. Ce n’est pas l’effet de votre propre règle de lecture.",
-        "unchanged": "Autres champs inchangés : {count}."
+        "unchanged": "Autres champs inchangés : {count}.",
+        "binary_note": "Le contenu binaire est affiché en octets. Un lecteur avec une règle le reçoit encodé avec un sous-schéma, c’est-à-dire le modèle sans les champs dissimulés."
       },
       "hl7": {
         "msh_3": "Application émettrice",
@@ -12133,7 +12147,6 @@
         "msh_12": "Version HL7"
       },
       "blocked_settings": "Ouvrir les paramètres du topic",
-      "blocked_preview": "L’aperçu n’est pas disponible : le contenu de ce topic ne peut pas être lu comme des champs.",
       "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
       "reads_rest": "Champs hors de la liste : dissimulés",
       "fields_search": "Rechercher un champ",
@@ -12206,7 +12219,57 @@
         "none_rules_title": "La clé n’est pas encore arrivée sur ce node, il n’y a donc rien à changer.",
         "not_operator": "Ce node n’est pas un opérateur de l’organisation : la clé ne peut pas être changée ici, faites-le sur un node opérateur.",
         "changed_reloaded": "La clé de hachage a changé entre-temps (quelqu’un l’a changée avant vous), rien n’a donc été modifié. La fenêtre affiche maintenant la version actuelle ({version}). Si vous voulez toujours changer la clé, confirmez à nouveau."
+      },
+      "block": {
+        "unbound": {
+          "title": "Ce topic attend un modèle de message",
+          "text": "Les messages de ce topic sont binaires (Avro, Protobuf ou Thrift), mais aucun modèle n’y est lié. Le modèle nomme les champs que l’on peut dissimuler et c’est de lui que naît le sous-schéma du lecteur qui a une règle : sans modèle, pas de dissimulation. Liez un modèle dans les paramètres du topic.",
+          "rules": "Ce topic a des règles enregistrées avant que ses messages soient considérés comme binaires. Sans modèle, on ne sait pas quels champs elles nomment : elles ne fonctionnent donc pas comme enregistré. Supprimez-les, liez un modèle dans les paramètres du topic et ajoutez de nouveau les règles.",
+          "preview": "L’aperçu n’est pas disponible : un topic de messages binaires n’a pas de modèle lié, donc aucun champ à afficher."
+        },
+        "withdrawn": {
+          "title": "Le modèle de ce topic est retiré",
+          "text": "Le modèle {name} ({format}) est retiré : on ne peut pas ajouter de règle. Un modèle retiré vérifie toujours les messages du topic. Liez dans les paramètres du topic un modèle qui n’est pas retiré.",
+          "rules": "Le modèle {name} est retiré : les règles existantes continuent de fonctionner, mais on ne peut ni en ajouter ni modifier celle-ci — seulement la supprimer. Pour lier un autre modèle, supprimez d’abord toutes les règles de ce topic."
+        },
+        "unreadable": {
+          "title": "Les champs du modèle n’ont pas pu être chargés",
+          "text": "Les règles de dissimulation ont besoin de la liste des champs du modèle {name}, et le serveur ne l’a pas fournie (le modèle a pu être enregistré sous des règles plus souples, ou le node ne répond pas un instant). Réessayez.",
+          "rules": "Les champs du modèle {name} n’ont pas pu être chargés : les règles ne peuvent pas être modifiées pour l’instant, seulement supprimées. Actualisez la page et réessayez.",
+          "preview": "L’aperçu n’est pas disponible : les champs du modèle n’ont pas pu être chargés."
+        },
+        "unsupported": {
+          "title": "Ce node ne gère pas la dissimulation de champs dans un contenu binaire",
+          "text": "Le modèle {name} ({format}) décrit des messages binaires, et ce node tourne sous une version plus ancienne qui ne connaît pas les règles pour eux. Mettez à jour tous les nodes et actualisez la page.",
+          "rules": "Ce node ne connaît pas les règles pour les messages binaires et n’en montrera pas les champs — on ne peut que les supprimer. Mettez à jour tous les nodes.",
+          "preview": "L’aperçu n’est pas disponible : ce node ne connaît pas les règles pour les messages binaires."
+        }
+      },
+      "binary": {
+        "note_title": "Messages binaires ({format}) : les règles portent sur les champs de premier niveau",
+        "note_text": "Les champs proviennent du modèle {name}, version {version}. Un lecteur avec une règle de lecture reçoit le message encodé avec un sous-schéma — le modèle sans les champs dissimulés. Un champ dissimulé disparaît entièrement ; « Caviarder » et « Hacher » ne sont pas disponibles pour les formats binaires.",
+        "hide_means": "le champ est entièrement retiré du message — il n’en reste ni la valeur ni la place.",
+        "mask_hash_off": "« Caviarder » et « Hacher » ne sont pas disponibles pour les formats binaires.",
+        "read_subschema": "Un lecteur avec cette règle reçoit le message encodé avec un sous-schéma : le modèle sans les champs dissimulés. Son programme le lit avec ce sous-schéma, pas avec le modèle complet.",
+        "write_avro": "Un champ Avro est « défini » lorsque sa valeur diffère de la valeur par défaut du modèle (ou de null s’il n’y en a pas). Un champ sans valeur par défaut ni null est toujours défini, car Avro écrit chaque champ dans chaque message. « Interdit » refuse un message dont le champ est défini, « Obligatoire » un message sans champ défini.",
+        "write_protobuf": "Un champ Protobuf est « défini » lorsque le message contient son numéro (tag) — même avec une valeur nulle. Un champ proto3 à valeur nulle n’est souvent pas écrit du tout par l’expéditeur et compte alors comme non défini.",
+        "write_thrift": "Un champ Thrift est « défini » lorsque le message contient son numéro (id) dans la structure principale. Un message sans champ marqué required dans l’IDL est refusé comme non conforme au modèle avant que la règle ne s’applique.",
+        "impact_read": "Le lecteur recevra le message encodé avec un sous-schéma qui n’a pas ces champs.",
+        "avro_always_forbidden": "{n|Le champ|Les champs} Avro {fields} n’{n|a|ont} ni valeur par défaut ni null, donc {n|il est défini|ils sont définis} dans chaque message. Avec « Interdit », chaque message sera refusé.",
+        "warn_title": "Cette règle refusera chaque message",
+        "stale": "{n|Le champ|Les champs} {fields} {n|figure|figurent} dans la règle, mais le modèle ne {n|l’a|les a} plus — l’enregistrement {n|le retire|les retire}."
       }
+    },
+    "schemaref": {
+      "line": "Modèle du message : numéro {id}",
+      "show": "Afficher le modèle",
+      "hide": "Masquer le modèle",
+      "hint": "Un message lu par un lecteur ayant une règle de dissimulation de champs est encodé avec un sous-schéma, c’est-à-dire le modèle sans les champs dissimulés. Vous voyez ici ce modèle.",
+      "no_fields": "La règle n’affiche aucun champ du message : le contenu est vide, mais encodé avec le sous-schéma de ce numéro.",
+      "withheld": "Contenu retenu : le message ne correspond pas à son modèle ou son modèle est illisible, donc un lecteur avec une règle de dissimulation de champs n’en reçoit rien.",
+      "derived_title": "Sous-schéma du modèle {name} ({format}, version {version}) — seulement les champs que la règle affiche",
+      "full_title": "Modèle {name} ({format}, version {version})",
+      "gone": "Ce modèle ne peut plus être récupéré : le serveur ne remet un sous-schéma que pour la règle de lecture actuelle, et la règle ou le modèle a changé depuis la lecture de ce message. Relisez le message."
     }
   },
   "composer": {
@@ -16118,6 +16181,7 @@
     "diagram_wait_gateway": "Retenu à une passerelle",
     "diagram_wait_scope": "Dans un sous-processus",
     "diagram_wait_ready": "Prêt à continuer",
+    "diagram_wait_blocked": "Bloqué, demande de l’attention",
     "diagram_token_count": "{count} {count|jeton|jetons}",
     "diagram_incident_count": "{count} {count|incident|incidents}",
     "diagram_legend": "Légende",
@@ -16157,4 +16221,3 @@
     "heart": "cœur"
   }
 }
-    "diagram_wait_blocked": "Bloqué, demande de l’attention",

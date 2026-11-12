@@ -190,6 +190,24 @@ struct Frame {
     via: Seg,
 }
 
+/// One top-level field of the root struct on the wire: `start..header_end` is
+/// its header (type and id), `header_end..end` its value.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TopSpan {
+    pub(super) id: i32,
+    pub(super) start: usize,
+    pub(super) header_end: usize,
+    pub(super) end: usize,
+}
+
+/// What the walk records about the root struct for a field policy.
+#[derive(Default)]
+struct TopRec {
+    /// `(id, start, header_end)` of the field whose value is being walked.
+    open: Option<(i32, usize, usize)>,
+    done: Vec<TopSpan>,
+}
+
 struct Walker<'a> {
     c: &'a Compiled,
     data: &'a [u8],
@@ -199,6 +217,8 @@ struct Walker<'a> {
     stack: Vec<Frame>,
     /// What the failing operation was reading, appended to the path.
     leaf: Option<Seg>,
+    /// Recorded only for a field policy (`top_spans`).
+    top: Option<TopRec>,
 }
 
 impl<'a> Walker<'a> {
@@ -297,6 +317,20 @@ impl<'a> Walker<'a> {
         while let Some(frame) = self.stack.last() {
             let cursor = frame.cursor;
             self.leaf = None;
+            if self.stack.len() == 1 {
+                // Back at the root struct: the field whose value was being
+                // walked (a nested struct, list or map) ends here.
+                if let Some(rec) = self.top.as_mut() {
+                    if let Some((id, start, header_end)) = rec.open.take() {
+                        rec.done.push(TopSpan {
+                            id,
+                            start,
+                            header_end,
+                            end: self.pos,
+                        });
+                    }
+                }
+            }
             match cursor {
                 Cursor::Struct {
                     def,
@@ -375,9 +409,16 @@ impl<'a> Walker<'a> {
         last_id: i32,
     ) -> Walk<()> {
         self.budget.charge(1)?;
+        let header_start = self.pos;
         let Some((wt, id, inline)) = self.field_header(last_id)? else {
             return self.close_struct(def, seen);
         };
+        if self.stack.len() == 1 {
+            let header_end = self.pos;
+            if let Some(rec) = self.top.as_mut() {
+                rec.open = Some((id, header_start, header_end));
+            }
+        }
         let known = def.and_then(|d| {
             let index = self.c.structs.get(d)?.field_by_id(id)?;
             Some((d, index))
@@ -715,6 +756,25 @@ pub(super) fn validate_with(
     payload: &[u8],
     budget: &mut Budget,
 ) -> Result<(), SchemaError> {
+    walk(c, payload, budget, false).map(|_| ())
+}
+
+/// The strict walk of the root struct, recording its top-level fields in wire
+/// order when `record_top` is set.
+pub(super) fn top_spans(
+    c: &Compiled,
+    payload: &[u8],
+    budget: &mut Budget,
+) -> Result<Vec<TopSpan>, SchemaError> {
+    walk(c, payload, budget, true)
+}
+
+fn walk(
+    c: &Compiled,
+    payload: &[u8],
+    budget: &mut Budget,
+    record_top: bool,
+) -> Result<Vec<TopSpan>, SchemaError> {
     let mut walker = Walker {
         c,
         data: payload,
@@ -723,9 +783,10 @@ pub(super) fn validate_with(
         budget,
         stack: Vec::new(),
         leaf: None,
+        top: record_top.then(TopRec::default),
     };
     match walker.run() {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(walker.top.take().map(|t| t.done).unwrap_or_default()),
         Err(Fail::Violation(msg)) => Err(SchemaError::Violation(format!(
             "{}: {msg}",
             shorten_path(&walker.render_path())

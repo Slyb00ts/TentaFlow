@@ -740,3 +740,99 @@ test('a refused removal stays in the window with the reason', async () => {
   assert.equal(norm(win.querySelector('[data-role="error"]').textContent), 'błąd: PolicyDenied');
   assert.deepEqual(saved, []);
 });
+
+// ---------------------------------------------------------------------------
+// F4 B6: a rule on a topic of Avro messages
+// ---------------------------------------------------------------------------
+
+const ORDER = fieldSource({
+  format: 'json',
+  binaryActions: ['hide'],
+  schema: {
+    subject: 'zamowienie',
+    schemaType: 'avro',
+    version: 3,
+    fields: ['numer', 'klient', 'uwagi'],
+    types: [{ name: 'numer', type: 'string', alwaysSet: true }, { name: 'klient', type: 'string', alwaysSet: true }, { name: 'uwagi', type: 'union<null, string>', alwaysSet: false }],
+  },
+});
+
+const binaryContext = (overrides = {}) => addContext({ format: 'binary', source: ORDER, rules: [], fieldActions: ['hide'], ...overrides });
+
+test('a binary topic: a row per field the server listed with its type, "Zamaskuj" and "Zahaszuj" drawn but locked, nothing to type in, the sub-schema explained', async () => {
+  closeAll();
+  const { ctx, sent } = binaryContext();
+  const win = openHidingAdd(ctx);
+  await tick();
+  chooseSubject(win, 'group:g-ksieg');
+  assert.deepEqual([...win.querySelectorAll('tf-segmented[data-field]')].map((s) => s.getAttribute('data-field')), ['numer', 'klient', 'uwagi']);
+  assert.match(norm(win.querySelector('[data-role="rows"]').textContent), /numer\s*string/);
+  const seg = rowFor(win, 'uwagi');
+  assert.deepEqual(optionLabels(seg), ['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+  assert.deepEqual([...seg.querySelectorAll('button')].map((b) => b.disabled), [false, false, true, true]);
+  assert.equal(win.querySelector('[data-role="extras"]').children.length, 0, 'every field a rule may name is in the list');
+  assert.match(norm(win.querySelector('[data-role="source-note"]').textContent), /^Pola pochodzą ze wzoru zamowienie \(Avro\), wersja 3 — to pola najwyższego poziomu\.$/);
+  const note = norm(win.querySelector('[data-role="actions-note"]').textContent);
+  assert.match(note, /Ukryj — pole jest usuwane z wiadomości w całości/);
+  assert.match(note, /„Zamaskuj” i „Zahaszuj” są niedostępne dla formatów binarnych\./);
+  assert.match(note, /Odbiorca z tą zasadą dostaje wiadomość zakodowaną pod-schematem/);
+  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte/);
+  pick(rowFor(win, 'uwagi'), 'hide');
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną z wiadomości pola: union<null, string> \(uwagi\)\..*Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma\./);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(sent, [{
+    instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
+    fields: ['klient', 'numer'], requiredFields: [], maskedFields: [], hashedFields: [], expectAbsent: true,
+  }]);
+});
+
+test('a binary writing rule explains what "set" means in Avro and warns, live, when a field that is always set is "Niedozwolone"', async () => {
+  closeAll();
+  const { ctx, sent } = binaryContext();
+  const win = openHidingAdd(ctx);
+  await tick();
+  pick(win.querySelector('[data-role="direction"]'), 'write');
+  chooseSubject(win, 'group:g-ksieg');
+  assert.deepEqual(optionLabels(rowFor(win, 'numer')), ['Dozwolone', 'Wymagane', 'Niedozwolone']);
+  assert.match(norm(win.querySelector('[data-role="actions-note"]').textContent), /^Pole Avro jest „ustawione”, gdy jego wartość różni się od wartości domyślnej wzoru \(a gdy domyślnej nie ma — od null\)\./);
+  const warn = win.querySelector('[data-role="binary-warn"]');
+  assert.equal(warn.hidden, true);
+  pick(rowFor(win, 'uwagi'), 'forbid');
+  assert.equal(warn.hidden, true, 'a field with null can be forbidden');
+  pick(rowFor(win, 'numer'), 'forbid');
+  assert.equal(warn.hidden, false);
+  assert.equal(warn.getAttribute('title'), 'Ta zasada odrzuci każdą wiadomość');
+  assert.match(warn.getAttribute('message'), /^Pole numer w Avro nie ma wartości domyślnej ani null, więc jest ustawione w każdej wiadomości\./);
+  pick(rowFor(win, 'numer'), 'require');
+  assert.equal(warn.hidden, true);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual([sent[0].fields, sent[0].requiredFields], [['klient', 'numer'], ['numer']]);
+});
+
+test('"Zmień" of a binary rule: a field the pattern lost is named and dropped, a mask an older node stored reads back as hidden', async () => {
+  closeAll();
+  const row = {
+    key: 'group:g-mag:read', subjectType: 'group', subjectId: 'g-mag', direction: 'read', label: 'Magazyn', memberCount: 2,
+    fields: ['numer', 'uwagi', 'stare'], requiredFields: [], maskedFields: ['uwagi'], hashedFields: [], updatedAtMs: NOW,
+  };
+  const { ctx, sent } = binaryContext();
+  const win = openHidingChange(row, ctx);
+  assert.equal(rowFor(win, 'numer').value, 'show');
+  assert.equal(rowFor(win, 'uwagi').value, 'hide');
+  assert.equal(rowFor(win, 'klient').value, 'hide');
+  assert.match(norm(win.querySelector('[data-role="stale-note"]').textContent), /^Pole stare jest w zasadzie, ale wzór już go nie ma — przy zapisie zostanie usunięte\.$/);
+  pick(rowFor(win, 'klient'), 'show');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual([sent[0].fields, sent[0].maskedFields, sent[0].expectedUpdatedAtMs], [['klient', 'numer'], [], NOW]);
+});
+
+test('"Usuń" of a binary rule names the hidden fields like any other', () => {
+  const row = {
+    key: 'group:g-mag:read', subjectType: 'group', subjectId: 'g-mag', direction: 'read', label: 'Magazyn', memberCount: 2,
+    fields: ['numer'], requiredFields: [], maskedFields: [], hashedFields: [], updatedAtMs: NOW,
+  };
+  assert.match(removeLead(row, ORDER), /Magazyn.*klient.*uwagi/);
+});

@@ -922,6 +922,7 @@ fn record_to_preview(rv: &bus::FetchedRecordMeta) -> BusMessagePreviewWire {
         payload_preview,
         is_blob_ref,
         truncated,
+        schema_ref_id: rv.schema_id,
     }
 }
 
@@ -943,6 +944,7 @@ fn record_to_dlq_wire(rv: &bus::FetchedRecordMeta) -> BusDlqRecordWire {
         payload_preview,
         is_blob_ref,
         truncated,
+        schema_ref_id: rv.schema_id,
     }
 }
 
@@ -1624,6 +1626,13 @@ pub async fn bus_dispatch(
             )
             .await?
         }
+        BusPayload::SchemaForRecordGetRequest {
+            topic,
+            schema_ref_id,
+        } => schema_for_record_get_v1(ctx, instance_id, topic.clone(), *schema_ref_id).await?,
+        BusPayload::SchemaFieldsGetRequest { subject, version } => {
+            schema_fields_get_v1(ctx, instance_id, subject.clone(), *version).await?
+        }
         BusPayload::SchemaRegisterRequest {
             subject,
             schema_type,
@@ -1719,6 +1728,8 @@ pub async fn bus_dispatch(
         | BusPayload::SchemaVersionListResponse { .. }
         | BusPayload::SchemaGetResponse { .. }
         | BusPayload::SchemaDerivedGetResponse { .. }
+        | BusPayload::SchemaForRecordGetResponse { .. }
+        | BusPayload::SchemaFieldsGetResponse { .. }
         | BusPayload::SchemaRegisterResponse { .. }
         | BusPayload::SchemaCompatibilitySetResponse
         | BusPayload::SchemaDeleteResponse { .. }
@@ -1830,6 +1841,14 @@ register_bus_variant!("BusSchemaGetRequest", "tentaflow_ws_handler_bus_schema_ge
 register_bus_variant!(
     "BusSchemaDerivedGetRequest",
     "tentaflow_ws_handler_bus_schema_derived_get"
+);
+register_bus_variant!(
+    "BusSchemaForRecordGetRequest",
+    "tentaflow_ws_handler_bus_schema_for_record_get"
+);
+register_bus_variant!(
+    "BusSchemaFieldsGetRequest",
+    "tentaflow_ws_handler_bus_schema_fields_get"
 );
 register_bus_variant!(
     "BusLagHistoryRequest",
@@ -3988,6 +4007,59 @@ async fn field_policy_preview(
             read,
         )
         .map_err(map_bus_error)?;
+        // A topic checked with an Avro, Protobuf or Thrift pattern (F4 B6): a
+        // field is shown whole or left out, so the preview is the record
+        // re-encoded for the fields BOTH the subject's rule and the caller's
+        // own read show.
+        if matches!(
+            field_policies::topic_kind(
+                &db,
+                &instance,
+                &org_id,
+                &cfg.content_type,
+                cfg.schema_id.as_deref()
+            )
+            .map_err(map_bus_error)?,
+            field_policies::TopicKind::Binary { .. }
+        ) {
+            let shown = |rule: &field_policies::FieldPolicy| -> std::collections::BTreeSet<String> {
+                rule.fields
+                    .iter()
+                    .filter(|f| {
+                        !rule.masked_fields.contains(*f) && !rule.hashed_fields.contains(*f)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let subject_visible = subject_rule.as_ref().map(shown);
+            let caller_visible = caller_rule.as_ref().map(shown);
+            let preview = svc
+                .preview_binary_record(
+                    &bctx,
+                    &topic,
+                    partition,
+                    offset,
+                    subject_visible.as_ref(),
+                    caller_visible.as_ref(),
+                )
+                .map_err(map_bus_error)?;
+            rec.payload = preview.payload;
+            rec.schema_id = preview.schema_id;
+            let applied = preview
+                .fields
+                .into_iter()
+                .map(|(field, is_shown)| BusFieldActionWire {
+                    field,
+                    action: if is_shown { "show" } else { "hide" }.to_string(),
+                })
+                .collect::<Vec<_>>();
+            let limited_by_caller = match (&caller_visible, &subject_visible) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(caller), Some(subject)) => !subject.is_subset(caller),
+            };
+            return Ok((record_to_preview(&rec), applied, limited_by_caller, false));
+        }
         let format = bus::payload_format::PayloadFormat::from_content_type(&cfg.content_type);
         let mut key_missing = false;
         // The subject's rule as it is applied over what the caller already
@@ -4148,6 +4220,31 @@ async fn schema_version_list_v1(
     Ok(BusPayload::SchemaVersionListResponse { versions })
 }
 
+/// A caller whose read rule restricts a topic checked with the Avro, Protobuf
+/// or Thrift pattern `subject` is not served the whole pattern: it would show
+/// the names, types and documentation of the fields the rule hides. Such a
+/// caller reads the pattern through the record it reads (`SchemaForRecordGet`);
+/// the registry's own readers ask for the administrator of each topic the rule
+/// is on.
+async fn require_pattern_not_hidden(
+    ctx: &HandlerContext,
+    g: &Gate,
+    subject: &str,
+) -> Result<(), ProtocolError> {
+    let bctx = bus_ctx(ctx, g);
+    let svc = g.svc.clone();
+    let subject = subject.to_string();
+    let hiding = run_blocking(move || {
+        svc.topics_hiding_pattern_from(&bctx, &subject)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    for topic in hiding {
+        require_topic_admin(ctx, g, &topic).await?;
+    }
+    Ok(())
+}
+
 async fn schema_get_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -4155,6 +4252,7 @@ async fn schema_get_v1(
     version: Option<u32>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    require_pattern_not_hidden(ctx, &g, &subject).await?;
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -4211,6 +4309,65 @@ async fn schema_derived_get_v1(
     })
     .await?;
     Ok(BusPayload::SchemaDerivedGetResponse { schema_text })
+}
+
+/// The schema a reader decodes a record of a binary topic with — as the
+/// caller itself reads the topic (`BusService::schema_for_reader`): a reader
+/// whose rule hides fields gets the sub-schema of what it sees. Read tier
+/// plus the topic's own access (`BusAction::Consume`, checked by the service).
+async fn schema_for_record_get_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: String,
+    schema_ref_id: u32,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    topics::validate_user_topic_name(topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX).unwrap_or(&topic))
+        .map_err(map_bus_error)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let schema = run_blocking(move || {
+        svc.schema_for_reader(&bctx, &topic, schema_ref_id)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    Ok(BusPayload::SchemaForRecordGetResponse {
+        schema: tentaflow_protocol::BusRecordSchemaWire {
+            subject: schema.subject,
+            schema_type: schema.schema_type.as_str().to_string(),
+            version: schema.version,
+            schema_ref_id: schema.schema_ref_id,
+            derived: schema.derived,
+            schema_text: schema.schema_text,
+        },
+    })
+}
+
+/// The top-level field names of a binary pattern, for the data-hiding
+/// window of a topic checked with it. `gate_read`, like reading the pattern,
+/// and refused to a caller a read rule restricts (`require_pattern_not_hidden`).
+async fn schema_fields_get_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    subject: String,
+    version: Option<u32>,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    require_pattern_not_hidden(ctx, &g, &subject).await?;
+    let db = ctx.state.db.clone();
+    let org_id = g.org_id.clone();
+    let instance = g.instance.as_str().to_string();
+    let (info, schema_type, fields) = run_blocking(move || {
+        schema_registry::registry::top_level_fields(&db, &instance, &org_id, &subject, version)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    Ok(BusPayload::SchemaFieldsGetResponse {
+        subject: info.subject,
+        schema_type: schema_type.as_str().to_string(),
+        version: info.version,
+        fields,
+    })
 }
 
 async fn schema_register_v1(
@@ -4661,6 +4818,10 @@ async fn lag_history_v1(
 // toru P task 5)
 // =============================================================================
 
+/// What a rule on a topic of Avro, Protobuf or Thrift messages may do to a
+/// field: a binary record shows it whole or leaves it out.
+const BINARY_FIELD_ACTIONS: [field_policies::FieldAction; 1] = [field_policies::FieldAction::Hide];
+
 /// The read-side actions beyond showing a field as it is, which
 /// `field_policies::project_read` applies: a field outside the policy's
 /// allow-list is removed, a shown one can be masked or hashed.
@@ -4730,6 +4891,10 @@ async fn capabilities_v1(
             .map(|t| t.as_str().to_string())
             .collect(),
         field_actions: FIELD_ACTIONS.iter().map(|a| a.as_str().to_string()).collect(),
+        binary_field_actions: BINARY_FIELD_ACTIONS
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
         org_id: g.org_id.clone(),
         org_name,
     };
@@ -6487,6 +6652,7 @@ mod tests {
                     ]
                 );
                 assert_eq!(capabilities.field_actions, vec!["hide", "mask", "hash"]);
+                assert_eq!(capabilities.binary_field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
                 // (see its own doc) — this is the SEPARATE
                 // `SessionAuthKind::Admin` site-admin tier, independent of
@@ -12168,6 +12334,228 @@ mod tests {
         // A subject that sees less than the caller is never limited by it.
         set_rule(&f, "group", &f.group, &["id"], &[], &[]).await.unwrap();
         assert!(!preview(&f, "group", &f.group).await.unwrap().2);
+    }
+
+    /// F4 B6: a Protobuf topic, one record `a=5, b="bee", c="sea"`, and the
+    /// caller's own read rule for `a`/`b`, so every subject is narrowed by it.
+    async fn binary_fixture(db: &DbPool) -> PreviewFixture {
+        let (ctx, org_id, _) = admin_session(db);
+        let inst = fixture_instance_id();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let subject = format!("rec.{tag}.proto");
+        let topic = format!("bytes.{tag}");
+        let text = "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; }";
+        schema_registry::registry::register(
+            &ctx.state.db,
+            inst.as_str(),
+            &org_id,
+            &subject,
+            schema_registry::SchemaType::Protobuf,
+            text,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                content_type: Some("application/octet-stream".to_string()),
+                schema_id: Some(subject),
+                validation: Some("dlq".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let payload = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
+        let g = gate_read(&ctx, inst.as_str()).expect("gate");
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&ctx, &g), topic.clone());
+        tokio::task::spawn_blocking(move || {
+            svc.local_partition(&bctx, &t, 0).expect("partition").open_leader_writes();
+            svc.publish(
+                &bctx,
+                &t,
+                bus::PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![bus::PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(payload),
+                        timestamp_ms: 1_000,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+        })
+        .await
+        .unwrap();
+        let caller = ctx.org_context.as_ref().unwrap().user_id.clone();
+        let f = PreviewFixture {
+            ctx,
+            org_id,
+            topic,
+            member: String::new(),
+            own_rule: format!("o-{tag}"),
+            group: format!("g-{tag}"),
+        };
+        seed_user(db, &f.own_rule, "Własna zasada");
+        seed_org_member(db, &f.org_id, &f.own_rule);
+        set_rule(&f, "user", &caller, &["a", "b"], &[], &[]).await.expect("caller rule");
+        f
+    }
+
+    #[tokio::test]
+    async fn field_policy_binary_topic_rules_name_pattern_fields_and_refuse_masks_and_foreign_names() {
+        let (_guard, db) = bus_fixture();
+        let f = binary_fixture(&db).await;
+        let refusal = |err: ProtocolError| {
+            assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
+            err.message
+        };
+        let own = f.own_rule.clone();
+        assert!(refusal(set_rule(&f, "user", &own, &["a", "zzz"], &[], &[]).await.unwrap_err())
+            .contains(field_policies::FIELD_NOT_IN_PATTERN));
+        assert!(refusal(set_rule(&f, "user", &own, &["a"], &["a"], &[]).await.unwrap_err())
+            .contains(field_policies::BINARY_TOPIC_NO_MASK_HASH));
+        set_rule(&f, "user", &own, &["a", "c"], &[], &[]).await.expect("fields of the pattern");
+    }
+
+    #[tokio::test]
+    async fn field_policy_binary_preview_shows_what_the_subject_and_the_caller_both_see() {
+        let (_guard, db) = bus_fixture();
+        let f = binary_fixture(&db).await;
+        let own = f.own_rule.clone();
+        set_rule(&f, "user", &own, &["a", "c"], &[], &[]).await.unwrap();
+        let answer = field_policy_preview_v1(
+            &f.ctx, fixture_instance_id().as_str(), f.topic.clone(), 0, 0, "user".to_string(), own.clone(),
+        )
+        .await
+        .unwrap();
+        let BusPayload::FieldPolicyPreviewResponse { record, applied, limited_by_caller, hash_key_missing } = answer
+        else {
+            panic!("unexpected response");
+        };
+        // The subject shows a and c, the caller a and b: only a is in both.
+        assert_eq!(record.payload_preview, vec![0x08, 5]);
+        assert_ne!(record.schema_ref_id, 0);
+        assert!(limited_by_caller, "the caller hides c from itself");
+        assert!(!hash_key_missing);
+        let mut applied: Vec<(String, String)> = applied.into_iter().map(|a| (a.field, a.action)).collect();
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec![
+                ("a".to_string(), "show".to_string()),
+                ("b".to_string(), "hide".to_string()),
+            ],
+            "`c` is hidden from the caller itself: the record is not said to set it"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_policy_binary_schema_of_a_record_is_the_readers_sub_schema_and_the_fields_come_from_the_pattern() {
+        let (_guard, db) = bus_fixture();
+        let f = binary_fixture(&db).await;
+        let inst = fixture_instance_id();
+        // The caller reads through its own rule (a, b): the browse carries the
+        // id of that sub-schema.
+        let browse = messages_browse_v1(&f.ctx, inst.as_str(), f.topic.clone(), None, vec![], 10, None)
+            .await
+            .expect("browse");
+        let BusPayload::MessagesBrowseResponse { result } = browse else { panic!("unexpected") };
+        let record = &result.records[0];
+        assert_eq!(record.payload_preview, [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat());
+        assert_ne!(record.schema_ref_id, 0);
+        let answer = schema_for_record_get_v1(&f.ctx, inst.as_str(), f.topic.clone(), record.schema_ref_id)
+            .await
+            .expect("the reader's sub-schema");
+        let BusPayload::SchemaForRecordGetResponse { schema } = answer else { panic!("unexpected") };
+        assert!(schema.derived);
+        assert_eq!(schema.schema_type, "protobuf");
+        assert_eq!(schema.schema_ref_id, record.schema_ref_id);
+        assert!(schema.schema_text.contains("string b = 2") && !schema.schema_text.contains("string c"));
+        let err = schema_for_record_get_v1(&f.ctx, inst.as_str(), f.topic.clone(), record.schema_ref_id ^ 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::NotFound, "{}", err.message);
+
+        let subject = {
+            let t = topics::get_topic(&f.ctx.state.db, inst.as_str(), &f.org_id, &f.topic).unwrap().unwrap();
+            t.schema_id.unwrap()
+        };
+        let fields = schema_fields_get_v1(&f.ctx, inst.as_str(), subject.clone(), None).await.unwrap();
+        let BusPayload::SchemaFieldsGetResponse { schema_type, version, fields, .. } = fields else { panic!("unexpected") };
+        assert_eq!((schema_type.as_str(), version, fields), ("protobuf", 1, vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        // A text pattern names no fields of binary messages.
+        schema_registry::registry::register(
+            &f.ctx.state.db, inst.as_str(), &f.org_id, "t.json", schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#, None, None,
+        )
+        .unwrap();
+        let err = schema_fields_get_v1(&f.ctx, inst.as_str(), "t.json".to_string(), None).await.unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn field_policy_binary_pattern_is_not_served_whole_to_a_reader_whose_rule_hides_fields() {
+        let (_guard, db) = bus_fixture();
+        let f = binary_fixture(&db).await;
+        let inst = fixture_instance_id();
+        let subject = {
+            let t = topics::get_topic(&f.ctx.state.db, inst.as_str(), &f.org_id, &f.topic)
+                .unwrap()
+                .unwrap();
+            t.schema_id.unwrap()
+        };
+        // A reader of the org: the matrix lets it read, no org Admin role.
+        let reader = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_user(&db, &reader, "Czytelnik");
+        seed_org_member(&db, &f.org_id, &reader);
+        seed_bus_permissions(&db, &reader, &["bus.read"]);
+        let reader_ctx = handler_ctx(db.clone(), org_context(&f.org_id, &reader, &[]));
+
+        // No rule of its own: the pattern is readable like any other.
+        schema_get_v1(&reader_ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .expect("no rule, no limit");
+        schema_fields_get_v1(&reader_ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .expect("no rule, no limit");
+
+        // A rule hiding `c`: neither the pattern text nor its field list.
+        set_rule(&f, "user", &reader, &["a", "b"], &[], &[])
+            .await
+            .expect("the reader's rule");
+        let denied = schema_get_v1(&reader_ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code,
+            ProtocolErrorCode::PolicyDenied,
+            "{}",
+            denied.message
+        );
+        let denied = schema_fields_get_v1(&reader_ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code,
+            ProtocolErrorCode::PolicyDenied,
+            "{}",
+            denied.message
+        );
+
+        // The topic's administrator keeps both, rule or not.
+        schema_get_v1(&f.ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .expect("administrator");
+        schema_fields_get_v1(&f.ctx, inst.as_str(), subject, None)
+            .await
+            .expect("administrator");
     }
 
     #[tokio::test]

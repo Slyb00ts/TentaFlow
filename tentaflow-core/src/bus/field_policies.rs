@@ -350,6 +350,38 @@ pub fn validate_write(
                 topic: topic.to_string(),
                 format: format.as_str(),
             })?;
+    check_present(policy, &present, topic)
+}
+
+/// `validate_write` for a record of a topic whose messages are Avro, Protobuf
+/// or Thrift (F4 B6): the fields the record SETS (`SchemaAwareFieldFormat::
+/// list_fields`, decoded with the topic's current pattern; for Avro "set"
+/// means "not at its default or null") against the rule. A record that is not
+/// valid under the pattern is malformed — never let through unchecked.
+pub fn validate_write_binary(
+    policy: &FieldPolicy,
+    schema_type: super::schema_registry::SchemaType,
+    compiled: &super::schema_registry::CompiledSchema,
+    payload: &[u8],
+    topic: &str,
+    budget: &mut super::schema_registry::ValidationBudget,
+) -> Result<(), BusServiceError> {
+    let malformed = || BusServiceError::FieldPolicyPayloadMalformed {
+        topic: topic.to_string(),
+        format: schema_type.as_str(),
+    };
+    let format = schema_type.field_format().ok_or_else(malformed)?;
+    let present = format
+        .list_fields(compiled, payload, budget)
+        .map_err(|_| malformed())?;
+    check_present(policy, &present, topic)
+}
+
+fn check_present(
+    policy: &FieldPolicy,
+    present: &BTreeSet<String>,
+    topic: &str,
+) -> Result<(), BusServiceError> {
     let mut disallowed: Vec<String> = present
         .iter()
         .filter(|f| !policy.fields.contains(*f))
@@ -479,6 +511,157 @@ pub fn project_read(
     }
 }
 
+/// What a rule that masks or hashes is refused with on a topic of binary
+/// messages: those two actions replace text, and a binary record has none
+/// (DECYZJE-2026-09-22, 23.09). The dashboard recognizes the sentence.
+pub const BINARY_TOPIC_NO_MASK_HASH: &str =
+    "masking and hashing do not apply to a topic whose messages are binary";
+
+/// What a rule on a topic of binary messages is refused with when no message
+/// pattern that is not withdrawn is linked to the topic: the pattern is what
+/// names the fields and what the reader's sub-schema is derived from.
+pub const BINARY_TOPIC_NEEDS_PATTERN: &str =
+    "field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn";
+
+/// The middle of the refusal of a rule that names a field the topic's binary
+/// pattern does not have: `field 'x' is not a field of the message pattern 'p' …`.
+pub const FIELD_NOT_IN_PATTERN: &str = "is not a field of the message pattern";
+
+/// Content types that declare the messages of a topic to be Avro, Protobuf or
+/// Thrift. `application/octet-stream` is NOT among them: it is also the
+/// default of every topic created before content types existed, and those are
+/// JSON topics (`PayloadFormat::from_content_type`).
+const BINARY_CONTENT_TYPES: [&str; 8] = [
+    "application/avro",
+    "avro/binary",
+    "application/x-protobuf",
+    "application/protobuf",
+    "application/vnd.google.protobuf",
+    "application/x-thrift",
+    "application/vnd.apache.thrift.binary",
+    "application/vnd.apache.thrift.compact",
+];
+
+/// What the messages of a topic are, as far as a field policy is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicKind {
+    /// JSON, XML or HL7 v2 text.
+    Text(PayloadFormat),
+    /// Checked with an Avro, Protobuf or Thrift pattern. `withdrawn`: the
+    /// subject is deprecated (a deprecated pattern keeps validating the topic
+    /// but cannot take a new rule).
+    Binary {
+        subject: String,
+        schema_type: super::schema_registry::SchemaType,
+        withdrawn: bool,
+    },
+    /// Declared binary by its content type, with no binary pattern linked.
+    BinaryUnbound,
+}
+
+/// The kind of a topic from its `content_type` and `schema_id` (a subject
+/// name). One point lookup of the subject, only when the topic names one.
+pub fn topic_kind(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    content_type: &str,
+    schema_id: Option<&str>,
+) -> Result<TopicKind, BusServiceError> {
+    if let Some(subject) = schema_id.filter(|s| !s.is_empty()) {
+        if let Some(row) = repository::bus_schema_subject_get(pool, instance_id, org_id, subject)? {
+            if let Some(schema_type) = super::schema_registry::SchemaType::parse(&row.schema_type)
+                .filter(|kind| kind.is_binary())
+            {
+                return Ok(TopicKind::Binary {
+                    subject: subject.to_string(),
+                    schema_type,
+                    withdrawn: row.deprecated_at_ms.is_some(),
+                });
+            }
+        }
+    }
+    if BINARY_CONTENT_TYPES.contains(&content_type) {
+        return Ok(TopicKind::BinaryUnbound);
+    }
+    Ok(TopicKind::Text(PayloadFormat::from_content_type(content_type)))
+}
+
+/// What a rule on a topic of binary messages is checked against: the version
+/// of `subject` the topic validates with. Its top-level fields are the names
+/// the rule may use; a rule that shows a field reaching the message itself while
+/// hiding another is refused (the nested copy keeps what the rule hides, see
+/// `schema_registry::leaking_field`); a WRITE rule that cannot be satisfied by
+/// any record is refused (`SchemaAwareFieldFormat::write_rule_obstacle`).
+fn check_binary_rule(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    topic: &str,
+    direction: Direction,
+    fields: &BTreeSet<String>,
+) -> Result<(), BusServiceError> {
+    let effective =
+        super::schema_registry::registry::resolve_effective(pool, instance_id, org_id, subject)?
+            .ok_or_else(|| BusServiceError::SchemaNotFound {
+                subject: subject.to_string(),
+            })?;
+    let unreadable = |e: super::schema_registry::SchemaError| {
+        BusServiceError::InvalidArgument(format!(
+            "subject '{subject}' v{}: {}: {e}",
+            effective.version,
+            super::STORED_SCHEMA_UNREADABLE
+        ))
+    };
+    let compiled = effective
+        .schema_type
+        .ops()
+        .compile(&effective.schema_text)
+        .map_err(unreadable)?;
+    let format = effective.schema_type.field_format().ok_or_else(|| {
+        BusServiceError::InvalidArgument(format!("subject '{subject}' is not a binary pattern"))
+    })?;
+    let declared: BTreeSet<String> = format
+        .declared_fields(&compiled)
+        .map_err(unreadable)?
+        .into_iter()
+        .collect();
+    // The required fields are a subset of `fields` (`prepare_policy` checks).
+    for f in fields {
+        if !declared.contains(f) {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "field '{f}' {FIELD_NOT_IN_PATTERN} '{subject}' of topic '{topic}'"
+            )));
+        }
+    }
+    if let Some(field) =
+        super::schema_registry::leaking_field(format, &compiled, fields).map_err(unreadable)?
+    {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "{}: topic '{topic}' is checked with the pattern '{subject}'",
+            super::schema_registry::leaking_field_refusal(&field)
+        )));
+    }
+    if direction == Direction::Write {
+        if let Some(obstacle) = format
+            .write_rule_obstacle(&compiled, fields)
+            .map_err(unreadable)?
+        {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "{obstacle}: topic '{topic}' is checked with the pattern '{subject}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What a read rule on a topic of binary messages is refused with while the
+/// topic does not validate its messages (`validation = off`): such records
+/// carry no id of the pattern version they were written under.
+pub const BINARY_TOPIC_READ_NEEDS_VALIDATION: &str =
+    "a read rule on a topic of binary messages needs the topic to validate its messages";
+
 /// What a rule on a topic of binary messages is refused with. The dashboard
 /// recognizes the sentence (`schemas.js` `busRefusalText`): reword both together.
 pub const BINARY_TOPIC_NO_POLICY: &str =
@@ -594,6 +777,9 @@ pub struct PreparedPolicy {
     row: DbBusFieldPolicy,
     expect: BusFieldPolicyExpect,
     adds_hashed_fields: bool,
+    /// The Avro, Protobuf or Thrift pattern the rule's field names were
+    /// checked against; written only while the topic is still bound to it.
+    binary_pattern: Option<String>,
 }
 
 impl PreparedPolicy {
@@ -718,31 +904,71 @@ pub fn prepare_policy(
             name: topic.to_string(),
         }
     })?;
-    // A rule reads fields of JSON, XML or HL7 v2 text. A topic checked with an
-    // Avro, Protobuf or Thrift pattern carries bytes of another shape: writes
-    // would fail as malformed and reads would come back empty. (A topic with
-    // the default `application/octet-stream` and no such pattern is the
-    // pre-F0 JSON topic and stays allowed.)
-    if let Some(subject) = cfg.schema_id.as_deref().filter(|s| !s.is_empty()) {
-        let bound = repository::bus_schema_subject_get(pool, instance_id, org_id, subject)?;
-        if let Some(kind) = bound
-            .as_ref()
-            .and_then(|row| super::schema_registry::SchemaType::parse(&row.schema_type))
-            .filter(|kind| kind.is_binary())
-        {
+    // What the topic's messages are decides what a field name means: a key of
+    // JSON, an element of XML, an address of HL7 v2 — or, for a topic checked
+    // with an Avro, Protobuf or Thrift pattern, a top-level field of that
+    // pattern (F4 B6). A rule hides fields of a binary record by re-encoding it
+    // under a sub-schema (`binary_projection`); masking and hashing need text
+    // to replace, so they stay refused there (DECYZJE-2026-09-22, 23.09).
+    let kind = topic_kind(
+        pool,
+        instance_id,
+        org_id,
+        &cfg.content_type,
+        cfg.schema_id.as_deref(),
+    )?;
+    let mut binary_pattern = None;
+    match &kind {
+        TopicKind::Text(format) => {
+            let codec = format.codec();
+            for f in fields.iter().chain(required_fields.iter()) {
+                codec.validate_field_name(f).map_err(|e| {
+                    BusServiceError::InvalidArgument(format!(
+                        "field '{f}' is not a valid field address for topic '{topic}'s payload format: {e}"
+                    ))
+                })?;
+            }
+        }
+        TopicKind::BinaryUnbound => {
             return Err(BusServiceError::InvalidArgument(format!(
-                "{BINARY_TOPIC_NO_POLICY}: topic '{topic}' is checked with the {} pattern '{subject}'",
-                kind.as_str()
+                "{BINARY_TOPIC_NEEDS_PATTERN}: topic '{topic}' declares binary messages \
+                 (content_type '{}') but no message pattern is linked to it",
+                cfg.content_type
             )));
         }
-    }
-    let codec = PayloadFormat::from_content_type(&cfg.content_type).codec();
-    for f in fields.iter().chain(required_fields.iter()) {
-        codec.validate_field_name(f).map_err(|e| {
-            BusServiceError::InvalidArgument(format!(
-                "field '{f}' is not a valid field address for topic '{topic}'s payload format: {e}"
-            ))
-        })?;
+        TopicKind::Binary {
+            subject,
+            schema_type,
+            withdrawn,
+        } => {
+            if !masked_fields.is_empty() || !hashed_fields.is_empty() {
+                return Err(BusServiceError::InvalidArgument(format!(
+                    "{BINARY_TOPIC_NO_MASK_HASH}: topic '{topic}' is checked with the {} \
+                     pattern '{subject}'",
+                    schema_type.as_str()
+                )));
+            }
+            if *withdrawn {
+                return Err(BusServiceError::InvalidArgument(format!(
+                    "{BINARY_TOPIC_NEEDS_PATTERN}: the {} pattern '{subject}' of topic '{topic}' \
+                     is withdrawn",
+                    schema_type.as_str()
+                )));
+            }
+            // A read rule is only enforced on records that carry the id of
+            // the version they were validated under: an unstamped record (a
+            // topic that does not validate) cannot be told apart from one an
+            // evolved pattern would read differently, so it is withheld.
+            if direction == Direction::Read && cfg.validation == topics::ValidationMode::Off {
+                return Err(BusServiceError::InvalidArgument(format!(
+                    "{BINARY_TOPIC_READ_NEEDS_VALIDATION}: topic '{topic}' is checked with the {} \
+                     pattern '{subject}' but does not validate its messages",
+                    schema_type.as_str()
+                )));
+            }
+            check_binary_rule(pool, instance_id, org_id, subject, topic, direction, fields)?;
+            binary_pattern = Some(subject.clone());
+        }
     }
     let now = super::now_ms();
     let existing = repository::bus_field_policy_get(
@@ -785,16 +1011,22 @@ pub fn prepare_policy(
         row,
         expect,
         adds_hashed_fields,
+        binary_pattern,
     })
 }
 
 /// Writes a rule `prepare_policy` accepted.
 pub fn commit_policy(pool: &DbPool, prepared: PreparedPolicy) -> Result<(), BusServiceError> {
-    let PreparedPolicy { row, expect, .. } = prepared;
+    let PreparedPolicy {
+        row,
+        expect,
+        binary_pattern,
+        ..
+    } = prepared;
     let topic = row.topic.as_str();
     // The topic and `expect` are checked again where the rule is written: the
     // topic may have been deleted, or the rule changed, since they were read.
-    match repository::bus_field_policy_set(pool, &row, expect)? {
+    match repository::bus_field_policy_set_bound(pool, &row, expect, binary_pattern.as_deref())? {
         BusFieldPolicyWrite::Written => Ok(()),
         BusFieldPolicyWrite::TopicMissing => Err(BusServiceError::TopicNotFound {
             name: topic.to_string(),
@@ -804,6 +1036,10 @@ pub fn commit_policy(pool: &DbPool, prepared: PreparedPolicy) -> Result<(), BusS
             schema_type,
         } => Err(BusServiceError::InvalidArgument(format!(
             "{BINARY_TOPIC_NO_POLICY}: topic '{topic}' is checked with the {schema_type} pattern '{subject}'"
+        ))),
+        BusFieldPolicyWrite::PatternChanged => Err(BusServiceError::InvalidArgument(format!(
+            "{BINARY_TOPIC_NEEDS_PATTERN}: the message pattern of topic '{topic}' was changed \
+             or withdrawn while the rule was being saved; try again"
         ))),
         BusFieldPolicyWrite::Changed => Err(BusServiceError::FieldPolicyChanged {
             topic: topic.to_string(),
@@ -1426,76 +1662,252 @@ mod tests {
         );
     }
 
+    fn binary_pattern_topic(
+        db: &DbPool,
+        kind: super::super::schema_registry::SchemaType,
+        subject: &str,
+        text: &str,
+        topic: &str,
+    ) {
+        use super::super::schema_registry::{registry, Compatibility};
+        registry::register(
+            db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            subject,
+            kind,
+            text,
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                schema_id: Some(subject.to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+    }
+
+    const BINARY_PATTERNS: [(super::super::schema_registry::SchemaType, &str, &str); 3] = [
+        (
+            super::super::schema_registry::SchemaType::Thrift,
+            "events.thrift",
+            "struct X { 1: required i32 a, 2: string b }",
+        ),
+        (
+            super::super::schema_registry::SchemaType::Avro,
+            "events.avro",
+            r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}"#,
+        ),
+        (
+            super::super::schema_registry::SchemaType::Protobuf,
+            "events.proto",
+            "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; }",
+        ),
+    ];
+
     #[test]
-    fn set_policy_refuses_a_topic_checked_with_a_binary_pattern() {
-        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+    fn a_rule_on_a_topic_checked_with_a_binary_pattern_names_fields_of_that_pattern() {
         let db = test_db();
-        for (kind, subject, text) in [
-            (SchemaType::Thrift, "events.thrift", "struct X { 1: i32 a }"),
-            (
-                SchemaType::Avro,
-                "events.avro",
-                r#"{"type":"record","name":"X","fields":[]}"#,
-            ),
-            (
-                SchemaType::Protobuf,
-                "events.proto",
-                "syntax = \"proto3\"; message X {}",
-            ),
-        ] {
-            registry::register(
-                &db,
-                TEST_INSTANCE,
-                TEST_ORG,
-                subject,
-                kind,
-                text,
-                Some(Compatibility::None),
-                None,
-            )
-            .expect("register");
+        for (kind, subject, text) in BINARY_PATTERNS {
             let topic = format!("bytes.{}", kind.as_str());
-            topics::create_topic(
-                &db,
-                TEST_INSTANCE,
-                TEST_ORG,
-                &topic,
-                topics::TopicOptions {
-                    content_type: Some("application/octet-stream".to_string()),
-                    schema_id: Some(subject.to_string()),
-                    ..Default::default()
-                },
-                NodeEnvironment::Prod,
-                1_000,
-            )
-            .expect("create topic");
-            let err = set_policy(
+            binary_pattern_topic(&db, kind, subject, text, &topic);
+            // A field of the pattern: accepted, for a read and for a write.
+            read_rule(&db, &topic, &["a"], &[], &[]).expect("a field of the pattern");
+            set_policy(
                 &db,
                 TEST_INSTANCE,
                 TEST_ORG,
                 &topic,
                 "any",
                 SUBJECT_ANY,
-                Direction::Read,
+                Direction::Write,
+                &field_set(&["a", "b"]),
                 &field_set(&["a"]),
                 &BTreeSet::new(),
-                &std::collections::BTreeSet::new(),
-                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
                 BusFieldPolicyExpect::Any,
             )
-            .expect_err("a binary topic has no fields to hide");
+            .expect("a write rule with a required field of the pattern");
+            // A name outside the pattern: refused, nothing stored for it.
+            let err = read_rule(&db, &topic, &["a", "zzz"], &[], &[])
+                .expect_err("a field the pattern does not have");
             assert!(
                 matches!(&err, BusServiceError::InvalidArgument(m)
-                if m == &format!(
-                    "field policies cannot apply to a topic whose messages are binary: topic '{topic}' is checked with the {} pattern '{subject}'",
-                    kind.as_str()
-                )),
+                    if m.contains("field 'zzz'") && m.contains(FIELD_NOT_IN_PATTERN)),
                 "{err:?}"
             );
-            assert!(list_policies(&db, TEST_INSTANCE, TEST_ORG, &topic)
-                .expect("list")
-                .is_empty());
+            let kept = list_policies(&db, TEST_INSTANCE, TEST_ORG, &topic).unwrap();
+            assert_eq!(kept.len(), 2, "the read and the write rule only");
         }
+    }
+
+    #[test]
+    fn a_withdrawn_pattern_takes_no_new_rule_and_keeps_the_ones_it_has() {
+        use super::super::schema_registry::registry;
+        let db = test_db();
+        let (kind, subject, text) = BINARY_PATTERNS[1];
+        binary_pattern_topic(&db, kind, subject, text, "bytes.avro");
+        read_rule(&db, "bytes.avro", &["a"], &[], &[]).expect("while the pattern is active");
+        registry::delete(&db, TEST_INSTANCE, TEST_ORG, subject, None, true).expect("deprecate");
+        let err = read_rule(&db, "bytes.avro", &["a", "b"], &[], &[])
+            .expect_err("a withdrawn pattern takes no new rule");
+        assert!(
+            matches!(&err, BusServiceError::InvalidArgument(m)
+                if m.starts_with(BINARY_TOPIC_NEEDS_PATTERN) && m.contains("withdrawn")),
+            "{err:?}"
+        );
+        let kept = list_policies(&db, TEST_INSTANCE, TEST_ORG, "bytes.avro").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].fields_json, r#"["a"]"#);
+    }
+
+    #[test]
+    fn a_topic_declared_binary_without_a_pattern_takes_no_rule() {
+        let db = test_db();
+        for content_type in ["application/x-protobuf", "application/avro", "application/x-thrift"] {
+            let topic = format!("bin.{}", content_type.rsplit(['/', '-']).next().unwrap());
+            topics::create_topic(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                &topic,
+                topics::TopicOptions {
+                    content_type: Some(content_type.to_string()),
+                    ..Default::default()
+                },
+                NodeEnvironment::Prod,
+                1_000,
+            )
+            .expect("create topic");
+            let err = read_rule(&db, &topic, &["a"], &[], &[]).expect_err("no pattern linked");
+            assert!(
+                matches!(&err, BusServiceError::InvalidArgument(m)
+                    if m.starts_with(BINARY_TOPIC_NEEDS_PATTERN)),
+                "{content_type}: {err:?}"
+            );
+        }
+        // The default `application/octet-stream` is the pre-F0 JSON topic.
+        create_topic_of(&db, "plain.bytes", "application/octet-stream");
+        read_rule(&db, "plain.bytes", &["a"], &[], &[]).expect("a JSON topic");
+    }
+
+    #[test]
+    fn the_pattern_of_a_topic_with_rules_cannot_be_changed_or_removed() {
+        use super::super::schema_registry::{registry, Compatibility};
+        let db = test_db();
+        let (kind, subject, text) = BINARY_PATTERNS[2];
+        binary_pattern_topic(&db, kind, subject, text, "bytes.proto");
+        let (_, other, other_text) = BINARY_PATTERNS[1];
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            other,
+            BINARY_PATTERNS[1].0,
+            other_text,
+            Some(Compatibility::None),
+            None,
+        )
+        .unwrap();
+        read_rule(&db, "bytes.proto", &["a"], &[], &[]).unwrap();
+        for schema_id in ["", other] {
+            let err = topics::update_topic(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                "bytes.proto",
+                topics::TopicOptions {
+                    schema_id: Some(schema_id.to_string()),
+                    ..Default::default()
+                },
+                2_000,
+            )
+            .expect_err("rules name fields of the bound pattern");
+            assert!(
+                err.to_string().contains("cannot change the message pattern"),
+                "{err}"
+            );
+        }
+        // Without rules the same change is fine.
+        delete_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "bytes.proto",
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            None,
+        )
+        .unwrap();
+        topics::update_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "bytes.proto",
+            topics::TopicOptions {
+                schema_id: Some(String::new()),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect("no rules, no guard");
+    }
+
+    #[test]
+    fn a_version_that_drops_a_field_a_write_rule_requires_is_refused() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        let (kind, subject, text) = BINARY_PATTERNS[2];
+        binary_pattern_topic(&db, kind, subject, text, "bytes.proto");
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "bytes.proto",
+            "any",
+            SUBJECT_ANY,
+            Direction::Write,
+            &field_set(&["a", "b"]),
+            &field_set(&["a"]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let register = |text: &str| {
+            registry::register(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                subject,
+                SchemaType::Protobuf,
+                text,
+                Some(Compatibility::None),
+                None,
+            )
+        };
+        let err = register("syntax = \"proto3\"; message X { string b = 2; }")
+            .expect_err("`a` is required by the write rule");
+        assert!(
+            err.to_string()
+                .contains(registry::VERSION_DROPS_REQUIRED_FIELD),
+            "{err}"
+        );
+        // Dropping a field the rules only ALLOW is fine, and so is adding one.
+        register("syntax = \"proto3\"; message X { int32 a = 1; int32 c = 3; }")
+            .expect("`b` was only allowed");
     }
 
     #[test]
@@ -2224,7 +2636,7 @@ mod tests {
                 .expect_err("a binary topic takes no mask or hash");
             assert!(
                 matches!(&err, BusServiceError::InvalidArgument(m)
-                    if m.starts_with(BINARY_TOPIC_NO_POLICY)),
+                    if m.starts_with(BINARY_TOPIC_NO_MASK_HASH)),
                 "{err:?}"
             );
         }

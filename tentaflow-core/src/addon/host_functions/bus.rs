@@ -831,6 +831,7 @@ pub fn bus_consume_next_v1(
                         })
                         .collect(),
                     payload: r.payload.to_vec(),
+                    schema_id: (r.schema_id != 0).then_some(r.schema_id),
                 })
                 .collect();
             let out = BusConsumeNextOutput::batch(records);

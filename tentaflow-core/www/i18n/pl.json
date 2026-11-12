@@ -11303,7 +11303,7 @@
       "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz.",
       "schema_kind_mismatch": "Wzór {name} jest dla treści {schemaKind}, a ten topik przyjmuje treść {topicKind}.",
       "stored_schema_unreadable": "Wzór {name} w wersji {version} został zapisany według luźniejszych zasad i rejestr nie może go już odczytać, więc topik nie sprawdzi nim wiadomości. Dodaj poprawioną wersję wzoru.",
-      "field_policy_binary_topic": "Topik {topic} przyjmuje wiadomości binarne (wzór {name}, {format}). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc nie można ich dodać.",
+      "field_policy_binary_topic": "Zasada tekstowa nie może obowiązywać na topiku {topic}: ma on wzór binarny {name} ({format}). Odśwież stronę i dodaj zasadę jeszcze raz.",
       "field_policy_binary_bind": "Topik {topic} ma zasady ukrywania danych, więc nie można do niego przypiąć wzoru binarnego {name} ({format}). Zasady działają na JSON, XML i HL7 v2 — usuń je najpierw.",
       "mask_hash_read_only": "Zamaskować albo zahaszować można tylko pole w zasadzie odczytu — zasada zapisu może pole tylko dopuścić, wymagać albo zabronić.",
       "mask_hash_not_shown": "Zamaskowane i zahaszowane pole musi być też na liście pól, które zasada pokazuje.",
@@ -11311,7 +11311,14 @@
       "field_hash_key_not_found": "Organizacja nie ma jeszcze klucza haszowania — powstaje przy pierwszej zasadzie „Zahaszuj”, więc nie ma czego zmieniać.",
       "field_hash_key_changed": "Klucz haszowania zmienił się w międzyczasie (ktoś zmienił go przed Tobą), więc nic nie zmieniono. Zamknij to okno i otwórz je ponownie, żeby zobaczyć aktualną wersję klucza.",
       "operator_node_required": "Tę czynność wykonuje tylko node operatora organizacji, a ten node nim nie jest. Zrób to na node'zie operatora (lista: Nody mesh).",
-      "hash_key_not_synced": "Organizacja haszuje już pola kluczem, który jeszcze nie dotarł na ten node, więc teraz nie można dodać kolejnego pola „Zahaszuj”. Poczekaj na synchronizację z node'em operatora albo sprawdź połączenie z nim."
+      "hash_key_not_synced": "Organizacja haszuje już pola kluczem, który jeszcze nie dotarł na ten node, więc teraz nie można dodać kolejnego pola „Zahaszuj”. Poczekaj na synchronizację z node'em operatora albo sprawdź połączenie z nim.",
+      "binary_no_mask_hash": "Zamaskować ani zahaszować pola nie można: topik {topic} ma wiadomości binarne (wzór {name}, {format}). Pole można tylko pokazać albo ukryć.",
+      "binary_needs_pattern_unbound": "Topik {topic} ma wiadomości binarne, ale nie ma przypiętego wzoru. Przypnij wzór w ustawieniach topiku, a potem dodaj zasadę.",
+      "binary_needs_pattern_withdrawn": "Wzór {name} ({format}) topiku {topic} jest wycofany, więc nie można dodać ani zmienić zasady. Zasady ukrywania pól w wiadomościach binarnych wymagają wzoru, który nie jest wycofany.",
+      "binary_pattern_changed": "Wzór topiku {topic} zmienił się albo został wycofany, zanim zasada się zapisała, więc nic nie zapisano. Odśwież stronę i spróbuj jeszcze raz.",
+      "field_not_in_pattern": "Pole „{field}” nie należy do wzoru {name} topiku {topic}. Zasada może wymieniać tylko pola najwyższego poziomu tego wzoru.",
+      "pattern_change_under_rules": "Nie można zmienić ani odpiąć wzoru {name} topiku {topic}, dopóki topik ma zasady ukrywania pól — zasady wymieniają pola tego wzoru. Usuń najpierw zasady w sekcji Ukrywanie danych.",
+      "version_drops_required_field": "Nowa wersja wzoru nie ma pola „{field}”, a zasada zapisu topiku {topic} wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku {topic}), a potem dodaj wersję."
     },
     "shell": {
       "instance": "Instancja",
@@ -13024,9 +13031,6 @@
       "col_changed": "Zmieniono",
       "empty_title": "Ten topik nie ma zasad ukrywania danych",
       "empty_text": "Każdy, kto może czytać ten topik, widzi całe wiadomości. Dodaj zasadę, aby ukryć wybrane pola.",
-      "blocked_title": "Treść binarna nie ma ukrywania danych",
-      "blocked_text": "Treść binarna nie podlega ukrywaniu pól: nie da się jej odczytać jako pól, więc każdy, kto ma prawo czytania topiku, widzi ją w całości. Ukrywanie danych działa dla wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
-      "blocked_with_rules": "Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.",
       "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich.",
       "sees_only": "Widzi tylko: {fields}",
       "sees_nothing": "Nie widzi żadnego pola",
@@ -13080,7 +13084,13 @@
         "read_unlisted_saved": "Pola spoza listy też znikną.",
         "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona.",
         "read_masked": "Dla {who} {n|pole|pola|pola} {fields} {n|będzie|będą|będą} widoczne tylko jako gwiazdki z 3 ostatnimi znakami.",
-        "read_hashed": "Dla {who} zamiast wartości {n|pola|pól|pól} {fields} pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji."
+        "read_hashed": "Dla {who} zamiast wartości {n|pola|pól|pól} {fields} pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji.",
+        "read_unlisted_binary": "Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte.",
+        "read_unlisted_saved_binary": "Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte.",
+        "write_unlisted_binary": "Wiadomość z polem spoza listy, np. dodanym dopiero przez nową wersję wzoru, też zostanie odrzucona.",
+        "write_unlisted_saved_binary": "Wiadomość z polem spoza listy, np. dodanym dopiero przez nową wersję wzoru, też zostanie odrzucona.",
+        "read_unlisted_only_binary": "Dla {who} wszystkie pola z listy zostają widoczne; ukryte będzie tylko pole, które doda dopiero nowa wersja wzoru.",
+        "write_unlisted_only_binary": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem, np. dodanym dopiero przez nową wersję wzoru, zostanie odrzucona."
       },
       "fields_label": "Pola",
       "source": {
@@ -13089,7 +13099,8 @@
         "failed": "Nie udało się wczytać wzoru wiadomości tego topiku, więc nie znamy jego pól. Wpisz niżej pola, które mają zostać widoczne.",
         "manual": "Nie znamy pól tego topiku — nie ma wzoru wiadomości, który by je wymieniał. Wpisz niżej pola, które mają zostać widoczne.",
         "complex": "Wzór wiadomości tego topiku zawiera pola, których nie da się z niego wypisać (odwołanie do innego pliku albo dowolne nazwy pól), więc nie znamy pełnej listy. Wpisz niżej pola, które mają zostać widoczne.",
-        "xsd": "Pola tego topiku wpisujesz ręcznie — z wzoru XSD tego topiku nie umiemy ich wypisać. Wpisz niżej pola, które mają zostać widoczne."
+        "xsd": "Pola tego topiku wpisujesz ręcznie — z wzoru XSD tego topiku nie umiemy ich wypisać. Wpisz niżej pola, które mają zostać widoczne.",
+        "binary": "Pola pochodzą ze wzoru {name} ({format}), wersja {version} — to pola najwyższego poziomu."
       },
       "extra": {
         "shown": "Inne pola, które mają zostać widoczne",
@@ -13108,7 +13119,9 @@
       "unlisted": {
         "read": "Pola, których nie ma na liście, też zostaną ukryte (także te, które pojawią się później), chyba że wpiszesz je niżej.",
         "write": "Wiadomość z polem spoza listy zostanie odrzucona, chyba że wpiszesz je niżej.",
-        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej."
+        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej.",
+        "read_binary": "Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte, dopóki go tu nie pokażesz.",
+        "write_binary": "Wiadomość z polem, które doda dopiero nowa wersja wzoru (albo z nieznanym numerem pola), zostanie odrzucona, dopóki go tu nie dopuścisz."
       },
       "add": {
         "button": "Dodaj zasadę",
@@ -13202,7 +13215,8 @@
         "summary_hash": "Zasady zahaszowały {count} {n|pole|pola|pól}: {fields}.",
         "key_missing_title": "Ten node nie ma jeszcze klucza haszowania organizacji",
         "key_missing_text": "Zasada haszuje pola, ale klucz organizacji jeszcze nie dotarł na ten node (przychodzi z node'a operatora), więc pola haszowane są w podglądzie ukryte, a nie zahaszowane. To nie jest skutek Twojej własnej zasady odczytu.",
-        "unchanged": "Pozostałe pola bez zmian: {count}."
+        "unchanged": "Pozostałe pola bez zmian: {count}.",
+        "binary_note": "Treść binarna jest pokazana jako bajty. Odbiorca z zasadą dostaje ją zakodowaną pod-schematem, czyli wzorem bez ukrytych pól."
       },
       "hl7": {
         "msh_3": "Aplikacja wysyłająca",
@@ -13271,7 +13285,6 @@
         "msh_12": "Wersja HL7"
       },
       "blocked_settings": "Otwórz ustawienia topiku",
-      "blocked_preview": "Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.",
       "writes_rest": "Inne pola albo brak wymaganych: odrzuć wiadomość",
       "reads_rest": "Pola spoza listy: ukryj",
       "fields_search": "Szukaj pola",
@@ -13344,7 +13357,57 @@
         "none_rules_title": "Klucz jeszcze nie dotarł na ten node, więc nie ma czego zmieniać.",
         "not_operator": "Ten node nie jest operatorem organizacji, więc klucza tu nie zmienisz — zrób to na node'zie operatora.",
         "changed_reloaded": "Klucz haszowania zmienił się w międzyczasie (ktoś zmienił go przed Tobą), więc nic nie zmieniono. Okno pokazuje już aktualną wersję ({version}). Jeśli nadal chcesz zmienić klucz, potwierdź jeszcze raz."
+      },
+      "block": {
+        "unbound": {
+          "title": "Ten topik czeka na wzór wiadomości",
+          "text": "Wiadomości tego topiku są binarne (Avro, Protobuf lub Thrift), ale nie ma on przypiętego wzoru. Wzór nazywa pola, które da się ukryć, i z niego powstaje pod-schemat dla odbiorcy z zasadą — bez wzoru nie ma ukrywania danych. Przypnij wzór w ustawieniach topiku.",
+          "rules": "Ten topik ma zasady zapisane, zanim jego wiadomości uznano za binarne. Bez wzoru nie wiadomo, jakie pola nazywają, więc nie działają tak, jak zapisano. Usuń je, przypnij wzór w ustawieniach topiku i dodaj zasady od nowa.",
+          "preview": "Podgląd jest niedostępny: topik z wiadomościami binarnymi nie ma przypiętego wzoru, więc nie ma pól do pokazania."
+        },
+        "withdrawn": {
+          "title": "Wzór tego topiku jest wycofany",
+          "text": "Wzór {name} ({format}) jest wycofany, więc nie można dodać zasady. Wycofany wzór nadal sprawdza wiadomości topiku. Przypnij w ustawieniach topiku wzór, który nie jest wycofany.",
+          "rules": "Wzór {name} jest wycofany: zasady, które już są, działają dalej, ale nie można dodać nowej ani zmienić tej — można ją tylko usunąć. Żeby przypiąć inny wzór, usuń najpierw wszystkie zasady tego topiku."
+        },
+        "unreadable": {
+          "title": "Nie udało się wczytać pól wzoru",
+          "text": "Zasady ukrywania potrzebują listy pól wzoru {name}, a serwer jej nie podał (wzór mógł zostać zapisany według luźniejszych zasad albo node chwilowo nie odpowiada). Spróbuj ponownie.",
+          "rules": "Nie udało się wczytać pól wzoru {name}, więc zasad nie da się teraz zmienić — można je tylko usunąć. Odśwież stronę i spróbuj ponownie.",
+          "preview": "Podgląd jest niedostępny: nie udało się wczytać pól wzoru."
+        },
+        "unsupported": {
+          "title": "Ten node nie obsługuje ukrywania pól w treści binarnej",
+          "text": "Wzór {name} ({format}) opisuje wiadomości binarne, a ten node jest w starszej wersji, która nie zna zasad dla takich wiadomości. Zaktualizuj wszystkie nody i odśwież stronę.",
+          "rules": "Ten node nie zna zasad dla wiadomości binarnych, więc nie pokaże ich pól — można je tylko usunąć. Zaktualizuj wszystkie nody.",
+          "preview": "Podgląd jest niedostępny: ten node nie zna zasad dla wiadomości binarnych."
+        }
+      },
+      "binary": {
+        "note_title": "Wiadomości binarne ({format}): zasady działają na polach najwyższego poziomu",
+        "note_text": "Pola pochodzą ze wzoru {name}, wersja {version}. Odbiorca z zasadą odczytu dostaje wiadomość zakodowaną pod-schematem — wzorem bez ukrytych pól. Pole ukryte znika w całości; „Zamaskuj” i „Zahaszuj” są niedostępne dla formatów binarnych.",
+        "hide_means": "pole jest usuwane z wiadomości w całości — nie zostaje ani jego wartość, ani miejsce po nim.",
+        "mask_hash_off": "„Zamaskuj” i „Zahaszuj” są niedostępne dla formatów binarnych.",
+        "read_subschema": "Odbiorca z tą zasadą dostaje wiadomość zakodowaną pod-schematem: wzorem bez ukrytych pól. Jego program czyta ją tym pod-schematem, a nie pełnym wzorem.",
+        "write_avro": "Pole Avro jest „ustawione”, gdy jego wartość różni się od wartości domyślnej wzoru (a gdy domyślnej nie ma — od null). Pole bez wartości domyślnej i bez null jest zawsze ustawione, bo Avro zapisuje każde pole w każdej wiadomości. „Niedozwolone” odrzuca wiadomość z ustawionym polem, „Wymagane” — wiadomość bez ustawionego pola.",
+        "write_protobuf": "Pole Protobuf jest „ustawione”, gdy wiadomość zawiera jego numer (tag) — także z wartością zerową. Pole proto3 z wartością zerową bywa w ogóle niezapisane przez nadawcę, wtedy liczy się jako nieustawione.",
+        "write_thrift": "Pole Thrift jest „ustawione”, gdy wiadomość zawiera jego numer (id) w strukturze głównej. Wiadomość bez pola oznaczonego w IDL jako required jest odrzucana już jako niezgodna ze wzorem, zanim zadziała zasada.",
+        "impact_read": "Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma.",
+        "avro_always_forbidden": "{n|Pole|Pola|Pola} {fields} w Avro {n|nie ma|nie mają|nie mają} wartości domyślnej ani null, więc {n|jest|są|są} ustawione w każdej wiadomości. Przy „Niedozwolone” każda wiadomość zostanie odrzucona.",
+        "warn_title": "Ta zasada odrzuci każdą wiadomość",
+        "stale": "{n|Pole|Pola|Pola} {fields} {n|jest|są|są} w zasadzie, ale wzór już {n|go|ich|ich} nie ma — przy zapisie {n|zostanie usunięte|zostaną usunięte|zostaną usunięte}."
       }
+    },
+    "schemaref": {
+      "line": "Wzór wiadomości: numer {id}",
+      "show": "Pokaż wzór",
+      "hide": "Ukryj wzór",
+      "hint": "Wiadomość czytana przez odbiorcę z zasadą ukrywania pól jest zakodowana pod-schematem, czyli wzorem bez ukrytych pól. Tu zobaczysz ten wzór.",
+      "no_fields": "Zasada nie pokazuje żadnego pola wiadomości, więc treść jest pusta, ale zakodowana pod-schematem o tym numerze.",
+      "withheld": "Treść wstrzymana: wiadomość nie pasuje do wzoru albo jej wzoru nie da się odczytać, więc czytelnik z zasadą ukrywania pól nie dostaje z niej nic.",
+      "derived_title": "Pod-schemat wzoru {name} ({format}, wersja {version}) — tylko pola, które zasada pokazuje",
+      "full_title": "Wzór {name} ({format}, wersja {version})",
+      "gone": "Tego wzoru nie da się już pobrać: serwer wydaje pod-schemat tylko według aktualnej zasady odczytu, a od odczytu tej wiadomości zasada albo wzór się zmieniły. Odczytaj wiadomość jeszcze raz."
     }
   },
   "composer": {
@@ -17256,6 +17319,7 @@
     "diagram_wait_gateway": "Zatrzymany na bramce",
     "diagram_wait_scope": "Wewnątrz podprocesu",
     "diagram_wait_ready": "Gotowy do dalszej drogi",
+    "diagram_wait_blocked": "Zablokowany, wymaga uwagi",
     "diagram_token_count": "{count} {count|token|tokeny|tokenów}",
     "diagram_incident_count": "{count} {count|incydent|incydenty|incydentów}",
     "diagram_legend": "Legenda",
@@ -17295,4 +17359,3 @@
     "heart": "serce"
   }
 }
-    "diagram_wait_blocked": "Zablokowany, wymaga uwagi",

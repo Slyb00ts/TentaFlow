@@ -431,6 +431,20 @@ export function thriftFieldsView(text) {
   return thriftView(text)?.fields ?? null;
 }
 
+/**
+ * The top-level fields of an Avro, Protobuf or Thrift text with the type each
+ * is written as: `[{ name, type, alwaysSet }]`; `alwaysSet` = an Avro field
+ * with neither a default nor `null` in its type, which every message sets (a
+ * write rule can only allow it). Empty for text that cannot be read or for
+ * another format; the server's own field list stays the authority on names.
+ */
+export function binaryFieldTypes(schemaType, text) {
+  if (schemaType === 'avro') return (avroFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: !f.optional }));
+  if (schemaType === 'protobuf') return (protobufFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: false }));
+  if (schemaType === 'thrift') return (thriftFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: false }));
+  return [];
+}
+
 /** `{ name, fields }` of the type `thriftFieldsView` lists, or `null`. */
 export function thriftView(text) {
   const lexed = thriftTokens(text);

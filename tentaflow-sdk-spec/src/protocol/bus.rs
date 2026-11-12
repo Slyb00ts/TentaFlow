@@ -68,6 +68,13 @@ pub struct BusRecordOut {
     pub headers: Vec<BusHeader>,
     #[n(6)]
     pub payload: Vec<u8>,
+    /// Id of the schema the payload is written under (`None` = none). For a
+    /// binary topic (Avro, Protobuf, Thrift) read through a data-hiding rule it
+    /// is the id of the reader's sub-schema; `None` with an empty payload
+    /// means the record was withheld. Absent in a record from a host built
+    /// before this field existed.
+    #[n(7)]
+    pub schema_id: Option<u32>,
 }
 
 // -----------------------------------------------------------------------------
@@ -458,6 +465,7 @@ mod tests {
             key: Some(b"order-1".to_vec()),
             headers: Vec::new(),
             payload: b"{\"id\":1}".to_vec(),
+            schema_id: Some(0xdead_beef),
         }]));
         roundtrip(&BusConsumeNextOutput::empty());
     }

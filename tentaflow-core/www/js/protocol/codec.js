@@ -4513,6 +4513,42 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * BusPayload::SchemaForRecordGetRequest (read tier + the topic's own read right) — the schema
+   * to decode a record of a binary topic (Avro/Protobuf/Thrift) with, AS THE CALLER READS IT.
+   * payload: { instanceId, topic, schemaRefId } — `topic` is the topic read (or its `__dlq.`
+   * topic), `schemaRefId` the `schemaRefId` of the record preview. A caller whose read rule
+   * hides fields is served the sub-schema of what it sees (`derived: true`), never the full
+   * pattern; the id of a rule changed since answers bus.schema_not_found. Answers
+   * BusSchemaForRecordGetResponse { schema: { subject, schemaType, version, schemaRefId,
+   * derived, schemaText } }.
+   */
+  busSchemaForRecordGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusSchemaForRecordGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      Number(payload.schemaRefId ?? payload.schema_ref_id ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaFieldsGetRequest (read tier) — the top-level field names of a binary
+   * pattern (what a data-hiding rule on a topic checked with it may name). payload:
+   * { instanceId, subject, version? } — `version` omitted/null = the version the topic
+   * validates with. Answers BusSchemaFieldsGetResponse { subject, schemaType, version, fields }.
+   */
+  busSchemaFieldsGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusSchemaFieldsGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      payload.version == null ? undefined : Number(payload.version),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // ----- Schema registry (SUM/tentabus/PLAN-F3.md §6; JS-codec) -----
 
   /** BusPayload::SchemaSubjectListRequest — every schema subject registered in the caller's org. payload: { instanceId }. */

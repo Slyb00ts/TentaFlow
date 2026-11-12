@@ -11303,7 +11303,7 @@
       "field_policy_changed": "The rule changed in the meantime, so nothing was saved. Refresh the list of rules and make the change again.",
       "schema_kind_mismatch": "Pattern {name} is for {schemaKind} content, but this topic takes {topicKind} content.",
       "stored_schema_unreadable": "Pattern {name}, version {version}, was stored under looser rules and the registry can no longer read it, so the topic cannot check messages with it. Add a corrected version of the pattern.",
-      "field_policy_binary_topic": "Topic {topic} carries binary messages (pattern {name}, {format}). Data-hiding rules work on JSON, XML and HL7 v2, so none can be added.",
+      "field_policy_binary_topic": "A text rule cannot apply to topic {topic}: it has the binary pattern {name} ({format}). Refresh the page and add the rule again.",
       "field_policy_binary_bind": "Topic {topic} has data-hiding rules, so the binary pattern {name} ({format}) cannot be attached to it. Rules work on JSON, XML and HL7 v2 — delete them first.",
       "mask_hash_read_only": "Only a reading rule can mask or hash a field — a writing rule can only allow, require or forbid it.",
       "mask_hash_not_shown": "A masked or hashed field must also be among the fields the rule shows.",
@@ -11311,7 +11311,14 @@
       "field_hash_key_not_found": "The organization has no hash key yet — it is created with the first “Hash” rule, so there is nothing to change.",
       "field_hash_key_changed": "The hash key changed in the meantime (somebody changed it before you), so nothing was changed. Close this window and open it again to see the current version of the key.",
       "operator_node_required": "Only an operator node of the organization can do this, and this node is not one. Do it on an operator node (see the mesh nodes list).",
-      "hash_key_not_synced": "The organization already hashes fields with a key that has not reached this node yet, so another “Hash” field cannot be added now. Wait for synchronization with the operator node or check the connection to it."
+      "hash_key_not_synced": "The organization already hashes fields with a key that has not reached this node yet, so another “Hash” field cannot be added now. Wait for synchronization with the operator node or check the connection to it.",
+      "binary_no_mask_hash": "A field cannot be masked or hashed: topic {topic} carries binary messages (pattern {name}, {format}). A field can only be shown or hidden.",
+      "binary_needs_pattern_unbound": "Topic {topic} carries binary messages but has no message pattern linked. Link a pattern in the topic settings, then add the rule.",
+      "binary_needs_pattern_withdrawn": "The pattern {name} ({format}) of topic {topic} is withdrawn, so a rule cannot be added or changed. Rules on binary messages need a pattern that is not withdrawn.",
+      "binary_pattern_changed": "The pattern of topic {topic} was changed or withdrawn before the rule was saved, so nothing was saved. Refresh the page and try again.",
+      "field_not_in_pattern": "The field “{field}” is not in the pattern {name} of topic {topic}. A rule can only name top-level fields of that pattern.",
+      "pattern_change_under_rules": "The pattern {name} of topic {topic} cannot be changed or unlinked while the topic has field rules — the rules name fields of this pattern. Delete the rules in the Data hiding section first.",
+      "version_drops_required_field": "The new version of the pattern lacks the field “{field}”, and the write rule of topic {topic} requires it — every write to the topic would be refused. Change that rule first (Data hiding of topic {topic}), then add the version."
     },
     "shell": {
       "instance": "Instance",
@@ -13024,9 +13031,6 @@
       "col_changed": "Changed",
       "empty_title": "This topic has no data hiding rules",
       "empty_text": "Anyone who can read this topic sees whole messages. Add a rule to hide chosen fields.",
-      "blocked_title": "Binary content has no data hiding",
-      "blocked_text": "Binary content cannot have fields hidden: it cannot be read as fields, so anyone who may read the topic sees it whole. Data hiding works for JSON, XML and HL7 v2 messages. The kind of content is set when the topic is created.",
-      "blocked_with_rules": "This topic has data-hiding rules, but its content is binary — the rules will not work. Delete them or create a JSON/XML/HL7 topic.",
       "keys_closed": "Outside systems with an API key are shut out of this topic for {directions}: it has rules for chosen people, groups or addons only and none for everyone.",
       "sees_only": "Sees only: {fields}",
       "sees_nothing": "Sees no field",
@@ -13080,7 +13084,13 @@
         "read_unlisted_saved": "Fields outside the list disappear too.",
         "write_unlisted_saved": "A message with a field outside the list is rejected too.",
         "read_masked": "For {who} the {n|field|fields} {fields} will show only as asterisks with the last 3 characters visible.",
-        "read_hashed": "For {who} the {n|field|fields} {fields} will show a hash instead of the value — a fixed string, the same for the same value across the whole organization."
+        "read_hashed": "For {who} the {n|field|fields} {fields} will show a hash instead of the value — a fixed string, the same for the same value across the whole organization.",
+        "read_unlisted_binary": "A field that only a new version of the pattern adds will be hidden too.",
+        "read_unlisted_saved_binary": "A field that only a new version of the pattern adds will be hidden too.",
+        "write_unlisted_binary": "A message with a field outside the list, e.g. one that only a new version of the pattern adds, will be refused too.",
+        "write_unlisted_saved_binary": "A message with a field outside the list, e.g. one that only a new version of the pattern adds, will be refused too.",
+        "read_unlisted_only_binary": "For {who} every field of the list stays visible; only a field that a new version of the pattern adds will be hidden.",
+        "write_unlisted_only_binary": "From {whoFrom} only a message with fields of the list is accepted. A message with another field, e.g. one that only a new version of the pattern adds, will be refused."
       },
       "fields_label": "Fields",
       "source": {
@@ -13089,7 +13099,8 @@
         "failed": "The message pattern of this topic could not be read, so its fields are not known. Type below the fields that stay visible.",
         "manual": "The fields of this topic are not known — no message pattern lists them. Type below the fields that stay visible.",
         "complex": "The message pattern of this topic holds fields that cannot be listed from it (a reference to another file or free-form field names), so the full list is not known. Type below the fields that stay visible.",
-        "xsd": "You type this topic's fields by hand — they cannot be listed from its XSD pattern. Type below the fields that stay visible."
+        "xsd": "You type this topic's fields by hand — they cannot be listed from its XSD pattern. Type below the fields that stay visible.",
+        "binary": "The fields come from the pattern {name} ({format}), version {version} — they are the top-level fields."
       },
       "extra": {
         "shown": "Other fields that stay visible",
@@ -13108,7 +13119,9 @@
       "unlisted": {
         "read": "Fields that are not on the list are hidden too (also those that appear later), unless you type them below.",
         "write": "A message with a field outside the list is rejected, unless you type that field below.",
-        "write_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you type its address below."
+        "write_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you type its address below.",
+        "read_binary": "A field that only a new version of the pattern adds will be hidden too, until you show it here.",
+        "write_binary": "A message with a field that only a new version of the pattern adds (or with an unknown field number) will be refused until you allow it here."
       },
       "add": {
         "button": "Add a rule",
@@ -13202,7 +13215,8 @@
         "summary_hash": "The rules hashed {count} {n|field|fields}: {fields}.",
         "key_missing_title": "This node does not have the organization's hash key yet",
         "key_missing_text": "A rule hashes fields, but the organization's key has not reached this node yet (it comes from an operator node), so the hashed fields are hidden in the preview instead of hashed. This is not an effect of your own reading rule.",
-        "unchanged": "Other fields unchanged: {count}."
+        "unchanged": "Other fields unchanged: {count}.",
+        "binary_note": "Binary content is shown as bytes. A reader with a rule gets it encoded under a sub-schema, i.e. the pattern without the hidden fields."
       },
       "hl7": {
         "msh_3": "Sending application",
@@ -13271,7 +13285,6 @@
         "msh_12": "HL7 version"
       },
       "blocked_settings": "Open the topic settings",
-      "blocked_preview": "The preview is not available: the content of this topic cannot be read as fields.",
       "writes_rest": "Other fields or a missing required one: reject the message",
       "reads_rest": "Fields outside the list: hide",
       "fields_search": "Search fields",
@@ -13344,7 +13357,57 @@
         "none_rules_title": "The key has not reached this node yet, so there is nothing to change.",
         "not_operator": "This node is not an operator of the organization, so the key cannot be changed here — do it on an operator node.",
         "changed_reloaded": "The hash key changed in the meantime (somebody changed it before you), so nothing was changed. The window now shows the current version ({version}). If you still want to change the key, confirm again."
+      },
+      "block": {
+        "unbound": {
+          "title": "This topic is waiting for a message pattern",
+          "text": "The messages of this topic are binary (Avro, Protobuf or Thrift), but no pattern is linked to it. The pattern names the fields that can be hidden, and the sub-schema for a reader with a rule is derived from it — without one there is no data hiding. Link a pattern in the topic settings.",
+          "rules": "This topic has rules that were saved before its messages were taken for binary. Without a pattern it is not known which fields they name, so they do not work as written. Delete them, link a pattern in the topic settings and add the rules again.",
+          "preview": "The preview is not available: a topic with binary messages has no pattern linked, so there are no fields to show."
+        },
+        "withdrawn": {
+          "title": "The pattern of this topic is withdrawn",
+          "text": "The pattern {name} ({format}) is withdrawn, so a rule cannot be added. A withdrawn pattern still checks the messages of the topic. Link a pattern that is not withdrawn in the topic settings.",
+          "rules": "The pattern {name} is withdrawn: the rules that exist keep working, but a new one cannot be added and this one cannot be changed — it can only be deleted. To link another pattern, delete all rules of this topic first."
+        },
+        "unreadable": {
+          "title": "The fields of the pattern could not be loaded",
+          "text": "Data-hiding rules need the field list of the pattern {name}, and the server did not give it (the pattern may have been stored under looser rules, or the node is not answering for a moment). Try again.",
+          "rules": "The fields of the pattern {name} could not be loaded, so the rules cannot be changed right now — they can only be deleted. Refresh the page and try again.",
+          "preview": "The preview is not available: the fields of the pattern could not be loaded."
+        },
+        "unsupported": {
+          "title": "This node does not support hiding fields in binary content",
+          "text": "The pattern {name} ({format}) describes binary messages, and this node runs an older version that does not know rules for them. Update all nodes and refresh the page.",
+          "rules": "This node does not know rules for binary messages, so it will not show their fields — they can only be deleted. Update all nodes.",
+          "preview": "The preview is not available: this node does not know rules for binary messages."
+        }
+      },
+      "binary": {
+        "note_title": "Binary messages ({format}): rules work on top-level fields",
+        "note_text": "The fields come from the pattern {name}, version {version}. A reader with a read rule gets the message encoded under a sub-schema — the pattern without the hidden fields. A hidden field disappears completely; “Mask” and “Hash” are not available for binary formats.",
+        "hide_means": "the field is removed from the message completely — neither its value nor its place is left.",
+        "mask_hash_off": "“Mask” and “Hash” are not available for binary formats.",
+        "read_subschema": "A reader with this rule gets the message encoded under a sub-schema: the pattern without the hidden fields. Their program reads it with that sub-schema, not with the full pattern.",
+        "write_avro": "An Avro field is “set” when its value differs from the default of the pattern (or from null when there is no default). A field with neither a default nor null is always set, because Avro writes every field in every message. “Not allowed” refuses a message whose field is set, “Required” a message without a set field.",
+        "write_protobuf": "A Protobuf field is “set” when the message contains its number (tag) — also with a zero value. A proto3 field with a zero value is often not written by the sender at all, and then counts as not set.",
+        "write_thrift": "A Thrift field is “set” when the message contains its number (id) in the main struct. A message without a field marked required in the IDL is refused as not matching the pattern before the rule applies.",
+        "impact_read": "The reader will get the message encoded under a sub-schema that does not have these fields.",
+        "avro_always_forbidden": "The Avro {n|field|fields} {fields} {n|has|have} neither a default nor null, so {n|it is|they are} set in every message. With “Not allowed” every message will be refused.",
+        "warn_title": "This rule will refuse every message",
+        "stale": "The {n|field|fields} {fields} {n|is|are} in the rule, but the pattern no longer has {n|it|them} — saving drops {n|it|them}."
       }
+    },
+    "schemaref": {
+      "line": "Message pattern: number {id}",
+      "show": "Show pattern",
+      "hide": "Hide pattern",
+      "hint": "A message read by a reader with a field-hiding rule is encoded under a sub-schema, i.e. the pattern without the hidden fields. Here you can see that pattern.",
+      "no_fields": "The rule shows no field of the message, so the content is empty, but encoded under the sub-schema with this number.",
+      "withheld": "Content withheld: the message does not match its pattern or its pattern cannot be read, so a reader with a field-hiding rule gets nothing of it.",
+      "derived_title": "Sub-schema of the pattern {name} ({format}, version {version}) — only the fields the rule shows",
+      "full_title": "Pattern {name} ({format}, version {version})",
+      "gone": "This pattern can no longer be fetched: the server hands out a sub-schema only for the current read rule, and the rule or the pattern changed since this message was read. Read the message again."
     }
   },
   "composer": {
@@ -17256,6 +17319,7 @@
     "diagram_wait_gateway": "Held at a gateway",
     "diagram_wait_scope": "Inside a subprocess",
     "diagram_wait_ready": "Ready to continue",
+    "diagram_wait_blocked": "Blocked, needs attention",
     "diagram_token_count": "{count} {count|token|tokens}",
     "diagram_incident_count": "{count} {count|incident|incidents}",
     "diagram_legend": "Legend",
@@ -17295,4 +17359,3 @@
     "heart": "heart"
   }
 }
-    "diagram_wait_blocked": "Blocked, needs attention",

@@ -711,6 +711,83 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Dashboard: ukrywanie danych na tematach z wzorem **Avro, Protobuf albo Thrift**
+  (F4 B6 UI). Blokada „treść binarna” zostaje tylko dla tematu bez wzoru, z wycofanym
+  wzorem, z nieczytelną listą pól albo na starszym serwerze (`binaryFieldActions`
+  w możliwościach); każdy powód ma własny tekst. Okno zasady listuje pola
+  najwyższego poziomu z `SchemaFieldsGet` (z typami z tekstu wzoru), odczyt to
+  „Pokaż / Ukryj” („Zamaskuj” i „Zahaszuj” są widoczne, ale zablokowane z wyjaśnieniem),
+  zapis „Dozwolone / Wymagane / Niedozwolone” z objaśnieniem, co znaczy „ustawione”
+  w danym formacie, i ostrzeżeniem, gdy pole Avro bez wartości domyślnej i bez null
+  jest „Niedozwolone”. Podgląd „jak widzi…”, przeglądarka wiadomości i okno
+  nieprzetworzonej wiadomości pokazują treść binarną jako bajty, numer wzoru
+  (`schemaRefId`) i „Pokaż wzór” (`SchemaForRecordGet`); rekord wstrzymany jest
+  nazwany. Nowe odmowy (maska/hasz, wzór wycofany lub niepodpięty, pole spoza wzoru,
+  zmiana lub odpięcie wzoru pod zasadami, nowa wersja bez pola wymaganego przez
+  zasadę zapisu) są opisane po polsku i w czterech pozostałych językach.
+- Zasady ukrywania danych działają na tematach z wzorem **Avro, Protobuf albo
+  Thrift** (F4 B6). Odczyt (`peek`, `fetch`, REST rekordów, funkcje hosta addonów,
+  reaktor/bloki flow, lista „nieprzetworzonych wiadomości”, podgląd „jak widzi X”)
+  dekoduje rekord wersją wzoru, którą go zapisano (id wpisane przy publikacji;
+  rekord bez id nie wskazuje żadnej wersji i jest wstrzymany), pomija pola, których
+  zasada nie pokazuje, i zwraca rekord w tym samym formacie i protokole, taki jak
+  napisany pod **pod-schematem** wyprowadzonym dla widocznych pól: Protobuf —
+  bez tagów ukrytych pól, Thrift — bez ich nagłówków (w TCompact delty id kolejnych
+  pól są liczone od nowa), Avro — bez bajtów ukrytych pól (kolejność pól i gałęzie
+  unii bez zmian). Dotyczy pól najwyższego poziomu. Rekord niepoprawny według
+  wzoru zapisu, z nieznaną wersją albo z wzorem, który się już nie kompiluje, jest
+  **wstrzymany** (pusty ładunek, id 0), nigdy pokazany. Maska i hasz nadal są
+  odmawiane na tematach binarnych (`masking and hashing do not apply to a topic
+  whose messages are binary`). Temat bez zasad nie płaci niczego; skompilowane
+  wersje i teksty pod-schematów są w pamięci podręcznej.
+- Rekord niesie id schematu, pod którym jest zapisany: `schema_id` w JSON REST
+  rekordów, `schema_ref_id` w podglądach wiadomości i nieprzetworzonych
+  wiadomości (`#[serde(default)]`), `schema_id` w rekordzie funkcji hosta
+  (`BusRecordOut`, opcjonalne). Dla czytelnika z zasadą to id jego pod-schematu;
+  tekst pobiera przez `SchemaForRecordGetRequest` (WS) albo
+  `GET /v1/bus/instances/{instance}/topics/{topic}/schemas/{schema_id}?org_id=`
+  (to samo prawo co odczyt tematu). Czytelnik z zasadą dostaje wyłącznie swój
+  pod-schemat, nigdy pełny wzór; id po zmianie zasady nie jest już obsługiwane
+  (`bus.schema_not_found`). `SchemaFieldsGetRequest` zwraca nazwy pól najwyższego
+  poziomu wzoru binarnego.
+- Zapis: zasada zapisu na temacie binarnym sprawdza pola, które rekord **ustawia**:
+  Protobuf — tagi na drucie, Thrift — id pól, Avro (gdzie każde pole jest zawsze
+  na drucie) — pola, których wartość jest inna niż domyślna albo `null` w
+  nullowalnej unii (pole bez domyślnej i bez `null` jest zawsze ustawione, więc
+  musi być dozwolone). Rekord niepoprawny według wzoru to `FieldPolicyPayloadMalformed`.
+- Nowe odmowy: zasada na temacie z wzorem wycofanym albo z typem treści
+  Avro/Protobuf/Thrift bez powiązanego wzoru (`field policies on a topic whose
+  messages are binary need a linked message pattern that is not withdrawn`),
+  nazwa pola spoza wzoru, zmiana albo odpięcie wzoru tematu, który ma zasady,
+  oraz nowa wersja wzoru bez pola, które zasada zapisu wymaga
+  (`registry::VERSION_DROPS_REQUIRED_FIELD`). Zasady już zapisane działają dalej
+  po wycofaniu wzoru. Bez migracji i bez podbicia `SCHEMA_VERSION`.
+- Poprawki po przeglądzie F4 B6 (R1): zasada nie może pokazać pola, którego typ
+  sięga z powrotem do wzoru (rekurencja przez korzeń, np. `next`), gdy ukrywa
+  jakiekolwiek inne pole — zagnieżdżona kopia korzenia niesie ukryte pola; taki
+  rekord (zasada sprzed nowej wersji wzoru) jest wstrzymany. Zasada odczytu na
+  temacie binarnym wymaga, by temat sprawdzał wiadomości (`validation` inne niż
+  `off`), a temat z taką zasadą nie przechodzi na `off`: rekord bez id wersji nie
+  jest czytany wersją bieżącą. Zasada zapisu, której nie spełni żaden rekord
+  (pole Avro bez domyślnej i bez `null`, niedozwolone), jest odmawiana. Zasada
+  zapisu nie dotyczy tematu `__dlq.*` (zapis brokera). Czytelnik, któremu
+  zasada odczytu ogranicza temat z wzorem binarnym, nie dostaje pełnego wzoru z
+  `SchemaGetRequest` ani `SchemaFieldsGetRequest` (tylko administrator tematu);
+  zgadywanie id pod-schematu kosztuje jeden skan wersji na zmianę rejestru.
+- Poprawki po przeglądzie F4 B6 (R2): zasada zapisu jest pomijana tylko dla
+  zapisu brokera do `__dlq.*` (martwy list nieudanej dostawy, kwarantanna), nie
+  dla każdego publish na temat o takiej nazwie — publish użytkownika na
+  `__dlq.x`, którego wiąże zasada zapisu tematu `x`, jest odmawiany
+  (`PermissionDenied`). REST rejestru schematów (`GET .../versions/{n}`) nie
+  oddaje pełnego wzoru Avro/Protobuf/Thrift kluczowi, któremu zasada odczytu
+  ogranicza temat z tym wzorem (403, klucz nie ma wyjątku administratora).
+  Protobuf i Thrift: zasada nie może pokazać pola sięgającego do korzenia nawet
+  wtedy, gdy pokazuje wszystkie pola wersji (rekord może nieść tag nowszej
+  wersji w zagnieżdżonej kopii). Odmowa wyprowadzenia pod-schematu jest
+  pamiętana (jedno ostrzeżenie zamiast jednego na odczyt). Strażnik
+  `validation=off` pod zasadą odczytu działa tylko, gdy aktualizacja dotyka
+  `validation`.
+
 - Zasada odczytu może pokazać pole **zamaskowane** albo **zahaszowane** (F4 B7;
   tylko JSON, XML i HL7 v2 — w Avro, Protobuf i Thrift zasada nadal jest
   odmawiana, więc maska i hasz też). Maska zostawia ostatnie 3 znaki, resztę

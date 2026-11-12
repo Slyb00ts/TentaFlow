@@ -10165,7 +10165,7 @@
       "field_policy_changed": "Die Regel hat sich in der Zwischenzeit geändert, daher wurde nichts gespeichert. Aktualisieren Sie die Regelliste und nehmen Sie die Änderung noch einmal vor.",
       "schema_kind_mismatch": "Das Muster {name} ist für {schemaKind}-Inhalt, dieses Topic nimmt aber {topicKind}-Inhalt an.",
       "stored_schema_unreadable": "Das Muster {name}, Version {version}, wurde nach lockereren Regeln gespeichert und die Registry kann es nicht mehr lesen, daher kann das Topic damit keine Nachrichten prüfen. Fügen Sie eine korrigierte Version des Musters hinzu.",
-      "field_policy_binary_topic": "Das Topic {topic} enthält binäre Nachrichten (Muster {name}, {format}). Regeln zum Ausblenden von Daten arbeiten mit JSON, XML und HL7 v2, daher können keine hinzugefügt werden.",
+      "field_policy_binary_topic": "Eine Textregel kann für das Topic {topic} nicht gelten: Es hat das binäre Muster {name} ({format}). Laden Sie die Seite neu und fügen Sie die Regel erneut hinzu.",
       "field_policy_binary_bind": "Das Topic {topic} hat Regeln zum Ausblenden von Daten, daher lässt sich das binäre Muster {name} ({format}) nicht daran binden. Regeln arbeiten mit JSON, XML und HL7 v2 — löschen Sie sie zuerst.",
       "mask_hash_read_only": "Nur eine Leseregel kann ein Feld maskieren oder hashen – eine Schreibregel kann es nur erlauben, verlangen oder verbieten.",
       "mask_hash_not_shown": "Ein maskiertes oder gehashtes Feld muss auch zu den Feldern gehören, die die Regel anzeigt.",
@@ -10173,7 +10173,14 @@
       "field_hash_key_not_found": "Die Organisation hat noch keinen Hash-Schlüssel – er entsteht mit der ersten „Hashen“-Regel, daher gibt es nichts zu ändern.",
       "field_hash_key_changed": "Der Hash-Schlüssel hat sich zwischenzeitlich geändert (jemand hat ihn vor Ihnen geändert), daher wurde nichts geändert. Schließen Sie dieses Fenster und öffnen Sie es erneut, um die aktuelle Version des Schlüssels zu sehen.",
       "operator_node_required": "Das kann nur ein Operator-Node der Organisation, und dieser Node ist keiner. Führen Sie es auf einem Operator-Node aus (Liste: Mesh-Nodes).",
-      "hash_key_not_synced": "Die Organisation hasht bereits Felder mit einem Schlüssel, der diesen Node noch nicht erreicht hat; ein weiteres „Hashen“-Feld kann daher jetzt nicht hinzugefügt werden. Warten Sie auf die Synchronisierung mit dem Operator-Node oder prüfen Sie die Verbindung zu ihm."
+      "hash_key_not_synced": "Die Organisation hasht bereits Felder mit einem Schlüssel, der diesen Node noch nicht erreicht hat; ein weiteres „Hashen“-Feld kann daher jetzt nicht hinzugefügt werden. Warten Sie auf die Synchronisierung mit dem Operator-Node oder prüfen Sie die Verbindung zu ihm.",
+      "binary_no_mask_hash": "Ein Feld lässt sich nicht maskieren oder hashen: Das Topic {topic} enthält binäre Nachrichten (Muster {name}, {format}). Ein Feld kann nur angezeigt oder ausgeblendet werden.",
+      "binary_needs_pattern_unbound": "Das Topic {topic} enthält binäre Nachrichten, hat aber kein verknüpftes Nachrichtenmuster. Verknüpfen Sie in den Topic-Einstellungen ein Muster und fügen Sie dann die Regel hinzu.",
+      "binary_needs_pattern_withdrawn": "Das Muster {name} ({format}) des Topics {topic} ist zurückgezogen, daher lässt sich keine Regel hinzufügen oder ändern. Regeln für binäre Nachrichten brauchen ein Muster, das nicht zurückgezogen ist.",
+      "binary_pattern_changed": "Das Muster des Topics {topic} wurde geändert oder zurückgezogen, bevor die Regel gespeichert war, daher wurde nichts gespeichert. Laden Sie die Seite neu und versuchen Sie es erneut.",
+      "field_not_in_pattern": "Das Feld „{field}“ gehört nicht zum Muster {name} des Topics {topic}. Eine Regel kann nur Felder der obersten Ebene dieses Musters nennen.",
+      "pattern_change_under_rules": "Das Muster {name} des Topics {topic} lässt sich nicht ändern oder lösen, solange das Topic Feldregeln hat — die Regeln nennen Felder dieses Musters. Löschen Sie zuerst die Regeln im Bereich „Ausblenden von Daten“.",
+      "version_drops_required_field": "Der neuen Version des Musters fehlt das Feld „{field}“, das die Schreibregel des Topics {topic} verlangt — jeder Schreibvorgang ins Topic würde abgelehnt. Ändern Sie zuerst diese Regel (Ausblenden von Daten des Topics {topic}) und fügen Sie dann die Version hinzu."
     },
     "shell": {
       "instance": "Instanz",
@@ -11886,9 +11893,6 @@
       "col_changed": "Geändert",
       "empty_title": "Dieses Topic hat keine Regeln zum Ausblenden von Daten",
       "empty_text": "Wer dieses Topic lesen darf, sieht die vollständigen Nachrichten. Fügen Sie eine Regel hinzu, um bestimmte Felder auszublenden.",
-      "blocked_title": "Binärer Inhalt hat kein Ausblenden von Daten",
-      "blocked_text": "Bei binärem Inhalt lassen sich keine Felder ausblenden: Er lässt sich nicht als Felder lesen, daher sieht ihn jeder, der das Topic lesen darf, vollständig. Das Ausblenden von Daten funktioniert bei JSON-, XML- und HL7-v2-Nachrichten. Die Art des Inhalts wird beim Erstellen des Topics festgelegt.",
-      "blocked_with_rules": "Dieses Topic hat Regeln zum Ausblenden von Daten, sein Inhalt ist aber binär — die Regeln wirken nicht. Löschen Sie sie oder legen Sie ein JSON-/XML-/HL7-Topic an.",
       "keys_closed": "Externe Systeme mit API-Schlüssel sind für dieses Topic im Bereich {directions} gesperrt: Es gibt nur Regeln für ausgewählte Personen, Gruppen oder Addons und keine Regel für alle.",
       "sees_only": "Sieht nur: {fields}",
       "sees_nothing": "Sieht kein Feld",
@@ -11942,7 +11946,13 @@
         "read_unlisted_saved": "Felder außerhalb der Liste verschwinden ebenfalls.",
         "write_unlisted_saved": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt.",
         "read_masked": "Für {who} erscheint {n|das Feld|die Felder} {fields} nur als Sternchen mit den letzten 3 sichtbaren Zeichen.",
-        "read_hashed": "Für {who} erscheint bei {n|dem Feld|den Feldern} {fields} statt des Werts ein Hash – eine feste Zeichenfolge, in der ganzen Organisation gleich für denselben Wert."
+        "read_hashed": "Für {who} erscheint bei {n|dem Feld|den Feldern} {fields} statt des Werts ein Hash – eine feste Zeichenfolge, in der ganzen Organisation gleich für denselben Wert.",
+        "read_unlisted_binary": "Ein Feld, das erst eine neue Version des Musters hinzufügt, wird ebenfalls ausgeblendet.",
+        "read_unlisted_saved_binary": "Ein Feld, das erst eine neue Version des Musters hinzufügt, wird ebenfalls ausgeblendet.",
+        "write_unlisted_binary": "Eine Nachricht mit einem Feld außerhalb der Liste, z. B. einem, das erst eine neue Version des Musters hinzufügt, wird ebenfalls abgelehnt.",
+        "write_unlisted_saved_binary": "Eine Nachricht mit einem Feld außerhalb der Liste, z. B. einem, das erst eine neue Version des Musters hinzufügt, wird ebenfalls abgelehnt.",
+        "read_unlisted_only_binary": "Für {who} bleiben alle Felder der Liste sichtbar; ausgeblendet wird nur ein Feld, das eine neue Version des Musters hinzufügt.",
+        "write_unlisted_only_binary": "Von {whoFrom} wird nur eine Nachricht mit Feldern der Liste angenommen. Eine Nachricht mit einem anderen Feld, z. B. einem, das erst eine neue Version des Musters hinzufügt, wird abgelehnt."
       },
       "fields_label": "Felder",
       "source": {
@@ -11951,7 +11961,8 @@
         "failed": "Das Nachrichtenmuster dieses Topics konnte nicht gelesen werden, daher sind seine Felder nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben.",
         "manual": "Die Felder dieses Topics sind nicht bekannt — kein Nachrichtenmuster nennt sie. Geben Sie unten die Felder ein, die sichtbar bleiben.",
         "complex": "Das Nachrichtenmuster dieses Topics enthält Felder, die sich daraus nicht auflisten lassen (Verweis auf eine andere Datei oder frei gewählte Feldnamen), daher ist die vollständige Liste nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben.",
-        "xsd": "Die Felder dieses Topics tragen Sie selbst ein – aus seinem XSD-Muster lassen sie sich nicht ablesen. Tragen Sie unten die Felder ein, die sichtbar bleiben sollen."
+        "xsd": "Die Felder dieses Topics tragen Sie selbst ein – aus seinem XSD-Muster lassen sie sich nicht ablesen. Tragen Sie unten die Felder ein, die sichtbar bleiben sollen.",
+        "binary": "Die Felder stammen aus dem Muster {name} ({format}), Version {version} — es sind die Felder der obersten Ebene."
       },
       "extra": {
         "shown": "Weitere Felder, die sichtbar bleiben",
@@ -11970,7 +11981,9 @@
       "unlisted": {
         "read": "Felder, die nicht in der Liste stehen, werden ebenfalls ausgeblendet (auch solche, die später hinzukommen), außer Sie geben sie unten ein.",
         "write": "Eine Nachricht mit einem Feld außerhalb der Liste wird abgelehnt, außer Sie geben dieses Feld unten ein.",
-        "write_hl7": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, PV1-1) werden angenommen. Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt, außer Sie geben dessen Adresse unten ein."
+        "write_hl7": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, PV1-1) werden angenommen. Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt, außer Sie geben dessen Adresse unten ein.",
+        "read_binary": "Ein Feld, das erst eine neue Version des Musters hinzufügt, ist ebenfalls ausgeblendet, bis Sie es hier anzeigen.",
+        "write_binary": "Eine Nachricht mit einem Feld, das erst eine neue Version des Musters hinzufügt (oder mit unbekannter Feldnummer), wird abgelehnt, bis Sie es hier erlauben."
       },
       "add": {
         "button": "Regel hinzufügen",
@@ -12064,7 +12077,8 @@
         "summary_hash": "Die Regeln haben {count} {n|Feld|Felder} gehasht: {fields}.",
         "key_missing_title": "Dieser Node hat den Hash-Schlüssel der Organisation noch nicht",
         "key_missing_text": "Eine Regel hasht Felder, aber der Schlüssel der Organisation ist noch nicht auf diesem Node angekommen (er kommt von einem Operator-Node). Gehashte Felder sind in der Vorschau daher ausgeblendet statt gehasht. Das ist keine Folge Ihrer eigenen Leseregel.",
-        "unchanged": "Übrige Felder unverändert: {count}."
+        "unchanged": "Übrige Felder unverändert: {count}.",
+        "binary_note": "Binärer Inhalt wird als Bytes angezeigt. Ein Empfänger mit Regel erhält ihn mit einem Teilschema kodiert, also dem Muster ohne die ausgeblendeten Felder."
       },
       "hl7": {
         "msh_3": "Sendende Anwendung",
@@ -12133,7 +12147,6 @@
         "msh_12": "HL7-Version"
       },
       "blocked_settings": "Topic-Einstellungen öffnen",
-      "blocked_preview": "Die Vorschau ist nicht verfügbar: Der Inhalt dieses Topics lässt sich nicht als Felder lesen.",
       "writes_rest": "Andere Felder oder ein fehlendes Pflichtfeld: Nachricht ablehnen",
       "reads_rest": "Felder außerhalb der Liste: ausblenden",
       "fields_search": "Felder suchen",
@@ -12206,7 +12219,57 @@
         "none_rules_title": "Der Schlüssel ist noch nicht auf diesem Node angekommen, daher gibt es nichts zu ändern.",
         "not_operator": "Dieser Node ist kein Operator der Organisation, daher lässt sich der Schlüssel hier nicht ändern – tun Sie es auf einem Operator-Node.",
         "changed_reloaded": "Der Hash-Schlüssel hat sich zwischenzeitlich geändert (jemand hat ihn vor Ihnen geändert), daher wurde nichts geändert. Das Fenster zeigt jetzt die aktuelle Version ({version}). Wenn Sie den Schlüssel weiterhin ändern möchten, bestätigen Sie erneut."
+      },
+      "block": {
+        "unbound": {
+          "title": "Dieses Topic wartet auf ein Nachrichtenmuster",
+          "text": "Die Nachrichten dieses Topics sind binär (Avro, Protobuf oder Thrift), es ist aber kein Muster verknüpft. Das Muster nennt die Felder, die sich ausblenden lassen, und aus ihm entsteht das Teilschema für Empfänger mit einer Regel — ohne Muster gibt es kein Ausblenden von Daten. Verknüpfen Sie in den Topic-Einstellungen ein Muster.",
+          "rules": "Dieses Topic hat Regeln, die gespeichert wurden, bevor seine Nachrichten als binär galten. Ohne Muster ist nicht bekannt, welche Felder sie nennen, daher wirken sie nicht wie gespeichert. Löschen Sie sie, verknüpfen Sie in den Topic-Einstellungen ein Muster und legen Sie die Regeln neu an.",
+          "preview": "Die Vorschau ist nicht verfügbar: Ein Topic mit binären Nachrichten hat kein verknüpftes Muster, daher gibt es keine Felder zum Anzeigen."
+        },
+        "withdrawn": {
+          "title": "Das Muster dieses Topics ist zurückgezogen",
+          "text": "Das Muster {name} ({format}) ist zurückgezogen, daher lässt sich keine Regel hinzufügen. Ein zurückgezogenes Muster prüft die Nachrichten des Topics weiterhin. Verknüpfen Sie in den Topic-Einstellungen ein Muster, das nicht zurückgezogen ist.",
+          "rules": "Das Muster {name} ist zurückgezogen: Die vorhandenen Regeln wirken weiter, aber eine neue lässt sich nicht hinzufügen und diese nicht ändern — sie lässt sich nur löschen. Um ein anderes Muster zu verknüpfen, löschen Sie zuerst alle Regeln dieses Topics."
+        },
+        "unreadable": {
+          "title": "Die Felder des Musters konnten nicht geladen werden",
+          "text": "Regeln zum Ausblenden brauchen die Feldliste des Musters {name}, und der Server hat sie nicht geliefert (das Muster wurde evtl. nach lockereren Regeln gespeichert, oder der Node antwortet kurz nicht). Versuchen Sie es erneut.",
+          "rules": "Die Felder des Musters {name} konnten nicht geladen werden, daher lassen sich die Regeln jetzt nicht ändern — nur löschen. Laden Sie die Seite neu und versuchen Sie es erneut.",
+          "preview": "Die Vorschau ist nicht verfügbar: Die Felder des Musters konnten nicht geladen werden."
+        },
+        "unsupported": {
+          "title": "Dieser Node unterstützt kein Ausblenden von Feldern in binärem Inhalt",
+          "text": "Das Muster {name} ({format}) beschreibt binäre Nachrichten, und dieser Node läuft in einer älteren Version, die Regeln dafür nicht kennt. Aktualisieren Sie alle Nodes und laden Sie die Seite neu.",
+          "rules": "Dieser Node kennt keine Regeln für binäre Nachrichten und zeigt deren Felder daher nicht an — sie lassen sich nur löschen. Aktualisieren Sie alle Nodes.",
+          "preview": "Die Vorschau ist nicht verfügbar: Dieser Node kennt keine Regeln für binäre Nachrichten."
+        }
+      },
+      "binary": {
+        "note_title": "Binäre Nachrichten ({format}): Regeln wirken auf Felder der obersten Ebene",
+        "note_text": "Die Felder stammen aus dem Muster {name}, Version {version}. Ein Empfänger mit Leseregel erhält die Nachricht mit einem Teilschema kodiert — dem Muster ohne die ausgeblendeten Felder. Ein ausgeblendetes Feld verschwindet vollständig; „Maskieren“ und „Hashen“ sind für binäre Formate nicht verfügbar.",
+        "hide_means": "Das Feld wird vollständig aus der Nachricht entfernt — weder sein Wert noch seine Stelle bleibt.",
+        "mask_hash_off": "„Maskieren“ und „Hashen“ sind für binäre Formate nicht verfügbar.",
+        "read_subschema": "Ein Empfänger mit dieser Regel erhält die Nachricht mit einem Teilschema kodiert: dem Muster ohne die ausgeblendeten Felder. Sein Programm liest sie mit diesem Teilschema, nicht mit dem vollständigen Muster.",
+        "write_avro": "Ein Avro-Feld ist „gesetzt“, wenn sein Wert vom Standardwert des Musters abweicht (ohne Standardwert: von null). Ein Feld ohne Standardwert und ohne null ist immer gesetzt, weil Avro jedes Feld in jeder Nachricht schreibt. „Nicht erlaubt“ lehnt eine Nachricht mit gesetztem Feld ab, „Erforderlich“ eine Nachricht ohne gesetztes Feld.",
+        "write_protobuf": "Ein Protobuf-Feld ist „gesetzt“, wenn die Nachricht seine Nummer (Tag) enthält — auch mit Nullwert. Ein proto3-Feld mit Nullwert wird vom Absender oft gar nicht geschrieben und gilt dann als nicht gesetzt.",
+        "write_thrift": "Ein Thrift-Feld ist „gesetzt“, wenn die Nachricht seine Nummer (ID) in der Hauptstruktur enthält. Eine Nachricht ohne ein im IDL als required markiertes Feld wird schon als musterwidrig abgelehnt, bevor die Regel greift.",
+        "impact_read": "Der Empfänger erhält die Nachricht mit einem Teilschema kodiert, in dem diese Felder fehlen.",
+        "avro_always_forbidden": "{n|Das Avro-Feld|Die Avro-Felder} {fields} {n|hat|haben} weder einen Standardwert noch null und {n|ist|sind} daher in jeder Nachricht gesetzt. Mit „Nicht erlaubt“ wird jede Nachricht abgelehnt.",
+        "warn_title": "Diese Regel lehnt jede Nachricht ab",
+        "stale": "{n|Das Feld|Die Felder} {fields} {n|steht|stehen} in der Regel, das Muster hat {n|es|sie} aber nicht mehr — beim Speichern {n|wird es|werden sie} entfernt."
       }
+    },
+    "schemaref": {
+      "line": "Nachrichtenmuster: Nummer {id}",
+      "show": "Muster anzeigen",
+      "hide": "Muster ausblenden",
+      "hint": "Eine Nachricht, die ein Empfänger mit einer Regel zum Ausblenden von Feldern liest, ist mit einem Teilschema kodiert, also dem Muster ohne die ausgeblendeten Felder. Hier sehen Sie dieses Muster.",
+      "no_fields": "Die Regel zeigt kein Feld der Nachricht, daher ist der Inhalt leer, aber mit dem Teilschema dieser Nummer kodiert.",
+      "withheld": "Inhalt zurückgehalten: Die Nachricht passt nicht zu ihrem Muster oder ihr Muster ist nicht lesbar, daher erhält ein Empfänger mit Regel zum Ausblenden von Feldern nichts davon.",
+      "derived_title": "Teilschema des Musters {name} ({format}, Version {version}) — nur die Felder, die die Regel anzeigt",
+      "full_title": "Muster {name} ({format}, Version {version})",
+      "gone": "Dieses Muster lässt sich nicht mehr abrufen: Der Server gibt ein Teilschema nur für die aktuelle Leseregel aus, und die Regel oder das Muster hat sich seit dem Lesen dieser Nachricht geändert. Lesen Sie die Nachricht erneut."
     }
   },
   "composer": {
@@ -16118,6 +16181,7 @@
     "diagram_wait_gateway": "An einem Gateway angehalten",
     "diagram_wait_scope": "Innerhalb eines Teilprozesses",
     "diagram_wait_ready": "Bereit zum Weitergehen",
+    "diagram_wait_blocked": "Blockiert, braucht Aufmerksamkeit",
     "diagram_token_count": "{count} {count|Token|Token}",
     "diagram_incident_count": "{count} {count|Vorfall|Vorfälle}",
     "diagram_legend": "Legende",
@@ -16157,4 +16221,3 @@
     "heart": "Herz"
   }
 }
-    "diagram_wait_blocked": "Blockiert, braucht Aufmerksamkeit",

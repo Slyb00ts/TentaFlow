@@ -127,6 +127,27 @@ pub fn parse_bus_records_path(path: &str) -> Option<(Option<&str>, &str)> {
     }
 }
 
+/// Matches `GET /v1/bus/instances/{instance_id}/topics/{topic}/schemas/{schema_id}`
+/// (F4 B6): the schema a reader decodes a record of a binary topic with —
+/// `schema_id` is the id the record carried (the `schema_id` of the records
+/// JSON). Returns `(instance, topic, schema_id)`. No legacy instance-less form:
+/// the route is new.
+pub fn parse_bus_record_schema_path(path: &str) -> Option<(&str, &str, u32)> {
+    let rest = path.strip_prefix("/v1/bus/instances/")?;
+    let (instance, after_instance) = rest.split_once("/topics/")?;
+    let (topic, id) = after_instance.split_once("/schemas/")?;
+    if instance.is_empty()
+        || instance.contains('/')
+        || topic.is_empty()
+        || topic.contains('/')
+        || id.is_empty()
+        || !id.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((instance, topic, id.parse().ok()?))
+}
+
 #[derive(Debug, Default)]
 struct BusRecordsQuery {
     org_id: Option<String>,
@@ -1022,7 +1043,115 @@ fn record_to_json(r: FetchedRecordMeta) -> serde_json::Value {
             ))
             .collect::<HashMap<String, String>>(),
         "payload": base64::engine::general_purpose::STANDARD.encode(r.payload),
+        // The id of the schema the payload is written under (`0` = none). For
+        // a binary topic read through a rule that hides fields it is the id of
+        // the reader's sub-schema (`.../schemas/{schema_id}`); `0` with an
+        // empty payload = the record was withheld.
+        "schema_id": r.schema_id,
     })
+}
+
+pub async fn handle_record_schema(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+    instance: String,
+    topic: String,
+    schema_id: u32,
+) -> std::result::Result<Response<OpenAIBody>, hyper::Error> {
+    let Some(db) = router.db.clone() else {
+        return Ok(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal_error",
+            "database unavailable".to_string(),
+        ));
+    };
+    Ok(record_schema(req, &db, &instance, &topic, schema_id).await)
+}
+
+/// Serves one record-schema request and, for a general key, writes its audit row.
+pub(crate) async fn record_schema<B>(
+    req: Request<B>,
+    db: &crate::db::DbPool,
+    instance: &str,
+    topic: &str,
+    schema_id: u32,
+) -> Response<OpenAIBody> {
+    let (peer_ip, user_agent) = request_origin(&req);
+    let mut facts = KeyAuditFacts::default();
+    let response = serve_record_schema(&req, db, instance, topic, schema_id, &mut facts);
+    audit_key_request(
+        db,
+        "bus.rest.consume",
+        Some(instance),
+        topic,
+        response.status(),
+        facts,
+        peer_ip,
+        user_agent,
+    );
+    response
+}
+
+/// The caller's schema for `schema_id` of `topic`: the sub-schema of what the
+/// caller's rule shows when it hides fields, else the registered version. The
+/// right is the right to consume the topic (`BusAction::Consume`), for a key
+/// checked before the instance is looked up.
+fn serve_record_schema<B>(
+    req: &Request<B>,
+    db: &crate::db::DbPool,
+    instance: &str,
+    topic: &str,
+    schema_id: u32,
+    facts: &mut KeyAuditFacts,
+) -> Response<OpenAIBody> {
+    let principal = req.extensions().get::<Principal>().cloned();
+    let query = match parse_query(req.uri().query().unwrap_or("")) {
+        Ok(q) => q,
+        Err(e) => {
+            facts.reason = Some(e.to_string());
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            );
+        }
+    };
+    let actor = match resolve_actor(db, principal.as_ref(), &query, facts) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = precheck_api_key(db, &actor, Some(instance), topic, BusAction::Consume, facts)
+    {
+        return resp;
+    }
+    let (instance_id, svc) = match resolve_engine(db, Some(instance)) {
+        Ok(v) => v,
+        Err(resp) => {
+            facts.reason = Some("instance_unavailable".to_string());
+            return resp;
+        }
+    };
+    let ctx = actor.call_context(instance_id);
+    let schema = match tokio::task::block_in_place(|| svc.schema_for_reader(&ctx, topic, schema_id))
+    {
+        Ok(schema) => schema,
+        Err(e) => {
+            facts.reason = Some(bus_error_reason(&e));
+            return map_bus_error(&e);
+        }
+    };
+    let body = serde_json::json!({
+        "subject": schema.subject,
+        "schema_type": schema.schema_type.as_str(),
+        "version": schema.version,
+        "schema_id": schema.schema_ref_id,
+        "derived": schema.derived,
+        "schema": schema.schema_text,
+    });
+    json_response(
+        StatusCode::OK,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 pub async fn handle_consume(
@@ -2235,6 +2364,142 @@ mod tests {
             payloads(&wildcard),
             vec![serde_json::json!({"id": 1, "name": "Jan"})]
         );
+    }
+
+    #[test]
+    fn parse_bus_record_schema_path_matches_only_the_instance_scoped_shape() {
+        assert_eq!(
+            parse_bus_record_schema_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/42"),
+            Some(("tentabus-0000abcd", "orders", 42))
+        );
+        for bad in [
+            "/v1/bus/topics/orders/schemas/42",
+            "/v1/bus/instances//topics/orders/schemas/42",
+            "/v1/bus/instances/tentabus-0000abcd/topics//schemas/42",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/-1",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/4294967296",
+            "/v1/bus/instances/tentabus-0000abcd/topics/a/b/schemas/1",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/records",
+        ] {
+            assert_eq!(parse_bus_record_schema_path(bad), None, "{bad}");
+        }
+        assert_eq!(parse_bus_records_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/1"), None);
+    }
+
+    /// F4 B6: a key reads a Protobuf topic through a rule; the record carries
+    /// the id of its sub-schema and the schema route serves that sub-schema —
+    /// and nothing else (never the full pattern).
+    #[test]
+    fn key_reads_of_a_binary_topic_carry_the_sub_schema_id_and_the_route_serves_it() {
+        use crate::bus::schema_registry::{registry, Compatibility, SchemaType};
+        let fx = key_fixture("cccc3b06");
+        let key = fx.key(&["read"]);
+        let text = "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; }";
+        registry::register(
+            &fx.state.db, fx.instance.as_str(), ORG, "x.proto", SchemaType::Protobuf, text,
+            Some(Compatibility::None), None,
+        )
+        .unwrap();
+        fx.svc
+            .create_topic(
+                &fx.user_ctx("u-admin"),
+                "bytes",
+                TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some("x.proto".to_string()),
+                    validation: Some(crate::bus::topics::ValidationMode::Dlq),
+                    ..TopicOptions::default()
+                },
+            )
+            .unwrap();
+        let resource_id = topic_acl_resource_id(fx.instance.as_str(), ORG, "bytes");
+        assert!(crate::db::repository::resource_permissions::set_topic_rule(
+            &fx.state.db, &resource_id, "api_key", &key, "read", "allow",
+        )
+        .unwrap());
+        let names = |n: &[&str]| -> std::collections::BTreeSet<String> {
+            n.iter().map(|s| s.to_string()).collect()
+        };
+        field_policies::set_policy(
+            &fx.state.db, fx.instance.as_str(), ORG, "bytes", "any", field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read, &names(&["a", "c"]), &names(&[]), &names(&[]), &names(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let full = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
+        fx.svc
+            .publish(
+                &fx.user_ctx("u-admin"),
+                "bytes",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(full),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+        let consumed = fx.send_to(
+            fx.instance.as_str(), "bytes", "GET", key_principal(&key), &own_group_query(&key), "",
+        );
+        assert_eq!(consumed.status, StatusCode::OK, "{}", consumed.json);
+        let record = &consumed.json["records"][0];
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(record["payload"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(payload, [vec![0x08, 5], vec![0x1a, 3], b"sea".to_vec()].concat());
+        let schema_id = record["schema_id"].as_u64().expect("the id of the sub-schema") as u32;
+        assert_ne!(schema_id, 0);
+
+        let fetch_schema = |id: u32, principal: Option<Principal>| {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/bus/instances/{}/topics/bytes/schemas/{id}?org_id={ORG}",
+                    fx.instance.as_str()
+                ))
+                .extension(principal.unwrap())
+                .extension(V1PeerIp("203.0.113.9".to_string()))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let (db, instance) = (fx.db(), fx.instance.as_str().to_string());
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let resp = tokio::spawn(async move {
+                    record_schema(req, &db, &instance, "bytes", id).await
+                })
+                .await
+                .unwrap();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                Reply { status, json: serde_json::from_slice(&bytes).expect("json body") }
+            })
+        };
+        let served = fetch_schema(schema_id, key_principal(&key));
+        assert_eq!(served.status, StatusCode::OK, "{}", served.json);
+        assert_eq!(served.json["derived"], true);
+        assert_eq!(served.json["schema_id"], schema_id);
+        assert_eq!(served.json["schema_type"], "protobuf");
+        let sub = served.json["schema"].as_str().unwrap();
+        assert!(sub.contains("int32 a = 1") && sub.contains("string c = 3"), "{sub}");
+        assert!(!sub.contains("string b"), "the hidden field is not in the sub-schema: {sub}");
+        let missing = fetch_schema(schema_id.wrapping_add(1), key_principal(&key));
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.json);
+        // A key with no right on the topic learns nothing.
+        let stranger = fx.key(&[]);
+        let denied = fetch_schema(schema_id, key_principal(&stranger));
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.json);
     }
 
     /// F4 B7: the records REST reads through the same projection — a key's

@@ -369,6 +369,39 @@ pub struct EffectiveSchema {
     pub schema_text: String,
 }
 
+/// The top-level field names of a binary pattern's version (`None` = the
+/// version a topic validates with), in the order the pattern declares them:
+/// what a data-hiding rule on a topic checked with it may name.
+pub fn top_level_fields(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    version: Option<u32>,
+) -> Result<(VersionInfo, SchemaType, Vec<String>), BusServiceError> {
+    let row = require_subject(db, instance_id, org_id, subject)?;
+    let (schema_type, _) = decode_subject(&row)?;
+    let Some(format) = schema_type.field_format() else {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "subject '{subject}' is a {} pattern: only Avro, Protobuf and Thrift patterns name \
+             fields of binary messages",
+            schema_type.as_str()
+        )));
+    };
+    let (info, text) = get(db, instance_id, org_id, subject, version)?;
+    let compiled = schema_type.ops().compile(&text).map_err(|e| {
+        BusServiceError::InvalidArgument(format!(
+            "subject '{subject}' v{}: {}: {e}",
+            info.version,
+            crate::bus::STORED_SCHEMA_UNREADABLE
+        ))
+    })?;
+    let fields = format
+        .declared_fields(&compiled)
+        .map_err(|e| BusServiceError::InvalidArgument(format!("subject '{subject}': {e}")))?;
+    Ok((info, schema_type, fields))
+}
+
 pub fn list_subjects(
     db: &DbPool,
     instance_id: &str,
@@ -498,6 +531,68 @@ mod test_hooks {
             hook(stage, subject, version);
         }
     }
+}
+
+/// What registering a version is refused with when a write rule of a topic
+/// bound to the subject REQUIRES a field the new version does not have: every
+/// publish to that topic would be refused as missing it. The dashboard
+/// recognizes the phrase: reword both together.
+pub const VERSION_DROPS_REQUIRED_FIELD: &str =
+    "the new version lacks a field that a write rule of a topic bound to this pattern requires";
+
+/// F4 B6: a field policy on a topic of Avro, Protobuf or Thrift messages names
+/// top-level fields of the pattern. A new version that drops a field only
+/// makes the rule's allowance for it moot (a read has nothing to show, a write
+/// may not set it); a field a write rule REQUIRES that the new version lacks
+/// would make the topic unwritable, so such a version is refused until the rule
+/// is changed.
+fn check_write_rules_still_satisfiable(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    schema_type: SchemaType,
+    schema_text: &str,
+) -> Result<(), BusServiceError> {
+    let topics = topics_by_subject(db, instance_id, org_id)?
+        .remove(subject)
+        .unwrap_or_default();
+    if topics.is_empty() {
+        return Ok(());
+    }
+    let Some(format) = schema_type.field_format() else {
+        return Ok(());
+    };
+    let compiled = schema_type
+        .ops()
+        .compile(schema_text)
+        .map_err(|e| BusServiceError::InvalidArgument(format!("schema: {e}")))?;
+    let declared: std::collections::BTreeSet<String> = format
+        .declared_fields(&compiled)
+        .map_err(|e| BusServiceError::InvalidArgument(format!("schema: {e}")))?
+        .into_iter()
+        .collect();
+    for topic in topics {
+        for rule in repository::bus_field_policy_list_for_topic(db, instance_id, org_id, &topic)? {
+            if rule.direction != "write" {
+                continue;
+            }
+            let required: std::collections::BTreeSet<String> = match &rule.required_fields_json {
+                Some(json) => serde_json::from_str(json).map_err(|e| {
+                    BusServiceError::Db(format!(
+                        "corrupt bus_field_policies.required_fields_json for topic '{topic}': {e}"
+                    ))
+                })?,
+                None => continue,
+            };
+            if let Some(missing) = required.iter().find(|f| !declared.contains(*f)) {
+                return Err(BusServiceError::InvalidArgument(format!(
+                    "{VERSION_DROPS_REQUIRED_FIELD}: field '{missing}' is required by a write rule of topic '{topic}'; change the rule first"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Registers a new version (or returns the existing one, content-addressed
@@ -637,6 +732,17 @@ pub fn register(
     let latest = repository::bus_schema_version_latest(db, instance_id, org_id, subject)?;
     if let Some(latest_row) = &latest {
         check_compat(latest_row, effective_compatibility)?;
+    }
+
+    if existing.is_some() && schema_type.is_binary() {
+        check_write_rules_still_satisfiable(
+            db,
+            instance_id,
+            org_id,
+            subject,
+            schema_type,
+            schema_text,
+        )?;
     }
 
     let next_version = latest.as_ref().map(|v| v.version + 1).unwrap_or(1);
