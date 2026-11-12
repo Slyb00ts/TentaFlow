@@ -1,6 +1,7 @@
 // ============ File: flows-builder/process-retry.js — what an incident says about its retry: the offer and, when there is none, the reason in words ============
 
 import { I18n } from '/js/i18n.js';
+import { fmtDuration } from '/js/utils.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 
@@ -64,4 +65,20 @@ export function retryRefusal(incident) {
     return text(keys[retry.deniedReason] ?? 'retry_denied_generic');
   }
   return null;
+}
+
+/**
+ * What the retry policy has done to this incident, in one sentence: the repeat
+ * that is waiting (its number among the allowed ones and how long until it
+ * starts) or, once none will start by itself, how many were made. Null for a
+ * step without a policy.
+ */
+export function retryAttemptsText(incident, nowMs = Date.now()) {
+  const attempts = incident.attempts;
+  if (!attempts) return null;
+  if (attempts.nextAttemptAtMs != null) {
+    return text('attempts_pending', { number: attempts.made + 1, limit: attempts.limit,
+      wait: fmtDuration(Math.max(0, attempts.nextAttemptAtMs - nowMs)) });
+  }
+  return text('attempts_ended', { made: attempts.made, limit: attempts.limit });
 }

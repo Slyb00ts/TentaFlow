@@ -1450,3 +1450,48 @@ test('an incident carries its retry kind and the reason it is not offered, and a
   assert.equal(old.retry?.kind ?? 'None', 'None');
   assert.equal(old.canRetry, false);
 });
+
+test('a retry policy is sent only when the step has one and comes back in camelCase', { skip }, () => {
+  const task = (extra) => ({ id: 'Service_1', name: 'Service', kind: { ServiceTask: {
+    flowId: 'f1', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, ...extra } } });
+  const model = (node) => ({ schemaVersion: 1, processId: 'P_1', variables: {}, nodes: [node],
+    sequenceFlows: [], diagram: { shapes: [], edges: [] } });
+  const args = (node) => ({ commandId: 'cmd', definitionId: null, expectedRevision: 0, name: 'Retry',
+    description: '', model: model(node) });
+  const save = (node) => request('processDefinitionSaveRequest', args(node));
+  const encode = (node) => codec.encode.processDefinitionSaveRequest(17, args(node));
+  const kind = (node) => save(node).model.nodes[0].kind.ServiceTask;
+
+  assert.equal(Object.hasOwn(kind(task({})), 'retry'), false, 'a step without a policy keeps its bytes');
+  assert.deepEqual(encode(task({ retry: null })), encode(task({})));
+  const fixed = { maxAttempts: 3, delaySeconds: 30, backoff: 'Fixed' };
+  assert.deepEqual(kind(task({ retry: fixed })).retry, fixed);
+  const grown = { maxAttempts: 5, delaySeconds: 10, backoff: { Exponential: { factorPercent: 200, maxDelaySeconds: 600 } } };
+  assert.deepEqual(kind(task({ retry: grown })).retry, grown);
+  assert.throws(() => encode(task({ retry: { ...fixed, extra: 1 } })), /unsupported retry policy field/);
+  assert.throws(() => encode(task({ retry: { ...fixed, delaySeconds: 1.5 } })), /whole attempts and delay/);
+  assert.throws(() => encode(task({ retry: { ...fixed, backoff: 'Linear' } })), /unsupported retry backoff field/);
+  assert.throws(() => encode(task({ retry: { ...grown, backoff: { Exponential: { factorPercent: 200 } } } })), /whole factor and delay cap/);
+});
+
+test('an incident carries what its retries went through, and an old server without it decodes cleanly', { skip }, () => {
+  const decodeIncidents = (incidents) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance: {
+      instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval', process_id: 'Process_Approval', start_node_id: 'Start_1',
+      initiator_user_id: 'u1', version: 1, revision: 1, status: 'Incident', variables: {}, active_node_ids: [], user_tasks: [], incidents,
+      created_at_ms: 1, updated_at_ms: 1, can_cancel: false, can_retry: false, can_send_message: false, subscriptions: [], event_races: [],
+      outgoing_messages: [], message_names: [], scopes: [], calls: [], repetition_groups: [], repetition_occurrences: [],
+      selected_repetition_occurrence: null } } } }))).instance.incidents;
+  const base = { incident_id: 'inc', node_id: 'Check', node_name: 'Check', job_id: 'job', code: 'SERVICE_FAILED', message: 'm', at_ms: 1, can_retry: false, scope_id: 'i1' };
+  const [pending, ended, old] = decodeIncidents([
+    { ...base, attempts: { made: 1, limit: 3, next_attempt_at_ms: 200 } },
+    { ...base, attempts: { made: 3, limit: 3 } },
+    base,
+  ]);
+  assert.deepEqual({ ...pending.attempts }, { made: 1, limit: 3, nextAttemptAtMs: 200 });
+  assert.equal(ended.attempts.made, 3);
+  assert.equal(ended.attempts.limit, 3);
+  assert.equal(ended.attempts.nextAttemptAtMs ?? null, null, 'no deadline once the engine gives up');
+  assert.equal(old.attempts ?? null, null);
+  assert.equal(old.incidentId, 'inc');
+});

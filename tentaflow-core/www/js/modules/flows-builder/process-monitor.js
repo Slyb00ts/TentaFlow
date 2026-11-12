@@ -17,7 +17,7 @@ import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
 import { focusFirstOf, replaceKeepingFocus } from './keep-focus.js';
-import { retryOffered, retryRefusal, retryWords } from './process-retry.js';
+import { retryAttemptsText, retryOffered, retryRefusal, retryWords } from './process-retry.js';
 
 // Fired by an instance window after it changed the instance (cancel, retry), so a
 // list that is open reloads instead of showing the old state.
@@ -294,6 +294,9 @@ export function processEventText(event) {
     node, code: event.data.error_code,
   });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
+  if (event.kind === 'job_retry_scheduled') return text('event_job_retry_scheduled', { node, attempt: event.data.attempt, limit: event.data.limit, time: date(event.data.next_attempt_at_ms) });
+  if (event.kind === 'job_retries_exhausted') return text('event_job_retries_exhausted', { node, made: event.data.made, limit: event.data.limit });
+  if (event.kind === 'job_retry_stopped') return text('event_job_retry_stopped', { node, reason: text(`retry_stopped_${event.data.reason}`) });
   return text(`event_${event.kind}`, { node });
 }
 
@@ -880,7 +883,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       const refusal = retryRefusal(incident);
-      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${mappingReason(incident, instance.variablesRedacted)}${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${mappingReason(incident, instance.variablesRedacted)}${retryAttemptsText(incident) ? `<p class="fb-field-hint" data-retry-attempts>${escapeHtml(retryAttemptsText(incident))}</p>` : ''}${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-focus-key="inspect:${escapeAttr(incident.incidentId)}" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${retryOffered(incident) ? `<tf-button variant="secondary" icon="refresh" data-focus-key="retry:${escapeAttr(incident.incidentId)}" data-retry>${escapeHtml(retryWords(incident).label)}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -1148,7 +1151,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     retryIncident: (incident) => retryIncident(incident),
     completeTask: (task) => complete(task),
     showDetails: () => showView('list'),
-    incidentText: (incident) => incidentSentence(incident, instance.variablesRedacted),
+    incidentText: (incident) => [incidentSentence(incident, instance.variablesRedacted), retryAttemptsText(incident)].filter(Boolean).join(' '),
   } });
   host.querySelector('[data-view]').addEventListener('change', (event) => showView(event.detail.value));
   let savedView = 'list';

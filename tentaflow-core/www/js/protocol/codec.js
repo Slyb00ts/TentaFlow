@@ -361,6 +361,25 @@ function processServiceImplementation(implementation) {
 
 const PROCESS_VERIFICATION_FAILURES = ['Error', 'NeedsHuman'];
 
+// A policy absent from the model is not sent, so a step without one keeps its original bytes.
+function processRetryPolicy(retry) {
+  processKnownFields(retry, ['maxAttempts', 'delaySeconds', 'backoff'], 'retry policy');
+  if (!Number.isInteger(retry.maxAttempts) || !Number.isInteger(retry.delaySeconds)) {
+    throw new TypeError('retry policy requires whole attempts and delay');
+  }
+  let backoff = retry.backoff;
+  if (backoff !== 'Fixed') {
+    processKnownFields(backoff, ['Exponential'], 'retry backoff');
+    const grown = backoff.Exponential;
+    processKnownFields(grown, ['factorPercent', 'maxDelaySeconds'], 'exponential backoff');
+    if (!Number.isInteger(grown.factorPercent) || !Number.isInteger(grown.maxDelaySeconds)) {
+      throw new TypeError('exponential backoff requires a whole factor and delay cap');
+    }
+    backoff = { Exponential: { factor_percent: grown.factorPercent, max_delay_seconds: grown.maxDelaySeconds } };
+  }
+  return { max_attempts: retry.maxAttempts, delay_seconds: retry.delaySeconds, backoff };
+}
+
 // Human is the default and travels as the bare variant name; the machine modes
 // carry their own fields, and a rejection must say what it turns into.
 function processVerification(verification) {
@@ -761,7 +780,8 @@ function processModel(model, bodyType = 'primary') {
         verification: verified ?? 'Human',
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
         ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }),
-        ...processServiceImplementation(body.implementation) };
+        ...processServiceImplementation(body.implementation),
+        ...(body.retry == null ? {} : { retry: processRetryPolicy(body.retry) }) };
     } else if (tag === 'ScriptTask') {
       processKnownFields(body, ['script', 'outputMapping'], 'script task');
       if (typeof body.script !== 'string' || !body.outputMapping || typeof body.outputMapping !== 'object'

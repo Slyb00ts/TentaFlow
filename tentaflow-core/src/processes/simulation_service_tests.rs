@@ -35,6 +35,7 @@ fn service_kind(
     result_expression: Option<&str>,
 ) -> ProcessNodeKind {
     ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: "flow-simulation-service".into(),
         input_mapping: BTreeMap::from([("seed".into(), "vars.answer".into())]),
         output_mapping: BTreeMap::from([("service_answer".into(), "outputs.answer".into())]),

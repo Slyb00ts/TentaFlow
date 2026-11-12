@@ -3472,7 +3472,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     forged.cancel_token_ids.push(waiting.token_id.clone());
     forged.create_tokens.push(waiting);
     let incident_id = Uuid::new_v4().to_string();
-    forged.add_incidents.push(tentaflow_protocol::processes::ProcessIncident {
+    forged.add_incidents.push(tentaflow_protocol::processes::ProcessIncident { attempts: None,
         incident_id: incident_id.clone(), scope_id: instance_id.clone(),
         node_id: Some("Choice".into()), node_name: Some("Select a terminal path".into()),
         job_id: None, code: "NO_MATCHING_FLOW".into(), message: message.into(), at_ms,

@@ -38,6 +38,7 @@ fn block_model(
         .find(|node| node.id == "Service")
         .unwrap();
     node.kind = ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: String::new(),
         input_mapping: BTreeMap::from([("payload".into(), payload.into())]),
         output_mapping: BTreeMap::from([("answer".into(), "outputs.payload".into())]),

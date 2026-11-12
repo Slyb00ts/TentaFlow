@@ -2394,6 +2394,23 @@ test('result routing fixture covers every route the table can show and pairs eac
   for (const [type, stimulus] of Object.entries(routingFixture.stimuli)) assert.ok(stimulus.row, `stimulus ${type} names its table row`);
 });
 
+test('only an agent step gets the cost note in its retry section', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1);
+  const config = inspector(graph);
+  const costNote = () => config.root.querySelector('[data-retry-policy] [data-retry-agent-cost]');
+  graph.updateNodeConfig(node.id, { implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } } });
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.ok(config.root.querySelector('[data-retry-policy]'));
+  assert.equal(costNote(), null, 'a tool step has no cost note');
+  graph.updateNodeConfig(node.id, { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 8, outputSchema: { type: 'object' } } } });
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.ok(config.root.querySelector('[data-retry-policy] [data-process="retryAttempts"]'), 'an agent step keeps its policy fields');
+  assert.equal(costNote()?.textContent, I18n.t('bpmn.retry_agent_cost_hint'));
+  assert.match(costNote().textContent, /runs the agent again/);
+  graph.destroy(); config.destroy();
+});
+
 test('result routing texts name both timeout codes, the caller catch, the kept task and working time', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1);

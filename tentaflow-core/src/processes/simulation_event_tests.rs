@@ -202,6 +202,7 @@ fn an_interrupting_timer_on_a_waiting_service_step_cancels_its_job() {
     model.nodes[1] = node(
         "User_1",
         ProcessNodeKind::ServiceTask {
+            retry: None,
             flow_id: "flow-simulation-service".into(),
             input_mapping: BTreeMap::new(),
             output_mapping: BTreeMap::new(),

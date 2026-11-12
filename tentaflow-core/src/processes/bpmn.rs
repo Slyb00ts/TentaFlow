@@ -18,6 +18,7 @@ use tentaflow_protocol::processes::{
     ProcessMessageTargetSpec, ProcessModel, ProcessModelingEdge, ProcessModelingShape,
     ProcessMultiInstanceInput, ProcessMultiInstanceMode, ProcessNode, ProcessNodeKind,
     ProcessOutputAssociation, ProcessParticipant, ProcessPoint, ProcessRepeatSpec,
+    ProcessRetryBackoff, ProcessRetryPolicy,
     ProcessSequenceFlow, ProcessShape, ProcessSignalDeclaration, ProcessSubProcess,
     ProcessTextAnnotation, ProcessTimerSpec, ProcessWorkCalendar,
     ServiceImplementation,
@@ -2599,7 +2600,12 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 (TF, "resultExpression"),
                 (TF, "blockConfig"),
                 (TF, "agentConfig"),
+                (TF, "retry"),
             ])?;
+            let retry = service
+                .child(TF, "retry")?
+                .map(retry_policy_from_xml)
+                .transpose()?;
             let result_expression = service
                 .child(TF, "resultExpression")?
                 .map(|result| -> Result<String> {
@@ -2793,6 +2799,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     .context("invalid service timeout")?,
                 result_expression,
                 implementation,
+                retry,
             }
         }
         "subProcess" => {
@@ -4115,6 +4122,45 @@ fn verification_failure(service: &Element) -> Result<VerificationOnFailure> {
     }
 }
 
+/// `<tentaflow:retry attempts delaySeconds [backoff factorPercent maxDelaySeconds]/>`;
+/// the limits are the model's, checked when the model is validated.
+fn retry_policy_from_xml(element: &Element) -> Result<ProcessRetryPolicy> {
+    element.attrs_only(&["attempts", "delaySeconds", "backoff", "factorPercent", "maxDelaySeconds"])?;
+    ensure!(element.children.is_empty() && element.text.trim().is_empty(),
+        "retry policy must be empty");
+    let number = |name: &str| -> Result<u32> {
+        element.required(name)?.parse().with_context(|| format!("invalid retry {name}"))
+    };
+    let backoff = match element.attr("backoff").unwrap_or("fixed") {
+        "fixed" => {
+            ensure!(element.attr("factorPercent").is_none() && element.attr("maxDelaySeconds").is_none(),
+                "only exponential retry can have a factor or a delay cap");
+            ProcessRetryBackoff::Fixed
+        }
+        "exponential" => ProcessRetryBackoff::Exponential {
+            factor_percent: number("factorPercent")?,
+            max_delay_seconds: number("maxDelaySeconds")?,
+        },
+        other => bail!("unsupported retry backoff {other} at byte {}", element.offset),
+    };
+    Ok(ProcessRetryPolicy {
+        max_attempts: number("attempts")?.try_into().context("invalid retry attempts")?,
+        delay_seconds: number("delaySeconds")?,
+        backoff,
+    })
+}
+
+fn retry_policy_xml(policy: &ProcessRetryPolicy) -> String {
+    let backoff = match &policy.backoff {
+        ProcessRetryBackoff::Fixed => " backoff=\"fixed\"".to_owned(),
+        ProcessRetryBackoff::Exponential { factor_percent, max_delay_seconds } => format!(
+            " backoff=\"exponential\" factorPercent=\"{factor_percent}\" maxDelaySeconds=\"{max_delay_seconds}\""
+        ),
+    };
+    format!("<tentaflow:retry attempts=\"{}\" delaySeconds=\"{}\"{backoff}/>",
+        policy.max_attempts, policy.delay_seconds)
+}
+
 fn failure_text(on_failure: VerificationOnFailure) -> &'static str {
     match on_failure {
         VerificationOnFailure::Error => "error",
@@ -4888,6 +4934,7 @@ fn write_graph(
                 timeout_seconds,
                 result_expression,
                 implementation,
+                retry,
             } => {
                 let verify = match verification {
                     ActivityVerification::Human => "human",
@@ -4985,6 +5032,9 @@ fn write_graph(
                         "<tentaflow:agentConfig>{}</tentaflow:agentConfig>",
                         escaped(&serde_json::to_string(&config)?)
                     ));
+                }
+                if let Some(policy) = retry {
+                    xml.push_str(&retry_policy_xml(policy));
                 }
                 xml.push_str("</tentaflow:service>");
                 if let Some(repeat) = &node.repeat {
@@ -5789,6 +5839,7 @@ mod tests {
             id: "Service_1".into(),
             name: "Check".into(),
             kind: ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "flow-123".into(),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::new(),
@@ -5969,6 +6020,7 @@ mod tests {
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-123".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -6197,6 +6249,7 @@ mod tests {
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-123".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -6616,6 +6669,7 @@ mod tests {
             id: "Service_1".into(),
             name: "Check".into(),
             kind: ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "flow-123".into(),
                 input_mapping: BTreeMap::from([(
                     "condition_input".into(),
@@ -6767,6 +6821,7 @@ mod tests {
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-123".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -6836,6 +6891,7 @@ mod tests {
             id: "Service_1".into(),
             name: "Check".into(),
             kind: ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "flow-123".into(),
                 input_mapping: BTreeMap::from([("input".into(), "vars.x".into())]),
                 output_mapping: BTreeMap::from([("output".into(), "result.x".into())]),
@@ -7419,6 +7475,7 @@ mod tests {
             }
         }
         model.nodes[1].kind = ProcessNodeKind::ServiceTask {
+            retry: None,
             flow_id: "flow-review".into(),
             input_mapping: BTreeMap::new(),
             output_mapping: BTreeMap::new(),
@@ -7448,6 +7505,7 @@ mod tests {
                 output_mapping: BTreeMap::new(),
             },
             ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "flow-review".into(),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::new(),

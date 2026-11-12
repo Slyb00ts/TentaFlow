@@ -4039,7 +4039,9 @@ mod tests {
             model.variables.insert("case_key".into(), json!("review-17"));
             let work = model.nodes.iter_mut().find(|node| node.id == "Work_Exact").unwrap();
             work.kind = match route {
-                "service" => ProcessNodeKind::ServiceTask { flow_id: flow_id.clone(),
+                "service" => ProcessNodeKind::ServiceTask {
+                    retry: None,
+                    flow_id: flow_id.clone(),
                     input_mapping: BTreeMap::from([("payload".into(), "vars.accepted_customer_id".into())]),
                     output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
                     implementation: Default::default(),

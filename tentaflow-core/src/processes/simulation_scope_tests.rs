@@ -545,6 +545,7 @@ fn a_service_step_inside_a_scope_waits_for_its_answer_and_hands_it_out() {
             node(
                 "Service_1",
                 ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-simulation-service".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::from([("got".into(), "outputs.answer".into())]),
@@ -638,6 +639,7 @@ fn an_escalation_raised_by_a_step_inside_a_scope_is_caught_by_its_boundary_insid
             node(
                 "InnerWork",
                 ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-simulation-service".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -724,6 +726,7 @@ fn an_interrupting_timer_on_a_sub_process_cancels_a_waiting_service_job_inside()
             for inner in &mut body.nodes {
                 if inner.id == "InnerWork" {
                     inner.kind = ProcessNodeKind::ServiceTask {
+                        retry: None,
                         flow_id: "flow-simulation-service".into(),
                         input_mapping: BTreeMap::new(),
                         output_mapping: BTreeMap::new(),

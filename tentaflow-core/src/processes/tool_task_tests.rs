@@ -36,6 +36,7 @@ pub(super) fn tool_model(timeout_seconds: u32, result_expression: Option<&str>) 
         .find(|node| node.id == "Service")
         .unwrap();
     node.kind = ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: String::new(),
         input_mapping: BTreeMap::from([("query".into(), "\"cats\"".into())]),
         output_mapping: BTreeMap::from([("answer".into(), "outputs.result.hits".into())]),

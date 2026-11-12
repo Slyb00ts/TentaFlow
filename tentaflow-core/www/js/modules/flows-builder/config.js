@@ -20,8 +20,11 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { PROCESS_RETRY_LIMITS, CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processRetryMode, processRetryChange, processRetryProblems, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
+
+const RETRY_POLICY_KEYS = ['retryAttempts', 'retryDelaySeconds', 'retryBackoff', 'retryFactorPercent', 'retryMaxDelaySeconds'];
+const PROCESS_RETRY_MAX_ATTEMPTS = PROCESS_RETRY_LIMITS.attempts;
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -905,7 +908,8 @@ export class FlowConfig {
         ${verificationMode === 'Test' || verificationMode === 'Critic' ? '' : `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>`}
         <div data-routing-view></div>`)
         + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${processTimeoutCeiling(config)}" step="1" ${processTimeoutProblem(config) ? `error="${escapeAttr(I18n.t('bpmn.timeout_invalid', { max: processTimeoutCeiling(config) }))}"` : ''}`)}
-        <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
+        <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>
+        ${this._retryPolicyHtml(config, input, disabled, Boolean(agentTask))}`);
       serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
       fields += `${textarea('script', 'script_body', config.script, 3)}
@@ -1417,6 +1421,7 @@ export class FlowConfig {
       const key = control.dataset.process;
       if (key === 'editSequence') { canvas.selectEdge(control.value); return; }
       if (this.readOnly) return;
+      if (RETRY_POLICY_KEYS.includes(key)) { this._changeRetry(node, key, control); return; }
       if (key === 'callTargetMode' || key === 'localBodyChoice'
         || key === 'calledDefinitionChoice' || key === 'calledVersionChoice' || key === 'calledProcessChoice'
         || key === 'calledElement') return;
@@ -1673,6 +1678,56 @@ export class FlowConfig {
     });
     this.root.querySelector('[data-process="delete"]')?.addEventListener('click', () => { this.opts.onDelete(node.id); this.renderEmpty(); });
     this.root.querySelector('[data-process="duplicate"]')?.addEventListener('click', () => this.opts.onDuplicate(node.id));
+  }
+
+  // The retry policy of a Service task, in the Timing tab: nothing is hidden, the
+  // detail fields only appear once there is a policy to describe. An agent step may
+  // have one too, with a note that every repeat runs the whole agent again.
+  _retryPolicyHtml(config, input, disabled, agentStep = false) {
+    const retry = config.retry ?? null;
+    const grown = retry?.backoff?.Exponential;
+    const problems = processRetryProblems(retry);
+    const error = (key, text) => (problems[key] ? `error="${escapeAttr(I18n.t(text, problems[key]))}"` : '');
+    return `<section class="fb-process-retry" data-retry-policy>
+      <h4>${escapeHtml(I18n.t('bpmn.retry_policy_title'))}</h4>
+      ${input('retryAttempts', 'retry_attempts', retry?.maxAttempts ?? 0, `type="number" min="0" max="${PROCESS_RETRY_MAX_ATTEMPTS}" step="1" ${error('retryAttempts', 'bpmn.retry_attempts_invalid')}`)}
+      <div data-retry-detail ${retry ? '' : 'hidden'}>
+        ${input('retryDelaySeconds', 'retry_delay', retry?.delaySeconds ?? '', `type="number" min="1" max="86400" step="1" ${error('retryDelaySeconds', 'bpmn.retry_delay_invalid')}`)}
+        <tf-segmented data-process="retryBackoff" size="sm" label="${escapeAttr(I18n.t('bpmn.retry_backoff'))}" value="${processRetryMode(retry)}" ${disabled}>
+          <option value="Fixed">${escapeHtml(I18n.t('bpmn.retry_backoff_fixed'))}</option>
+          <option value="Exponential">${escapeHtml(I18n.t('bpmn.retry_backoff_exponential'))}</option>
+        </tf-segmented>
+        <div data-retry-growing ${grown ? '' : 'hidden'}>
+          ${input('retryFactorPercent', 'retry_factor', grown?.factorPercent ?? '', `type="number" min="101" max="1000" step="1" ${error('retryFactorPercent', 'bpmn.retry_factor_invalid')}`)}
+          ${input('retryMaxDelaySeconds', 'retry_max_delay', grown?.maxDelaySeconds ?? '', `type="number" min="1" max="86400" step="1" ${error('retryMaxDelaySeconds', 'bpmn.retry_max_delay_invalid')}`)}
+        </div>
+      </div>
+      <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.retry_policy_hint'))}</p>
+      ${agentStep ? `<p class="fb-field-hint" data-retry-agent-cost>${escapeHtml(I18n.t('bpmn.retry_agent_cost_hint'))}</p>` : ''}
+    </section>`;
+  }
+
+  // Applies one field of the retry section to the node and brings the other
+  // controls in line (values the section chose, errors, which fields show).
+  _changeRetry(node, key, control) {
+    const next = processRetryChange(node.config.retry ?? null, key, control.value);
+    this.opts.onConfigChange(node.id, { retry: next });
+    const problems = processRetryProblems(next);
+    const grown = next?.backoff?.Exponential;
+    const shown = { retryAttempts: next?.maxAttempts ?? 0, retryDelaySeconds: next?.delaySeconds ?? '',
+      retryFactorPercent: grown?.factorPercent ?? '', retryMaxDelaySeconds: grown?.maxDelaySeconds ?? '' };
+    const messages = { retryAttempts: 'bpmn.retry_attempts_invalid', retryDelaySeconds: 'bpmn.retry_delay_invalid',
+      retryFactorPercent: 'bpmn.retry_factor_invalid', retryMaxDelaySeconds: 'bpmn.retry_max_delay_invalid' };
+    for (const [field, value] of Object.entries(shown)) {
+      const target = this.root.querySelector(`[data-process="${field}"]`);
+      if (!target) continue;
+      if (field !== key && String(target.value) !== String(value)) target.value = String(value);
+      if (problems[field]) target.setAttribute('error', I18n.t(messages[field], problems[field]));
+      else target.removeAttribute('error');
+    }
+    this.root.querySelector('[data-process="retryBackoff"]').value = processRetryMode(next);
+    this.root.querySelector('[data-retry-detail]').hidden = !next;
+    this.root.querySelector('[data-retry-growing]').hidden = !grown;
   }
 
   _bindServiceTabs(node) {

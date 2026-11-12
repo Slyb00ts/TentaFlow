@@ -645,6 +645,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (32 zakresy, 32 grupy powtórzeń, 128 wystąpień, 8 instancji w drzewie
   wywołań) kończą się zrozumiałym komunikatem w pięciu językach. Przebieg
   z kodem wykonawczym `RealExecution` nadal jest odrzucany.
+- Polityka ponowień per krok BPMN (B4.6): zadanie usługi może mieć `retry`
+  (1–10 ponowień, odstęp od 1 s do 24 h, stały albo rosnący z mnożnikiem i
+  limitem). Krok bez polityki serializuje się bajt w bajt jak dotąd, więc
+  opublikowane modele zachowują swoje sumy SHA-256. Silnik sam ponawia tylko
+  awarię, która dowodnie nic nie zrobiła na zewnątrz; niepewny wynik, przekroczony
+  czas po wysłaniu i nieudane mapowanie wyniku nigdy nie są ponawiane
+  automatycznie, a ręczne ponowienie liczy się do limitu. Jedna awaria to jeden
+  incydent: migracja 210 dodaje do `bpmn_incidents` liczbę prób, limit i termin
+  kolejnej próby, więc restart w trakcie oczekiwania nie gubi ani nie podwaja
+  ponowienia, a osoba dostaje powiadomienie raz, dopiero gdy silnik rezygnuje.
+  Historia ma zdarzenia `job_retry_scheduled`, `job_retries_exhausted` i
+  `job_retry_stopped`, a incydent pokazuje `attempts` (wykonane, limit, termin).
+  Import `failedJobRetryTimeCycle` (`R<n>/PT…`) mapuje się na politykę, cykle
+  nieregularne na najbliższą z ostrzeżeniem. Symulacja uruchamia krok raz i mówi o
+  tym w formularzu. Inspektor ma sekcję ponowień w zakładce „Czas”
+  (pięć języków); przy kroku agenta ostrzega, że każde ponowienie uruchamia agenta
+  od nowa i zużywa jego model, czas i budżet.
 - Bramka AI i limity tokenów. Wyczerpany limit tokenów zatrzymuje teraz wywołanie
   modelu w każdym przepływie (zwykłym, systemowym i strumieniowym), a nie tylko w
   kroku procesu; wcześniej zwykły przepływ tylko logował odmowę i działał dalej bez

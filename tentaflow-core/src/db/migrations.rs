@@ -1332,8 +1332,67 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_activity_io_generations",
             MigrationStep::Sql(BPMN_ACTIVITY_IO_GENERATIONS),
         ),
+        (
+            210,
+            "bpmn_incident_retry_attempts",
+            MigrationStep::Sql(BPMN_INCIDENT_RETRY_ATTEMPTS),
+        ),
     ]
 }
+
+/// v210 — BPMN B4.6 retry policy per activity. One failure of a step is one
+/// incident row for as long as it lasts, however many times it is repeated, so
+/// the repeats are counted ON the row: `attempt_count` is how many repeats
+/// (automatic or by a person) were made, `attempt_limit` what the step's policy
+/// allows the engine to make (NULL: the step has none), `next_attempt_at_ms`
+/// when the engine repeats it next (NULL: it will not). The deadline is on the
+/// row, so a restart in the middle of a wait neither loses nor doubles the repeat.
+///
+/// An incident that is still waiting for its automatic repeat has not yet
+/// failed for good, so the insert trigger leaves it alone; the person is told
+/// once the engine gives up (the row is reopened, or disarmed, with no repeat
+/// left). `INSERT OR IGNORE` on the notice key keeps that to one notice per
+/// incident whatever happens later. The columns are added in place: nothing
+/// references them and the table's foreign keys, indexes and triggers stay.
+const BPMN_INCIDENT_RETRY_ATTEMPTS: &str = r#"
+ALTER TABLE bpmn_incidents ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(attempt_count)='integer' AND attempt_count>=0);
+ALTER TABLE bpmn_incidents ADD COLUMN attempt_limit INTEGER
+    CHECK(attempt_limit IS NULL OR (typeof(attempt_limit)='integer' AND attempt_limit BETWEEN 1 AND 10));
+ALTER TABLE bpmn_incidents ADD COLUMN next_attempt_at_ms INTEGER
+    CHECK(next_attempt_at_ms IS NULL OR (typeof(next_attempt_at_ms)='integer' AND next_attempt_at_ms>0));
+CREATE INDEX idx_bpmn_incidents_next_attempt ON bpmn_incidents(next_attempt_at_ms)
+    WHERE next_attempt_at_ms IS NOT NULL AND resolved_at_ms IS NULL;
+DROP TRIGGER bpmn_incidents_queue_notices;
+CREATE TRIGGER bpmn_incidents_queue_notices
+AFTER INSERT ON bpmn_incidents
+WHEN NEW.resolved_at_ms IS NULL AND NEW.next_attempt_at_ms IS NULL
+    AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_meta')
+BEGIN
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, i.initiator_user_id, NEW.at_ms
+    FROM bpmn_instances i WHERE i.instance_id = NEW.instance_id;
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, d.owner_user_id, NEW.at_ms
+    FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id = i.definition_id
+    WHERE i.instance_id = NEW.instance_id;
+END;
+CREATE TRIGGER bpmn_incidents_queue_notices_when_retries_end
+AFTER UPDATE OF next_attempt_at_ms, resolved_at_ms ON bpmn_incidents
+WHEN NEW.resolved_at_ms IS NULL AND NEW.next_attempt_at_ms IS NULL
+    AND NEW.attempt_limit IS NOT NULL
+    AND (OLD.next_attempt_at_ms IS NOT NULL OR OLD.resolved_at_ms IS NOT NULL)
+    AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_meta')
+BEGIN
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, i.initiator_user_id, NEW.at_ms
+    FROM bpmn_instances i WHERE i.instance_id = NEW.instance_id;
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, d.owner_user_id, NEW.at_ms
+    FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id = i.definition_id
+    WHERE i.instance_id = NEW.instance_id;
+END;
+"#;
 
 /// v209 — BPMN B4.5 output-mapping retry. An accepted Service result whose
 /// mapping into variables failed (`output_blocked`) may be mapped again without
@@ -13447,6 +13506,7 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
     model.nodes.push(ProcessNode { activity_io: None, repeat: None,
         id: "Service_1".into(), name: "Service".into(),
         kind: ProcessNodeKind::ServiceTask {
+            retry: None,
             flow_id: "flow-pinned".into(), input_mapping: Default::default(),
             output_mapping: Default::default(), verification: ActivityVerification::Human,
             timeout_seconds: 60,
@@ -17136,7 +17196,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 209);
+        assert_eq!(head, 210);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -17155,7 +17215,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 30);
+        assert_eq!(applied_after_179.len(), 31);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -17174,6 +17234,7 @@ mod tests {
         assert_eq!(applied_after_179[27], "bpmn_monitor_permission");
         assert_eq!(applied_after_179[28], "bpmn_incident_notices");
         assert_eq!(applied_after_179[29], "bpmn_activity_io_generations");
+        assert_eq!(applied_after_179[30], "bpmn_incident_retry_attempts");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17631,6 +17692,79 @@ mod tests {
         conn.execute("UPDATE bpmn_instances SET initiator_user_id='owner'", []).unwrap();
         conn.execute_batch(&incident("same-person", "NULL")).unwrap();
         assert_eq!(notices(&conn), 3, "an initiator who owns the definition is one recipient");
+    }
+
+    /// v210: the retry columns are there, an incident waiting for its automatic
+    /// repeat queues no notice, the notice is queued once when the repeats end
+    /// and the notice key keeps it at one per recipient.
+    #[test]
+    fn migration_210_adds_retry_columns_and_notifies_once_when_retries_end() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 209);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('d1','o','owner','n','',1,'{}',1,0,1,1);
+             INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,selected_process_id,start_node_id) VALUES('i1','d1',1,'o','starter',1,'incident','{}',1,1,'p','Start');
+             INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES('before','i1','i1',NULL,NULL,'X','m',5);",
+        )
+        .unwrap();
+        run(&conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('bpmn_incidents')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in ["attempt_count", "attempt_limit", "next_attempt_at_ms"] {
+            assert!(columns.iter().any(|c| c == column), "{column}");
+        }
+        let (count, limit, next): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT attempt_count,attempt_limit,next_attempt_at_ms FROM bpmn_incidents WHERE incident_id='before'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((count, limit, next), (0, None, None), "a row from before the rung has no policy");
+
+        let notices = |conn: &Connection, incident: &str| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM bpmn_incident_notices WHERE incident_id=?1", [incident], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(notices(&conn, "before"), 2, "the notices queued by the rung before stay as they were");
+
+        conn.execute_batch(
+            "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,attempt_limit,next_attempt_at_ms) VALUES('waiting','i1','i1',NULL,NULL,'X','m',7,3,9000);",
+        )
+        .unwrap();
+        assert_eq!(notices(&conn, "waiting"), 0, "an incident waiting for its repeat has not failed for good");
+
+        conn.execute("UPDATE bpmn_incidents SET attempt_count=1 WHERE incident_id='waiting'", []).unwrap();
+        assert_eq!(notices(&conn, "waiting"), 0, "counting an attempt alone queues nothing");
+        conn.execute("UPDATE bpmn_incidents SET next_attempt_at_ms=NULL WHERE incident_id='waiting'", []).unwrap();
+        let queued: Vec<(String, String, i64)> = conn
+            .prepare("SELECT incident_id,user_id,queued_at_ms FROM bpmn_incident_notices WHERE incident_id='waiting' ORDER BY user_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            queued,
+            vec![("waiting".into(), "owner".into(), 7), ("waiting".into(), "starter".into(), 7)],
+            "one notice per recipient once the repeats end"
+        );
+
+        conn.execute("UPDATE bpmn_incidents SET next_attempt_at_ms=9500 WHERE incident_id='waiting'", []).unwrap();
+        conn.execute("UPDATE bpmn_incidents SET next_attempt_at_ms=NULL WHERE incident_id='waiting'", []).unwrap();
+        assert_eq!(notices(&conn, "waiting"), 2, "INSERT OR IGNORE keeps one notice per incident and recipient");
+
+        conn.execute_batch(
+            "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES('plain','i1','i1',NULL,NULL,'X','m',8);",
+        )
+        .unwrap();
+        assert_eq!(notices(&conn, "plain"), 2, "an incident with no policy is still queued on insert");
     }
 
     /// v206: a rule from before the migration keeps its fields and gains NULL
@@ -19707,6 +19841,7 @@ mod tests {
         model.nodes.push(ProcessNode {
             id: "Service_1".into(), name: "Historical service".into(),
             kind: ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "historical-flow".into(), input_mapping: Default::default(),
                 output_mapping: Default::default(), verification: ActivityVerification::Human,
                 timeout_seconds: 30, result_expression: None,

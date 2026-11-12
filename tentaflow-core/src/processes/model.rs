@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tentaflow_protocol::processes::{
     ProcessBodyModeling, ProcessCallTarget, ProcessDiagram, ProcessEscalationPathReason,
     ProcessMessageTargetSpec, ProcessModel, ProcessMultiInstanceInput, ProcessNode,
-    ProcessNodeKind, ProcessRepeatSpec, ProcessSequenceFlow, ProcessTimerSpec,
-    ServiceImplementation,
+    ProcessNodeKind, ProcessRepeatSpec, ProcessRetryBackoff, ProcessRetryPolicy,
+    ProcessSequenceFlow, ProcessTimerSpec, ServiceImplementation,
 };
 
 use crate::flow_engine::expr;
@@ -834,8 +834,10 @@ fn validate_draft_body<'a>(
                 result_expression,
                 implementation,
                 flow_id,
+                retry,
                 ..
             } => {
+                validate_retry_policy(&node.id, retry.as_ref())?;
                 if let ServiceImplementation::Unbound { origin } = implementation {
                     ensure!(
                         flow_id.is_empty()
@@ -1412,7 +1414,9 @@ fn validate_body<'a>(
                 timeout_seconds,
                 result_expression,
                 implementation,
+                retry,
             } => {
+                validate_retry_policy(&node.id, retry.as_ref())?;
                 match implementation {
                     ServiceImplementation::Flow => {
                         ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
@@ -2644,6 +2648,55 @@ fn service_timeout_ceiling(implementation: &ServiceImplementation) -> u32 {
     }
 }
 
+pub const MAX_RETRY_ATTEMPTS: u8 = 10;
+pub const MIN_RETRY_DELAY_SECONDS: u32 = 1;
+pub const MAX_RETRY_DELAY_SECONDS: u32 = 24 * 60 * 60;
+pub const MIN_RETRY_FACTOR_PERCENT: u32 = 101;
+pub const MAX_RETRY_FACTOR_PERCENT: u32 = 1000;
+
+/// A retry policy stays inside the limits the UI offers, so a delay can neither
+/// busy-loop a failing task nor park an instance for longer than a day.
+fn validate_retry_policy(node_id: &str, retry: Option<&ProcessRetryPolicy>) -> Result<()> {
+    let Some(policy) = retry else { return Ok(()) };
+    ensure!(
+        (1..=MAX_RETRY_ATTEMPTS).contains(&policy.max_attempts),
+        "service task {node_id} retry attempts are outside 1..={MAX_RETRY_ATTEMPTS}"
+    );
+    ensure!(
+        (MIN_RETRY_DELAY_SECONDS..=MAX_RETRY_DELAY_SECONDS).contains(&policy.delay_seconds),
+        "service task {node_id} retry delay is outside {MIN_RETRY_DELAY_SECONDS}..={MAX_RETRY_DELAY_SECONDS} seconds"
+    );
+    if let ProcessRetryBackoff::Exponential { factor_percent, max_delay_seconds } = &policy.backoff {
+        ensure!(
+            (MIN_RETRY_FACTOR_PERCENT..=MAX_RETRY_FACTOR_PERCENT).contains(factor_percent),
+            "service task {node_id} retry factor is outside {MIN_RETRY_FACTOR_PERCENT}..={MAX_RETRY_FACTOR_PERCENT} percent"
+        );
+        ensure!(
+            (policy.delay_seconds..=MAX_RETRY_DELAY_SECONDS).contains(max_delay_seconds),
+            "service task {node_id} retry delay cap is outside {}..={MAX_RETRY_DELAY_SECONDS} seconds",
+            policy.delay_seconds
+        );
+    }
+    Ok(())
+}
+
+/// Seconds to wait before automatic retry number `retry_number` (1 is the
+/// first repeat) of a failure. Integer arithmetic that saturates at the cap, so
+/// a large factor cannot overflow.
+pub(super) fn retry_delay_seconds(policy: &ProcessRetryPolicy, retry_number: u32) -> u32 {
+    match &policy.backoff {
+        ProcessRetryBackoff::Fixed => policy.delay_seconds,
+        ProcessRetryBackoff::Exponential { factor_percent, max_delay_seconds } => {
+            let cap = u64::from(*max_delay_seconds);
+            let mut delay = u64::from(policy.delay_seconds).min(cap);
+            for _ in 1..retry_number {
+                delay = (delay * u64::from(*factor_percent) / 100).min(cap);
+            }
+            delay as u32
+        }
+    }
+}
+
 /// Longest criteria text a critic is given; it travels in every verification run.
 pub const MAX_CRITIC_CRITERIA_BYTES: usize = 8 * 1024;
 
@@ -3820,6 +3873,7 @@ mod tests {
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-123".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -5693,6 +5747,7 @@ mod tests {
                 id: "ServiceReview".into(),
                 name: "Review".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: "flow-review".into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
@@ -6114,6 +6169,7 @@ mod tests {
                 output_mapping: BTreeMap::new(),
             },
             ProcessNodeKind::ServiceTask {
+                retry: None,
                 flow_id: "flow-review".into(),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::new(),

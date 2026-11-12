@@ -80,6 +80,8 @@ mod notices_tests;
 #[cfg(test)]
 mod retry_tests;
 #[cfg(test)]
+mod retry_policy_tests;
+#[cfg(test)]
 mod output_retry_tests;
 #[cfg(test)]
 mod simulation_tests;

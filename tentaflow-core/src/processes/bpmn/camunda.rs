@@ -26,7 +26,8 @@ use quick_xml::Reader;
 use tentaflow_protocol::processes::{
     ProcessDiagnostic, ProcessDiagnosticSeverity as Severity, ProcessExecutableProcess,
     ProcessImportTranslation, ProcessModel, ProcessMultiInstanceInput, ProcessMultiInstanceMode,
-    ProcessNode, ProcessNodeKind, ProcessRepeatSpec, ProcessTimerSpec, ServiceImplementation,
+    ProcessNode, ProcessNodeKind, ProcessRepeatSpec, ProcessRetryBackoff, ProcessRetryPolicy,
+    ProcessTimerSpec, ServiceImplementation,
 };
 
 use super::{
@@ -38,7 +39,9 @@ use crate::processes::expression_translate::{
     read_variables, translate, SourceLanguage, TranslationRefusal,
 };
 use crate::processes::model::{
-    valid_id, validate_interchange_model, validate_timer_spec, MAX_VARIABLE_KEYS,
+    retry_delay_seconds, valid_id, validate_interchange_model, validate_timer_spec,
+    MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY_SECONDS, MAX_RETRY_FACTOR_PERCENT, MAX_VARIABLE_KEYS,
+    MIN_RETRY_DELAY_SECONDS, MIN_RETRY_FACTOR_PERCENT,
 };
 
 pub const CAMUNDA_NAMESPACE: &str = "http://camunda.org/schema/1.0/bpmn";
@@ -597,7 +600,8 @@ impl<'a> Importer<'a> {
         self.strip_annotations(process, false);
         let mut ext = self.take_extension(process);
         if let Some(extension) = ext.as_mut() {
-            let _ = self.camunda_extension_children(process, extension);
+            let dropped = self.camunda_extension_children(process, extension);
+            self.retry_cycle_not_imported(process, dropped.retry_cycle, "only a service task has a retry policy");
             self.finish_extension(process, ext);
         }
         self.rewrite_graph(process);
@@ -748,7 +752,8 @@ impl<'a> Importer<'a> {
         self.strip_annotations(flow, false);
         let mut ext = self.take_extension(flow);
         if let Some(extension) = ext.as_mut() {
-            let _ = self.camunda_extension_children(flow, extension);
+            let dropped = self.camunda_extension_children(flow, extension);
+            self.retry_cycle_not_imported(flow, dropped.retry_cycle, "only a service task has a retry policy");
             self.finish_extension(flow, ext);
         }
         let Some(position) = flow
@@ -881,13 +886,17 @@ impl<'a> Importer<'a> {
         let repeat_bound = ext
             .as_ref()
             .is_some_and(|extension| extension.children.iter().any(|c| c.is(TF, "repeat")));
+        let mut retry_cycle = parameters.retry_cycle.take();
 
         match local.as_str() {
-            "serviceTask" => self.rewrite_service_task(node, &mut ext, parameters),
+            "serviceTask" => {
+                self.rewrite_service_task(node, &mut ext, parameters, &mut retry_cycle)
+            }
             "scriptTask" => self.rewrite_script_task(node, &mut ext, parameters),
             "userTask" => self.rewrite_user_task(node, &mut ext, parameters),
             _ => self.skip_parameters(node, parameters, "this element has no mapping"),
         }
+        self.retry_cycle_not_imported(node, retry_cycle, "only a service task has a retry policy");
         self.rewrite_foreign_attributes(node);
         self.finish_extension(node, ext);
         if local == "subProcess" {
@@ -1032,6 +1041,7 @@ impl<'a> Importer<'a> {
         node: &mut Element,
         ext: &mut Option<Element>,
         parameters: Parameters,
+        retry_cycle: &mut Option<String>,
     ) {
         let class = take_camunda(node, "class");
         let delegate = take_camunda(node, "delegateExpression");
@@ -1116,6 +1126,31 @@ impl<'a> Importer<'a> {
         }
         if !output.is_empty() {
             children.push(json_element("outputMapping", &output, offset));
+        }
+        if let Some(cycle) = retry_cycle.take() {
+            match map_retry_cycle(&cycle) {
+                RetryCycle::Exact(policy) => {
+                    children.extend(policy.map(|policy| retry_element(&policy, offset)));
+                }
+                RetryCycle::Approximated(policy) => {
+                    self.report(
+                        Severity::Warning,
+                        "CAMUNDA_RETRY_CYCLE_APPROXIMATED",
+                        node,
+                        format!(
+                            "retry cycle {} was imported as the closest policy: {}",
+                            clip(&cycle),
+                            describe_retry(&policy)
+                        ),
+                    );
+                    children.push(retry_element(&policy, offset));
+                }
+                RetryCycle::Unmappable(reason) => self.retry_cycle_not_imported(
+                    node,
+                    Some(cycle),
+                    reason,
+                ),
+            }
         }
         let service = element(
             TF,
@@ -1382,6 +1417,17 @@ impl<'a> Importer<'a> {
         );
     }
 
+    fn retry_cycle_not_imported(&mut self, owner: &Element, cycle: Option<String>, reason: &str) {
+        if let Some(cycle) = cycle {
+            self.report(
+                Severity::Warning,
+                "CAMUNDA_RETRY_CYCLE_SKIPPED",
+                owner,
+                format!("retry cycle {} was not imported: {reason}", clip(&cycle)),
+            );
+        }
+    }
+
     fn skip_parameters(&mut self, node: &Element, parameters: Parameters, reason: &str) {
         if !parameters.input.is_empty() || !parameters.output.is_empty() {
             self.report(
@@ -1426,7 +1472,8 @@ impl<'a> Importer<'a> {
         let mut invalid = false;
         for child in &mut mi.children {
             if child.is(BPMN, "extensionElements") {
-                let _ = self.camunda_extension_children(node, child);
+                let dropped = self.camunda_extension_children(node, child);
+                self.retry_cycle_not_imported(node, dropped.retry_cycle, "only a service task has a retry policy");
             } else if matches!(
                 child.local.as_str(),
                 "loopDataInputRef" | "inputDataItem" | "loopDataOutputRef" | "outputDataItem"
@@ -1631,15 +1678,9 @@ impl<'a> Importer<'a> {
                         describe_listener(&child)
                     ),
                 ),
-                "failedJobRetryTimeCycle" => self.report(
-                    Severity::Warning,
-                    "CAMUNDA_RETRY_CYCLE_SKIPPED",
-                    owner,
-                    format!(
-                        "retry cycle {} was not imported; per-activity retries do not exist yet",
-                        child.text.trim()
-                    ),
-                ),
+                "failedJobRetryTimeCycle" => {
+                    parameters.retry_cycle = Some(child.text.trim().to_string());
+                }
                 "formData" => self.report(
                     Severity::Warning,
                     "CAMUNDA_FORM_SKIPPED",
@@ -2148,11 +2189,142 @@ impl<'a> Importer<'a> {
     }
 }
 
+/// What a `failedJobRetryTimeCycle` becomes. Camunda's `R<n>` counts the first
+/// run, so it is `n - 1` automatic retries; `R1` is no retry at all.
+enum RetryCycle {
+    /// The policy is the cycle, run for run (`None`: the cycle asks for no retry).
+    Exact(Option<ProcessRetryPolicy>),
+    /// The closest policy: the cycle's list of intervals is not a geometric series.
+    Approximated(ProcessRetryPolicy),
+    Unmappable(&'static str),
+}
+
+fn map_retry_cycle(text: &str) -> RetryCycle {
+    use RetryCycle::{Approximated, Exact, Unmappable};
+    let parts: Vec<&str> = text.split('/').collect();
+    let [repeat, intervals] = parts.as_slice() else {
+        return Unmappable("only R<n>/<interval>[,<interval>...] is mapped");
+    };
+    let Some(runs) = repeat.strip_prefix('R').and_then(|n| n.parse::<u32>().ok()).filter(|n| *n >= 1)
+    else {
+        return Unmappable("the repeat count is not R<n> with n of at least 1");
+    };
+    let retries = runs - 1;
+    if retries > u32::from(MAX_RETRY_ATTEMPTS) {
+        return Unmappable("the cycle asks for more retries than a step can have");
+    }
+    let mut delays = Vec::new();
+    for interval in intervals.split(',') {
+        match iso_interval_seconds(interval.trim()) {
+            Some(seconds) if (MIN_RETRY_DELAY_SECONDS..=MAX_RETRY_DELAY_SECONDS).contains(&seconds) => {
+                delays.push(seconds);
+            }
+            _ => return Unmappable("an interval is not a duration between one second and 24 hours"),
+        }
+    }
+    if retries == 0 {
+        return Exact(None);
+    }
+    // The i-th interval waits before the i-th retry and the last one repeats.
+    let wanted: Vec<u32> = (0..retries as usize)
+        .map(|i| delays[i.min(delays.len() - 1)])
+        .collect();
+    let max_attempts = retries as u8;
+    if wanted.iter().all(|delay| *delay == wanted[0]) {
+        return Exact(Some(ProcessRetryPolicy {
+            max_attempts,
+            delay_seconds: wanted[0],
+            backoff: ProcessRetryBackoff::Fixed,
+        }));
+    }
+    let first = wanted[0];
+    let cap = *wanted.iter().max().expect("at least one retry");
+    let factor = (u64::from(wanted[1]) * 100 + u64::from(first) / 2) / u64::from(first);
+    let growing = wanted[1] > first
+        && (u64::from(MIN_RETRY_FACTOR_PERCENT)..=u64::from(MAX_RETRY_FACTOR_PERCENT)).contains(&factor);
+    if !growing {
+        return Unmappable("the intervals neither repeat nor grow by a steady factor");
+    }
+    let policy = ProcessRetryPolicy {
+        max_attempts,
+        delay_seconds: first,
+        backoff: ProcessRetryBackoff::Exponential {
+            factor_percent: factor as u32,
+            max_delay_seconds: cap,
+        },
+    };
+    let schedule: Vec<u32> = (1..=retries).map(|n| retry_delay_seconds(&policy, n)).collect();
+    if schedule == wanted { Exact(Some(policy)) } else { Approximated(policy) }
+}
+
+/// `PT10M`, `PT1H30M`, `P1DT2H`, `PT45S`: days, hours, minutes and seconds only
+/// (a month or a year has no fixed length).
+fn iso_interval_seconds(text: &str) -> Option<u32> {
+    let rest = text.strip_prefix('P')?;
+    let (date, time) = rest.split_once('T').unwrap_or((rest, ""));
+    let mut total = 0u64;
+    for (part, units) in [(date, &[('D', 86_400u64)][..]), (time, &[('H', 3_600), ('M', 60), ('S', 1)][..])] {
+        let mut remaining = part;
+        for (unit, seconds) in units {
+            if let Some((number, tail)) = remaining.split_once(*unit) {
+                total += number.parse::<u64>().ok()?.checked_mul(*seconds)?;
+                remaining = tail;
+            }
+        }
+        if !remaining.is_empty() {
+            return None;
+        }
+    }
+    u32::try_from(total).ok()
+}
+
+fn retry_element(policy: &ProcessRetryPolicy, offset: usize) -> Element {
+    let attempts = policy.max_attempts.to_string();
+    let delay = policy.delay_seconds.to_string();
+    match &policy.backoff {
+        ProcessRetryBackoff::Fixed => element(
+            TF,
+            "retry",
+            &[("attempts", &attempts), ("delaySeconds", &delay), ("backoff", "fixed")],
+            Vec::new(),
+            "",
+            offset,
+        ),
+        ProcessRetryBackoff::Exponential { factor_percent, max_delay_seconds } => element(
+            TF,
+            "retry",
+            &[
+                ("attempts", &attempts),
+                ("delaySeconds", &delay),
+                ("backoff", "exponential"),
+                ("factorPercent", &factor_percent.to_string()),
+                ("maxDelaySeconds", &max_delay_seconds.to_string()),
+            ],
+            Vec::new(),
+            "",
+            offset,
+        ),
+    }
+}
+
+fn describe_retry(policy: &ProcessRetryPolicy) -> String {
+    match &policy.backoff {
+        ProcessRetryBackoff::Fixed => format!(
+            "{} retries, {} s apart", policy.max_attempts, policy.delay_seconds),
+        ProcessRetryBackoff::Exponential { factor_percent, max_delay_seconds } => format!(
+            "{} retries, first after {} s, then {}% of the previous wait, at most {} s",
+            policy.max_attempts, policy.delay_seconds, factor_percent, max_delay_seconds),
+    }
+}
+
 #[derive(Default)]
 struct Parameters {
     input: BTreeMap<String, String>,
     output: BTreeMap<String, String>,
     connector: Option<String>,
+    /// Text of `failedJobRetryTimeCycle`; consumed by the service task rewrite,
+    /// reported as skipped for every other element.
+    retry_cycle: Option<String>,
 }
 
 fn diagnostic(
