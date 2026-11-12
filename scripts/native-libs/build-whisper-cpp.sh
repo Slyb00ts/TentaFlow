@@ -41,7 +41,7 @@ android_cxx_for_platform() {
   local triple
   triple="$(android_triple_for_platform "$1")"
   printf '%s/bin/%s%s-clang++\n' \
-    "$ndk_root/toolchains/llvm/prebuilt/linux-x86_64" \
+    "$ndk_root/toolchains/llvm/prebuilt/$(android_host_tag)" \
     "$triple" \
     "${ANDROID_API_LEVEL:-26}"
 }
@@ -179,11 +179,13 @@ build_isolated_dylib() {
         echo "[whisper.cpp] brak Android NDK clang++: $android_cxx" >&2
         exit 1
       }
+      # Android 15+ devices with 16 KB pages refuse ELF segments aligned to 4 KB.
       "$android_cxx" -shared -fPIC \
         -o "$out_dir/libwhisper_tf.so" \
         -Wl,--version-script="$map" \
         -Wl,--whole-archive "${archives[@]}" -Wl,--no-whole-archive \
         -Wl,--no-undefined \
+        -Wl,-z,max-page-size=16384 \
         -lm -ldl -llog -landroid -lc++_shared
       ;;
     *)
@@ -245,7 +247,7 @@ build_backend() {
   )
 
   if [ "$backend" = "multi" ]; then
-    enabled_backends=("${MULTI_BACKENDS[@]}")
+    enabled_backends=(${MULTI_BACKENDS[@]+"${MULTI_BACKENDS[@]}"})
   else
     enabled_backends=("$backend")
   fi
@@ -274,7 +276,7 @@ build_backend() {
       ;;
   esac
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     cmake_args+=(-DGGML_CUDA=ON)
     # Architektura CUDA jawnie (jak w build-llama-cpp.sh) — "native" nie wykrywa
     # nowych GPU jak Blackwell GB10/sm_121 -> build na zlej domyslnej arch.
@@ -285,19 +287,19 @@ build_backend() {
       [[ "$cuda_cc" =~ ^[0-9]+$ ]] && cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
     fi
   fi
-  backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
-  backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_METAL=ON)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_VULKAN=ON)
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     jobs="${WHISPER_CPP_CUDA_JOBS:-4}"
   else
     jobs="$(platform_cpu_count)"
   fi
 
   local targets=(whisper ggml ggml-base ggml-cpu)
-  backend_enabled cuda "${enabled_backends[@]}" && targets+=(ggml-cuda)
-  backend_enabled metal "${enabled_backends[@]}" && targets+=(ggml-metal)
-  backend_enabled vulkan "${enabled_backends[@]}" && targets+=(ggml-vulkan)
+  backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-cuda)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-metal)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-vulkan)
 
   echo "[whisper.cpp] build backend: $backend (${enabled_backends[*]:-cpu})"
   env \

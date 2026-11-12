@@ -28,6 +28,7 @@ import { PROCESS_INCIDENT_KIND } from '/js/modules/system-events.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { renderMarkdown } from '/js/lib/md-lite.js';
+import { DecodeMeter, SessionMetrics, sparkMarkup, fmtRate } from '/js/lib/chat-metrics.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 import { openActionMenu, openConfirmWindow, openHandoverWindow, showUndoToast } from '/js/lib/actions/index.js';
 import { openHandover } from '/js/modules/org-structure/handover-nav.js';
@@ -55,8 +56,7 @@ import '/js/components/tf-stat-card.js';
 import '/js/components/tf-progress-bar.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-file-input.js';
-import '/js/components/tf-chat-bubble.js';
-import '/js/components/tf-chat-composer.js';
+import '/js/components/tf-tooltip.js';
 import '/js/components/tf-spinner.js';
 import '/js/components/tf-tag-input.js';
 import '/js/components/tf-line-chart.js';
@@ -108,7 +108,9 @@ const SOURCE_KIND_ICON = { document: 'file-text', url: 'globe', git: 'branch', z
 const SOURCE_STATUS_CHIP = { pending: 'info', indexing: 'accent', ready: 'ok', error: 'err', cancelled: 'warn' };
 const FILE_STATUS_CHIP = { pending: 'info', indexing: 'accent', ready: 'ok', skipped: 'warn', error: 'err' };
 
-const UPLOAD_CHUNK_BYTES = 1024 * 1024;
+// A raw 1 MiB chunk plus the CBOR envelope exceeds the 1 MiB binary-WS frame
+// limit, so the connection was closed for every file above ~1 MiB.
+const UPLOAD_CHUNK_BYTES = 512 * 1024;
 const FILES_PAGE_SIZE = 50;
 const INGEST_POLL_MS = 3000;
 const INGEST_LOG_CAP = 200;
@@ -231,6 +233,9 @@ const state = {
   chatMessages: [],
   chatBusy: false,
   chatUnsub: null,
+  chatMeter: null,
+  chatSampler: null,
+  chatMetrics: new Map(),
   // Members / settings
   members: [],
   functions: [],
@@ -338,6 +343,14 @@ function sprite(id) {
 function t(key, params) {
   return I18n.t(`project_studio.${key}`, params);
 }
+
+// Strings the Chat app already owns (labels, hints, metrics) stay in its namespace.
+function chatT(key, params) {
+  return I18n.t(`chat.${key}`, params);
+}
+
+// Same number as the server cap (knowledge::MAX_CHAT_MESSAGE_CHARS).
+const CHAT_MAX_CHARS = 24000;
 
 function formatTimestamp(value) {
   if (!value) return '—';
@@ -889,6 +902,15 @@ function renderProjectTable(host, visible) {
   });
 }
 
+// A menu without an anchor hangs off its zero-width host and runs past the right
+// edge of the viewport for a trigger at the end of a row; with the trigger as
+// anchor tf-menu positions the panel itself and keeps it on screen.
+function toggleMenuAt(menu, anchor) {
+  if (!menu) return;
+  menu.anchor = anchor;
+  menu.toggle();
+}
+
 // One delegated listener survives every grid re-render (tf-menu requires the
 // menus to be statically present in each card's HTML).
 function wireGridEvents() {
@@ -907,7 +929,7 @@ function wireGridEvents() {
     const more = e.target.closest('[data-more]');
     if (more) {
       e.stopPropagation();
-      more.parentElement?.querySelector('[data-card-menu]')?.toggle();
+      toggleMenuAt(more.parentElement?.querySelector('[data-card-menu]'), more);
       return;
     }
     if (e.target.closest('[data-card-menu]')) return;
@@ -1768,7 +1790,6 @@ function renderProjectShell() {
       <span slot="badges" class="ps-head-badges">
         <tf-chip status="accent">${sprite('users')} ${escapeHtml(t('head_members', { count: memberCount }))}</tf-chip>
         <tf-chip>${escapeHtml(accessSummary(project))}</tf-chip>
-        ${functionChips(projectAccess().functions)}
         <tf-chip status="info">${sprite('database')} ${escapeHtml(t('head_sources', { count: sourceCount }))}</tf-chip>
         <tf-chip status="info">${sprite('grid-rows')} ${escapeHtml(t('modules_chip'))}: ${escapeHtml(orientationLabel(project))}</tf-chip>
       </span>
@@ -2295,7 +2316,7 @@ function sourceRowHtml(source) {
     // Git sources fetch + delta re-index ("Odśwież"); everything else re-runs
     // the full ingest.
     if (source.kind === 'git' && canRefreshRepo()) {
-      actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-refresh="${escapeAttr(sourceId)}">${escapeHtml(t('source_refresh'))}</tf-button>`);
+      actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-refresh="${escapeAttr(sourceId)}" title="${escapeAttr(t('source_refresh'))}"></tf-button>`);
     } else {
       actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-reingest="${escapeAttr(sourceId)}" title="${escapeAttr(t('action_reingest'))}"></tf-button>`);
     }
@@ -2373,7 +2394,7 @@ async function renderSources() {
     const more = e.target.closest('[data-source-more]');
     if (more) {
       e.stopPropagation();
-      more.parentElement?.querySelector('[data-source-menu]')?.toggle();
+      toggleMenuAt(more.parentElement?.querySelector('[data-source-menu]'), more);
       return;
     }
     const cancel = e.target.closest('[data-cancel-job]');
@@ -2814,15 +2835,15 @@ function openSourceWindow() {
     }
   });
 
-  // Uploads one file in 1 MiB chunks; the final chunk response carries the
-  // content-hash file_ref used by SourceCreate.
+  // Uploads one file in 512 KiB chunks read lazily from the File, so a
+  // multi-GB file never sits in browser memory; the final chunk response
+  // carries the content-hash file_ref used by SourceCreate.
   const uploadFile = async (item, index) => {
     const uploadId = crypto.randomUUID();
-    const buffer = new Uint8Array(await item.file.arrayBuffer());
-    const totalChunks = Math.max(1, Math.ceil(buffer.length / UPLOAD_CHUNK_BYTES));
+    const totalChunks = Math.max(1, Math.ceil(item.file.size / UPLOAD_CHUNK_BYTES));
     let fileRef = null;
     for (let seq = 0; seq < totalChunks; seq += 1) {
-      const chunk = buffer.subarray(seq * UPLOAD_CHUNK_BYTES, Math.min((seq + 1) * UPLOAD_CHUNK_BYTES, buffer.length));
+      const chunk = new Uint8Array(await item.file.slice(seq * UPLOAD_CHUNK_BYTES, Math.min((seq + 1) * UPLOAD_CHUNK_BYTES, item.file.size)).arrayBuffer());
       const resp = await ApiBinary.one('projectStudioSourceUploadChunkRequest', {
         projectId: projectId(),
         uploadId,
@@ -3504,25 +3525,54 @@ async function renderChat() {
 
   panel.innerHTML = `
     <div class="ps-chat-layout">
-      <div class="ps-chat-list">
-        <tf-button variant="primary" size="sm" icon="plus" id="ps-chat-new" ${canSendChat() ? '' : 'hidden'}>${escapeHtml(t('chat_new'))}</tf-button>
-        <div class="ps-chat-private-hint">${sprite('eye')}${escapeHtml(t('chat_private_hint'))}</div>
-        <div id="ps-chat-convs"></div>
-      </div>
-      <div class="ps-chat-main">
-        <div class="ps-chat-head">
-          <div>
-            <div class="ps-chat-title" id="ps-chat-title"></div>
-            <div class="ps-chat-sub">${escapeHtml(t('chat_context_sub'))}</div>
-          </div>
-          <div class="ps-chat-head-actions">
-            <tf-button variant="ghost" size="sm" icon="edit" id="ps-chat-rename" hidden>${escapeHtml(t('chat_rename'))}</tf-button>
-            <tf-button variant="ghost" size="sm" icon="trash" id="ps-chat-delete" hidden title="${escapeAttr(t('chat_delete'))}"></tf-button>
-          </div>
+      <div class="chat-cq">
+        <div class="chat-shell" id="ps-chat-shell">
+          <aside class="conv-panel" aria-label="${escapeAttr(chatT('conv_aria'))}">
+            <div class="conv-top">
+              <tf-button variant="primary" size="sm" icon="plus" id="ps-chat-new" ${canSendChat() ? '' : 'hidden'}>${escapeHtml(t('chat_new'))}</tf-button>
+            </div>
+            <div class="conv-list" id="ps-chat-convs"></div>
+            <div class="conv-foot">${escapeHtml(t('chat_private_hint'))}</div>
+          </aside>
+          <div class="conv-scrim" id="ps-chat-scrim"></div>
+          <section class="chat-col">
+            <header class="chat-top">
+              <tf-tooltip block align="start" side="bottom" delay="120">
+                <div class="chat-metric is-decode" id="ps-chat-decode" tabindex="0">
+                  <div class="chat-metric__k">${sprite('gauge')}<span>${escapeHtml(chatT('metric_decode'))}</span><span class="lbl-full"> · ${escapeHtml(chatT('metric_scope'))}</span></div>
+                  <div class="chat-metric__v"><b id="ps-m-cur">—</b><small>${escapeHtml(chatT('perf_decode'))}</small></div>
+                  <div class="chat-metric__sub" id="ps-m-sub"></div>
+                  <svg class="chat-metric__spark" id="ps-m-spark" viewBox="0 0 64 22" aria-hidden="true"></svg>
+                </div>
+                <div slot="content" class="chat-tip" id="ps-m-tip"></div>
+              </tf-tooltip>
+              <div class="chat-metric" id="chat-ttft" tabindex="0" title="${escapeAttr(chatT('metric_ttft_hint'))}">
+                <div class="chat-metric__k">${escapeHtml(chatT('perf_ttft'))}</div>
+                <div class="chat-metric__v"><b id="ps-m-ttft">—</b><small id="ps-m-ttft-unit" hidden>ms</small></div>
+              </div>
+              <div class="top-actions">
+                <div class="ps-chat-title" id="ps-chat-title"></div>
+                <tf-button variant="ghost" size="sm" icon="edit" id="ps-chat-rename" hidden title="${escapeAttr(t('chat_rename'))}"></tf-button>
+                <tf-button variant="ghost" size="sm" icon="trash" id="ps-chat-delete" hidden title="${escapeAttr(t('chat_delete'))}"></tf-button>
+              </div>
+            </header>
+            <div class="chat-body ps-chat-body" id="ps-chat-msgs"></div>
+            <div class="chat-composer-wrap">
+              <div class="chat-composer" id="ps-chat-composer">
+                <tf-textarea id="ps-chat-input" autogrow rows="1" maxlength="${CHAT_MAX_CHARS}"
+                  aria-label="${escapeAttr(t('chat_placeholder'))}" placeholder="${escapeAttr(t('chat_placeholder'))}"></tf-textarea>
+                <tf-button variant="primary" size="sm" icon="send" id="ps-chat-send" aria-label="${escapeAttr(chatT('send'))}" title="${escapeAttr(chatT('send'))}"></tf-button>
+              </div>
+              <div class="chat-hints">
+                <tf-button class="conv-opener" id="ps-chat-conv-open" variant="ghost" size="sm" icon="message">${escapeHtml(chatT('conv_open'))}</tf-button>
+                <span><kbd>Enter</kbd> ${escapeHtml(chatT('hint_send'))}</span>
+                <span><kbd>Shift</kbd>+<kbd>Enter</kbd> ${escapeHtml(chatT('hint_newline'))}</span>
+                <span class="spacer"></span>
+                <span class="counter" id="ps-chat-counter"></span>
+              </div>
+            </div>
+          </section>
         </div>
-        <div class="ps-chat-msgs" id="ps-chat-msgs"></div>
-        <div class="ps-chat-notice">${sprite('shield')}<span>${escapeHtml(t('chat_notice'))}</span></div>
-        <tf-chat-composer id="ps-chat-composer" placeholder="${escapeAttr(t('chat_placeholder'))}"></tf-chat-composer>
       </div>
     </div>
   `;
@@ -3539,26 +3589,29 @@ async function renderChat() {
   });
   byId('ps-chat-rename')?.addEventListener('click', () => renameCurrentChat());
   byId('ps-chat-delete')?.addEventListener('click', () => deleteCurrentChat());
-  byId('ps-chat-composer')?.addEventListener('send', (e) => {
-    const text = String(e.detail?.text ?? '').trim();
-    if (text) sendChatMessage(text);
+  byId('ps-chat-send')?.addEventListener('click', () => {
+    if (state.chatBusy) stopChatStream();
+    else submitChatInput();
   });
+  // Bare Enter sends, Shift/Alt+Enter inserts a newline; IME composition passes
+  // through, like in the Chat app.
+  byId('ps-chat-input')?.addEventListener('tf-keydown', (e) => {
+    const { key, shiftKey, altKey, original } = e.detail;
+    if (original?.isComposing || key !== 'Enter' || shiftKey || altKey) return;
+    original?.preventDefault();
+    submitChatInput();
+  });
+  byId('ps-chat-input')?.addEventListener('input', updateChatCounter);
+  byId('ps-chat-conv-open')?.addEventListener('click', () => byId('ps-chat-shell')?.classList.add('conv-open'));
+  byId('ps-chat-scrim')?.addEventListener('click', () => byId('ps-chat-shell')?.classList.remove('conv-open'));
+  byId('ps-chat-msgs')?.addEventListener('click', onChatMessagesClick);
   const convs = byId('ps-chat-convs');
   convs?.addEventListener('click', (e) => {
-    const rename = e.target.closest('[data-conv-rename]');
-    if (rename) {
-      e.stopPropagation();
-      renameChat(rename.dataset.convRename);
-      return;
-    }
-    const del = e.target.closest('[data-conv-delete]');
-    if (del) {
-      e.stopPropagation();
-      deleteChat(del.dataset.convDelete);
-      return;
-    }
     const conv = e.target.closest('[data-conv]');
-    if (conv) selectChat(conv.dataset.conv);
+    if (conv) {
+      byId('ps-chat-shell')?.classList.remove('conv-open');
+      selectChat(conv.dataset.conv);
+    }
   });
 
   renderChatConvs();
@@ -3571,21 +3624,15 @@ function renderChatConvs() {
   const host = byId('ps-chat-convs');
   if (!host) return;
   if (!state.chats.length) {
-    host.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('chat_empty_list'))}</div>`;
+    host.innerHTML = `<div class="conv-empty">${escapeHtml(t('chat_empty_list'))}</div>`;
     return;
   }
   host.innerHTML = state.chats.map((c) => {
     const chatId = c.chatId;
     return `
-      <div class="ps-chat-conv ${chatId === state.chatId ? 'is-active' : ''}" data-conv="${escapeAttr(chatId)}" role="button" tabindex="0">
-        <div class="ps-conv-main">
-          <div class="ps-conv-title">${escapeHtml(c.title || t('chat_untitled'))}</div>
-          <div class="ps-conv-sub">${escapeHtml(c.lastMessagePreview ?? '')}</div>
-        </div>
-        <div class="ps-conv-actions" ${canArea('chat', 'write') ? '' : 'hidden'}>
-          <tf-button variant="ghost" size="sm" icon="edit" data-conv-rename="${escapeAttr(chatId)}" title="${escapeAttr(t('chat_rename'))}"></tf-button>
-          <tf-button variant="ghost" size="sm" icon="trash" data-conv-delete="${escapeAttr(chatId)}" title="${escapeAttr(t('chat_delete'))}"></tf-button>
-        </div>
+      <div class="conv-item ${chatId === state.chatId ? 'active' : ''}" data-conv="${escapeAttr(chatId)}" role="button" tabindex="0">
+        <div class="conv-item__title"><span>${escapeHtml(c.title || t('chat_untitled'))}</span></div>
+        <div class="conv-item__meta">${escapeHtml(c.lastMessagePreview ?? '')}</div>
       </div>
     `;
   }).join('');
@@ -3616,8 +3663,8 @@ async function loadChatHistory() {
       projectId: projectId(), chatId: state.chatId, limit: 50,
     });
     const messages = Array.isArray(resp.messages) ? resp.messages : [];
-    // The wire pages newest-first; the transcript renders oldest-first.
-    state.chatMessages = messages.slice().reverse().map((m) => ({
+    // The handler already returns the page oldest-first.
+    state.chatMessages = messages.map((m) => ({
       role: m.role,
       content: m.content,
       citationsJson: m.citationsJson ?? '',
@@ -3640,52 +3687,183 @@ function parseCitations(citationsJson) {
   }
 }
 
-function citationsHtml(citationsJson) {
-  const citations = parseCitations(citationsJson);
-  if (!citations.length) return '';
-  const rows = citations.map((c, i) => {
-    const title = c.source_name ?? c.title ?? c.file_path ?? t('chat_source');
-    const path = c.file_path ?? c.location ?? '';
-    const snippet = c.snippet ?? c.text ?? '';
-    return `
-      <div class="ps-chat-src">
-        <div class="ps-chat-src-num">${i + 1}</div>
-        <div>
-          <div class="ps-chat-src-file">${escapeHtml(String(title))}</div>
-          ${path ? `<div class="ps-chat-src-path">${escapeHtml(String(path))}</div>` : ''}
-          ${snippet ? `<div class="ps-chat-src-snip">${escapeHtml(String(snippet))}</div>` : ''}
-        </div>
-      </div>
-    `;
-  }).join('');
-  return `
-    <div class="ps-chat-sources">
-      <div class="ps-chat-sources-head">${sprite('database')}${escapeHtml(t('chat_sources', { count: citations.length }))}</div>
-      ${rows}
+// What a citation is called: the two synthetic passages the retrieval adds
+// (file catalog, whole-project digest) have no file behind them.
+const CITATION_PSEUDO_DOCS = { 'project-files': 'chat_src_project_files', 'project-overview': 'chat_src_project_overview' };
+
+// One entry per file: the answer cites several fragments of the same document,
+// and listing each as its own row made the sources longer than the answer.
+function groupCitations(citationsJson) {
+  const groups = new Map();
+  // The answer cites passages as [n] = position in the context the model was
+  // given, which is the order of this list; the sources must carry that number.
+  parseCitations(citationsJson).forEach((c, position) => {
+    const pseudo = CITATION_PSEUDO_DOCS[c.doc_id];
+    const name = pseudo ? t(pseudo) : String(c.path ?? c.file_path ?? c.title ?? t('chat_source'));
+    const key = pseudo ? c.doc_id : name;
+    if (!groups.has(key)) groups.set(key, { name, pseudo: !!pseudo, fragments: [] });
+    groups.get(key).fragments.push({ n: position + 1, index: c.chunk_index, text: String(c.text ?? c.snippet ?? '') });
+  });
+  return [...groups.values()];
+}
+
+function citationsHtml(citationsJson, messageIndex) {
+  const groups = groupCitations(citationsJson);
+  if (!groups.length) return '';
+  const chips = groups.map((g, gi) => `
+    <tf-button variant="ghost" size="sm" icon="${g.pseudo ? 'database' : 'file-text'}" data-cite="${messageIndex}:${gi}"
+      title="${escapeAttr(t('chat_source_open'))}">${escapeHtml(g.name)} · ${g.fragments.map((f) => `[${f.n}]`).join(' ')}</tf-button>
+  `).join('');
+  return `<div class="ps-chat-sources"><span class="ps-chat-sources-label">${escapeHtml(t('chat_sources_label'))}</span>${chips}</div>`;
+}
+
+// The fragment text is only shown on demand, in a window.
+function openCitationWindow(group) {
+  const { body, foot, cleanup } = openWindow({
+    title: group.name,
+    subtitle: t('chat_source_fragments', { count: group.fragments.length }),
+    icon: group.pseudo ? 'database' : 'file-text',
+    width: 760,
+  });
+  body.innerHTML = group.fragments.map((f) => `
+    <div class="ps-cite-frag">
+      <div class="ps-cite-frag-head">[${f.n}]${group.pseudo || f.index === undefined ? '' : ` · ${escapeHtml(t('chat_source_fragment', { n: Number(f.index) + 1 }))}`}</div>
+      <div class="ps-cite-frag-text">${escapeHtml(f.text)}</div>
     </div>
-  `;
+  `).join('');
+  foot.innerHTML = `<div class="ps-footer-right"><tf-button variant="ghost" data-action="close-cite">${escapeHtml(t('action_close'))}</tf-button></div>`;
+  foot.querySelector('[data-action="close-cite"]').addEventListener('click', cleanup);
+}
+
+function onChatMessagesClick(e) {
+  const cite = e.target.closest('[data-cite]');
+  if (cite) {
+    const [mi, gi] = cite.dataset.cite.split(':').map(Number);
+    const group = groupCitations(state.chatMessages[mi]?.citationsJson)[gi];
+    if (group) openCitationWindow(group);
+    return;
+  }
+  const copy = e.target.closest('[data-copy]');
+  if (copy) {
+    const text = state.chatMessages[Number(copy.dataset.copy)]?.content ?? '';
+    navigator.clipboard?.writeText(text).then(() => toast(chatT('copied'), 'success')).catch(() => {});
+  }
+}
+
+function chatMessageHtml(m, index) {
+  const when = escapeHtml(m.time || '');
+  if (m.role === 'user') {
+    return `
+      <div class="chat-msg user">
+        <div class="chat-msg__av" aria-hidden="true">${escapeHtml(initials(state.me?.username ?? '?'))}</div>
+        <div class="chat-msg__body">
+          <div class="chat-msg__who">${escapeHtml(chatT('you'))} · ${when}</div>
+          <div class="chat-msg__txt">${escapeHtml(m.content).replaceAll('\n', '<br>')}</div>
+        </div>
+      </div>`;
+  }
+  const streaming = m.streaming === true;
+  const hasText = (m.content || '').length > 0;
+  const body = hasText ? renderMarkdown(m.content, { streaming }) : '';
+  const caret = streaming ? '<span class="chat-caret"></span>' : '';
+  const waiting = streaming && !hasText
+    ? '<span class="chat-typing" aria-hidden="true"><span></span><span></span><span></span></span>'
+    : '';
+  const sources = !streaming && m.citationsJson ? citationsHtml(m.citationsJson, index) : '';
+  const acts = streaming ? '' : `
+    <span class="chat-msg__acts">
+      <tf-button variant="ghost" size="sm" icon="copy" data-copy="${index}" aria-label="${escapeAttr(chatT('copy'))}" title="${escapeAttr(chatT('copy'))}"></tf-button>
+    </span>`;
+  return `
+    <div class="chat-msg ai">
+      <div class="chat-msg__av" aria-hidden="true">${sprite('sparkles')}</div>
+      <div class="chat-msg__body">
+        <div class="chat-msg__who">${escapeHtml(chatT('assistant'))} · ${when}</div>
+        <div class="chat-msg__txt">${body}${caret}${waiting}</div>
+        ${sources || acts ? `<div class="chat-msg__meta">${sources}${acts}</div>` : ''}
+      </div>
+    </div>`;
 }
 
 function renderChatMessages() {
   const host = byId('ps-chat-msgs');
   if (!host) return;
-  if (!state.chatMessages.length) {
-    host.innerHTML = `<tf-empty-state icon="message" title="${escapeAttr(t('chat_empty_thread'))}"></tf-empty-state>`;
-  } else {
-    host.innerHTML = state.chatMessages.map((m) => `
-      <tf-chat-bubble role="${m.role === 'user' ? 'user' : 'assistant'}"
-        ${m.streaming ? 'streaming' : ''}
-        sender="${escapeAttr(m.role === 'user' ? '' : t('chat_assistant'))}"
-        time="${escapeAttr(m.time || '')}">${escapeHtml(m.content)}</tf-chat-bubble>
-      ${m.role !== 'user' && m.citationsJson ? citationsHtml(m.citationsJson) : ''}
-    `).join('');
-  }
+  host.innerHTML = state.chatMessages.length
+    ? state.chatMessages.map(chatMessageHtml).join('')
+    : `<tf-empty-state icon="message" title="${escapeAttr(t('chat_empty_thread'))}"></tf-empty-state>`;
   host.scrollTop = host.scrollHeight;
-  const composer = byId('ps-chat-composer');
-  if (composer) {
-    if (state.chatBusy || !canSendChat()) composer.setAttribute('disabled', '');
-    else composer.removeAttribute('disabled');
+  const input = byId('ps-chat-input');
+  if (input) input.toggleAttribute('disabled', !canSendChat());
+  const send = byId('ps-chat-send');
+  if (send) {
+    const stop = state.chatBusy;
+    send.setAttribute('icon', stop ? 'square' : 'send');
+    send.setAttribute('title', chatT(stop ? 'stop' : 'send'));
+    send.setAttribute('aria-label', chatT(stop ? 'stop' : 'send'));
+    send.toggleAttribute('disabled', !stop && !canSendChat());
   }
+  updateChatMetrics();
+}
+
+function submitChatInput() {
+  const input = byId('ps-chat-input');
+  const text = String(input?.value ?? '').trim();
+  if (!text || state.chatBusy) return;
+  if (text.length > CHAT_MAX_CHARS) {
+    toast(t('chat_too_long', { max: CHAT_MAX_CHARS }), 'error');
+    return;
+  }
+  input.value = '';
+  updateChatCounter();
+  sendChatMessage(text);
+}
+
+function updateChatCounter() {
+  const counter = byId('ps-chat-counter');
+  if (!counter) return;
+  const len = String(byId('ps-chat-input')?.value ?? '').length;
+  counter.textContent = len > CHAT_MAX_CHARS * 0.5 ? `${len} / ${CHAT_MAX_CHARS}` : '';
+  counter.classList.toggle('warn', len > CHAT_MAX_CHARS * 0.9);
+}
+
+// Decode speed and TTFT of the open conversation, measured in the browser from
+// the token stream (the project chat stream carries no server-side numbers).
+function chatMetricsFor(chatId) {
+  let m = state.chatMetrics.get(chatId);
+  if (!m) {
+    m = new SessionMetrics();
+    state.chatMetrics.set(chatId, m);
+  }
+  return m;
+}
+
+function updateChatMetrics() {
+  const hero = byId('ps-chat-decode');
+  if (!hero) return;
+  const lang = I18n.getLanguage();
+  const metrics = state.chatId ? state.chatMetrics.get(state.chatId) : null;
+  const stats = metrics ? metrics.stats() : null;
+  byId('ps-m-cur').textContent = stats ? fmtRate(stats.cur, lang) : '—';
+  const sub = byId('ps-m-sub');
+  sub.innerHTML = stats
+    ? escapeHtml(chatT('metric_avg', { avg: fmtRate(stats.avg, lang), n: stats.n })).replaceAll('&lt;b&gt;', '<b>').replaceAll('&lt;/b&gt;', '</b>')
+    : '';
+  byId('ps-m-spark').innerHTML = sparkMarkup(metrics ? metrics.values : [], stats ? stats.avg : 0);
+  const tip = byId('ps-m-tip');
+  const richTip = (key) => escapeHtml(chatT(key)).replaceAll('&lt;b&gt;', '<b>').replaceAll('&lt;/b&gt;', '</b>');
+  tip.innerHTML = stats ? `<b>${escapeHtml(chatT('tip_title'))}</b> ${richTip('tip_body')}` : `<b>${escapeHtml(chatT('tip_title'))}</b> ${richTip('tip_empty')}`;
+  hero.classList.toggle('has-data', !!stats);
+  byId('ps-m-ttft').textContent = metrics?.ttftMs ? String(metrics.ttftMs) : '—';
+  byId('ps-m-ttft-unit').hidden = !metrics?.ttftMs;
+}
+
+function endChatMeter(meter, chatId, finished) {
+  clearInterval(state.chatSampler);
+  state.chatSampler = null;
+  if (!finished) return;
+  const rate = meter.overall();
+  if (!meter.sampled && rate) chatMetricsFor(chatId).push(rate);
+  updateChatMetrics();
 }
 
 function nowTime() {
@@ -3717,6 +3895,16 @@ async function sendChatMessage(text) {
 
   const chatId = state.chatId;
   state.chatBusy = true;
+  const meter = new DecodeMeter();
+  const metrics = chatMetricsFor(chatId);
+  state.chatMeter = meter;
+  clearInterval(state.chatSampler);
+  state.chatSampler = setInterval(() => {
+    const rate = meter.sample();
+    if (rate === null) return;
+    metrics.push(rate);
+    updateChatMetrics();
+  }, 1000);
   state.chatMessages.push({ role: 'user', content: text, citationsJson: '', time: nowTime(), streaming: false });
   const assistant = { role: 'assistant', content: '', citationsJson: '', time: nowTime(), streaming: true };
   state.chatMessages.push(assistant);
@@ -3726,6 +3914,7 @@ async function sendChatMessage(text) {
     if (!state.chatBusy) return;
     state.chatBusy = false;
     state.chatUnsub = null;
+    endChatMeter(meter, chatId, false);
     assistant.streaming = false;
     assistant.content = assistant.content || t('chat_stream_error');
     toast(`${t('chat_stream_failed')}${message ? `: ${message}` : ''}`, 'error');
@@ -3741,6 +3930,9 @@ async function sendChatMessage(text) {
           if (body?._variant !== 'ProjectStudioBody.ChatStreamChunk') return;
           if (state.chatId !== chatId) return;
           if (body.kind === 'token') {
+            const first = meter.firstAt === null;
+            meter.delta();
+            if (first) metrics.setTtft(meter.ttftMs);
             assistant.content += body.text ?? '';
             renderChatMessages();
           } else if (body.kind === 'citations') {
@@ -3758,6 +3950,7 @@ async function sendChatMessage(text) {
           }
           state.chatBusy = false;
           state.chatUnsub = null;
+          endChatMeter(meter, chatId, true);
           assistant.streaming = false;
           renderChatMessages();
           // Refresh previews/ordering in the conversation list.
@@ -3782,8 +3975,11 @@ function stopChatStream() {
     state.chatUnsub = null;
   }
   state.chatBusy = false;
+  clearInterval(state.chatSampler);
+  state.chatSampler = null;
   const last = state.chatMessages[state.chatMessages.length - 1];
   if (last?.streaming) last.streaming = false;
+  renderChatMessages();
 }
 
 async function renameChat(chatId) {
@@ -5024,7 +5220,7 @@ async function renderCasesView() {
   // "new case" opens the kind menu instead of assuming 'manual'.
   byId('ps-cases-new')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    byId('ps-cases-new-menu')?.toggle();
+    toggleMenuAt(byId('ps-cases-new-menu'), byId('ps-cases-new'));
   });
   byId('ps-cases-new-menu')?.addEventListener('action', (e) => {
     const kind = e.detail?.action;
@@ -12848,7 +13044,7 @@ async function renderConnections() {
     const more = e.target.closest('[data-ml-more]');
     if (more) {
       e.stopPropagation();
-      more.parentElement?.querySelector('[data-ml-menu]')?.toggle();
+      toggleMenuAt(more.parentElement?.querySelector('[data-ml-menu]'), more);
       return;
     }
     const openBtn = e.target.closest('[data-ml-open]');

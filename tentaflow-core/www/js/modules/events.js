@@ -120,7 +120,44 @@ function originClass(origin) { return ORIGIN_CLASS[origin] ?? 'o-system'; }
  * Groups newest-first (the order the cursor pages in, so scrolling down goes
  * back in time), rows inside a group oldest-first (a turn reads forward).
  */
-function buildItems(rows) {
+// A step is ONE ledger entry: the closing row, which already carries the
+// duration. Its opening row and its stored content (`step_io`) are folded into
+// it instead of being listed as rows of their own.
+function foldSteps(rows) {
+  const byRun = new Map();
+  for (const row of rows) {
+    if (!byRun.has(row.runId)) byRun.set(row.runId, []);
+    byRun.get(row.runId).push(row);
+  }
+  for (const runRows of byRun.values()) {
+    runRows.sort((a, b) => a.seq - b.seq);
+    const lastClosing = new Map();
+    for (const row of runRows) {
+      if (row.kind === 'step_end' || (row.kind === 'error' && row.nodeId)) {
+        lastClosing.set(row.nodeId, row);
+        row.io = null;
+      } else if (row.kind === 'step_io') {
+        const closing = lastClosing.get(row.nodeId);
+        if (closing) {
+          closing.io = {
+            seq: row.seq,
+            inputBytes: row.payload?.input_bytes ?? 0,
+            outputBytes: row.payload?.output_bytes ?? 0,
+            truncated: row.payload?.truncated === true,
+            model: row.payload?.model ?? null,
+            servedModel: row.payload?.served_model ?? null,
+            promptTokens: row.payload?.prompt_tokens ?? null,
+            completionTokens: row.payload?.completion_tokens ?? null,
+          };
+        }
+      }
+    }
+  }
+  return rows.filter((row) => row.kind !== 'step_start' && row.kind !== 'step_io');
+}
+
+function buildItems(allRows) {
+  const rows = foldSteps(allRows);
   const groups = new Map();
   for (const row of rows) {
     const key = `${row.runId}#${row.turn ?? '-'}`;
@@ -185,18 +222,32 @@ function rangeOptions() {
     .join('');
 }
 
+// Wall-clock span of the loaded rows of one run: the number a person compares
+// with how long the answer took, which no single step or turn shows.
+function runTotal(runId) {
+  let first = Infinity;
+  let last = -Infinity;
+  for (const r of state.rows) {
+    if (r.runId !== runId) continue;
+    first = Math.min(first, r.atMs);
+    last = Math.max(last, r.atMs);
+  }
+  return fmtMs(Math.max(0, last - first), lang());
+}
+
 function renderHead(item) {
   const g = item.group;
   const row = g.first;
-  const title = g.turn === null
-    ? t('group_run', { run: g.runId.slice(0, 12) })
-    : t('group_turn', { turn: g.turn });
+  const named = g.rows.find((r) => r.sessionLabel)?.sessionLabel
+    ?? g.rows.find((r) => r.flowName)?.flowName
+    ?? t('group_run');
+  const title = g.turn === null ? named : `${named} · ${t('group_turn', { turn: g.turn })}`;
   const sub = [
     t(`origin_${row.origin}`),
     actorLabel(row),
   ].filter(Boolean).map(escapeHtml).join(' · ');
   return `<div class="ev-turnhead">${escapeHtml(title)}
-    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))}</span>
+    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(t('run_total', { time: runTotal(g.runId) }))}</span>
   </div>`;
 }
 
@@ -229,15 +280,34 @@ function kv(label, value, muted = false) {
   return `<dt>${escapeHtml(label)}</dt><dd${cls}>${value}</dd>`;
 }
 
+// What an llm step ran on. The requested name is often an alias, so the model
+// the backend reports serving is shown beside it when they differ.
+function modelKv(row) {
+  const io = row.io;
+  if (!io || (!io.model && !io.servedModel)) return '';
+  const parts = [];
+  if (io.model) parts.push(kv(t('llm_model'), escapeHtml(io.model)));
+  if (io.servedModel && io.servedModel !== io.model) {
+    parts.push(kv(t('llm_served'), escapeHtml(io.servedModel)));
+  }
+  if (io.promptTokens !== null || io.completionTokens !== null) {
+    parts.push(kv(t('llm_tokens'), escapeHtml(t('llm_tokens_value', {
+      prompt: io.promptTokens ?? 0,
+      completion: io.completionTokens ?? 0,
+    }))));
+  }
+  return parts.join('\n      ');
+}
+
 function inspectorKeySection(row) {
   if (row.actorKind !== 'api_key') return '';
   const binding = row.actorUserId
-    ? `${escapeHtml(row.actorUserId)} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
+    ? `${escapeHtml(row.actorUserName ?? t('actor_unresolved', { kind: t('actor_kind_user') }))} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
     : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
   return `<div class="ev-sec">
     <h4>${escapeHtml(t('key_section'))}</h4>
     <dl class="ev-kv">
-      ${kv(t('key_name'), escapeHtml(row.actorId ?? t('unknown_actor')))}
+      ${kv(t('key_name'), escapeHtml(actorLabel(row)))}
       ${kv(t('key_binding'), binding)}
     </dl>
     <div class="ev-sec-actions">
@@ -248,6 +318,7 @@ function inspectorKeySection(row) {
 
 function inspectorLinks(row) {
   const links = [
+    [t('correlation'), row.correlationId],
     [t('link_run'), row.runId],
     [t('link_session'), row.sessionId],
     [t('link_node'), row.nodeId],
@@ -321,26 +392,94 @@ function renderInspector() {
     <dl class="ev-kv">
       ${kv(t('origin'), `<span class="ev-origin"><span class="dot ${originClass(row.origin)}"></span>${escapeHtml(t(`origin_${row.origin}`))}</span>`)}
       ${kv(t('actor'), `${escapeHtml(actorLabel(row))} <span class="muted">(${escapeHtml(t(`actor_kind_${row.actorKind}`))})</span>`)}
+      ${modelKv(row)}
       ${timing.join('\n      ')}
-      ${kv(
-        t('correlation'),
-        row.correlationId
-          ? escapeHtml(row.correlationId)
-          : `<span class="muted">${escapeHtml(t('none_recorded'))}</span>`,
-      )}
     </dl>
     ${inspectorKeySection(row)}
-    <div class="ev-sec">
+    ${row.io ? '<div class="ev-sec" id="events-io"></div>' : `<div class="ev-sec">
       <h4>${escapeHtml(t('details'))}</h4>
       ${chronometry(row)}
       <div class="ev-pre">${escapeHtml(prettyPayload(row))}</div>
-    </div>
+    </div>`}
     ${inspectorLinks(row)}
   `;
+
+  if (row.io) loadStepIo(row);
 
   byId('events-filter-actor')?.addEventListener('click', () => {
     setActor(row.actorId ?? null);
   });
+}
+
+/**
+ * Readable text for a stored side. Content is JSON text; printing it through
+ * `JSON.stringify` would leave every passage as one line full of `\n` escapes,
+ * so strings are written out as they are and only the structure is indented.
+ */
+function readable(text) {
+  let value;
+  try { value = JSON.parse(text); } catch { return text; }
+  const lines = [];
+  const walk = (node, indent) => {
+    const pad = '  '.repeat(indent);
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => {
+        lines.push(`${pad}[${i}]`);
+        walk(item, indent + 1);
+      });
+    } else if (node && typeof node === 'object') {
+      for (const [key, item] of Object.entries(node)) {
+        if (item && typeof item === 'object') {
+          lines.push(`${pad}${key}:`);
+          walk(item, indent + 1);
+        } else if (typeof item === 'string' && item.includes('\n')) {
+          lines.push(`${pad}${key}:`);
+          item.split('\n').forEach((line) => lines.push(`${pad}  ${line}`));
+        } else {
+          lines.push(`${pad}${key}: ${item}`);
+        }
+      }
+    } else if (typeof node === 'string') {
+      node.split('\n').forEach((line) => lines.push(`${pad}${line}`));
+    } else {
+      lines.push(`${pad}${node}`);
+    }
+  };
+  walk(value, 0);
+  return lines.join('\n');
+}
+
+/** Fetches and shows what the selected step received and returned. */
+async function loadStepIo(row) {
+  const host = byId('events-io');
+  if (!host) return;
+  host.innerHTML = `<h4>${escapeHtml(t('io_input'))} / ${escapeHtml(t('io_output'))}</h4>
+    <div class="muted">${escapeHtml(t('io_loading'))}</div>`;
+  const key = row.key;
+  try {
+    const body = await ApiBinary.one('eventsStepIoRequest', { runId: row.runId, seq: row.io.seq });
+    if (state.selectedKey !== key) return;
+    const cut = body.truncated
+      ? `<div class="ev-io-note">${escapeHtml(t('io_cut'))}</div>`
+      : '';
+    const section = (label, bytes, text) => `
+      <h4>${escapeHtml(label)} <span class="ev-io-size">${escapeHtml(fmtBytes(bytes))}</span></h4>
+      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>`;
+    byId('events-io').innerHTML = `${cut}
+      ${section(t('io_input'), body.inputBytes, body.input)}
+      ${section(t('io_output'), body.outputBytes, body.output)}`;
+  } catch (err) {
+    if (state.selectedKey !== key) return;
+    const host2 = byId('events-io');
+    if (host2) host2.innerHTML = `<div class="muted">${escapeHtml(t('io_failed', { error: err?.message ?? String(err) }))}</div>`;
+  }
+}
+
+function fmtBytes(n) {
+  if (typeof n !== 'number') return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function prettyPayload(row) {
@@ -533,10 +672,10 @@ function refreshActorOptions() {
     seen.set(row.actorId, row);
   }
   const options = [...seen.values()]
-    .sort((a, b) => a.actorId.localeCompare(b.actorId))
+    .sort((a, b) => actorLabel(a).localeCompare(actorLabel(b)))
     .map((row) => ({
       value: row.actorId,
-      label: row.actorId,
+      label: actorLabel(row),
       description: row.actorKind === 'api_key'
         ? bindingText(row)
         : t(`actor_kind_${row.actorKind}`),
@@ -550,7 +689,7 @@ function renderCorrelationChip() {
   if (!chip) return;
   chip.hidden = !state.correlationId;
   if (state.correlationId) {
-    chip.setAttribute('label', t('correlation_filter', { id: state.correlationId }));
+    chip.setAttribute('label', t('correlation_filter'));
   }
 }
 

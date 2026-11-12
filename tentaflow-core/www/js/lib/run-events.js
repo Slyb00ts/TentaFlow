@@ -52,6 +52,10 @@ export function normalizeRow(raw) {
     actorKind: String(raw.actorKind ?? ''),
     actorId: raw.actorId ?? null,
     actorUserId: raw.actorUserId ?? null,
+    actorName: raw.actorName ?? null,
+    actorUserName: raw.actorUserName ?? null,
+    sessionLabel: raw.sessionLabel ?? null,
+    flowName: raw.flowName ?? null,
     orgId: raw.orgId ?? null,
     correlationId: raw.correlationId ?? null,
     sessionId: raw.sessionId ?? null,
@@ -70,9 +74,12 @@ export function normalizeRow(raw) {
 // Row text
 // -----------------------------------------------------------------------------
 
+// An id is never shown as a label: a row whose actor cannot be resolved (a
+// deleted user or key) says what kind of actor it was instead.
 export function actorLabel(row) {
-  if (row.actorId) return row.actorId;
-  return t(`actor_kind_${row.actorKind}`);
+  if (row.actorName) return row.actorName;
+  const kind = t(`actor_kind_${row.actorKind}`);
+  return row.actorId ? t('actor_unresolved', { kind }) : kind;
 }
 
 function truncate(text, max = 160) {
@@ -118,7 +125,7 @@ export function rowDetail(row) {
   const p = row.payload ?? {};
   switch (row.kind) {
     case 'request_started':
-      return [p.service_type, p.modality, p.flow_id].filter(Boolean).join(' · ');
+      return [p.service_type, p.modality, row.flowName].filter(Boolean).join(' · ');
     case 'first_token':
       return t('detail_first_token');
     case 'assistant_message': {

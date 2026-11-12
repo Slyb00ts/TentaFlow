@@ -18,6 +18,7 @@ pub mod db;
 pub mod metrics;
 pub mod progress_log;
 pub mod retention;
+pub mod step_io;
 pub mod store;
 #[cfg(test)]
 mod test_support;

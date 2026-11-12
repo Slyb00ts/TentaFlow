@@ -31,6 +31,7 @@ use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::processes::agent_sink as process_sink;
 use crate::project_studio::{
     generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
+    project_db, summary,
 };
 use crate::services::org::DEFAULT_ORG_ID;
 
@@ -62,7 +63,7 @@ const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
 /// Core tools that only read. They may run alongside the other calls of a turn
 /// and are the whole of what a critic of a process step may use.
-pub const READ_ONLY_CORE_TOOLS: [CoreToolName; 10] = [
+pub const READ_ONLY_CORE_TOOLS: [CoreToolName; 12] = [
     CoreToolName::FsRead,
     CoreToolName::FsList,
     CoreToolName::FsGlob,
@@ -73,9 +74,24 @@ pub const READ_ONLY_CORE_TOOLS: [CoreToolName; 10] = [
     CoreToolName::AgentList,
     CoreToolName::ProjectSearch,
     CoreToolName::ProjectListSources,
+    CoreToolName::ProjectFileSummaries,
+    CoreToolName::ProjectDigest,
 ];
 
 const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
+
+fn string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
 /// model can adapt to (mirrors the service's private helper).
@@ -483,6 +499,90 @@ impl ToolExecNodeAdapter {
         let outcome = match CoreToolName::from_public_name(&call.name) {
             Some(CoreToolName::ProjectListSources) => {
                 project_knowledge::list_sources_json(project_id)
+            }
+            Some(CoreToolName::ProjectFileSummaries) => {
+                let source_ids = string_array(&args, "source_ids");
+                let file_ids = string_array(&args, "file_ids");
+                project_db::open(project_id).and_then(|pool| {
+                    let (rows, total) = if !file_ids.is_empty() {
+                        let rows = summary::summaries_for_files(&pool, &file_ids)?;
+                        let total = rows.len() as u32;
+                        (rows, total)
+                    } else if args.get("mode").and_then(|v| v.as_str()) == Some("random") {
+                        let count = args
+                            .get("count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(5)
+                            .clamp(1, 50) as u32;
+                        let rows = summary::random_summaries(&pool, &source_ids, count)?;
+                        let total = rows.len() as u32;
+                        (rows, total)
+                    } else {
+                        let offset =
+                            args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let limit = args
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(20)
+                            .clamp(1, 200) as u32;
+                        summary::list_summaries(&pool, &source_ids, offset, limit)?
+                    };
+                    Ok(summary::summaries_to_json_bounded(
+                        &rows,
+                        total,
+                        summary::TOOL_RESULT_BUDGET_CHARS,
+                    ))
+                })
+            }
+            Some(CoreToolName::ProjectDigest) => {
+                let source_ids = string_array(&args, "source_ids");
+                let file_ids = string_array(&args, "file_ids");
+                let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("");
+                let budget = args
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3000)
+                    .clamp(256, summary::SUMMARY_MAX_TOKENS as u64) as u32;
+                let selection = project_db::open(project_id).and_then(|pool| {
+                    if !file_ids.is_empty() {
+                        let rows = summary::summaries_for_files(&pool, &file_ids)?;
+                        let total = rows.len() as u32;
+                        Ok((rows, total))
+                    } else if let Some(count) = args.get("random_count").and_then(|v| v.as_u64()) {
+                        let rows = summary::random_summaries(
+                            &pool,
+                            &source_ids,
+                            (count as u32).clamp(1, summary::MAX_DIGEST_FILES),
+                        )?;
+                        let total = rows.len() as u32;
+                        Ok((rows, total))
+                    } else {
+                        summary::list_summaries(&pool, &source_ids, 0, summary::MAX_DIGEST_FILES)
+                    }
+                });
+                match selection {
+                    Ok((rows, _)) if rows.is_empty() => Err(anyhow!(
+                        "no summaries yet: files are summarised after indexing finishes"
+                    )),
+                    Ok((rows, total)) => {
+                        let model = summary::ContextModel {
+                            llm: ctx.llm.clone(),
+                            provenance: ctx.provenance(),
+                            user_id: Some(user_id.to_string()),
+                            user_role: ctx.user_role.clone(),
+                            cancel: ctx.cancel_token.clone(),
+                        };
+                        let outcome =
+                            summary::digest_rows(&model, rows, total, focus, budget).await;
+                        if let Err(error) =
+                            project_knowledge::require_member(&org, project_id, user_id)
+                        {
+                            return error_result(call, error.to_string());
+                        }
+                        outcome
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Some(CoreToolName::ProjectSearch) => {
                 let Some(query) = args

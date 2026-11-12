@@ -29,6 +29,28 @@ pub enum ProgressEvent {
     /// DIFFERENCES BETWEEN EVENTS — no adapter measures its own latency.
     /// Emitted once per streaming step (per harness iteration), never per run.
     FirstToken { node_id: String },
+    /// What a node received and what it returned, as JSON text, so the event
+    /// log can keep the content behind a step. Either side may be absent: the
+    /// engine reports what it saw, and a later event for the same node
+    /// replaces an earlier one (the `llm` node reports its exact prompt, which
+    /// is more than the generic envelope snapshot). Carries no timing.
+    NodeIo {
+        node_id: String,
+        input: Option<String>,
+        output: Option<String>,
+    },
+    /// Which model a `llm` step used and what it spent. `requested` is the name
+    /// the flow asked for (often an alias); `served` is what the backend says
+    /// it ran. Fields arrive in separate events (the request is built before
+    /// the answer exists) and merge per node; an absent field never erases one
+    /// already reported.
+    NodeModel {
+        node_id: String,
+        requested: Option<String>,
+        served: Option<String>,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    },
     /// A `loop` body iteration began (phase 5 emits). `max` is the configured
     /// iteration budget (0 = unbounded / until-only).
     IterationStarted { node_id: String, n: u32, max: u32 },
@@ -104,6 +126,13 @@ pub enum ProgressEvent {
 /// stateless and lets one sink serve runs across scopes.
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, scope: &str, event: ProgressEvent);
+
+    /// Whether anyone keeps the content of a step. Building a `NodeIo` means
+    /// serialising every node's payload, so the engine only does it for a sink
+    /// that stores it.
+    fn wants_io(&self) -> bool {
+        false
+    }
 }
 
 /// Default no-op sink used by tests/test_support and whenever no broker is

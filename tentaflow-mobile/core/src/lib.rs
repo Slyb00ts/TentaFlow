@@ -14,7 +14,7 @@ mod diagnostics;
 
 use anyhow::Result;
 #[cfg(target_os = "android")]
-use jni::{objects::{JClass, JString}, JNIEnv};
+use jni::{objects::{JClass, JObject, JString}, JNIEnv};
 #[cfg(target_os = "android")]
 use std::path::PathBuf;
 use tentaflow_core::config::NodeConfig;
@@ -56,8 +56,25 @@ pub extern "C" fn tentaflow_mobile_start() {
 pub extern "system" fn Java_ai_tentaflow_mobile_NativeLib_start(
     mut env: JNIEnv,
     _class: JClass,
+    context: JObject,
     data_dir: JString,
 ) {
+    // Crates that reach Android system services (DNS config, network interfaces,
+    // browser launch) read the JavaVM and Context from ndk_context and abort with
+    // "android context was not initialized" when nobody set them. The global ref
+    // is leaked on purpose: the context must outlive every thread that reads it.
+    match (env.get_java_vm(), env.new_global_ref(&context)) {
+        (Ok(vm), Ok(global)) => {
+            let ctx_ptr = global.as_obj().as_raw() as *mut std::ffi::c_void;
+            std::mem::forget(global);
+            unsafe { ndk_context::initialize_android_context(vm.get_java_vm_pointer() as *mut _, ctx_ptr) };
+        }
+        (vm, global) => {
+            platform::init_logging();
+            error!("Nie mozna zainicjalizowac ndk_context: vm={:?} context={:?}", vm.err(), global.err());
+        }
+    }
+
     let data_dir = match env.get_string(&data_dir) {
         Ok(value) => Some(PathBuf::from(value.to_string_lossy().into_owned())),
         Err(e) => {

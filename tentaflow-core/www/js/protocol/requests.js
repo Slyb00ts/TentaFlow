@@ -302,6 +302,7 @@ export const requests = {
   encodeStorageCreateDirRequest: (parent, name) => encode('StorageAdminBody', 'CreateDirRequest', { parent, name }),
   encodeStorageMigrateRequest: (key, newPath, moveData) => encode('StorageAdminBody', 'MigrateRequest', { key, new_path: newPath, move_data: moveData }),
   encodeEventsRunRequest: (runId, afterSeq, limit) => encode('EventsBody', 'RunRequest', { run_id: runId, after_seq: afterSeq, limit }),
+  encodeEventsStepIoRequest: (runId, seq) => encode('EventsBody', 'StepIoRequest', { run_id: runId, seq }),
   encodeModelConversionStartRequest: (serviceId, sourcePath, sourceFormat, precision, tolerance, testInputPath) => encode('ModelConversionBody', 'StartRequest', { service_id: serviceId, source_path: sourcePath, source_format: sourceFormat, precision, tolerance, test_input_path: testInputPath }),
   encodeModelConversionStatusRequest: (serviceId) => encode('ModelConversionBody', 'StatusRequest', { service_id: serviceId }),
   encodeEnvironmentGetKindRequest: () => encode('EnvironmentPromotionBody', 'GetKindRequest', {}),

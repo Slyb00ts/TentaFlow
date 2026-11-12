@@ -80,6 +80,7 @@ pub enum EventKind {
     TurnStart,
     TurnEnd,
     Error,
+    StepIo,
 }
 
 impl EventKind {
@@ -97,6 +98,7 @@ impl EventKind {
             EventKind::TurnStart => "turn_start",
             EventKind::TurnEnd => "turn_end",
             EventKind::Error => "error",
+            EventKind::StepIo => "step_io",
         }
     }
 
@@ -112,6 +114,7 @@ impl EventKind {
             "turn_start" => EventKind::TurnStart,
             "turn_end" => EventKind::TurnEnd,
             "error" => EventKind::Error,
+            "step_io" => EventKind::StepIo,
             _ => return None,
         };
         Some(kind)
@@ -175,6 +178,26 @@ pub enum EventPayload {
     Error {
         stage: String,
         message: String,
+    },
+    /// What the step it follows received and returned, zstd-compressed and
+    /// base64-encoded in `z` (see `events::step_io`). The sizes stay in the
+    /// clear so a list can show them without unpacking anything.
+    StepIo {
+        z: String,
+        input_bytes: u64,
+        output_bytes: u64,
+        truncated: bool,
+        /// For a `llm` step: the model name the flow asked for (often an
+        /// alias), the model the backend says it served, and the tokens spent.
+        /// Kept beside `z` so a list can show them without unpacking anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u64>,
     },
 }
 
@@ -286,6 +309,7 @@ impl EventPayload {
             EventPayload::TurnStart { .. } => EventKind::TurnStart,
             EventPayload::TurnEnd { .. } => EventKind::TurnEnd,
             EventPayload::Error { .. } => EventKind::Error,
+            EventPayload::StepIo { .. } => EventKind::StepIo,
         }
     }
 
@@ -353,6 +377,7 @@ impl EventPayload {
             payload @ (EventPayload::RequestStarted { .. }
             | EventPayload::FirstToken {}
             | EventPayload::StepStart { .. }
+            | EventPayload::StepIo { .. }
             | EventPayload::TurnStart { .. }) => payload,
         }
     }

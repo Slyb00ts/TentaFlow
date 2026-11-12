@@ -140,6 +140,21 @@ pub struct EventRowWire {
     pub call_id: Option<String>,
     /// The stored payload, already redacted, internally tagged with `kind`.
     pub payload_json: String,
+    /// Human name of the actor (a user's display name, an API key's name, an
+    /// addon instance's name), resolved by the server at read time. `None` when
+    /// it could not be resolved — the browser then says so instead of printing
+    /// an id.
+    #[serde(default)]
+    pub actor_name: Option<String>,
+    /// "Project · chat title" for a run that belongs to a project chat.
+    #[serde(default)]
+    pub session_label: Option<String>,
+    /// Name of the flow a `request_started` row ran.
+    #[serde(default)]
+    pub flow_name: Option<String>,
+    /// Name of the user an API key is bound to.
+    #[serde(default)]
+    pub actor_user_name: Option<String>,
 }
 
 #[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
@@ -176,6 +191,28 @@ pub struct EventsRunResponse {
     pub next_after_seq: Option<i64>,
 }
 
+/// The content behind one `step_io` row. Kept out of the page responses: a page
+/// of rows would carry every prompt of every step.
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Default)]
+pub struct EventsStepIoRequest {
+    pub run_id: String,
+    /// `seq` of the `step_io` row.
+    pub seq: i64,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Default)]
+pub struct EventsStepIoResponse {
+    /// What the step received, as the engine reported it (already redacted).
+    pub input: String,
+    /// What the step returned.
+    pub output: String,
+    /// Size of each side before any cut, in bytes.
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    /// True when a side was cut to the storage cap.
+    pub truncated: bool,
+}
+
 /// The whole Events-browser surface behind one `MessageBody::EventsBody`.
 #[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum EventsPayload {
@@ -183,6 +220,8 @@ pub enum EventsPayload {
     BrowseResponse(EventsBrowseResponse),
     RunRequest(EventsRunRequest),
     RunResponse(EventsRunResponse),
+    StepIoRequest(EventsStepIoRequest),
+    StepIoResponse(EventsStepIoResponse),
 }
 
 #[cfg(test)]
@@ -211,6 +250,10 @@ mod tests {
             node_id: Some("llm-1".into()),
             call_id: Some("c-a70".into()),
             payload_json: r#"{"kind":"tool_call","name":"core.fs_read","arguments":{}}"#.into(),
+            actor_name: Some("Anna Kowalska".into()),
+            session_label: Some("Projekt Alfa · Pytania o regulamin".into()),
+            flow_name: Some("RAG query".into()),
+            actor_user_name: Some("Anna Kowalska".into()),
         }
     }
 

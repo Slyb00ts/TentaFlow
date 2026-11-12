@@ -424,7 +424,7 @@ case "$PLATFORM" in
     ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-26}"
     ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}}"
     ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk}}"
-    ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(android_host_tag)/bin"
     if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
         echo "Build Android zvec wymaga Android NDK (ustaw ANDROID_NDK_HOME)." >&2
         exit 1

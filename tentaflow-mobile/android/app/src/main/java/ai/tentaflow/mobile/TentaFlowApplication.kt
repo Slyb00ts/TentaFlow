@@ -14,7 +14,7 @@ class TentaFlowApplication : Application() {
 
         Thread {
             try {
-                NativeLib.start(filesDir.absolutePath)
+                NativeLib.start(applicationContext, filesDir.absolutePath)
             } catch (e: Throwable) {
                 Log.e(TAG, "Blad uruchomienia Rust core", e)
             }

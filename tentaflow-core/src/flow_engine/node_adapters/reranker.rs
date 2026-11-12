@@ -29,14 +29,32 @@ const MAX_CANDIDATES: usize = 200;
 /// `text` to treść pasaża wysyłana do rerankera. `doc_id`/`chunk_index` są
 /// opcjonalne (obecne tylko dla wejścia vector-hits RAG); niosą je tu, żeby
 /// po rerankingu odtworzyć cytaty w meta["rag_citations"] w nowej kolejności.
-/// `vector_score` to surowy score z vector-search (0.0 poza ścieżką RAG) —
+/// `vector_distance` to surowy dystans z vector-search (mniejszy = blizej) (0.0 poza ścieżką RAG) —
 /// służy do degradacji do kolejności wektorowej gdy reranker jest niedostępny.
 struct Candidate {
     id: String,
     text: String,
     doc_id: serde_json::Value,
     chunk_index: serde_json::Value,
-    vector_score: f32,
+    /// `path` / `location` of the hit, when its namespace stores them — kept so
+    /// the rewritten citations still name the file and the place in it.
+    place: serde_json::Map<String, serde_json::Value>,
+    vector_distance: f32,
+}
+
+impl Candidate {
+    fn citation(&self, score: impl Into<serde_json::Value>) -> serde_json::Value {
+        let mut cite = serde_json::json!({
+            "doc_id": self.doc_id,
+            "chunk_index": self.chunk_index,
+            "text": self.text,
+            "score": score.into(),
+        });
+        for (key, value) in &self.place {
+            cite[key] = value.clone();
+        }
+        cite
+    }
 }
 
 /// Kształt wejścia rozpoznany w `parse_input`. RAG vector-hits ma fallback
@@ -154,7 +172,8 @@ impl RerankerNodeAdapter {
                 text,
                 doc_id: serde_json::Value::Null,
                 chunk_index: serde_json::Value::Null,
-                vector_score: 0.0,
+                place: serde_json::Map::new(),
+                vector_distance: 0.0,
             });
         }
         Ok((query, candidates))
@@ -211,29 +230,52 @@ impl RerankerNodeAdapter {
                 .and_then(|f| f.get("chunk_index"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let vector_score = hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let place: serde_json::Map<String, serde_json::Value> = ["path", "location"]
+                .into_iter()
+                .filter_map(|key| {
+                    let v = fields.and_then(|f| f.get(key))?;
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|_| (key.to_string(), v.clone()))
+                })
+                .collect();
+            let vector_distance = hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             candidates.push(Candidate {
                 id,
                 text: text.to_string(),
                 doc_id,
                 chunk_index,
-                vector_score,
+                place,
+                vector_distance,
             });
         }
         Ok((query, candidates))
     }
 
     /// Bug 2 (degradacja RAG) — gdy reranker niedostępny, buduje wynik z
-    /// kandydatów posortowanych malejąco po vector score, ucięty do top_n.
-    /// Emituje `{ranked:[{id,score,text}]}` ze score=vector_score oraz
+    /// kandydatów posortowanych rosnąco po dystansie wektorowym, ucięty do top_n.
+    /// Emituje `{ranked:[{id,score,text}]}` ze score=podobienstwo (1 - dystans) oraz
     /// nadpisuje meta["rag_citations"] (z vector score) — RAG odpowiada dalej.
-    /// Wołane WYŁĄCZNIE na ścieżce vector-hits (gdzie vector_score jest realny).
+    /// Wołane WYŁĄCZNIE na ścieżce vector-hits (gdzie vector_distance jest realny).
     fn degrade_to_vector_order(
         mut out: FlowEnvelope,
         mut candidates: Vec<Candidate>,
         top_n: Option<usize>,
+        min_score_ratio: Option<f32>,
     ) -> FlowEnvelope {
-        candidates.sort_by(|a, b| b.vector_score.total_cmp(&a.vector_score));
+        // The vector backend reports a metric DISTANCE (lower = closer), so the
+        // order is ascending and the citation score is turned into a similarity.
+        candidates.sort_by(|a, b| a.vector_distance.total_cmp(&b.vector_distance));
+        // Passages far below the best hit are noise for the answer model: it
+        // tends to summarise whatever it is handed, relevant or not.
+        if let (Some(ratio), Some(best)) = (
+            min_score_ratio,
+            candidates.first().map(|c| 1.0 - c.vector_distance),
+        ) {
+            if best > 0.0 {
+                candidates.retain(|c| 1.0 - c.vector_distance >= best * ratio);
+            }
+        }
         if let Some(n) = top_n {
             candidates.truncate(n);
         }
@@ -243,7 +285,7 @@ impl RerankerNodeAdapter {
             .map(|c| {
                 serde_json::json!({
                     "id": c.id,
-                    "score": c.vector_score,
+                    "score": 1.0 - c.vector_distance,
                     "text": c.text,
                 })
             })
@@ -251,14 +293,7 @@ impl RerankerNodeAdapter {
 
         let citations: Vec<serde_json::Value> = candidates
             .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "doc_id": c.doc_id,
-                    "chunk_index": c.chunk_index,
-                    "text": c.text,
-                    "score": c.vector_score,
-                })
-            })
+            .map(|c| c.citation(1.0 - c.vector_distance))
             .collect();
         out.meta.insert(
             "rag_citations".to_string(),
@@ -330,6 +365,23 @@ impl NodeAdapter for RerankerNodeAdapter {
             return Ok(out);
         }
 
+        // `mode: "vector"` keeps the vector-search order and never calls a
+        // model: a cross-encoder that scores independently of the query (seen
+        // with GGUF Jina v3 / Qwen3 on llama.cpp) is worse than no rerank.
+        let min_score_ratio = node
+            .config
+            .get("min_score_ratio")
+            .and_then(|v| v.as_f64())
+            .map(|r| r as f32);
+        if is_rag && node.config.get("mode").and_then(|v| v.as_str()) == Some("vector") {
+            return Ok(Self::degrade_to_vector_order(
+                out,
+                candidates,
+                top_n,
+                min_score_ratio,
+            ));
+        }
+
         // Cap kandydatów PRZED dispatchem (kontrola wąskiego gardła §8).
         if candidates.len() > MAX_CANDIDATES {
             candidates.truncate(MAX_CANDIDATES);
@@ -361,7 +413,12 @@ impl NodeAdapter for RerankerNodeAdapter {
             Ok(resp) => resp,
             Err(e) if is_rag => {
                 warn!("reranker niedostępny, degradacja do vector order: {e}");
-                return Ok(Self::degrade_to_vector_order(out, candidates, top_n));
+                return Ok(Self::degrade_to_vector_order(
+                    out,
+                    candidates,
+                    top_n,
+                    min_score_ratio,
+                ));
             }
             Err(e) => return Err(anyhow!("reranker adapter: dispatcher failed: {e}")),
         };
@@ -410,14 +467,7 @@ impl NodeAdapter for RerankerNodeAdapter {
         if is_rag {
             let citations: Vec<serde_json::Value> = ranked
                 .iter()
-                .map(|(score, cand)| {
-                    serde_json::json!({
-                        "doc_id": cand.doc_id,
-                        "chunk_index": cand.chunk_index,
-                        "text": cand.text,
-                        "score": score,
-                    })
-                })
+                .map(|(score, cand)| cand.citation(*score))
                 .collect();
             out.meta.insert(
                 "rag_citations".to_string(),
@@ -780,6 +830,36 @@ mod tests {
         assert!(s0 >= s1, "cytaty malejąco po score rerankera: {s0} >= {s1}");
     }
 
+    /// A cited fragment must stay traceable to its file: `path` and `location`
+    /// of the hit survive the rewrite of `rag_citations`, and a hit without them
+    /// (the addon's namespace) gets neither key.
+    #[tokio::test]
+    async fn citations_keep_the_file_path_and_location_of_the_hit() {
+        let env = vector_hits_env(
+            "q",
+            json!([
+                {"ref_id": 10, "score": 0.1, "fields": {"text": "aa", "doc_id": "docA", "chunk_index": 1, "path": "docs/a.pdf", "location": "page 3"}},
+                {"ref_id": 20, "score": 0.2, "fields": {"text": "bbbbbb", "doc_id": "docB", "chunk_index": 2}},
+            ]),
+        );
+        let mut ctx = stub_ctx();
+        ctx.reranker = Arc::new(LenReranker {
+            last_doc_count: Mutex::new(0),
+            last_top_n: Mutex::new(None),
+            last_flow_depth: Mutex::new(0),
+        });
+        let out = RerankerNodeAdapter::new()
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+        let cites = out.meta["rag_citations"].as_array().unwrap().clone();
+        let a = cites.iter().find(|c| c["doc_id"] == "docA").unwrap();
+        assert_eq!(a["path"], "docs/a.pdf");
+        assert_eq!(a["location"], "page 3");
+        let b = cites.iter().find(|c| c["doc_id"] == "docB").unwrap();
+        assert!(b.get("path").is_none() && b.get("location").is_none());
+    }
+
     /// Dispatcher który ZAWSZE zawodzi — symuluje padnięcie wszystkich
     /// targetów failover `rag-reranker` (degradacja na ścieżce RAG).
     struct FailingReranker;
@@ -830,8 +910,8 @@ mod tests {
     }
 
     /// Bug 2 — gdy reranker padnie na ścieżce RAG, węzeł degraduje do kolejności
-    /// vector-score (NIE wywraca flow). Wynik = hity posortowane malejąco po
-    /// vector score, ucięte do top_n, + cytaty z vector score.
+    /// kolejności wektorowej (NIE wywraca flow). Wynik = hity posortowane rosnąco
+    /// po dystansie (najbliższe pierwsze), ucięte do top_n, + cytaty z podobieństwem.
     #[tokio::test]
     async fn reranker_failure_degrades_to_vector_order() {
         let env = vector_hits_env(
@@ -854,11 +934,11 @@ mod tests {
             FlowValue::Json(v) => v.get("ranked").and_then(|r| r.as_array()).cloned().unwrap(),
             other => panic!("expected Json, got {other:?}"),
         };
-        // Vector order malejąco: 0.9 (high) > 0.6 (mid), ucięte do top_n=2.
+        // Najmniejszy dystans pierwszy: 0.3 (low) < 0.6 (mid), ucięte do top_n=2.
         assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0]["id"], "20");
-        assert_eq!(ranked[0]["text"], "high");
-        assert_eq!(ranked[0]["score"].as_f64().unwrap(), 0.9_f32 as f64);
+        assert_eq!(ranked[0]["id"], "10");
+        assert_eq!(ranked[0]["text"], "low");
+        assert_eq!(ranked[0]["score"].as_f64().unwrap(), (1.0_f32 - 0.3) as f64);
         assert_eq!(ranked[1]["id"], "30");
 
         // Cytaty z vector score, w tej samej (vector) kolejności.
@@ -868,8 +948,8 @@ mod tests {
             .and_then(|c| c.as_array())
             .expect("cytaty z degradacji vector order");
         assert_eq!(cites.len(), 2);
-        assert_eq!(cites[0]["doc_id"], "docB");
-        assert_eq!(cites[0]["score"].as_f64().unwrap(), 0.9_f32 as f64);
+        assert_eq!(cites[0]["doc_id"], "docA");
+        assert_eq!(cites[0]["score"].as_f64().unwrap(), (1.0_f32 - 0.3) as f64);
     }
 
     /// Bug 2 — generyczny kontrakt {query,candidates} (brak vector score) NIE ma

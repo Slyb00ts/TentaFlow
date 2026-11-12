@@ -95,7 +95,7 @@ pub use environment::{
 };
 pub use events::{
     EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
-    EventsRunRequest, EventsRunResponse,
+    EventsRunRequest, EventsRunResponse, EventsStepIoRequest, EventsStepIoResponse,
 };
 pub use legal::{
     LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,

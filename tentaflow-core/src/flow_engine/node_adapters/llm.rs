@@ -504,6 +504,32 @@ impl LlmNodeAdapter {
         // and it is shared by the blocking and the streaming path.
         ctx.usage_sink.record_model(&model);
         let messages = Self::build_messages(node, envelope);
+        if ctx.progress.wants_io() {
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                crate::flow_engine::dispatchers::ProgressEvent::NodeModel {
+                    node_id: node.id.clone(),
+                    requested: Some(model.clone()),
+                    served: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                },
+            );
+            // The exact prompt, not the envelope it was assembled from: this is
+            // what the model was actually given.
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
+                    node_id: node.id.clone(),
+                    input: serde_json::to_string_pretty(&serde_json::json!({
+                        "model": model,
+                        "messages": messages,
+                    }))
+                    .ok(),
+                    output: None,
+                },
+            );
+        }
         let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {
             // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
@@ -744,6 +770,18 @@ impl NodeAdapter for LlmNodeAdapter {
         let response = Self::execute_chat_with_retry(node, ctx, request).await?;
 
         ctx.usage_sink.record(&node.id, response.usage);
+        if ctx.progress.wants_io() {
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                crate::flow_engine::dispatchers::ProgressEvent::NodeModel {
+                    node_id: node.id.clone(),
+                    requested: None,
+                    served: response.model.clone(),
+                    prompt_tokens: Some(response.usage.prompt_tokens),
+                    completion_tokens: Some(response.usage.completion_tokens),
+                },
+            );
+        }
 
         // A reasoning model can spend the whole output budget thinking and
         // return neither text nor a call. Read as a final answer, that ended an

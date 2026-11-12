@@ -55,7 +55,7 @@ use crate::flow_engine::node_adapters::{
     PersistTurnNodeAdapter, PiiFilterNodeAdapter, PlatformSwitchNodeAdapter,
     PptxExtractNodeAdapter, ProjectKnowledgeNodeAdapter, RagAccumulateNodeAdapter,
     RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
-    RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
+    RagOverviewNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter, StoreNodeAdapter, SttNodeAdapter, SubagentStatusNodeAdapter,
     SubflowNodeAdapter, TableStructureNodeAdapter, TaskGateNodeAdapter, TextExtractNodeAdapter,
     ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
@@ -2162,6 +2162,7 @@ fn wrap_blocking_as_stream(
                     usage: Some(usage),
                     perf,
                     finish_reason: Some(finish),
+                    model: None,
                     error: err,
                 }))
             }
@@ -2220,6 +2221,7 @@ fn build_registry(
         Arc::new(RagQuerySeedNodeAdapter::new()),
         Arc::new(RagAccumulateNodeAdapter::new()),
         Arc::new(RagJudgeNodeAdapter::new()),
+        Arc::new(RagOverviewNodeAdapter::new()),
         Arc::new(RagFinalizeNodeAdapter::new()),
         // RAG E3.2 — hop grafowy (GraphRAG): identyfikacja encji zapytania ->
         // seedy PPR, oraz PPR/neighbors -> fakty grafowe fuzowane z pasazami.

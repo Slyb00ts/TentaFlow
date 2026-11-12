@@ -124,6 +124,8 @@ pub struct LlmResponse {
     /// Natywne audio modelu omni. Wspolistnieje z `content` — model mowi i
     /// pisze w jednej turze, wiec to nie jest alternatywa dla tekstu.
     pub audio: Option<LlmAudioOut>,
+    /// Model the backend reports it served (the requested name may be an alias).
+    pub model: Option<String>,
 }
 
 /// Zadanie audio wyjsciowego.

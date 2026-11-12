@@ -1,7 +1,7 @@
 {
   "id": "retrieval_round",
   "name": "RAG — retrieval round (multi-hop body)",
-  "description": "Cialo pojedynczego hopu petli multi-hop RAG (E2.2 + GraphRAG E3.2), wykonywane przez loop block z query.flow.json. Jeden hop: rag_query_seed (payload = biezace pod-pytanie z meta.rag_current_query, init = oryginalne pytanie) -> rag_graph_seed (identyfikacja encji zapytania -> seedy PPR w meta.graph_seeds; payload bez zmian) -> embeddings -> vector(search 'passages', FILTR po collection_id z meta jak E2.0) -> reranker(rag-reranker, top_n=5; query z meta.rag_query_text) -> rag_accumulate (DEDUP po (doc_id,chunk_index), akumulacja do meta.rag_accumulated, cap 20; payload = kontekst dla sedziego) -> rag_graph_facts (PPR po seedach z meta -> top encje -> neighbors -> FAKTY grafowe; FUZJA z pasazami wektorowymi w kontekscie; best-effort: brak grafu/encji -> pass-through) -> llm(rag-llm SEDZIA: zwraca JSON {enough, next_query?}) -> rag_judge (parsuje werdykt: enough -> meta.harness_done=true; inaczej meta.rag_current_query = next_query) -> output. Meta (rag_accumulated, rag_current_query, graph_seeds, rag_graph_facts, harness_done) PRZETRWA do nastepnej iteracji bo loop podaje output-envelope hopu N jako input hopu N+1.",
+  "description": "Cialo pojedynczego hopu petli multi-hop RAG (E2.2 + GraphRAG E3.2), wykonywane przez loop block z query.flow.json. Jeden hop: rag_query_seed (payload = biezace pod-pytanie z meta.rag_current_query, init = oryginalne pytanie) -> rag_graph_seed (identyfikacja encji zapytania -> seedy PPR w meta.graph_seeds; payload bez zmian) -> embeddings -> vector(search 'passages', FILTR po collection_id z meta jak E2.0) -> reranker(mode=vector: kolejnosc wyszukiwania wektorowego bez modelu, top_n=5, prog min_score_ratio=0.75 wzgledem najlepszego trafienia) -> rag_accumulate (DEDUP po (doc_id,chunk_index), akumulacja do meta.rag_accumulated, cap 20; payload = kontekst dla sedziego) -> rag_overview (na zadanie sedziego dolacza zbiorcze streszczenie plikow projektu jako pasaz; w pozostalych rundach pass-through) -> rag_graph_facts (PPR po seedach z meta -> top encje -> neighbors -> FAKTY grafowe; FUZJA z pasazami wektorowymi w kontekscie; best-effort: brak grafu/encji -> pass-through) -> llm(rag-llm SEDZIA: zwraca JSON {enough, next_query?}) -> rag_judge (parsuje werdykt: enough -> meta.harness_done=true; inaczej meta.rag_current_query = next_query) -> output. Meta (rag_accumulated, rag_current_query, graph_seeds, rag_graph_facts, harness_done) PRZETRWA do nastepnej iteracji bo loop podaje output-envelope hopu N jako input hopu N+1.",
   "nodes": [
     {
       "id": "trigger",
@@ -36,7 +36,7 @@
         "op": "search",
         "namespace": "passages",
         "metric": "cosine",
-        "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
+        "output_fields": ["text", "doc_id", "chunk_index", "collection_id", "path", "location"]
       },
       "position": { "x": 1440, "y": 0 }
     },
@@ -44,8 +44,9 @@
       "id": "rerank",
       "type": "reranker",
       "config": {
-        "model": "rag-reranker",
-        "top_n": 5
+        "mode": "vector",
+        "top_n": 5,
+        "min_score_ratio": 0.75
       },
       "position": { "x": 1800, "y": 0 }
     },
@@ -54,6 +55,12 @@
       "type": "rag_accumulate",
       "config": {},
       "position": { "x": 2160, "y": 0 }
+    },
+    {
+      "id": "overview",
+      "type": "rag_overview",
+      "config": {},
+      "position": { "x": 2340, "y": 0 }
     },
     {
       "id": "graph_facts",
@@ -66,7 +73,9 @@
       "type": "llm",
       "config": {
         "model": "rag-llm",
-        "system_prompt": "Jestes SEDZIA retrievalu RAG. Dostajesz oryginalne pytanie uzytkownika i zakumulowane pasaze (kontekst). Oce, czy kontekst WYSTARCZA do pelnej, popartej zrodlami odpowiedzi na pytanie. Odpowiedz WYLACZNIE jednym obiektem JSON, bez zadnego innego tekstu: {\"enough\": true} gdy kontekst starczy, albo {\"enough\": false, \"next_query\": \"<konkretne pod-pytanie do nastepnego wyszukiwania>\"} gdy brakuje informacji. next_query ma byc samodzielnym zapytaniem wyszukiwarki (nie meta-komentarzem). Nie odpowiadaj na samo pytanie — tylko ocen wystarczalnosc kontekstu."
+        "max_tokens": 96,
+        "temperature": 0,
+        "system_prompt": "Jestes SEDZIA retrievalu RAG. Dostajesz oryginalne pytanie uzytkownika i zakumulowane pasaze (kontekst). Oce, czy kontekst WYSTARCZA do pelnej, popartej zrodlami odpowiedzi na pytanie. Odpowiedz WYLACZNIE jednym obiektem JSON, bez zadnego innego tekstu: {\"enough\": true} gdy kontekst starczy, albo {\"enough\": false, \"next_query\": \"<konkretne pod-pytanie do nastepnego wyszukiwania>\"} gdy brakuje informacji. Gdy pytanie dotyczy CALEGO projektu albo wielu plikow naraz (streszczenie plikow, o czym jest projekt, jakie dokumenty zawiera, przeglad zbioru), a pasaze tego nie pokrywaja, odpowiedz {\"enough\": false, \"overview\": true, \"focus\": \"<na czym skupic zbiorcze podsumowanie>\"} — system dolaczy wtedy zbiorcze streszczenie plikow projektu. next_query ma byc samodzielnym zapytaniem wyszukiwarki (nie meta-komentarzem). Nie odpowiadaj na samo pytanie — tylko ocen wystarczalnosc kontekstu."
       },
       "position": { "x": 2880, "y": 0 }
     },
@@ -128,6 +137,13 @@
     },
     {
       "from_node": "accumulate",
+      "to_node": "overview",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "overview",
       "to_node": "graph_facts",
       "from_port": "full",
       "to_port": "in",

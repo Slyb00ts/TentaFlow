@@ -65,6 +65,16 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
             e.kind = "first_token".into();
             e.node_id = node_id;
         }
+        // The content of a step goes to the event log only; a live view of a
+        // run has no use for a prompt-sized body on every node.
+        ProgressEvent::NodeIo { node_id, .. } => {
+            e.kind = "node_io".into();
+            e.node_id = node_id;
+        }
+        ProgressEvent::NodeModel { node_id, .. } => {
+            e.kind = "node_model".into();
+            e.node_id = node_id;
+        }
         ProgressEvent::IterationStarted { node_id, n, max } => {
             e.kind = "iteration_started".into();
             e.node_id = node_id;

@@ -15,6 +15,7 @@
 // i kopiowane do tego katalogu na release build.
 import initWasm, * as wasm from './wasm_glue.js';
 import { requests } from './requests.js';
+import { initWithFallback } from '../wasm-fallback.js';
 
 let _wasm = null;
 let _messageKind = null;
@@ -24,7 +25,7 @@ let _messageKind = null;
  * WSZYSTKIE inne funkcje z tego modulu wymagaja uprzedniego `await codecReady`.
  */
 export const codecReady = (async () => {
-  await initWasm();
+  await initWithFallback(initWasm, new URL('./wasm_glue_asm.js', import.meta.url));
   _wasm = wasm;
   _messageKind = wasm.messageKind();
   return wasm;
@@ -3125,6 +3126,18 @@ export const encode = {
       Number(afterSeq ?? 0),
       Number(limit ?? 0),
     );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::EventsBody(StepIoRequest { runId, seq }) — the content behind one step_io row. */
+  eventsStepIoRequest(correlationId, { runId, seq } = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeEventsStepIoRequest(String(runId ?? ''), Number(seq ?? 0));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

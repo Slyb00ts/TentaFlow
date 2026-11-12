@@ -49,8 +49,17 @@ _Bool tentaflow_mobile_push_camera_h264(const unsigned char* ptr, int len);
 // Swift MLX bridge — typy callbackow i rejestracja
 // =============================================================================
 
-// Callback wolany przez Swift dla kazdego wygenerowanego tokena
-typedef void (*tentaflow_token_callback_t)(const char* token_text, _Bool is_final, void* callback_context);
+// Callback wolany przez Swift dla kazdego wygenerowanego tokena. Sygnatura musi
+// zgadzac sie z TokenCallbackFn w mlx_swift_bridge.rs i z MLXSwiftEngine.swift.
+typedef void (*tentaflow_token_callback_t)(
+    const char* token_text,
+    _Bool is_final,
+    unsigned int prompt_tokens,
+    unsigned int completion_tokens,
+    float prefill_tps,
+    float completion_tps,
+    void* callback_context
+);
 
 // Callback: zaladuj model z podanej sciezki. Zwraca 0=OK, <0=blad
 typedef int (*tentaflow_load_model_fn_t)(const char* model_path, void* context);

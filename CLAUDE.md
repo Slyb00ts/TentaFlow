@@ -866,7 +866,18 @@ PDF text layer via pdfium; scans/images are `skipped` until the vision pipeline 
 `addon_id="ps-<project_id>"` namespace `passages` created AT the project directory
 (`NamespaceManager::get_or_create_at`). Deliberately does NOT use the flow `store` node. Jobs:
 cancel registry + `log_bus` progress + panic guard + semaphore of 2 concurrent ingests. Upload:
-4 MiB chunks, 64 MiB per file.
+the server takes chunks up to 4 MiB and caps neither file size nor file count; the dashboard sends
+512 KiB chunks because a 1 MiB chunk plus its CBOR envelope exceeds the 1 MiB binary-WS frame limit.
+
+**File summaries** (`summary.rs`, table `file_summaries`, migration 7). After a job every ready file
+gets ONE summary (≤ 8192 tokens, alias `rag-llm`) written in the background. Nothing larger than
+`MAP_INPUT_CHARS` (~16k tokens) goes to one model call, so a 32k-context model suffices: a long document
+is cut into windows, each is summarised, the partials are folded level by level, and a document needing
+more than 24 windows is covered by evenly spaced ones (`coverage_pct` says how much). A reply cut off by
+its token cap is retried shorter, never stored. Agent tools `core.project_file_summaries` (list / random /
+by id) and `core.project_digest` (folds many summaries into one text of a requested size); the chat judge
+may answer `{"overview": true}`, which makes `rag_overview` add a digest of up to 40 files to the context.
+Summaries are keyed by file sha256, so a re-ingest of unchanged content keeps them.
 
 **Chat.** System flow `ps-chat` (fixed UUID, `is_system=1`): trigger → project_knowledge →
 conversation_history → llm streaming. Passages are pushed into `context.system_prompts` as

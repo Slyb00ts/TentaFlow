@@ -301,6 +301,7 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     usage: chunk.usage,
                                     perf: chunk.perf,
                                     finish_reason: chunk.finish_reason,
+                                    model: chunk.model,
                                     error: chunk.error,
                                 };
                                 return Some((
@@ -326,6 +327,7 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     usage: chunk.usage,
                                     perf: chunk.perf,
                                     finish_reason: chunk.finish_reason,
+                                    model: chunk.model,
                                     error: chunk.error,
                                 };
                                 return Some((

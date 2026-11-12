@@ -14,12 +14,49 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, NodeInput};
+use crate::flow_engine::envelope::{
+    ChatMessage, ChatMessageContent, ChatRole, FlowEnvelope, NodeInput,
+};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "conversation_history";
 const DEFAULT_MAX_MESSAGES: u32 = 20;
+
+/// Characters a message is counted by when a window budget applies. Parts
+/// (images, audio) carry no text worth budgeting here.
+fn message_chars(m: &ChatMessage) -> usize {
+    match &m.content {
+        ChatMessageContent::Text(t) => t.chars().count(),
+        ChatMessageContent::Parts(_) => 0,
+    }
+}
+
+/// Fits the replayed window into a character budget: a single message above
+/// `per_message` keeps only its head, then the OLDEST messages are dropped until
+/// the sum fits `total`. The count cap alone lets a few long answers (a runaway
+/// 70k-character reply is enough) push the next prompt past the model's context.
+fn fit_history(history: &mut Vec<ChatMessage>, per_message: Option<usize>, total: Option<usize>) {
+    if let Some(cap) = per_message {
+        for m in history.iter_mut() {
+            if let ChatMessageContent::Text(t) = &mut m.content {
+                if t.chars().count() > cap {
+                    let head: String = t.chars().take(cap).collect();
+                    *t = format!("{head} [...]");
+                }
+            }
+        }
+    }
+    if let Some(total) = total {
+        let mut sum: usize = history.iter().map(message_chars).sum();
+        let mut drop = 0;
+        while sum > total && drop < history.len() {
+            sum -= message_chars(&history[drop]);
+            drop += 1;
+        }
+        history.drain(..drop);
+    }
+}
 
 /// Meta key carrying the number of messages replayed from the durable store.
 /// `persist_turn` reads it as the delta boundary: only `messages[base..]` is a
@@ -130,7 +167,21 @@ impl NodeAdapter for ConversationHistoryNodeAdapter {
         // The window is cut by count, so it can open on tool results whose
         // assistant call fell outside it. A result with no call before it is
         // refused by strict backends ("tool message must follow tool_calls").
-        let orphaned = history.iter().take_while(|m| m.role == ChatRole::Tool).count();
+        let config_chars = |key: &str| {
+            node.config
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+        };
+        fit_history(
+            &mut history,
+            config_chars("max_message_chars"),
+            config_chars("max_chars"),
+        );
+        let orphaned = history
+            .iter()
+            .take_while(|m| m.role == ChatRole::Tool)
+            .count();
         history.drain(..orphaned);
         let base_len = history.len();
 
@@ -212,7 +263,10 @@ mod tests {
         let mut envelope = FlowEnvelope::empty();
         let mut ctx = stub_ctx();
         ctx.session_id = Some("run-1".into());
-        assert_eq!(conversation_of(&node, &envelope, &ctx).as_deref(), Some("run-1"));
+        assert_eq!(
+            conversation_of(&node, &envelope, &ctx).as_deref(),
+            Some("run-1")
+        );
         envelope.meta.insert(
             CONVERSATION_META_KEY.into(),
             serde_json::Value::String("code-session:s1".into()),
@@ -321,5 +375,29 @@ mod tests {
             Some(&serde_json::Value::from(0usize))
         );
         assert_eq!(out.payload.as_text(), Some("question"));
+    }
+
+    #[test]
+    fn history_window_fits_a_character_budget() {
+        let msg = |role, text: &str| ChatMessage {
+            role,
+            content: ChatMessageContent::Text(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+        let mut h = vec![
+            msg(ChatRole::User, "old question"),
+            msg(ChatRole::Assistant, &"x".repeat(5000)),
+            msg(ChatRole::User, "new question"),
+        ];
+        fit_history(&mut h, Some(100), Some(120));
+        // The long reply is cut to its head, then the oldest message is dropped.
+        assert_eq!(h.len(), 2);
+        assert!(
+            matches!(&h[0].content, ChatMessageContent::Text(t) if t.ends_with("[...]") && t.len() < 120)
+        );
+        assert!(matches!(&h[1].content, ChatMessageContent::Text(t) if t == "new question"));
     }
 }

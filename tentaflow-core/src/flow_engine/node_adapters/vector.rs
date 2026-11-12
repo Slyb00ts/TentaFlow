@@ -709,7 +709,7 @@ fn hits_to_json(
 }
 
 /// RAG E2.0 — buduje listę cytatów z REALNYCH hitów retrievalu. Każdy cytat to
-/// `{doc_id, chunk_index, text, score}` wyciągnięte z pól wektora (output_fields
+/// `{doc_id, chunk_index, text, score}` (+ `path`/`location`, gdy namespace je ma) wyciągnięte z pól wektora (output_fields
 /// muszą zawierać `doc_id`/`chunk_index`/`text`, jak w query.flow.json). `score`
 /// to faktyczny dystans z backendu. To jedyne źródło prawdy o cytatach — addon
 /// NIE buduje ich osobnym SELECT-em.
@@ -721,20 +721,33 @@ fn citations_from_hits<'a>(
             let mut doc_id = serde_json::Value::Null;
             let mut chunk_index = serde_json::Value::Null;
             let mut text = serde_json::Value::Null;
+            let mut path = None;
+            let mut location = None;
             for f in &h.fields {
                 match f.name.as_str() {
                     "doc_id" => doc_id = field_value_to_json(f.value.clone()),
                     "chunk_index" => chunk_index = field_value_to_json(f.value.clone()),
                     "text" => text = field_value_to_json(f.value.clone()),
+                    "path" => path = Some(field_value_to_json(f.value.clone())),
+                    "location" => location = Some(field_value_to_json(f.value.clone())),
                     _ => {}
                 }
             }
-            serde_json::json!({
+            let mut cite = serde_json::json!({
                 "doc_id": doc_id,
                 "chunk_index": chunk_index,
                 "text": text,
                 "score": h.score,
-            })
+            });
+            // Only namespaces that store them carry the file path and the place
+            // in it; the addon's namespace does not, and a null would read as
+            // "a file named null".
+            for (key, value) in [("path", path), ("location", location)] {
+                if let Some(v) = value.filter(|v| v.as_str().is_some_and(|s| !s.is_empty())) {
+                    cite[key] = v;
+                }
+            }
+            cite
         })
         .collect();
     serde_json::Value::Array(arr)

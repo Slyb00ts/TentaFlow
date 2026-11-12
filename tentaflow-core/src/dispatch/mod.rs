@@ -1849,6 +1849,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::EventsPayload::BrowseResponse(_) => "EventsBrowseResponse",
             tentaflow_protocol::EventsPayload::RunRequest(_) => "EventsRunRequest",
             tentaflow_protocol::EventsPayload::RunResponse(_) => "EventsRunResponse",
+            tentaflow_protocol::EventsPayload::StepIoRequest(_) => "EventsStepIoRequest",
+            tentaflow_protocol::EventsPayload::StepIoResponse(_) => "EventsStepIoResponse",
         },
         MessageBody::ModelConversionBody(p) => match p {
             tentaflow_protocol::ModelConversionPayload::StartRequest(_) => {
