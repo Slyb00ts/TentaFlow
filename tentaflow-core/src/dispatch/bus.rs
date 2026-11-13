@@ -4045,6 +4045,7 @@ async fn field_policy_preview(
                 .map_err(map_bus_error)?;
             rec.payload = preview.payload;
             rec.schema_id = preview.schema_id;
+            let caller_withheld = preview.caller_withheld;
             let applied = preview
                 .fields
                 .into_iter()
@@ -4053,11 +4054,15 @@ async fn field_policy_preview(
                     action: if is_shown { "show" } else { "hide" }.to_string(),
                 })
                 .collect::<Vec<_>>();
-            let limited_by_caller = match (&caller_visible, &subject_visible) {
-                (None, _) => false,
-                (Some(_), None) => true,
-                (Some(caller), Some(subject)) => !subject.is_subset(caller),
-            };
+            // Also true when subject and caller see the same fields: the fields
+            // the caller's own rule withholds are not listed, so the summary
+            // must not claim the rules changed nothing.
+            let limited_by_caller = caller_withheld
+                || match (&caller_visible, &subject_visible) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(caller), Some(subject)) => !subject.is_subset(caller),
+                };
             return Ok((record_to_preview(&rec), applied, limited_by_caller, false));
         }
         let format = bus::payload_format::PayloadFormat::from_content_type(&cfg.content_type);
@@ -12454,6 +12459,29 @@ mod tests {
             ],
             "`c` is hidden from the caller itself: the record is not said to set it"
         );
+    }
+
+    #[tokio::test]
+    async fn field_policy_binary_preview_as_the_caller_itself_still_reports_the_limit() {
+        let (_guard, db) = bus_fixture();
+        let f = binary_fixture(&db).await;
+        let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
+        seed_user(&db, &caller, "Admin");
+        seed_org_member(&db, &f.org_id, &caller);
+        let answer = field_policy_preview_v1(
+            &f.ctx, fixture_instance_id().as_str(), f.topic.clone(), 0, 0, "user".to_string(), caller,
+        )
+        .await
+        .unwrap();
+        let BusPayload::FieldPolicyPreviewResponse { record, applied, limited_by_caller, .. } = answer
+        else {
+            panic!("unexpected response");
+        };
+        // The caller's rule shows a and b: the record is shorter by c, which
+        // is neither listed nor changed by the subject's (identical) rule.
+        assert_eq!(record.payload_preview, [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat());
+        assert!(applied.iter().all(|a| a.field != "c"));
+        assert!(limited_by_caller, "the shorter record is the caller's own rule at work");
     }
 
     #[tokio::test]

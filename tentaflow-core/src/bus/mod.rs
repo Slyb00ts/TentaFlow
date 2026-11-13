@@ -1927,6 +1927,10 @@ pub struct BinaryPreview {
     pub schema_id: u32,
     /// The fields the record sets, with whether the preview shows each.
     pub fields: Vec<(String, bool)>,
+    /// The record sets a field the CALLER's own read rule withholds, so
+    /// `fields` leaves it out. Independent of the subject's rule: it holds
+    /// even when subject and caller see exactly the same fields.
+    pub caller_withheld: bool,
 }
 
 /// `BusService::schema_for_reader`'s answer.
@@ -4867,6 +4871,7 @@ impl BusService {
             payload: Bytes::new(),
             schema_id: 0,
             fields: Vec::new(),
+            caller_withheld: false,
         };
         let Some(version) =
             self.binary_projector
@@ -4896,11 +4901,16 @@ impl BusService {
         };
         // A field the CALLER may not see is not listed either, not even as one
         // the preview hides: its name would tell the record sets it.
+        let present: Vec<String> = present
+            .into_iter()
+            .filter(|name| version.declared.contains(name))
+            .collect();
+        let caller_withheld = present
+            .iter()
+            .any(|name| !caller_visible.is_none_or(|c| c.contains(name)));
         let fields = present
             .into_iter()
-            .filter(|name| {
-                version.declared.contains(name) && caller_visible.is_none_or(|c| c.contains(name))
-            })
+            .filter(|name| caller_visible.is_none_or(|c| c.contains(name)))
             .map(|name| {
                 let is_shown = shown(&name);
                 (name, is_shown)
@@ -4911,6 +4921,7 @@ impl BusService {
                 payload: raw.payload,
                 schema_id: raw.schema_id,
                 fields,
+                caller_withheld,
             });
         }
         let read = binary_projection::BinaryRead::new(
@@ -4923,6 +4934,7 @@ impl BusService {
             payload,
             schema_id,
             fields,
+            caller_withheld,
         })
     }
 
@@ -6146,7 +6158,31 @@ impl BusService {
                 };
                 let dlq_topic = dlq::dlq_topic_name(topic);
                 let violation_count = violations.len();
-                let dlq_result = self.ensure_dlq_topic(ctx, topic, &cfg).and_then(|_| {
+                // `ensure_dlq_topic` only PROPOSES the DLQ partitions'
+                // assignments; the coordinator applies them asynchronously.
+                // On a fresh topic the first quarantine write would meet
+                // `NotLeader (leader_node_id=None)` and the record be lost,
+                // so wait (bounded) for the assignments first. A DLQ
+                // partition still unassigned after the wait fails the
+                // publish — the caller retries, nothing is dropped. Any
+                // other DLQ failure (a partition another node leads, too few
+                // replicas, ...) keeps the non-fatal drop below, or every
+                // batch with an invalid record would fail for good.
+                let dlq_cfg = self.ensure_dlq_topic(ctx, topic, &cfg);
+                if let Ok(dlq_cfg) = &dlq_cfg {
+                    if let Err(e) = self.await_dlq_placement(&ctx.org_id, dlq_cfg) {
+                        self.schema_dlq_write_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                            violation_count, error = %e,
+                            "the DLQ has no partition assignment; failing the \
+                             publish instead of dropping the schema-violating records"
+                        );
+                        return Err(e);
+                    }
+                }
+                let dlq_result = dlq_cfg.and_then(|_| {
                     self.publish_dead_letter(
                         &quarantine_ctx,
                         &dlq_topic,
@@ -7822,6 +7858,45 @@ impl BusService {
     }
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
+
+    /// Waits, up to `DLQ_PLACEMENT_WAIT`, until every partition of the DLQ
+    /// topic has an assignment this node has applied. Only the "no
+    /// assignment yet" state is waited out: a partition another node leads
+    /// (or one without enough ISR) is not going to change within the wait.
+    /// Returns the `NotLeader` error `publish` would have produced when a
+    /// partition is still unassigned at the deadline; the only DLQ state
+    /// that fails the publish itself.
+    fn await_dlq_placement(
+        &self,
+        org_id: &str,
+        dlq_cfg: &topics::TopicConfig,
+    ) -> Result<(), BusServiceError> {
+        const DLQ_PLACEMENT_WAIT: Duration = Duration::from_secs(2);
+        const DLQ_PLACEMENT_POLL: Duration = Duration::from_millis(10);
+        let Some(coordinator) = self.replication() else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + DLQ_PLACEMENT_WAIT;
+        for partition in 0..dlq_cfg.partitions {
+            loop {
+                let role = coordinator.role(org_id, &dlq_cfg.name, partition);
+                let unassigned = matches!(
+                    role,
+                    PartitionRole::Unavailable {
+                        reason: UnavailableReason::NoAssignment
+                    }
+                );
+                if !unassigned {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(role_not_leader_error(role));
+                }
+                std::thread::sleep(DLQ_PLACEMENT_POLL);
+            }
+        }
+        Ok(())
+    }
 
     fn ensure_dlq_topic(
         &self,
@@ -20296,6 +20371,162 @@ mod tests {
         assert_eq!(batch.records[0].payload.as_ref(), br#"{"id":"ok-1"}"#);
     }
 
+    /// A fresh `validation = dlq` topic: `__dlq.<topic>` is created by the
+    /// first violation and its partitions get their assignment applied a
+    /// moment later. The first invalid record must wait for that, not be
+    /// dropped with `NotLeader (leader_node_id=None)`.
+    fn fresh_dlq_topic_with_unplaced_dlq(
+        svc: &BusService,
+        ctx: &BusCallContext,
+    ) -> (Arc<FakeCoordinator>, String) {
+        register_schema(svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source_cfg = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.events")
+            .unwrap()
+            .unwrap();
+        let dlq_topic = dlq::dlq_topic_name("orders.events");
+        svc.ensure_dlq_topic(ctx, "orders.events", &source_cfg)
+            .unwrap();
+        let system_ctx = BusCallContext {
+            actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
+            ..ctx.clone()
+        };
+        open_leader_writes(svc, &system_ctx, &dlq_topic, 0);
+        let coord = FakeCoordinator::leader(1);
+        coord.topic_roles.lock().insert(
+            dlq_topic.clone(),
+            PartitionRole::Unavailable {
+                reason: UnavailableReason::NoAssignment,
+            },
+        );
+        svc.set_replication(coord.clone());
+        open_leader_writes(svc, ctx, "orders.events", 0);
+        (coord, dlq_topic)
+    }
+
+    #[test]
+    fn the_first_invalid_record_of_a_fresh_topic_waits_for_the_dlq_leader_and_is_quarantined() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let placed = Arc::clone(&coord);
+        let dlq_for_thread = dlq_topic.clone();
+        let placer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            placed.topic_roles.lock().insert(
+                dlq_for_thread,
+                PartitionRole::Leader { epoch: 1 },
+            );
+        });
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"status":"missing-required-id"}"#)],
+                },
+            )
+            .unwrap();
+        placer.join().unwrap();
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(result.schema_dropped, 0);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 0);
+        assert_eq!(
+            svc.partition_stats(&ctx, &dlq_topic, 0)
+                .unwrap()
+                .high_watermark,
+            1,
+            "the record is in the DLQ"
+        );
+    }
+
+    #[test]
+    fn an_invalid_record_whose_dlq_never_gets_a_leader_fails_the_publish_instead_of_being_dropped() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (_coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let started = Instant::now();
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the wait is bounded");
+        assert_eq!(svc.schema_dlq_write_failures_total(), 1);
+        assert_eq!(
+            svc.partition_stats(&ctx, &dlq_topic, 0)
+                .unwrap()
+                .high_watermark,
+            0
+        );
+        assert_eq!(
+            svc.partition_stats(&ctx, "orders.events", 0)
+                .unwrap()
+                .high_watermark,
+            0,
+            "the valid record is not published either: the caller retries the whole batch"
+        );
+    }
+
+    #[test]
+    fn a_dlq_led_by_another_node_still_drops_the_violation_without_failing_the_publish() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let led_by_b = PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 1,
+        };
+        for partition in 0..8 {
+            coord
+                .topic_partition_roles
+                .lock()
+                .insert((dlq_topic.clone(), partition), led_by_b.clone());
+        }
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.schema_rejected, 0);
+        assert_eq!(result.schema_dropped, 1);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 1);
+    }
+
     #[test]
     fn publish_stamps_schema_ref_id_only_on_a_validated_record() {
         let (_tmp, svc) = test_service();
@@ -24064,6 +24295,17 @@ mod tests {
                 let mut fields = preview.fields.clone();
                 fields.sort();
                 assert_eq!(fields, shown);
+                assert!(preview.caller_withheld, "the caller does not see `b`");
+                // Subject and caller see the same fields: nothing differs
+                // between them, yet the caller's own rule still withholds `b`.
+                let same = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&caller), Some(&caller))
+                    .unwrap();
+                assert!(same.caller_withheld, "{:?}", case.kind);
+                let open_caller = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&subject), None)
+                    .unwrap();
+                assert!(!open_caller.caller_withheld, "{:?}", case.kind);
                 // No rule at all: the record as it is.
                 let open = svc
                     .preview_binary_record(&ctx, "bytes.topic", 0, 0, None, None)
