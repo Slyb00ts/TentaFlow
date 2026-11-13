@@ -519,6 +519,7 @@ mod tests {
                     flow_id: None,
                     service_type: Some("llm".into()),
                     modality: Some("text".into()),
+                    bus_source: None,
                 },
             )
             .with_org(DEFAULT_ORG_ID),

@@ -121,6 +121,19 @@ impl EventKind {
     }
 }
 
+/// Coordinates of the bus record that triggered a run: where to find it in the
+/// TentaBus preview. Coordinates only, never the record's content (TB-02.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusRecordRef {
+    /// The TentaBus instance the record lives on: a coordinate like the rest,
+    /// needed to open the right preview when several instances are enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    pub topic: String,
+    pub partition: u32,
+    pub offset: u64,
+}
+
 /// Body of one timeline entry, stored as `payload_json`.
 ///
 /// Internally tagged with the same `kind` spelling as the column: the row stays
@@ -140,6 +153,10 @@ pub enum EventPayload {
         flow_id: Option<String>,
         service_type: Option<String>,
         modality: Option<String>,
+        /// The record that triggered a bus-origin run. Absent for every other
+        /// origin and for a reactor batch (no single triggering record).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bus_source: Option<BusRecordRef>,
     },
     /// First NON-EMPTY delta of a streaming node (§2.6). Carries no body: its
     /// whole content is the instant it happened, and `at_ms` already holds it.
@@ -897,12 +914,42 @@ mod tests {
         .expect("the assistant message reached the log")
     }
 
+    /// A `request_started` row written before `bus_source` existed still reads
+    /// back, and the field survives a round trip when present.
+    #[test]
+    fn request_started_json_reads_with_and_without_the_bus_source() {
+        let legacy = r#"{"kind":"request_started","model":null,"flow_id":"f","service_type":null,"modality":null}"#;
+        match serde_json::from_str::<EventPayload>(legacy).expect("legacy row") {
+            EventPayload::RequestStarted { bus_source, .. } => assert!(bus_source.is_none()),
+            other => panic!("unexpected payload {other:?}"),
+        }
+        let with = EventPayload::RequestStarted {
+            model: None,
+            flow_id: None,
+            service_type: None,
+            modality: None,
+            bus_source: Some(BusRecordRef {
+                instance_id: None,
+                topic: "t".into(),
+                partition: 1,
+                offset: 9,
+            }),
+        };
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(!json.contains("instance_id"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<EventPayload>(&json).expect("read back"),
+            with
+        );
+    }
+
     fn request_started() -> EventPayload {
         EventPayload::RequestStarted {
             model: Some("qwen3".into()),
             flow_id: None,
             service_type: Some("llm".into()),
             modality: Some("text".into()),
+            bus_source: None,
         }
     }
 

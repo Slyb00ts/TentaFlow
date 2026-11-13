@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRoute, routeParams, MAIN_TABS, DEFAULT_TAB, TOPIC_SECTIONS, DEFAULT_SECTION, CONSUMER_SECTIONS } from './routes.js';
+import { parseRoute, routeParams, carriedParams, MAIN_TABS, DEFAULT_TAB, TOPIC_SECTIONS, DEFAULT_SECTION, CONSUMER_SECTIONS } from './routes.js';
 
 test('the six main tabs, overview first and default', () => {
   assert.deepEqual(MAIN_TABS, ['overview', 'topics', 'groups', 'dlq', 'schemas', 'replication']);
@@ -73,4 +73,30 @@ test('a message pattern opens under Wzory wiadomości; a topic or a consumer win
   assert.deepEqual(routeParams({ instance: 'i', tab: 'schemas', subject: 'wizyta' }), { instance: 'i', tab: 'schemas', subject: 'wizyta' });
   assert.equal(parseRoute({ topic: 'wizyty', subject: 'wizyta' }).subject, null);
   assert.equal(parseRoute({ group: 'app', gtopic: 'wizyty', subject: 'wizyta' }).subject, null);
+});
+
+test('the Events deep link into a message preview: corr, partition and offset under a topic', () => {
+  const route = parseRoute({ topic: 'zgloszenia.nowe', corr: 'req-42', partition: '2', offset: '18402' });
+  assert.equal(route.topic, 'zgloszenia.nowe');
+  assert.equal(route.corr, 'req-42');
+  assert.equal(route.partition, 2);
+  assert.equal(route.offset, 18402);
+  assert.equal(parseRoute({ topic: 't', partition: '0', offset: '0' }).offset, 0, 'number 0 is a real place');
+});
+
+test('the preview params are dropped when malformed or not under a topic, and never written back', () => {
+  const bad = parseRoute({ topic: 't', corr: '  ', partition: '-1', offset: '1.5' });
+  assert.equal('corr' in bad, false);
+  assert.equal('partition' in bad, false);
+  assert.equal('offset' in bad, false);
+  const stray = parseRoute({ tab: 'groups', corr: 'x', partition: '1', offset: '2' });
+  assert.equal('corr' in stray, false);
+  assert.equal('offset' in stray, false);
+  assert.deepEqual(routeParams({ instance: 'i', topic: 't' }), { instance: 'i', tab: 'topics', topic: 't' });
+});
+
+test('choosing an instance keeps the topic and the preview deep link', () => {
+  const route = parseRoute({ topic: 't', corr: 'c', partition: '1', offset: '7', section: 'settings' });
+  assert.deepEqual(carriedParams(route), { topic: 't', corr: 'c', partition: 1, offset: 7 });
+  assert.deepEqual(carriedParams(parseRoute({ tab: 'dlq' })), {});
 });

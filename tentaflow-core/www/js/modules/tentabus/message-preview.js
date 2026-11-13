@@ -6,12 +6,18 @@
 // being written now. Every read is written to the audit log by the server
 // and shows what the data-hiding rules let this reader see — the banner says
 // both. Nothing here consumes: the topic's consumers keep their own place.
+//
+// A correlation id typed into the filter narrows the read to the messages
+// stamped with it. The server looks through a bounded stretch of the partition
+// per request, so a page can be empty before the partition ends: the window
+// then says how far the search got and offers to go on from the next number.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { bytesToPreviewText, headerText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
 import { payloadHtml } from '/js/modules/tentabus/payload-view.js';
 import { recordSchemaHtml, wireRecordSchema } from '/js/modules/tentabus/record-schema.js';
+import { shortCorrelation, normalizeCorrelation, eventsCorrelationHref } from '/js/lib/correlation.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -24,6 +30,14 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 
 export const PREVIEW_PAGE = 50;
 const PAYLOAD_PREVIEW_BYTES = 4096;
+
+/** The "Korelacja" cell: the id shortened, in mono, the whole id in its title; a dash for a message without one. */
+function correlationCell(record) {
+  const id = headerText(record.headers, 'tf.correlation_id');
+  return id
+    ? `<span class="tf-table__cell--mono" title="${escapeAttr(id)}">${escapeHtml(shortCorrelation(id))}</span>`
+    : '—';
+}
 
 const highWatermark = (p) => Number(p?.highWatermark ?? p?.logEndOffset) || 0;
 const earliest = (p) => Number(p?.earliestOffset) || 0;
@@ -50,11 +64,30 @@ export function previewStart(partition, pageSize = PREVIEW_PAGE) {
   return Math.max(earliest(partition), highWatermark(partition) - pageSize);
 }
 
-/** The browse request for one partition, from `fromOffset` (the oldest kept message when `null`). */
-export function buildBrowseRequest(instanceId, topic, partition, fromOffset, limit = PREVIEW_PAGE) {
+/**
+ * The browse request for one partition, from `fromOffset` (the oldest kept
+ * message when `null`), keeping only the messages stamped with
+ * `correlationId` when one is given.
+ */
+export function buildBrowseRequest(instanceId, topic, partition, fromOffset, limit = PREVIEW_PAGE, correlationId = null) {
   const req = { instanceId, topic, partition: Number(partition), limit };
   if (fromOffset != null) req.fromOffsets = [{ partition: Number(partition), offset: Number(fromOffset) }];
+  if (correlationId) req.correlationId = correlationId;
   return req;
+}
+
+/** The number the search of a filtered read reached: the last message it looked at. */
+export function scannedUpTo(info) {
+  return Math.max(0, (Number(info?.nextOffset) || 0) - 1);
+}
+
+/**
+ * Whether a filtered read stopped because the server's search budget ran out
+ * before it found a match: nothing came back, yet the partition has more.
+ * This is not "no results" — the rest of the partition was never searched.
+ */
+export function searchRanOut({ correlation, records, info }) {
+  return Boolean(correlation) && records.length === 0 && Boolean(info?.hasMore);
 }
 
 /** "od 30 433 233 do 72 405 459", or that the partition keeps nothing. */
@@ -68,8 +101,9 @@ export function rangeText(partition) {
 }
 
 /** The line under the list: its order, and whether more follows or which number comes next. */
-export function pageNote(info) {
+export function pageNote(info, matches = null) {
   if (!info) return T('topics.preview.order');
+  if (matches != null) return T('topics.preview.filtered_note', { count: fmtCount(matches), number: fmtCount(scannedUpTo(info)) });
   if (info.hasMore) return `${T('topics.preview.order')} ${T('topics.preview.more_after', { number: fmtCount(info.nextOffset) })}`;
   return `${T('topics.preview.order')} ${T('topics.preview.next_number', { number: fmtCount(highWatermark(info)) })}`;
 }
@@ -78,10 +112,11 @@ export function pageNote(info) {
  * Opens the window. `browse(request)` sends one `MessagesBrowseRequest`;
  * `loadPartitions()` resolves the topic's partitions with their oldest kept
  * message and next number (may reject: the window then starts at the oldest
- * message of partition 0); `describeError(err)` words a failure;
+ * message of partition 0); `initial` (optional) = `{ correlation, partition, from }` opens the window on a
+ * given place and filter (the deep link from Events); `describeError(err)` words a failure;
  * `loadRecordSchema(topic, schemaRefId)` (optional) answers the schema a binary record was encoded under; `binaryTopic` = the topic is checked with a binary pattern.
  */
-export function openMessagePreview({ instanceId, topic, partitionCount, browse, loadPartitions, loadRecordSchema = null, binaryTopic = false, describeError = (e) => String(e?.message || e) }) {
+export function openMessagePreview({ instanceId, topic, partitionCount, browse, loadPartitions, loadRecordSchema = null, binaryTopic = false, initial = null, describeError = (e) => String(e?.message || e) }) {
   const state = {
     partition: 0,
     from: null,
@@ -95,8 +130,21 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     // Set once the reader picks a partition or a start number: the topic's
     // partition list arriving later must not move them elsewhere.
     chosen: false,
+    // Opened by a deep link: the first read waits for the partition list so a number
+    // the topic no longer keeps can be moved to the oldest one kept.
+    deepLink: false,
+    // A short line about what the window changed on its own (a start number moved).
+    notice: '',
+    // The correlation id the list is narrowed to, or `null`.
+    correlation: normalizeCorrelation(initial?.correlation),
   };
-  const count = Math.max(1, Number(partitionCount) || 1);
+  if (Number.isInteger(initial?.partition) || Number.isInteger(initial?.from)) {
+    state.chosen = true;
+    state.deepLink = true;
+    state.partition = Number.isInteger(initial.partition) ? initial.partition : 0;
+    state.from = Number.isInteger(initial.from) ? initial.from : null;
+  }
+  let count = Math.max(1, Number(partitionCount) || 1, state.partition + 1);
 
   const win = document.createElement('tf-window');
   win.className = 'tb-window tb-preview-window';
@@ -115,6 +163,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       <div class="tb-preview-controls">
         <tf-select data-role="partition" label="${escapeAttr(T('topics.preview.partition_label'))}"></tf-select>
         <tf-input data-role="from" type="number" inputmode="numeric" min="0" label="${escapeAttr(T('topics.preview.from_label'))}" placeholder="${escapeAttr(T('topics.preview.from_placeholder'))}"></tf-input>
+        <tf-input data-role="corr" class="tb-corr-input" label="${escapeAttr(T('topics.preview.corr_label'))}" placeholder="${escapeAttr(T('topics.preview.corr_placeholder'))}"></tf-input>
         <div class="tb-preview-range"><div class="k">${escapeHtml(T('topics.preview.range_label'))}</div><div class="v" data-role="range">—</div></div>
       </div>
       <div data-role="list"></div>
@@ -124,6 +173,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
 
   const partitionSelect = win.querySelector('[data-role="partition"]');
   const fromInput = win.querySelector('[data-role="from"]');
+  const corrInput = win.querySelector('[data-role="corr"]');
 
   const listHost = win.querySelector('[data-role="list"]');
   listHost.innerHTML = `
@@ -132,6 +182,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
         <tf-column key="partition" label="${escapeAttr(T('topics.preview.col_partition'))}" priority="low"></tf-column>
         <tf-column key="offset" label="${escapeAttr(T('topics.preview.col_number'))}" renderer="num"></tf-column>
         <tf-column key="when" label="${escapeAttr(T('topics.preview.col_when'))}"></tf-column>
+        <tf-column key="correlation" label="${escapeAttr(T('topics.preview.col_correlation'))}" renderer="html" priority="low"></tf-column>
         <tf-column key="key" label="${escapeAttr(T('topics.preview.col_key'))}" renderer="html" fill></tf-column>
       </tf-table>
     </div>
@@ -150,11 +201,13 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     if (!r) { host.innerHTML = ''; return; }
     const blob = r.isBlobRef ? parseBlobRefJson(r.payloadPreview) : null;
     const origin = headerText(r.headers, 'tf.origin');
+    const correlation = headerText(r.headers, 'tf.correlation_id');
     const newest = state.selected === state.records.length - 1 && !state.info?.hasMore;
     const title = T(`topics.preview.${newest ? 'record_title_newest' : 'record_title'}`, { number: fmtCount(r.offset), partition: fmtCount(r.partition), when: fmtWhen(r.timestampMs) });
     const chips = [
       r.truncated ? `<tf-chip size="sm" variant="outline" status="warn" label="${escapeAttr(T('topics.preview.truncated'))}"></tf-chip>` : '',
       origin ? `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(T('topics.preview.origin', { origin }))}"></tf-chip>` : '',
+      correlation ? `<a class="tb-corr-link" data-role="corr-link" href="${escapeAttr(eventsCorrelationHref(correlation))}" title="${escapeAttr(correlation)}">${escapeHtml(T('topics.preview.corr_link', { id: shortCorrelation(correlation) }))}</a>` : '',
     ].join('');
     host.innerHTML = `
       <div class="tb-preview-record">
@@ -164,6 +217,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
           : payloadHtml(r.payloadPreview, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('topics.preview.payload_empty'), truncated: Boolean(r.truncated) })}
         ${loadRecordSchema ? recordSchemaHtml(r, { empty: !r.payloadPreview?.length, binary: binaryTopic }) : ''}
       </div>`;
+    host.querySelector('[data-role="corr-link"]')?.addEventListener('click', () => win.close(true));
   };
 
   const paint = () => {
@@ -176,6 +230,10 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       stateEl.innerHTML = `<tf-spinner size="sm"></tf-spinner>${escapeHtml(T('shell.loading'))}`;
     } else if (state.error) {
       stateEl.innerHTML = `${sprite('alert')}<span>${escapeHtml(state.error)}</span>`;
+    } else if (searchRanOut(state)) {
+      stateEl.innerHTML = `<span>${escapeHtml(T('topics.preview.scanned', { number: fmtCount(scannedUpTo(state.info)) }))}</span><tf-button variant="secondary" size="sm" data-role="scan-on">${escapeHtml(T('topics.preview.scan_on', { number: fmtCount(state.info.nextOffset) }))}</tf-button>`;
+    } else if (!state.records.length && state.correlation) {
+      stateEl.textContent = T('topics.preview.empty_corr', { number: fmtCount(state.from ?? earliest(known)) });
     } else if (!state.records.length) {
       stateEl.textContent = state.from != null ? T('topics.preview.empty_from', { number: fmtCount(state.from) }) : T('topics.preview.empty');
     } else {
@@ -187,12 +245,13 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       partition: T('topics.preview.partition_n', { n: r.partition }),
       offset: fmtCount(r.offset),
       when: fmtWhen(r.timestampMs),
+      correlation: correlationCell(r),
       key: r.key?.length ? `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(bytesToPreviewText(r.key, 64))}</span></span>` : '—',
       _offset: r.offset,
       _class: i === state.selected ? 'selected' : '',
     }));
-    note.textContent = state.records.length ? pageNote(state.info) : '';
-    more.hidden = !(state.info?.hasMore) || state.loading;
+    note.textContent = [state.notice, state.records.length ? pageNote(state.info, state.correlation ? state.records.length : null) : ''].filter(Boolean).join(' ');
+    more.hidden = !(state.info?.hasMore) || state.loading || searchRanOut(state);
     paintDetail();
   };
 
@@ -203,8 +262,10 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     if (!append) { state.records = []; state.info = null; state.selected = -1; }
     paint();
     const fromOffset = append ? state.info?.nextOffset : state.from;
+    const firstDeepRead = state.deepLink;
+    state.deepLink = false;
     try {
-      const resp = await browse(buildBrowseRequest(instanceId, topic, state.partition, fromOffset));
+      const resp = await browse(buildBrowseRequest(instanceId, topic, state.partition, fromOffset, PREVIEW_PAGE, state.correlation));
       if (gen !== state.generation) return;
       const records = (resp?.records || []).filter((r) => Number(r.partition) === state.partition);
       // A reader still on the newest message follows it to the newest loaded one.
@@ -216,6 +277,13 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       if (!append || onNewest) state.selected = state.records.length - 1;
     } catch (err) {
       if (gen !== state.generation) return;
+      // A number the topic no longer keeps (retention) is refused: read from the oldest message instead.
+      if (firstDeepRead && !append && state.from != null) {
+        state.from = null;
+        state.notice = T('topics.preview.from_moved');
+        fromInput.value = '';
+        return load(false);
+      }
       state.error = describeError(err);
     }
     state.loading = false;
@@ -229,9 +297,10 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
 
   const partitionOptions = () => Array.from({ length: count }, (_, i) => ({ value: String(i), label: T('topics.preview.partition_n', { n: i }) }));
 
-  partitionSelect.setOptions(partitionOptions(), '0');
+  partitionSelect.setOptions(partitionOptions(), String(state.partition));
   partitionSelect.addEventListener('change', (e) => {
     state.chosen = true;
+    state.notice = '';
     state.partition = Number(e.detail.value) || 0;
     state.from = previewStart(state.known.get(state.partition));
     fromInput.value = state.from == null ? '' : String(state.from);
@@ -243,14 +312,33 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     if (raw !== '' && !Number.isFinite(n)) return;
     if (n === state.from) return;
     state.chosen = true;
+    state.notice = '';
     state.from = n;
     load(false);
   };
+  const applyCorrelation = () => {
+    const next = normalizeCorrelation(corrInput.value);
+    if (next === state.correlation) return;
+    state.chosen = true;
+    state.correlation = next;
+    load(false);
+  };
+  corrInput.addEventListener('change', applyCorrelation);
+  corrInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyCorrelation(); });
+  // The search budget ran out: go on from the number after the last one looked at.
+  listHost.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-role="scan-on"]') || !state.info) return;
+    state.from = state.info.nextOffset;
+    fromInput.value = String(state.from);
+    load(false);
+  });
   fromInput.addEventListener('change', applyFrom);
   fromInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyFrom(); });
   listHost.querySelector('[data-role="more"]').addEventListener('click', () => load(true));
   win.addEventListener('action', (e) => { if (e.detail?.action === 'close-preview') win.close(true); });
 
+  fromInput.value = state.from == null ? '' : String(state.from);
+  corrInput.value = state.correlation ?? '';
   document.body.appendChild(win);
   paint();
   Promise.resolve()
@@ -258,8 +346,24 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     .then((parts) => {
       for (const p of parts || []) state.known.set(Number(p.partition), p);
       if (!state.chosen) state.partition = pickPartition(parts);
+      // The topic's own partition list is the truth: a deep link may have named a partition beyond the count it was opened with.
+      const listed = (parts || []).reduce((most, p) => Math.max(most, Number(p.partition) + 1), 0);
+      const wanted = Math.max(count, (parts || []).length, listed);
+      if (wanted !== count) {
+        count = wanted;
+        partitionSelect.setOptions(partitionOptions(), String(state.partition));
+      }
     }, () => {})
     .then(() => {
+      if (state.deepLink) {
+        const kept = earliest(state.known.get(state.partition));
+        if (state.from != null && state.from < kept) {
+          state.from = kept;
+          state.notice = T('topics.preview.from_moved');
+          fromInput.value = String(kept);
+        }
+        return load(false);
+      }
       // The reader's own choice already loaded its page; only the range
       // line learns what the list said about that partition.
       if (state.chosen) { paint(); return undefined; }

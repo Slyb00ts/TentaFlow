@@ -766,6 +766,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Zwykłe `events.read` nadal widzi własne przebiegi, także bez organizacji. Przebiegi
   z magistrali nie zapisują treści kroków (`step_io`) ani lustra audytu w outboxie;
   zostają oś czasu i czasy kroków.
+- Korelacja w interfejsie (TB-02.4): Zdarzenia mają widoczne pole „Korelacja” (to samo
+  filtrowanie co `?correlation=`) i sekcję korelacji w szczegółach przebiegu (kopiowanie,
+  współrzędne wiadomości z magistrali z linkiem „Otwórz w TentaBus”, „Pokaż wszystko z tą
+  korelacją”). Podgląd wiadomości TentaBus ma kolumnę „Korelacja”, filtr szukający od
+  numeru „Od numeru”, link do Zdarzeń w szczegółach wiadomości, a gdy budżet przeszukania
+  się wyczerpie — „Przeszukano do numeru N” i „Szukaj dalej od N+1” zamiast „brak wyników”.
+  Adres `#/tentabus?topic=…&corr=…&partition=…&offset=…` otwiera podgląd na rekordzie.
+  Historia wykonań przepływu ma kolumnę „Korelacja” i link „Oś czasu →”. Zdarzenie
+  rozpoczynające przebieg z magistrali zapisuje `bus_source` (instancja, topik, partycja i numer
+  rekordu, bez treści).
 - Dashboard: ukrywanie danych na tematach z wzorem **Avro, Protobuf albo Thrift**
   (F4 B6 UI). Blokada „treść binarna” zostaje tylko dla tematu bez wzoru, z wycofanym
   wzorem, z nieczytelną listą pól albo na starszym serwerze (`binaryFieldActions`

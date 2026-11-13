@@ -236,6 +236,7 @@ mod tests {
             flow_id: None,
             service_type: Some("llm".into()),
             modality: Some("text".into()),
+            bus_source: None,
         }
     }
 

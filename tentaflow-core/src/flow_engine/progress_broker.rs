@@ -86,6 +86,8 @@ pub struct RunProvenance {
     pub org_id: Option<String>,
     pub correlation_id: Option<String>,
     pub session_id: Option<String>,
+    /// The bus record that triggered the run, for a `FlowOrigin::Bus` run.
+    pub bus_source: Option<crate::events::store::BusRecordRef>,
     /// WHAT the run executes, the other half of the accountability question
     /// (§2.8: "which actor, from which origin, against which model"). Minted by
     /// the dispatcher at the same instant as this binding — see
@@ -162,6 +164,7 @@ impl RunProvenance {
             org_id: meta.org_id.clone(),
             correlation_id: meta.correlation_id.clone(),
             session_id: meta.session_id.clone(),
+            bus_source: meta.bus_source.clone(),
             descriptor,
         }
     }

@@ -28,7 +28,9 @@ use bytes::Bytes;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use tentaflow_core::agents::{reactive_run_meta, AgentPrincipal, ReactorFlowDispatch};
+use tentaflow_core::agents::{
+    bus_source_of, reactive_run_meta, AgentPrincipal, ReactorFlowDispatch,
+};
 use tentaflow_core::bus::{
     self, groups::CommitMode, topics, BusAction, BusCallContext, BusInitConfig, BusService,
     BusServiceError, ConsumerConfig, PublishBatch, PublishRecord,
@@ -210,7 +212,8 @@ impl ReactorFlowDispatch for RelayDispatch {
             .get(&flow_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown flow {flow_id}"))?;
-        let meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
+        let mut meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
+        meta.bus_source = bus_source_of(&initial, &principal);
         begin_run(&meta, RunDescriptor::default().with_flow(&flow_id));
 
         let mut ctx = self.base_ctx.clone();
@@ -400,6 +403,7 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
                 flow_id: None,
                 service_type: None,
                 modality: None,
+                bus_source: None,
             },
         )
         .with_correlation(CORRELATION_ID)
@@ -446,6 +450,22 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     assert_eq!(runs.len(), 2, "exactly the two relay runs: {runs:?}");
+
+    // The opening row of each reactor-triggered run names the record that
+    // started it (instance, topic, partition, offset) and nothing of its content.
+    let mut sources: Vec<(String, u32, u64)> = Vec::new();
+    for event in browse(ORG_ID).events {
+        if let EventPayload::RequestStarted { bus_source, .. } = event.payload {
+            let source = bus_source.expect("a reactor run records its trigger");
+            assert_eq!(source.instance_id.as_deref(), Some(instance_id().as_str()));
+            sources.push((source.topic, source.partition, source.offset));
+        }
+    }
+    sources.sort();
+    assert_eq!(
+        sources,
+        vec![(TOPIC_A.to_string(), 0, 0), (TOPIC_B.to_string(), 0, 0)]
+    );
     assert!(!runs.iter().any(|r| r == "run-foreign"));
 
     let foreign: Vec<String> = browse(OTHER_ORG_ID)

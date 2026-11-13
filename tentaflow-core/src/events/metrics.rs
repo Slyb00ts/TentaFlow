@@ -441,6 +441,7 @@ mod tests {
                     flow_id: None,
                     service_type: None,
                     modality: None,
+                    bus_source: None,
                 },
             )
             .with_org("org-quiet"),
@@ -531,6 +532,7 @@ mod tests {
             flow_id: None,
             service_type: None,
             modality: None,
+            bus_source: None,
         }
     }
 

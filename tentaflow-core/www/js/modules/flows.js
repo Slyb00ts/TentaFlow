@@ -11,6 +11,7 @@ import {
 import { TfWindow } from '/js/components/tf-window.js';
 import { openFlowBuilder } from '/js/modules/flows-builder.js';
 import { I18n } from '/js/i18n.js';
+import { executionsTableHtml } from '/js/lib/flow-executions.js';
 import { emptyProcessModel, processCommand } from './flows-builder/bpmn.js';
 import { openProcessInstances } from './flows-builder/process-monitor.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
@@ -260,36 +261,12 @@ async function showExecs(flowId) {
         </div>
         ${execs.length === 0 ? `
           <div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('flows.exec_empty'))}</div></div>
-        ` : `
-          <table class="data-table">
-            <thead><tr>
-              <th>${escapeHtml(I18n.t('flows.col_exec_id'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_status'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_exec_start'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_exec_end'))}</th>
-            </tr></thead>
-            <tbody>
-              ${execs.map((e) => `
-                <tr>
-                  <td><code style="font-size:11px;">${escapeHtml(e.id)}</code></td>
-                  <td><tf-chip status="${execStatus(e.status)}">${escapeHtml(e.status)}</tf-chip></td>
-                  <td style="font-size:12px;color:var(--text-3);">${formatDate(e.startedAtEpoch)}</td>
-                  <td style="font-size:12px;color:var(--text-3);">${e.completedAtEpoch ? formatDate(e.completedAtEpoch) : '—'}</td>
-                </tr>`).join('')}
-            </tbody>
-          </table>`}
+        ` : executionsTableHtml(execs)}
       </div>`;
     byId('execs-close')?.addEventListener('click', () => { host.innerHTML = ''; });
   } catch (err) {
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
-}
-
-function execStatus(s) {
-  const v = (s || '').toLowerCase();
-  if (v === 'completed' || v === 'success' || v === 'ok') return 'ok';
-  if (v === 'running' || v === 'pending') return 'info';
-  return 'warn';
 }
 
 export default FlowsScreen;

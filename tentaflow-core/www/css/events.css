@@ -68,6 +68,7 @@
 .ev-bar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
 .ev-bar .tf-select-wrap::after { right: 11px; width: 6px; height: 6px; }
 .ev-bar .tf-searchbox { height: 30px; border-radius: var(--tf-radius-sm); }
+.ev-bar .ev-corr-input { flex: 0 1 300px; min-width: 200px; font-family: var(--ev-mono); }
 /* The actor rows carry the API-key binding, which is the whole reason to open
    this picker; at the toolbar's field width both the name and the binding
    ellipsize away, so the popover keeps its own width and gives the binding a
@@ -197,6 +198,15 @@
   color: var(--tf-text-3); margin: 0 0 7px;
 }
 .ev-sec-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.ev-mono { font-family: var(--ev-mono); }
+.ev-corr-id { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.ev-corr-chip {
+  display: inline-block; max-width: 100%; padding: 3px 10px; font-size: 11.5px;
+  color: var(--tf-text); background: var(--tf-bg-input); border: 1px solid var(--tf-border);
+  border-radius: 999px; overflow-wrap: anywhere;
+}
+.ev-corr-note { font-size: 12px; margin-top: 4px; }
+.ev-link { color: var(--tf-accent, var(--tf-text)); text-decoration: underline; margin-left: 6px; }
 .ev-pre {
   background: var(--tf-bg-input); border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
   padding: 9px 11px; font-family: var(--ev-mono); font-size: 11.5px;

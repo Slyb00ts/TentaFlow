@@ -1933,6 +1933,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             cancel_token: cancel,
             progress_sink: Some(progress),
             flow_depth: 0,
+            bus_source: None,
         };
 
         let outcome = dispatcher

@@ -26,7 +26,7 @@ import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
 import { fmtCount, fmtElapsed, loadErrorKind } from '/js/modules/tentabus/format.js';
-import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
+import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams, carriedParams } from '/js/modules/tentabus/routes.js';
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
@@ -451,7 +451,7 @@ async function resolveInstanceGate(requestedId) {
 // exist) and there is not exactly one to open: the same header card as the
 // screen itself, then one row per instance. The screen's own picker takes
 // over as soon as one is open.
-function renderInstanceGate(instances, unknownRequestedId = null) {
+function renderInstanceGate(instances, unknownRequestedId = null, carried = {}) {
   const root = byId('tb-root');
   if (!root) return;
   const enabled = instances.filter((a) => a.enabled);
@@ -484,7 +484,7 @@ function renderInstanceGate(instances, unknownRequestedId = null) {
     </div>
   `;
   root.querySelector('#tb-instance-goto-apps')?.addEventListener('click', () => Router.navigate('apps-home'));
-  const open = (el) => Router.navigate('tentabus', { instance: el.dataset.instance });
+  const open = (el) => Router.navigate('tentabus', { instance: el.dataset.instance, ...carried });
   root.querySelectorAll('.tb-instance-row').forEach((el) => {
     el.addEventListener('click', () => open(el));
     el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(el); } });
@@ -508,7 +508,7 @@ const TentaBusScreen = {
     if (!target) {
       state.instanceId = null;
       state.instanceLabel = '';
-      renderInstanceGate(instances, unknownRequestedId || null);
+      renderInstanceGate(instances, unknownRequestedId || null, carriedParams(route));
       return;
     }
     state.instanceId = target.addonId;
@@ -527,8 +527,10 @@ const TentaBusScreen = {
     wireShell(root);
 
     renderPanel();
-    if (route.topic) openTopicDetail(route.topic, route.section);
-    else if (route.group && route.groupTopic) openConsumer(route.group, route.groupTopic, route.section);
+    if (route.topic) {
+      openTopicDetail(route.topic, route.section);
+      if (route.corr || route.offset != null) openTopicPreview(route.topic, { correlation: route.corr, partition: route.partition, from: route.offset });
+    } else if (route.group && route.groupTopic) openConsumer(route.group, route.groupTopic, route.section);
     else if (route.subject) openSchema(route.subject);
     loadShellMeta();
     startStatsPolling();
@@ -1153,12 +1155,13 @@ function recordSchemaLoader(instanceId) {
   return async (topic, schemaRefId) => (await busCall('busSchemaForRecordGetRequest', { instanceId, topic, schemaRefId })).schema;
 }
 
-function openTopicPreview(name) {
+function openTopicPreview(name, initial = null) {
   const instanceId = state.instanceId;
   const topic = topicByName(name);
   openMessagePreview({
     loadRecordSchema: recordSchemaLoader(requireInstanceId(instanceId)),
     binaryTopic: topicIsBinary(name),
+    initial,
     instanceId: requireInstanceId(instanceId),
     topic: name,
     partitionCount: topic?.partitions ?? state.detail?.topic?.partitions ?? 1,

@@ -293,6 +293,7 @@ mod tests {
                 flow_id: Some("f-1".into()),
                 service_type: Some("llm".into()),
                 modality: Some("text".into()),
+                bus_source: None,
             },
         )
         .with_correlation("corr-1")
@@ -470,6 +471,7 @@ mod tests {
                 flow_id: None,
                 service_type: None,
                 modality: None,
+                bus_source: None,
             },
         );
         assert!(system.org_id.is_none());

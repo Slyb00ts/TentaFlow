@@ -12,7 +12,10 @@
 //   Filtering and paging are the SERVER's: every filter goes into the request
 //   and the next page is the keyset cursor from the previous response. Arriving
 //   with `?correlation=<id>` (the audit deep link) preselects that filter and
-//   shows it as a clearable chip — nothing else is narrowed.
+//   shows it as a clearable chip — nothing else is narrowed. The same filter is
+//   typed into the visible "Korelacja" input of the filter bar, and the
+//   inspector of a run offers its correlation section (copy, the bus record
+//   that triggered it, "show everything with this correlation").
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -22,12 +25,16 @@ import { createVirtualList } from '/js/lib/virtual-list.js';
 import {
   normalizeRow, plotFrom, actorLabel, rowName, rowDetail,
 } from '/js/lib/run-events.js';
+import {
+  busRecordHref, busSourceOf, normalizeCorrelation,
+} from '/js/lib/correlation.js';
 import '/js/components/tf-run-timeline.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-combobox.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-button.js';
+import '/js/components/tf-input.js';
 
 const PAGE_SIZE = 200;
 // Loading the next page this far from the bottom keeps the list ahead of the
@@ -318,7 +325,6 @@ function inspectorKeySection(row) {
 
 function inspectorLinks(row) {
   const links = [
-    [t('correlation'), row.correlationId],
     [t('link_run'), row.runId],
     [t('link_session'), row.sessionId],
     [t('link_node'), row.nodeId],
@@ -331,6 +337,47 @@ function inspectorLinks(row) {
     <h4>${escapeHtml(t('links'))}</h4>
     <div class="ev-pre">${escapeHtml(text)}</div>
   </div>`;
+}
+
+/** The run's opening row, when the loaded pages hold it. */
+function startRowOf(row) {
+  return state.rows.find((r) => r.runId === row.runId && r.kind === 'request_started') ?? null;
+}
+
+function inspectorCorrelation(row) {
+  if (!row.correlationId) return '';
+  const start = startRowOf(row);
+  const source = busSourceOf(start);
+  // Only a run that came from the bus has a triggering record to point at.
+  let coordinates = '';
+  if (row.origin === 'bus') {
+    coordinates = source
+      ? `<dl class="ev-kv">
+          ${kv(t('corr_topic'), `<span class="ev-mono">${escapeHtml(source.topic)}</span>`)}
+          ${kv(t('corr_partition_number'), `<span class="ev-mono">${escapeHtml(`${source.partition} / ${source.offset}`)}</span> <a class="ev-link" id="events-open-bus" href="${escapeAttr(busRecordHref(source, row.correlationId))}">${escapeHtml(t('corr_open_bus'))}</a>`)}
+        </dl>`
+      : `<div class="ev-corr-note muted">${escapeHtml(t(start ? 'corr_no_coordinates' : 'corr_coordinates_not_loaded'))}</div>`;
+  }
+  return `<div class="ev-sec" id="events-correlation-section">
+    <h4>${escapeHtml(t('correlation_label'))}</h4>
+    <div class="ev-corr-id">
+      <span class="ev-mono ev-corr-chip" title="${escapeAttr(row.correlationId)}">${escapeHtml(row.correlationId)}</span>
+      <tf-button variant="ghost" size="sm" icon="copy" id="events-copy-correlation">${escapeHtml(t('corr_copy'))}</tf-button>
+    </div>
+    ${coordinates}
+    <div class="ev-sec-actions">
+      <tf-button variant="secondary" size="sm" icon="filter" id="events-show-correlation">${escapeHtml(t('corr_show_all'))}</tf-button>
+    </div>
+  </div>`;
+}
+
+async function copyCorrelation(correlationId) {
+  try {
+    await navigator.clipboard.writeText(correlationId);
+    toast(t('corr_copied'), 'success');
+  } catch {
+    toast(t('corr_copy_failed'), 'error');
+  }
 }
 
 function chronometry(row) {
@@ -396,6 +443,7 @@ function renderInspector() {
       ${timing.join('\n      ')}
     </dl>
     ${inspectorKeySection(row)}
+    ${inspectorCorrelation(row)}
     ${row.io ? '<div class="ev-sec" id="events-io"></div>' : `<div class="ev-sec">
       <h4>${escapeHtml(t('details'))}</h4>
       ${chronometry(row)}
@@ -409,6 +457,8 @@ function renderInspector() {
   byId('events-filter-actor')?.addEventListener('click', () => {
     setActor(row.actorId ?? null);
   });
+  byId('events-copy-correlation')?.addEventListener('click', () => copyCorrelation(row.correlationId));
+  byId('events-show-correlation')?.addEventListener('click', () => setCorrelation(row.correlationId));
 }
 
 /**
@@ -694,7 +744,9 @@ function renderCorrelationChip() {
 }
 
 function setCorrelation(correlationId) {
-  state.correlationId = correlationId || null;
+  state.correlationId = normalizeCorrelation(correlationId);
+  const input = byId('events-correlation-input');
+  if (input && input.value !== (state.correlationId ?? '')) input.value = state.correlationId ?? '';
   renderCorrelationChip();
   loadPage({ reset: true });
 }
@@ -729,6 +781,10 @@ const EventsScreen = {
           <tf-segmented id="events-range" value="all" size="sm">
             ${rangeOptions()}
           </tf-segmented>
+          <tf-input id="events-correlation-input" class="ev-corr-input"
+            label="${escapeAttr(t('correlation_label'))}"
+            placeholder="${escapeAttr(t('correlation_placeholder'))}"
+            value="${escapeAttr(state.correlationId ?? '')}"></tf-input>
           <tf-searchbox id="events-search" debounce="350"
             placeholder="${escapeAttr(t('search_placeholder'))}"></tf-searchbox>
           <tf-chip class="ev-chip" id="events-correlation" status="accent" removable
@@ -755,6 +811,13 @@ const EventsScreen = {
     timeline = byId('events-timeline');
     renderCorrelationChip();
     byId('events-correlation')?.addEventListener('remove', () => setCorrelation(null));
+    const correlationInput = byId('events-correlation-input');
+    const applyCorrelation = () => {
+      const next = normalizeCorrelation(correlationInput.value);
+      if (next !== state.correlationId) setCorrelation(next);
+    };
+    correlationInput?.addEventListener('change', applyCorrelation);
+    correlationInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyCorrelation(); });
     narrowQuery = window.matchMedia('(max-width: 720px)');
     onNarrowChange = () => list?.refresh();
     narrowQuery.addEventListener('change', onNarrowChange);

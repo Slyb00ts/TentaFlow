@@ -426,6 +426,8 @@ fn build_envelope(
 ) -> FlowEnvelope {
     let mut env = FlowEnvelope::empty();
     env.meta
+        .insert("bus_instance".into(), serde_json::json!(config.instance_id));
+    env.meta
         .insert("bus_topic".into(), serde_json::json!(config.topic));
     env.meta
         .insert("bus_group".into(), serde_json::json!(config.group));

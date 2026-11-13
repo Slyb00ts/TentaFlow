@@ -396,6 +396,7 @@ impl ScopeState {
                             flow_id: provenance.descriptor.flow_id.clone(),
                             service_type: provenance.descriptor.service_type.clone(),
                             modality: provenance.descriptor.modality.clone(),
+                            bus_source: provenance.bus_source.clone(),
                         },
                         None,
                         None,
@@ -731,6 +732,50 @@ mod tests {
             )
             .expect("count outbox");
         (rows, queued)
+    }
+
+    /// Decision 12 (TB-02.4): the opening row of a bus-origin run names the
+    /// coordinates of the triggering record and nothing of its content; a run
+    /// of any other origin carries none.
+    #[tokio::test]
+    async fn a_bus_run_opening_row_carries_the_record_coordinates_only() {
+        let mut meta = FlowRequestMeta::new("run-src", FlowOrigin::Bus, FlowActor::system());
+        meta.org_id = Some("org-3".into());
+        meta.session_id = Some(SCOPE.into());
+        meta.bus_source = Some(crate::events::store::BusRecordRef {
+            instance_id: Some("tentabus-8b000003".into()),
+            topic: "zgloszenia.nowe".into(),
+            partition: 2,
+            offset: 18402,
+        });
+        let h = Harness::start_with(RunProvenance::from_meta(&meta, descriptor()));
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "bus_consume".into(),
+        });
+        let rows = h.rows("run-src", 2).await;
+        match &rows[0].payload {
+            EventPayload::RequestStarted { bus_source, .. } => {
+                let source = bus_source.as_ref().expect("coordinates on the opening row");
+                assert_eq!(source.topic, "zgloszenia.nowe");
+                assert_eq!((source.partition, source.offset), (2, 18402));
+            }
+            other => panic!("expected request_started, got {other:?}"),
+        }
+        let json = serde_json::to_string(&rows[0].payload).expect("payload json");
+        assert!(json.contains("\"bus_source\""), "{json}");
+
+        let other = Harness::start("run-plain");
+        other.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "llm".into(),
+        });
+        let rows = other.rows("run-plain", 2).await;
+        let json = serde_json::to_string(&rows[0].payload).expect("payload json");
+        assert!(
+            !json.contains("bus_source"),
+            "absent for other origins: {json}"
+        );
     }
 
     /// Decisions 8 and 10 (TB-02): a bus-origin run keeps its timeline (opening
@@ -1085,6 +1130,7 @@ mod tests {
                 flow_id,
                 service_type,
                 modality,
+                ..
             } => {
                 assert_eq!(
                     (
@@ -1158,6 +1204,7 @@ mod tests {
                 flow_id,
                 service_type,
                 modality,
+                ..
             } => {
                 assert_eq!(flow_id.as_deref(), Some("harness-flow"));
                 assert!(

@@ -90,7 +90,8 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
             .dispatcher
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("flow dispatcher dropped (shutdown)"))?;
-        let meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
+        let mut meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
+        meta.bus_source = bus_source_of(&initial, &principal);
         let outcome = dispatcher
             .dispatch_by_flow_id_background(
                 crate::flow_engine::dispatcher::FlowRef::live(flow_id),
@@ -104,6 +105,29 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
         }
         Ok(())
     }
+}
+
+/// Coordinates of the single bus record a bus-origin run was seeded from, read
+/// from the envelope the reactor itself built (`bus_topic` / `bus_partition` /
+/// `bus_offset`). `None` for any other origin and for a batch, which has no one
+/// triggering record. Coordinates only: the record's content never goes here.
+pub fn bus_source_of(
+    initial: &FlowEnvelope,
+    principal: &AgentPrincipal,
+) -> Option<crate::events::store::BusRecordRef> {
+    if principal.origin != crate::flow_engine::dispatcher::FlowOrigin::Bus {
+        return None;
+    }
+    let meta = &initial.meta;
+    Some(crate::events::store::BusRecordRef {
+        instance_id: meta
+            .get("bus_instance")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        topic: meta.get("bus_topic")?.as_str()?.to_string(),
+        partition: u32::try_from(meta.get("bus_partition")?.as_u64()?).ok()?,
+        offset: meta.get("bus_offset")?.as_u64()?,
+    })
 }
 
 /// The request meta of a reactive run (sub-agent completion or bus record).
@@ -452,6 +476,36 @@ mod tests {
         assert!(reactive_run_meta("req-2".into(), &bare)
             .correlation_id
             .is_none());
+    }
+
+    #[test]
+    fn a_bus_run_carries_the_coordinates_of_its_single_triggering_record() {
+        let bus = AgentPrincipal::new(None, None, FlowOrigin::Bus, FlowActor::system());
+        let mut single = FlowEnvelope::empty();
+        single
+            .meta
+            .insert("bus_topic".into(), json!("zgloszenia.nowe"));
+        single.meta.insert("bus_partition".into(), json!(0));
+        single.meta.insert("bus_offset".into(), json!(18402));
+        single.payload = FlowValue::Json(json!({"secret": "record body"}));
+        let source = bus_source_of(&single, &bus).expect("coordinates");
+        assert_eq!(source.topic, "zgloszenia.nowe");
+        assert_eq!((source.partition, source.offset), (0, 18402));
+
+        let mut batch = FlowEnvelope::empty();
+        batch
+            .meta
+            .insert("bus_topic".into(), json!("zgloszenia.nowe"));
+        assert!(
+            bus_source_of(&batch, &bus).is_none(),
+            "a batch has no single record"
+        );
+
+        let api = AgentPrincipal::new(None, None, FlowOrigin::Api, FlowActor::system());
+        assert!(
+            bus_source_of(&single, &api).is_none(),
+            "only bus-origin runs"
+        );
     }
 
     fn db() -> DbPool {

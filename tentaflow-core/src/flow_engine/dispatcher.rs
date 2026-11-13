@@ -502,6 +502,10 @@ pub struct FlowRequestMeta {
     /// by nie narósł (nieograniczona rekurencja). `make_context` seeduje z tego
     /// pola `subflow_depth`.
     pub flow_depth: u8,
+    /// The bus record that triggered this run (coordinates only), stamped by the
+    /// reactor dispatch for `FlowOrigin::Bus` runs and written on the run-start
+    /// event. A separate field for the same reason as `origin`.
+    pub bus_source: Option<crate::events::store::BusRecordRef>,
 }
 
 /// Maps a refused block access to the dispatch error a caller already handles:
@@ -542,6 +546,7 @@ impl FlowRequestMeta {
             cancel_token: CancellationToken::new(),
             progress_sink: None,
             flow_depth: 0,
+            bus_source: None,
         }
     }
 
