@@ -778,7 +778,7 @@ test('a binary topic: a row per field the server listed with its type, "Zamaskuj
   assert.match(note, /Odbiorca z tą zasadą dostaje wiadomość zakodowaną pod-schematem/);
   assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte/);
   pick(rowFor(win, 'uwagi'), 'hide');
-  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną z wiadomości pola: union<null, string> \(uwagi\)\..*Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma\./);
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną z wiadomości pola: uwagi \(union<null, string>\)\..*Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma\./);
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(sent, [{

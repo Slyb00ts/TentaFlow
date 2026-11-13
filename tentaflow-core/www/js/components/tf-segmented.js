@@ -10,14 +10,19 @@
 //     <option value="allow" variant="ok">Zezwól</option>
 //     <option value="deny" variant="err">Odmów</option>
 //   </tf-segmented>
+//   `label` (optional): a visible caption above the control that also names the
+//   radiogroup (aria-labelledby). Without it nothing is rendered.
 // =============================================================================
 
+let labelSeq = 0;
+
 class TfSegmented extends HTMLElement {
-  static get observedAttributes() { return ['value', 'size', 'disabled']; }
+  static get observedAttributes() { return ['value', 'size', 'disabled', 'label']; }
   constructor() {
     super();
     this._options = [];
     this._container = null;
+    this._labelEl = null;
     this._onClick = this._onClick.bind(this);
     this._onKey = this._onKey.bind(this);
   }
@@ -95,6 +100,10 @@ class TfSegmented extends HTMLElement {
       this._container.removeEventListener('keydown', this._onKey);
     }
     this.innerHTML = '';
+    this._labelEl = document.createElement('span');
+    this._labelEl.className = 'tf-label tf-segmented-label';
+    this._labelEl.id = `tf-segmented-label-${++labelSeq}`;
+    this.appendChild(this._labelEl);
     const wrap = document.createElement('div');
     wrap.className = 'tf-segmented';
     wrap.setAttribute('role', 'radiogroup');
@@ -137,6 +146,11 @@ class TfSegmented extends HTMLElement {
     const val = this.value;
     const size = this.getAttribute('size') || '';
     const disabled = this.hasAttribute('disabled');
+    const label = this.getAttribute('label') || '';
+    this._labelEl.textContent = label;
+    this._labelEl.hidden = !label;
+    if (label) this._container.setAttribute('aria-labelledby', this._labelEl.id);
+    else this._container.removeAttribute('aria-labelledby');
     this._container.classList.toggle('tf-segmented-sm', size === 'sm');
     this._container.classList.toggle('tf-segmented-md', size === 'md');
     this._container.classList.toggle('tf-segmented-disabled', disabled);

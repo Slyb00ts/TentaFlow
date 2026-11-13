@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processRetryRefusalText, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
 
@@ -591,6 +591,8 @@ export class FlowCanvas {
         }
         const timeoutCeiling = node.type === 'bpmn_service_task' ? processTimeoutProblem(node.config) : null;
         if (timeoutCeiling) errors.push(I18n.t('bpmn.timeout_out_of_range', { node: this._nodeName(node), max: timeoutCeiling }));
+        const retryRefusal = node.type === 'bpmn_service_task' ? processRetryRefusalText(this._nodeName(node), node.config.retry) : null;
+        if (retryRefusal) errors.push(retryRefusal);
         const called = node.type === 'bpmn_call_activity' ? node.config : null;
         if (called && !(called.localBody ? called.localBody.processId
           : called.calledDefinitionId && Number.isInteger(called.calledVersion) && called.calledVersion >= 1

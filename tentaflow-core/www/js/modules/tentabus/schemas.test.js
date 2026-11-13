@@ -131,6 +131,26 @@ test('binding a pattern to a topic of another payload kind is refused in plain w
   assert.equal(schemaKindMismatchText(undefined), '');
 });
 
+test('the B6 refusals (recursive field, read rule without validation, unwritable write rule) are put in plain words', () => {
+  const recursive = busRefusalText("bus.invalid_argument: field 'next' refers back to the message itself and cannot be shown without the fields the rule hides: topic 'wezly' is checked with the pattern 'node'");
+  assert.match(recursive, /^Pole „next” odwołuje się do całej wiadomości/);
+  assert.match(recursive, /topik wezly, wzór node/);
+  assert.match(busRefusalText("field 'next' refers back to the message itself and cannot be shown without the fields the rule hides"), /^Pole „next”/);
+  const read = busRefusalText("bus.invalid_argument: a read rule on a topic of binary messages needs the topic to validate its messages: topic 'zam-off' is checked with the avro pattern 'zam-avro' but does not validate its messages");
+  assert.match(read, /topik zam-off \(wzór zam-avro\) ma sprawdzanie wyłączone/);
+  assert.match(
+    busRefusalText("bus.invalid_topic_config: a read rule on a topic of binary messages needs the topic to validate its messages: cannot turn validation off on topic 'zam' while a read rule exists for it; delete its read rules first"),
+    /wyłączyć sprawdzania wiadomości topiku zam/,
+  );
+  const write = busRefusalText("bus.invalid_argument: field 'customer' has no default value and is not nullable, so every record sets it and a write rule has to allow it: topic 'zam' is checked with the pattern 'zam-avro'");
+  assert.match(write, /pole „customer” nie ma wartości domyślnej/);
+  assert.match(write, /topik zam, wzór zam-avro/);
+  assert.match(
+    busRefusalText("the default value of field 'big' is too large to evaluate (more than 1 bytes or 2 steps once its nested defaults are filled in), so a write rule cannot tell whether the field is set and has to allow it: topic 'zam' is checked with the pattern 'zam-avro'"),
+    /Zasada zapisu nie może ocenić pola „big”/,
+  );
+});
+
 test('the stable server sentences about a stored pattern and a rule on a binary topic are put in plain words', () => {
   assert.match(
     busRefusalText("protocol error BadRequest: bus.invalid_argument: subject 'zamowienie' v3: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema: field 'a' of struct 'X' has no explicit id (line 1)"),

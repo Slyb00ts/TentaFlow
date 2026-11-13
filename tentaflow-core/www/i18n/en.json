@@ -11332,7 +11332,12 @@
       "binary_pattern_changed": "The pattern of topic {topic} was changed or withdrawn before the rule was saved, so nothing was saved. Refresh the page and try again.",
       "field_not_in_pattern": "The field “{field}” is not in the pattern {name} of topic {topic}. A rule can only name top-level fields of that pattern.",
       "pattern_change_under_rules": "The pattern {name} of topic {topic} cannot be changed or unlinked while the topic has field rules — the rules name fields of this pattern. Delete the rules in the Data hiding section first.",
-      "version_drops_required_field": "The new version of the pattern lacks the field “{field}”, and the write rule of topic {topic} requires it — every write to the topic would be refused. Change that rule first (Data hiding of topic {topic}), then add the version."
+      "version_drops_required_field": "The new version of the pattern lacks the field “{field}”, and the write rule of topic {topic} requires it — every write to the topic would be refused. Change that rule first (Data hiding of topic {topic}), then add the version.",
+      "field_policy_recursive": "Field “{field}” refers back to the whole message, so it cannot be shown without the fields the rule hides (topic {topic}, pattern {name}). Hide or show it together with the fields it points to, or change the pattern.",
+      "read_rule_needs_validation": "A read rule on a topic of binary messages needs the topic to validate its messages: topic {topic} (pattern {name}) has validation turned off. Turn validation on in the topic settings, then add the rule.",
+      "validation_off_under_read_rules": "Validation of topic {topic} cannot be turned off while it has read rules — rules on binary messages need validation. Delete the read rules in the Data hiding section first.",
+      "write_rule_field_required": "The write rule would reject every message: field “{field}” has no default value and cannot be empty, so every record sets it and the rule has to allow it (topic {topic}, pattern {name}). Set it to “Required” or “Allowed”.",
+      "write_rule_default_too_large": "The write rule cannot evaluate field “{field}”: its default value is too large to tell whether the field is set, so the rule has to allow it (topic {topic}, pattern {name})."
     },
     "shell": {
       "instance": "Instance",
@@ -16134,6 +16139,7 @@
     "retry_factor_invalid": "Use a whole percentage from {min} to {max}.",
     "retry_max_delay": "Longest wait (seconds)",
     "retry_max_delay_invalid": "Use a whole number of seconds from {min} to {max}; not less than the first wait.",
+    "retry_out_of_range": "“{node}”: {reason}",
     "retry_policy_hint": "Only a failure that provably did nothing outside is repeated automatically, including a timeout that happened before the call was sent. A timeout after the call was sent, an uncertain outcome and a result that could not be applied are never repeated by themselves. A person can retry such a step by hand only where repeating cannot do the work twice; after an uncertain outcome that is not offered.",
     "retry_agent_cost_hint": "An agent step may have a retry policy, but every repeat runs the agent again from the start and uses its model, time and budget. Set the fewest repeats you really need.",
     "retry_refused": "This retry is no longer available. The run was reloaded.",

@@ -10194,7 +10194,12 @@
       "binary_pattern_changed": "Le modèle du topic {topic} a changé ou a été retiré avant l’enregistrement de la règle : rien n’a été enregistré. Actualisez la page et réessayez.",
       "field_not_in_pattern": "Le champ « {field} » n’appartient pas au modèle {name} du topic {topic}. Une règle ne peut nommer que des champs de premier niveau de ce modèle.",
       "pattern_change_under_rules": "On ne peut ni modifier ni délier le modèle {name} du topic {topic} tant que le topic a des règles de champs : elles nomment des champs de ce modèle. Supprimez d’abord les règles dans la section Dissimulation des données.",
-      "version_drops_required_field": "La nouvelle version du modèle n’a pas le champ « {field} », que la règle d’écriture du topic {topic} exige : chaque écriture dans le topic serait refusée. Modifiez d’abord cette règle (Dissimulation des données du topic {topic}), puis ajoutez la version."
+      "version_drops_required_field": "La nouvelle version du modèle n’a pas le champ « {field} », que la règle d’écriture du topic {topic} exige : chaque écriture dans le topic serait refusée. Modifiez d’abord cette règle (Dissimulation des données du topic {topic}), puis ajoutez la version.",
+      "field_policy_recursive": "Le champ « {field} » renvoie au message entier : on ne peut donc pas l’afficher sans les champs que la règle dissimule (topic {topic}, modèle {name}). Dissimulez-le ou affichez-le avec les champs vers lesquels il pointe, ou changez le modèle.",
+      "read_rule_needs_validation": "Une règle de lecture sur un topic de messages binaires exige que le topic valide ses messages : la validation du topic {topic} (modèle {name}) est désactivée. Activez la validation dans les réglages du topic, puis ajoutez la règle.",
+      "validation_off_under_read_rules": "La validation du topic {topic} ne peut pas être désactivée tant qu’il a des règles de lecture — les règles sur les messages binaires exigent la validation. Supprimez d’abord les règles de lecture dans la section Dissimulation des données.",
+      "write_rule_field_required": "La règle d’écriture rejetterait tous les messages : le champ « {field} » n’a pas de valeur par défaut et ne peut pas être vide, donc chaque enregistrement le définit et la règle doit l’autoriser (topic {topic}, modèle {name}). Réglez-le sur « Obligatoire » ou « Autorisé ».",
+      "write_rule_default_too_large": "La règle d’écriture ne peut pas évaluer le champ « {field} » : sa valeur par défaut est trop grande pour savoir si le champ est défini, donc la règle doit l’autoriser (topic {topic}, modèle {name})."
     },
     "shell": {
       "instance": "Instance",
@@ -14996,6 +15001,7 @@
     "retry_factor_invalid": "Saisissez un pourcentage entier de {min} à {max}.",
     "retry_max_delay": "Attente maximale (secondes)",
     "retry_max_delay_invalid": "Saisissez un nombre entier de secondes de {min} à {max} ; pas moins que la première attente.",
+    "retry_out_of_range": "« {node} » : {reason}",
     "retry_policy_hint": "Seul un échec qui n’a prouvablement rien fait à l’extérieur est repris automatiquement, y compris un dépassement de durée survenu avant l’envoi de l’appel. Un dépassement de durée après l’envoi, un résultat incertain et un résultat qui n’a pu être appliqué ne sont jamais repris seuls. Une personne ne peut relancer une telle étape à la main que là où la répétition ne peut pas faire le travail deux fois ; après un résultat incertain, ce n’est pas proposé.",
     "retry_agent_cost_hint": "Une étape d’agent peut avoir une politique de reprise, mais chaque reprise relance l’agent depuis le début et consomme son modèle, son temps et son budget. Choisissez le moins de reprises dont vous avez réellement besoin.",
     "retry_refused": "Cette nouvelle tentative n’est plus disponible. L’exécution a été rechargée.",

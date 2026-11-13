@@ -260,6 +260,20 @@ export function processRetryProblems(retry) {
   return problems;
 }
 
+const RETRY_PROBLEM_TEXT_KEYS = Object.freeze({
+  retryAttempts: 'bpmn.retry_attempts_invalid',
+  retryDelaySeconds: 'bpmn.retry_delay_invalid',
+  retryFactorPercent: 'bpmn.retry_factor_invalid',
+  retryMaxDelaySeconds: 'bpmn.retry_max_delay_invalid',
+});
+
+/** The inspector's sentence for the first broken field of a retry policy, naming the step; `null` when the policy is valid or absent. */
+export function processRetryRefusalText(nodeName, retry) {
+  const [field, limits] = Object.entries(processRetryProblems(retry))[0] || [];
+  if (!field) return null;
+  return I18n.t('bpmn.retry_out_of_range', { node: nodeName, reason: I18n.t(RETRY_PROBLEM_TEXT_KEYS[field], limits) });
+}
+
 const AGENT_STEP_DEFAULT_ITERATIONS = 10;
 // The model accepts 1..=100 iterations whatever the agent allows.
 const AGENT_STEP_MAX_ITERATIONS = 100;
@@ -1009,6 +1023,15 @@ export function processExplainError(message, model, options = null) {
   }
   const unbound = /UNBOUND_IMPLEMENTATION: service task ([\w.-]+) has no implementation/.exec(text);
   if (unbound && names.has(unbound[1])) return processUnboundRefusal([names.get(unbound[1])]).join('\n');
+  // `validate_retry_policy`: the server states no code, the limits are the ones the inspector already checks.
+  const retryRefused = /service task ([\w.-]+) retry (attempts|delay|factor|delay cap) (?:are|is) outside /.exec(text);
+  if (retryRefused) {
+    const field = { attempts: 'retryAttempts', delay: 'retryDelaySeconds', factor: 'retryFactorPercent', 'delay cap': 'retryMaxDelaySeconds' }[retryRefused[2]];
+    const { attempts, minDelay, maxDelay, minFactor, maxFactor } = PROCESS_RETRY_LIMITS;
+    const limits = { retryAttempts: { max: attempts }, retryDelaySeconds: { min: minDelay, max: maxDelay }, retryFactorPercent: { min: minFactor, max: maxFactor },
+      retryMaxDelaySeconds: { min: Number(/outside (\d+)\.\./.exec(text)?.[1]) || minDelay, max: maxDelay } }[field];
+    return I18n.t('bpmn.retry_out_of_range', { node: names.get(retryRefused[1]) || retryRefused[1], reason: I18n.t(RETRY_PROBLEM_TEXT_KEYS[field], limits) });
+  }
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
   // A publication names every refused step, one per line; two steps of one name carry their occurrence number.

@@ -371,6 +371,8 @@ export function fieldLabel(source, name) {
 /** "PESEL pacjenta (pacjent.pesel)", or the bare address when the field has no name. */
 export function fieldPhrase(source, name) {
   const label = fieldLabel(source, name);
+  // A binary pattern's label is the field's type, so the name leads: "customer (string)".
+  if (source.mode === 'binary' && label) return `${showHidden(name)} (${label})`;
   return label ? `${label} (${showHidden(name)})` : showHidden(name);
 }
 

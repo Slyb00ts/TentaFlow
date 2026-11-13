@@ -3471,6 +3471,25 @@ test('a step time limit outside its range is marked on the field and refuses Sav
   assert.equal(named, I18n.t('bpmn.timeout_out_of_range', { node: 'Review case', max: 3600 }));
 });
 
+test('a retry policy outside its limits refuses Save before the server, and the server sentence is told in the inspector words', async () => {
+  const saved = [];
+  const state = await mount(definition('draft-retry', { model: agentStepModel() }), saveFixtures('draft-retry', saved));
+  state.canvas.updateNodeConfig('Agent_1', { retry: { maxAttempts: 11, delaySeconds: 30, backoff: 'Fixed' } });
+  assert.equal(await builder._save(), false);
+  assert.equal(saved.length, 0, 'nothing is sent');
+  const shown = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.equal(shown, I18n.t('bpmn.retry_out_of_range', { node: 'Review case', reason: I18n.t('bpmn.retry_attempts_invalid', { max: 10 }) }));
+  assert.ok(!/outside|\.\.=/.test(shown));
+  state.canvas.updateNodeConfig('Agent_1', { retry: { maxAttempts: 3, delaySeconds: 30, backoff: 'Fixed' } });
+  assert.equal(await builder._save(), true);
+  const model = agentStepModel();
+  const reason = (key, limits) => I18n.t('bpmn.retry_out_of_range', { node: 'Review case', reason: I18n.t(key, limits) });
+  assert.equal(processExplainError('service task Agent_1 retry attempts are outside 1..=10', model), reason('bpmn.retry_attempts_invalid', { max: 10 }));
+  assert.equal(processExplainError('service task Agent_1 retry delay is outside 1..=86400 seconds', model), reason('bpmn.retry_delay_invalid', { min: 1, max: 86400 }));
+  assert.equal(processExplainError('service task Agent_1 retry factor is outside 101..=1000 percent', model), reason('bpmn.retry_factor_invalid', { min: 101, max: 1000 }));
+  assert.equal(processExplainError('service task Agent_1 retry delay cap is outside 45..=86400 seconds', model), reason('bpmn.retry_max_delay_invalid', { min: 45, max: 86400 }));
+});
+
 test('a disabled agent is flagged on the inspector and the canvas and its publication refusal names step and agent', async () => {
   const state = await mount(definition('draft-gone', { model: agentStepModel({ agentId: 'agent-gone' }) }), saveFixtures('draft-gone'));
   state.canvas.selectNode('Agent_1'); await flush(2);

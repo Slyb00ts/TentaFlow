@@ -10194,7 +10194,12 @@
       "binary_pattern_changed": "El patrón del topic {topic} cambió o se retiró antes de guardar la regla, así que no se guardó nada. Actualiza la página e inténtalo de nuevo.",
       "field_not_in_pattern": "El campo «{field}» no pertenece al patrón {name} del topic {topic}. Una regla solo puede nombrar campos de primer nivel de ese patrón.",
       "pattern_change_under_rules": "No se puede cambiar ni desvincular el patrón {name} del topic {topic} mientras el topic tenga reglas de campos: las reglas nombran campos de este patrón. Elimina primero las reglas en la sección Ocultar datos.",
-      "version_drops_required_field": "La nueva versión del patrón no tiene el campo «{field}», y la regla de escritura del topic {topic} lo exige: cada escritura en el topic se rechazaría. Cambia primero esa regla (Ocultar datos del topic {topic}) y luego añade la versión."
+      "version_drops_required_field": "La nueva versión del patrón no tiene el campo «{field}», y la regla de escritura del topic {topic} lo exige: cada escritura en el topic se rechazaría. Cambia primero esa regla (Ocultar datos del topic {topic}) y luego añade la versión.",
+      "field_policy_recursive": "El campo «{field}» remite al mensaje completo, así que no se puede mostrar sin los campos que la regla oculta (tópico {topic}, patrón {name}). Ocúltalo o muéstralo junto con los campos a los que apunta, o cambia el patrón.",
+      "read_rule_needs_validation": "Una regla de lectura en un tópico con mensajes binarios exige que el tópico valide sus mensajes: el tópico {topic} (patrón {name}) tiene la validación desactivada. Activa la validación en los ajustes del tópico y luego añade la regla.",
+      "validation_off_under_read_rules": "No se puede desactivar la validación del tópico {topic} mientras tenga reglas de lectura: las reglas sobre mensajes binarios necesitan validación. Elimina antes las reglas de lectura en la sección Ocultar datos.",
+      "write_rule_field_required": "La regla de escritura rechazaría todos los mensajes: el campo «{field}» no tiene valor por defecto y no puede estar vacío, así que todo registro lo establece y la regla debe permitirlo (tópico {topic}, patrón {name}). Ponlo en «Obligatorio» o «Permitido».",
+      "write_rule_default_too_large": "La regla de escritura no puede evaluar el campo «{field}»: su valor por defecto es demasiado grande para saber si el campo está establecido, así que la regla debe permitirlo (tópico {topic}, patrón {name})."
     },
     "shell": {
       "instance": "Instancia",
@@ -14996,6 +15001,7 @@
     "retry_factor_invalid": "Usa un porcentaje entero de {min} a {max}.",
     "retry_max_delay": "Espera máxima (segundos)",
     "retry_max_delay_invalid": "Usa un número entero de segundos de {min} a {max}; no menos que la primera espera.",
+    "retry_out_of_range": "«{node}»: {reason}",
     "retry_policy_hint": "Solo se repite automáticamente un fallo que demostrablemente no hizo nada fuera, también un tiempo agotado antes de enviar la llamada. Un tiempo agotado después del envío, un resultado incierto y un resultado que no pudo aplicarse nunca se repiten solos. Una persona solo puede reintentar un paso así a mano donde repetirlo no pueda hacer el trabajo dos veces; tras un resultado incierto no se ofrece.",
     "retry_agent_cost_hint": "Un paso de agente puede tener una política de reintentos, pero cada repetición ejecuta el agente de nuevo desde el principio y consume su modelo, su tiempo y su presupuesto. Elige los menos reintentos que realmente necesites.",
     "retry_refused": "Este reintento ya no está disponible. La ejecución se ha vuelto a cargar.",

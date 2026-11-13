@@ -89,6 +89,21 @@ export function busRefusalText(message) {
   if (keepPattern) return T('errors.pattern_change_under_rules', { topic: keepPattern[1], name: keepPattern[2] });
   const dropsField = /the new version lacks a field that a write rule of a topic bound to this pattern requires: field '([^']*)' is required by a write rule of topic '([^']*)'/.exec(text);
   if (dropsField) return T('errors.version_drops_required_field', { field: dropsField[1], topic: dropsField[2] });
+  // `schema_registry/mod.rs` `leaking_field_refusal` (the suffix is absent when a sub-schema is derived, not a rule saved).
+  const recursive = /field '([^']*)' refers back to the message itself and cannot be shown without the fields the rule hides(?:: topic '([^']*)' is checked with the pattern '([^']*)')?/.exec(text);
+  if (recursive) return T('errors.field_policy_recursive', { field: recursive[1], topic: recursive[2] || '', name: recursive[3] || '' });
+  // `field_policies.rs` BINARY_TOPIC_READ_NEEDS_VALIDATION (a rule saved, or `topics.rs` turning validation off under a read rule).
+  if (/a read rule on a topic of binary messages needs the topic to validate its messages/.test(text)) {
+    const saved = /: topic '([^']*)' is checked with the \w+ pattern '([^']*)' but does not validate its messages/.exec(text);
+    if (saved) return T('errors.read_rule_needs_validation', { topic: saved[1], name: saved[2] });
+    const turnedOff = /: cannot turn validation off on topic '([^']*)' while a read rule exists/.exec(text);
+    if (turnedOff) return T('errors.validation_off_under_read_rules', { topic: turnedOff[1] });
+  }
+  // `avro.rs` `write_rule_obstacle`.
+  const required = /field '([^']*)' has no default value and is not nullable, so every record sets it and a write rule has to allow it: topic '([^']*)' is checked with the pattern '([^']*)'/.exec(text);
+  if (required) return T('errors.write_rule_field_required', { field: required[1], topic: required[2], name: required[3] });
+  const tooLarge = /the default value of field '([^']*)' is too large to evaluate[\s\S]*?: topic '([^']*)' is checked with the pattern '([^']*)'/.exec(text);
+  if (tooLarge) return T('errors.write_rule_default_too_large', { field: tooLarge[1], topic: tooLarge[2], name: tooLarge[3] });
   // `field_policies.rs` MASK_HASH_READ_ONLY / MASK_HASH_NOT_SHOWN / MASK_HASH_OVERLAP.
   if (/masking and hashing apply to read rules only/.test(text)) return T('errors.mask_hash_read_only');
   if (/masked_fields and hashed_fields must be subsets of fields/.test(text)) return T('errors.mask_hash_not_shown');

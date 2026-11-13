@@ -11332,7 +11332,12 @@
       "binary_pattern_changed": "Wzór topiku {topic} zmienił się albo został wycofany, zanim zasada się zapisała, więc nic nie zapisano. Odśwież stronę i spróbuj jeszcze raz.",
       "field_not_in_pattern": "Pole „{field}” nie należy do wzoru {name} topiku {topic}. Zasada może wymieniać tylko pola najwyższego poziomu tego wzoru.",
       "pattern_change_under_rules": "Nie można zmienić ani odpiąć wzoru {name} topiku {topic}, dopóki topik ma zasady ukrywania pól — zasady wymieniają pola tego wzoru. Usuń najpierw zasady w sekcji Ukrywanie danych.",
-      "version_drops_required_field": "Nowa wersja wzoru nie ma pola „{field}”, a zasada zapisu topiku {topic} wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku {topic}), a potem dodaj wersję."
+      "version_drops_required_field": "Nowa wersja wzoru nie ma pola „{field}”, a zasada zapisu topiku {topic} wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku {topic}), a potem dodaj wersję.",
+      "field_policy_recursive": "Pole „{field}” odwołuje się do całej wiadomości, więc nie można go pokazać bez pól, które zasada ukrywa (topik {topic}, wzór {name}). Ukryj albo pokaż je razem z polami, na które wskazuje, albo zmień wzór.",
+      "read_rule_needs_validation": "Zasada odczytu na topiku z wiadomościami binarnymi wymaga, żeby topik sprawdzał wiadomości: topik {topic} (wzór {name}) ma sprawdzanie wyłączone. Włącz sprawdzanie w ustawieniach topiku, a potem dodaj zasadę.",
+      "validation_off_under_read_rules": "Nie można wyłączyć sprawdzania wiadomości topiku {topic}, dopóki ma on zasady odczytu — zasady na wiadomościach binarnych wymagają sprawdzania. Usuń najpierw zasady odczytu w sekcji Ukrywanie danych.",
+      "write_rule_field_required": "Zasada zapisu odrzuciłaby każdą wiadomość: pole „{field}” nie ma wartości domyślnej i nie może być puste, więc każdy rekord je ustawia, a zasada musi je dopuścić (topik {topic}, wzór {name}). Ustaw je na „Wymagane” albo „Dozwolone”.",
+      "write_rule_default_too_large": "Zasada zapisu nie może ocenić pola „{field}”: jego wartość domyślna jest zbyt duża, żeby sprawdzić, czy pole jest ustawione, więc zasada musi je dopuścić (topik {topic}, wzór {name})."
     },
     "shell": {
       "instance": "Instancja",
@@ -16134,6 +16139,7 @@
     "retry_factor_invalid": "Podaj całkowite procenty od {min} do {max}.",
     "retry_max_delay": "Najdłuższe czekanie (sekundy)",
     "retry_max_delay_invalid": "Podaj całkowitą liczbę sekund od {min} do {max}; nie mniej niż pierwsze czekanie.",
+    "retry_out_of_range": "„{node}”: {reason}",
     "retry_policy_hint": "Automatycznie ponawiana jest tylko awaria, która dowodnie nic nie zrobiła na zewnątrz, także przekroczenie czasu, do którego doszło przed wysłaniem wywołania. Przekroczenie czasu po wysłaniu, niepewny wynik i wynik, którego nie dało się zastosować, nigdy nie są ponawiane same. Osoba może ponowić krok ręcznie tylko tam, gdzie powtórzenie nie zrobi pracy dwa razy; po niepewnym wyniku takiej opcji nie ma.",
     "retry_agent_cost_hint": "Krok agenta może mieć politykę ponowień, ale każde ponowienie uruchamia agenta od nowa i zużywa jego model, czas i budżet. Ustaw najmniejszą liczbę ponowień, jakiej naprawdę potrzebujesz.",
     "retry_refused": "To ponowienie nie jest już dostępne. Przebieg został wczytany ponownie.",

@@ -440,7 +440,7 @@ export function thriftFieldsView(text) {
  */
 export function binaryFieldTypes(schemaType, text) {
   if (schemaType === 'avro') return (avroFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: !f.optional }));
-  if (schemaType === 'protobuf') return (protobufFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: false }));
+  if (schemaType === 'protobuf') return (protobufFieldsView(text) || []).map((f) => ({ name: f.name, type: f.label === 'repeated' ? `repeated ${f.type}` : f.type, alwaysSet: false }));
   if (schemaType === 'thrift') return (thriftFieldsView(text) || []).map((f) => ({ name: f.name, type: f.type, alwaysSet: false }));
   return [];
 }

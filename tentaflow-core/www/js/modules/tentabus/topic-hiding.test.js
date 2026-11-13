@@ -216,6 +216,15 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(fieldLabel({ fields: [{ name: 'x', label: 'etykieta\u200B' }] }, 'x'), 'etykieta⟦U+200B⟧');
 });
 
+test('a binary field is written "name (type)" and a repeated Protobuf field keeps its container', async () => {
+  const { binaryFieldTypes } = await import('./schema-detail.js');
+  const types = binaryFieldTypes('protobuf', 'syntax = "proto3"; message M { string customer = 1; repeated Line lines = 2; repeated string tags = 3; map<string, int32> m = 4; } message Line { string sku = 1; }');
+  assert.deepEqual(types.map((t) => t.type), ['string', 'repeated Line', 'repeated string', 'map<string, int32>']);
+  const source = fieldSource({ format: 'json', schema: { subject: 's', schemaType: 'protobuf', fields: types.map((t) => t.name), types }, binaryActions: ['hide'] });
+  assert.equal(fieldPhrase(source, 'customer'), 'customer (string)');
+  assert.equal(fieldPhrase(source, 'lines'), 'lines (repeated Line)');
+});
+
 test('an address the server would refuse is refused before the request: HL7 SEGMENT-n, an XML name, nothing empty', () => {
   assert.equal(fieldNameProblem('hl7v2', 'PID-5'), null);
   assert.equal(fieldNameProblem('hl7v2', 'ZX1-12'), null);
@@ -1068,7 +1077,7 @@ test('the sentences of a binary rule say the reader gets a sub-schema, and name 
   const form = { ...blankForm('read', binarySource), actions: Object.assign(Object.create(null), { numer: 'show', klient: 'hide', uwagi: 'show' }) };
   const lines = ruleImpact({ who: 'Ala', direction: 'read', form, current: null, source: binarySource });
   assert.deepEqual(lines, [
-    'Dla „Ala” znikną z wiadomości pola: string (klient).',
+    'Dla „Ala” znikną z wiadomości pola: klient (string).',
     'Pozostałe pola z listy bez zmian.',
     'Pole, które doda dopiero nowa wersja wzoru, też będzie ukryte.',
     'Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma.',

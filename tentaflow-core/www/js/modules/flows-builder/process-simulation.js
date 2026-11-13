@@ -685,6 +685,7 @@ function fixturesSection(model) {
       <p>${escapeHtml(text(`simulation_unsupported_${step.reason}`))}</p></article>`).join('')}
     ${steps.map((step) => `<article class="fb-simulation-fixture" data-fixture-step="${escapeAttr(step.nodeId)}">
       <strong>${escapeHtml(labels.get(step.nodeId))}</strong>
+      ${step.hasRetryPolicy ? `<tf-alert tone="info" data-fixture-retry-skipped message="${escapeAttr(text('simulation_retry_skipped'))}"></tf-alert>` : ''}
       <tf-select data-fixture-mode wrap-selected label="${escapeAttr(text('simulation_fixture_mode'))}" hint="${escapeAttr(text('simulation_mode_real_unavailable'))}" value="Result">
         <option value="Result">${escapeHtml(text('simulation_mode_result'))}</option>
         <option value="Fixture">${escapeHtml(text('simulation_mode_fixture'))}</option>
@@ -692,6 +693,8 @@ function fixturesSection(model) {
       </tf-select>
       <div data-fixture-form hidden>${answerFormHtml(step, blankServiceDraft())}</div>
     </article>`).join('')}`;
+  // The step's note is already above the mode choice; the form must not repeat it.
+  section.querySelectorAll('[data-fixture-retry-skipped]').forEach((note) => note.closest('[data-fixture-step]').querySelector('[data-answer-retry-skipped]')?.remove());
   section.querySelectorAll('[data-fixture-step]').forEach((article) => fillAnswerForm(article, blankServiceDraft()));
   section.addEventListener('change', (event) => {
     const mode = event.target.closest('[data-fixture-mode]');

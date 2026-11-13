@@ -10194,7 +10194,12 @@
       "binary_pattern_changed": "Das Muster des Topics {topic} wurde geändert oder zurückgezogen, bevor die Regel gespeichert war, daher wurde nichts gespeichert. Laden Sie die Seite neu und versuchen Sie es erneut.",
       "field_not_in_pattern": "Das Feld „{field}“ gehört nicht zum Muster {name} des Topics {topic}. Eine Regel kann nur Felder der obersten Ebene dieses Musters nennen.",
       "pattern_change_under_rules": "Das Muster {name} des Topics {topic} lässt sich nicht ändern oder lösen, solange das Topic Feldregeln hat — die Regeln nennen Felder dieses Musters. Löschen Sie zuerst die Regeln im Bereich „Ausblenden von Daten“.",
-      "version_drops_required_field": "Der neuen Version des Musters fehlt das Feld „{field}“, das die Schreibregel des Topics {topic} verlangt — jeder Schreibvorgang ins Topic würde abgelehnt. Ändern Sie zuerst diese Regel (Ausblenden von Daten des Topics {topic}) und fügen Sie dann die Version hinzu."
+      "version_drops_required_field": "Der neuen Version des Musters fehlt das Feld „{field}“, das die Schreibregel des Topics {topic} verlangt — jeder Schreibvorgang ins Topic würde abgelehnt. Ändern Sie zuerst diese Regel (Ausblenden von Daten des Topics {topic}) und fügen Sie dann die Version hinzu.",
+      "field_policy_recursive": "Das Feld „{field}“ verweist auf die ganze Nachricht und lässt sich daher nicht ohne die Felder anzeigen, die die Regel ausblendet (Topic {topic}, Muster {name}). Blenden Sie es zusammen mit den Feldern ein oder aus, auf die es zeigt, oder ändern Sie das Muster.",
+      "read_rule_needs_validation": "Eine Leseregel für ein Topic mit binären Nachrichten setzt voraus, dass das Topic seine Nachrichten prüft: Bei Topic {topic} (Muster {name}) ist die Prüfung ausgeschaltet. Schalten Sie die Prüfung in den Topic-Einstellungen ein und fügen Sie die Regel dann hinzu.",
+      "validation_off_under_read_rules": "Die Prüfung von Topic {topic} lässt sich nicht ausschalten, solange es Leseregeln hat — Regeln für binäre Nachrichten brauchen die Prüfung. Löschen Sie zuerst die Leseregeln im Abschnitt Daten ausblenden.",
+      "write_rule_field_required": "Die Schreibregel würde jede Nachricht ablehnen: Das Feld „{field}“ hat keinen Standardwert und darf nicht leer sein, jeder Datensatz setzt es also, und die Regel muss es zulassen (Topic {topic}, Muster {name}). Stellen Sie es auf „Erforderlich“ oder „Erlaubt“.",
+      "write_rule_default_too_large": "Die Schreibregel kann das Feld „{field}“ nicht auswerten: Sein Standardwert ist zu groß, um festzustellen, ob das Feld gesetzt ist, daher muss die Regel es zulassen (Topic {topic}, Muster {name})."
     },
     "shell": {
       "instance": "Instanz",
@@ -14996,6 +15001,7 @@
     "retry_factor_invalid": "Gib ganze Prozent von {min} bis {max} an.",
     "retry_max_delay": "Längste Wartezeit (Sekunden)",
     "retry_max_delay_invalid": "Gib ganze Sekunden von {min} bis {max} an; nicht weniger als die erste Wartezeit.",
+    "retry_out_of_range": "„{node}“: {reason}",
     "retry_policy_hint": "Nur ein Fehler, der nachweislich nichts nach außen bewirkt hat, wird automatisch wiederholt, auch eine Zeitüberschreitung vor dem Absenden des Aufrufs. Eine Zeitüberschreitung nach dem Absenden, ein unsicherer Ausgang und ein nicht anwendbares Ergebnis werden nie von selbst wiederholt. Eine Person kann einen solchen Schritt nur dann von Hand wiederholen, wenn die Wiederholung die Arbeit nicht doppelt ausführen kann; nach einem unsicheren Ausgang wird das nicht angeboten.",
     "retry_agent_cost_hint": "Ein Agentenschritt darf eine Wiederholungsrichtlinie haben, aber jede Wiederholung startet den Agenten von vorn und verbraucht sein Modell, seine Zeit und sein Budget. Wähle so wenige Wiederholungen wie nötig.",
     "retry_refused": "Diese Wiederholung ist nicht mehr verfügbar. Der Ablauf wurde neu geladen.",

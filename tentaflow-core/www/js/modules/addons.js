@@ -107,6 +107,30 @@ function formatVisibilityBadge(visibilityScope) {
   });
 }
 
+// Brings the card of an addon in line with its enabled state without
+// re-rendering the grid: the toggle was just confirmed by the server, and the
+// status and footer would otherwise keep the old state until the next refresh.
+function syncCardState(card, entry) {
+  if (!card || !entry) return;
+  const enabled = !!entry.isEnabled;
+  card.classList.toggle('disabled', !enabled);
+  const status = card.querySelector('.a-status');
+  if (status) {
+    status.classList.toggle('on', enabled);
+    status.classList.toggle('off', !enabled);
+    status.textContent = `● ${I18n.t(enabled ? 'addons.enabled' : 'addons.disabled').toLowerCase()}`;
+  }
+  const note = card.querySelector('.a-foot-note');
+  if (note) {
+    note.textContent = footerTextForAddon({
+      enabled,
+      usersWithOauth: Number(entry.usersWithOauthCount ?? 0),
+      oauthMode: entry.oauthMode ?? null,
+      runtime: entry.runtime || '',
+    });
+  }
+}
+
 function footerTextForAddon({ enabled, usersWithOauth, oauthMode, runtime }) {
   if (!enabled) return I18n.t('addons.not_loaded');
   if (usersWithOauth > 0) {
@@ -380,6 +404,7 @@ function renderList() {
         if (entry) {
           entry.isEnabled = enabled;
         }
+        syncCardState(card, entry);
       } catch (err) {
         // Rollback wizualny gdy backend odmowil.
         if (enabled) t.removeAttribute('checked'); else t.setAttribute('checked', '');
