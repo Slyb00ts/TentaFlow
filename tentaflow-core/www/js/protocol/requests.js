@@ -1069,12 +1069,13 @@ export const requests = {
     } else throw new Error(`unknown offset reset mode '${mode}'`);
     return bus(instanceId, 'OffsetResetRequest', { group, topic, partition, mode: wireMode });
   },
-  encodeBusMessagesBrowseRequest: (instanceId, topic, fromOffset, limit, fromOffsetsJson, partition) => bus(instanceId, 'MessagesBrowseRequest', {
+  encodeBusMessagesBrowseRequest: (instanceId, topic, fromOffset, limit, fromOffsetsJson, partition, correlationId) => bus(instanceId, 'MessagesBrowseRequest', {
     topic,
     from_offset: fromOffset,
     from_offsets: fromOffsetsJson == null ? [] : parseJson(fromOffsetsJson, 'from_offsets_json'),
     limit,
     partition,
+    correlation_id: correlationId ?? null,
   }),
   encodeBusDlqListRequest: (instanceId, sourceTopic, fromOffset, limit, fromOffsetsJson, partition, newestFirst) => bus(instanceId, 'DlqListRequest', {
     source_topic: sourceTopic,

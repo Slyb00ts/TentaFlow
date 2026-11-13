@@ -322,6 +322,8 @@ impl EventPayload {
     /// The rest of the log is DIAGNOSTIC: mirroring every token and tool result
     /// would multiply the hash-chained audit log by the traffic of the node
     /// while adding nothing an investigator cannot reach through the link.
+    /// `write_event` skips the mirror for runs of origin `bus` (one run per
+    /// record would flood the audit trail).
     pub fn security_relevant(&self) -> bool {
         matches!(self, EventPayload::RequestStarted { .. })
     }
@@ -621,7 +623,10 @@ fn write_event(tx: &Transaction<'_>, core_db: &DbPool, event: RunEvent) -> Resul
     };
     let payload = payload.redacted();
     let kind = payload.kind();
-    let security_relevant = payload.security_relevant();
+    // A bus-origin run is not mirrored: a reactor starts one per record, the
+    // publisher's own bus audit already exists, and the timeline row stays.
+    let security_relevant = payload.security_relevant()
+        && event.origin != crate::flow_engine::dispatcher::FlowOrigin::Bus;
     let seq: i64 = tx.query_row(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
         rusqlite::params![event.run_id],
@@ -812,6 +817,19 @@ pub fn run_actor_user_id(pool: &DbPool, run_id: &str) -> Result<Option<Option<St
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
     conn.query_row(
         "SELECT actor_user_id FROM run_events WHERE run_id = ?1 ORDER BY seq LIMIT 1",
+        rusqlite::params![run_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(|e| anyhow!("events db read: {e}"))
+}
+
+/// The organisation a run was recorded under: `None` when the run has no rows,
+/// `Some(None)` when its first row names no organisation.
+pub fn run_org_id(pool: &DbPool, run_id: &str) -> Result<Option<Option<String>>> {
+    let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
+    conn.query_row(
+        "SELECT org_id FROM run_events WHERE run_id = ?1 ORDER BY seq LIMIT 1",
         rusqlite::params![run_id],
         |row| row.get::<_, Option<String>>(0),
     )

@@ -644,6 +644,12 @@ required-features = ["test-support"]
 name = "bus_flow_chain_p11_gate"
 required-features = ["test-support"]
 
+# TB-02: one correlation id across REST-style entry -> A -> F1 -> B -> F2 -> C,
+# flow_executions and run_events. Needs `stub_ctx`.
+[[test]]
+name = "bus_correlation_chain"
+required-features = ["test-support"]
+
 # ort-backed state classifier + plate OCR: load pool + run one forward on a real
 # model. `#[ignore]`, env-gated (`TENTAFLOW_VISION_ORT_TEST=<home dir>`) — needs
 # the ort dylib + provisioned model files (falls back to CPU EP without a GPU).

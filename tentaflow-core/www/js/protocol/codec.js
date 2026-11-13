@@ -4218,8 +4218,11 @@ export const encode = {
    * BusPayload::MessagesBrowseRequest (M08 — audited `bus.messages.browse`, <=100
    * records / <=1 MiB, redacted preview, never a real consumer; uses `BusService::peek`,
    * follow-up toru P task 1 — no ephemeral consumer group/`bus_groups` row anymore).
-   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition?, correlationId? }.
    * `fromOffsets` (per-partition) wins over the legacy scalar `fromOffset` when non-empty.
+   * `correlationId` (TB-02) keeps only the records stamped with that id: a bounded scan, so a page
+   * can be short or empty before the partition ends — each partition's `nextOffset` in the response
+   * says how far it got.
    * `partition` (R3-2 follow-up, `KRYTYK-M1-R3.md`): number = server-side filter restricting
    * the peek to that single partition; `null`/`undefined`/absent = every partition (unchanged).
    */
@@ -4227,6 +4230,7 @@ export const encode = {
     assertReady();
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const filterId = payload.correlationId ?? payload.correlation_id;
     const body = requests.encodeBusMessagesBrowseRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
@@ -4234,6 +4238,7 @@ export const encode = {
       Number(payload.limit ?? 100),
       fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
       payload.partition == null ? undefined : Number(payload.partition),
+      filterId == null || filterId === '' ? undefined : String(filterId),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

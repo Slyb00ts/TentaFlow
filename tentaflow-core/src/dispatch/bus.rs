@@ -205,13 +205,17 @@ fn gate_admin(ctx: &HandlerContext, instance_id: &str) -> Result<Gate, ProtocolE
 /// caller of `bus::*` that speaks for the dashboard, as opposed to flow/
 /// addon/mesh origins PLAN §6.1 also describes but which land through
 /// different call sites entirely).
-fn bus_ctx(ctx: &HandlerContext, g: &Gate) -> BusCallContext {
+///
+/// `correlation_id` is a fresh UUID per operation (TB-02): the per-connection
+/// WS frame counter it used to carry restarts at 1 on every connection, so
+/// two operations on different sockets shared an id.
+fn bus_ctx(g: &Gate) -> BusCallContext {
     BusCallContext {
         instance_id: g.instance.clone(),
         org_id: g.org_id.clone(),
         actor: Some(g.user_id.clone()),
         actor_kind: ActorKind::User,
-        correlation_id: Some(ctx.correlation_id.to_string()),
+        correlation_id: Some(crate::bus::correlation::mint()),
         origin: "ui".to_string(),
     }
 }
@@ -1018,6 +1022,12 @@ fn validate_partition_filter(
 /// to that single partition — the caller MUST have already validated `p`
 /// against `partitions` via `validate_partition_filter`. `None` keeps the
 /// original "walk every partition in order" behavior unchanged.
+///
+/// `correlation_id` (TB-02) keeps only the records stamped with it, through
+/// `BusService::peek_filtered_within`'s bounded scan: the scan allowance is
+/// one budget for the whole request, spent across partitions in order, and
+/// each partition's `next_offset` is how far its scan got (its start when the
+/// budget ran out before it), so a short page is not the end of the data.
 fn peek_topic(
     bctx: &BusCallContext,
     topic: &str,
@@ -1025,6 +1035,7 @@ fn peek_topic(
     starts: &std::collections::HashMap<u32, u64>,
     limit: u32,
     partition_filter: Option<u32>,
+    correlation_id: Option<&str>,
 ) -> Result<
     (
         Vec<bus::FetchedRecordMeta>,
@@ -1044,6 +1055,7 @@ fn peek_topic(
     let mut partitions_wire = Vec::with_capacity(partition_range.len());
     let mut any_has_more = false;
     let mut max_next_offset = 0u64;
+    let mut budget = bus::ScanBudget::default();
 
     for partition in partition_range {
         if limit_left == 0 {
@@ -1051,36 +1063,44 @@ fn peek_topic(
         }
         let requested_start = starts.get(&partition).copied();
         let start = requested_start.unwrap_or(0);
-        let result = match svc.peek(
+        let result = match svc.peek_filtered_within(
             bctx,
             topic,
             partition,
             start,
             limit_left,
             bus::PEEK_MAX_BYTES,
+            correlation_id,
+            &mut budget,
         ) {
             Ok(r) => r,
             Err(BusServiceError::Engine(tentaflow_bus::BusError::OffsetOutOfRange {
                 earliest,
                 ..
             })) if requested_start.is_none() => svc
-                .peek(
+                .peek_filtered_within(
                     bctx,
                     topic,
                     partition,
                     earliest,
                     limit_left,
                     bus::PEEK_MAX_BYTES,
+                    correlation_id,
+                    &mut budget,
                 )
                 .map_err(map_bus_error)?,
             Err(e) => return Err(map_bus_error(e)),
         };
-        let next_offset = result
-            .records
-            .iter()
-            .map(|r| r.offset + 1)
-            .max()
-            .unwrap_or_else(|| start.max(result.earliest_offset));
+        // A filtered scan resumes where it stopped examining records, which
+        // is past the last MATCH (and past `start` even with no match).
+        let next_offset = result.next_offset.unwrap_or_else(|| {
+            result
+                .records
+                .iter()
+                .map(|r| r.offset + 1)
+                .max()
+                .unwrap_or_else(|| start.max(result.earliest_offset))
+        });
         let has_more = next_offset < result.high_watermark;
         any_has_more |= has_more;
         max_next_offset = max_next_offset.max(next_offset);
@@ -1432,6 +1452,7 @@ pub async fn bus_dispatch(
             from_offsets,
             limit,
             partition,
+            correlation_id,
         } => {
             messages_browse_v1(
                 ctx,
@@ -1441,6 +1462,7 @@ pub async fn bus_dispatch(
                 from_offsets.clone(),
                 *limit,
                 *partition,
+                correlation_id.clone(),
             )
             .await?
         }
@@ -1945,7 +1967,7 @@ async fn topic_create_v1(
     options: BusTopicOptionsWire,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let opts = topic_options_from_wire(options)?;
     let svc = g.svc.clone();
     let cfg =
@@ -1962,7 +1984,7 @@ async fn topic_update_v1(
     options: BusTopicOptionsWire,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let opts = topic_options_from_wire(options)?;
     let svc = g.svc.clone();
     let cfg =
@@ -1978,7 +2000,7 @@ async fn topic_delete_v1(
     name: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     run_blocking(move || svc.delete_topic(&bctx, &name).map_err(map_bus_error)).await?;
     Ok(BusPayload::TopicDeleteResponse)
@@ -1996,7 +2018,7 @@ async fn topic_detail_v1(
     name: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -2197,7 +2219,7 @@ async fn group_list_v1(
     instance_id: &str,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
     let org_admin = is_org_admin(ctx);
@@ -2277,7 +2299,7 @@ async fn require_topic_admin(
     g: &Gate,
     topic: &str,
 ) -> Result<(), ProtocolError> {
-    let bctx = bus_ctx(ctx, g);
+    let bctx = bus_ctx(g);
     let svc = g.svc.clone();
     let topic_for_access = topic.to_string();
     let (_, _, topic_admin) =
@@ -2292,7 +2314,7 @@ fn require_topic_admin_blocking(
     g: &Gate,
     topic: &str,
 ) -> Result<(), ProtocolError> {
-    let (_, _, topic_admin) = g.svc.topic_access(&bus_ctx(ctx, g), topic);
+    let (_, _, topic_admin) = g.svc.topic_access(&bus_ctx(g), topic);
     topic_admin_verdict(ctx, topic_admin, topic)
 }
 
@@ -2371,7 +2393,7 @@ async fn group_detail_v1(
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
     let (group_clone, topic_clone) = (group.clone(), topic.clone());
@@ -2440,7 +2462,7 @@ async fn group_pause_v1(
     // Admin tier, like the offset move and the UI's `can_admin`: pausing
     // stops every consumer of the group, whoever runs it.
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     run_blocking(move || {
         svc.pause_group(&bctx, &group, &topic)
@@ -2457,7 +2479,7 @@ async fn group_resume_v1(
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     run_blocking(move || {
         svc.resume_group(&bctx, &group, &topic)
@@ -2477,7 +2499,7 @@ async fn offset_reset_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: rewrites committed consumer state — admin tier.
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let new_offset = match mode {
         BusOffsetResetMode::Explicit { offset } => {
@@ -2559,7 +2581,7 @@ async fn offset_for_timestamp_v1(
     ts_ms: i64,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let offset = run_blocking(move || {
         svc.resolve_offset_for_timestamp(&bctx, &topic, partition, ts_ms)
@@ -2573,6 +2595,7 @@ async fn offset_for_timestamp_v1(
 // Message preview (audited `bus.messages.browse`) and DLQ
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn messages_browse_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -2581,9 +2604,18 @@ async fn messages_browse_v1(
     from_offsets: Vec<BusPartitionOffsetWire>,
     limit: u32,
     partition: Option<u32>,
+    correlation_id: Option<String>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    if let Some(id) = correlation_id.as_deref() {
+        if !bus::correlation::validate(id) {
+            return Err(ProtocolError::bad_request(
+                "bus.invalid_argument: correlation_id must be 1-128 ASCII characters \
+                 [A-Za-z0-9._:-] starting with a letter or digit",
+            ));
+        }
+    }
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -2614,6 +2646,7 @@ async fn messages_browse_v1(
             &starts,
             limit,
             partition,
+            correlation_id.as_deref(),
         )
     })
     .await?;
@@ -2650,7 +2683,7 @@ async fn dlq_list_v1(
              partition); the scalar from_offset is not accepted with it",
         ));
     }
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -2690,6 +2723,7 @@ async fn dlq_list_v1(
                 &starts,
                 limit,
                 partition,
+                None,
             )?
         };
         // M1-R2 review N-5, coordinator decision 2: `peek` itself stays
@@ -2720,7 +2754,7 @@ async fn dlq_retry_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: republishes an existing record — write tier.
     let g = gate_write(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let result = run_blocking(move || {
@@ -2745,7 +2779,7 @@ async fn dlq_discard_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: destroys the only remaining copy of a failed record — admin tier.
     let g = gate_admin(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     run_blocking(move || {
@@ -2764,7 +2798,7 @@ async fn dlq_retry_all_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: bounded (DLQ_RETRY_ALL_MAX), same tier as the single retry.
     let g = gate_write(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -3958,7 +3992,7 @@ async fn field_policy_preview(
         )));
     }
     require_topic_admin(ctx, &g, &topic).await?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let db = ctx.state.db.clone();
     let org_id = g.org_id.clone();
@@ -4236,7 +4270,7 @@ async fn require_pattern_not_hidden(
     g: &Gate,
     subject: &str,
 ) -> Result<(), ProtocolError> {
-    let bctx = bus_ctx(ctx, g);
+    let bctx = bus_ctx(g);
     let svc = g.svc.clone();
     let subject = subject.to_string();
     let hiding = run_blocking(move || {
@@ -4298,7 +4332,7 @@ async fn schema_derived_get_v1(
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let schema_text = run_blocking(move || {
         svc.schema_derived_get(
@@ -4329,7 +4363,7 @@ async fn schema_for_record_get_v1(
     let g = gate_read(ctx, instance_id)?;
     topics::validate_user_topic_name(topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX).unwrap_or(&topic))
         .map_err(map_bus_error)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let schema = run_blocking(move || {
         svc.schema_for_reader(&bctx, &topic, schema_ref_id)
@@ -4581,7 +4615,7 @@ async fn stats_snapshot_v1(
     instance_id: &str,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let svc = g.svc.clone();
@@ -4765,7 +4799,7 @@ async fn lag_history_v1(
             "bus.invalid_argument: lag history needs a topic or a group",
         ));
     }
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let svc = g.svc.clone();
     let since_ms = since_ms
         .unwrap_or(0)
@@ -5168,7 +5202,7 @@ async fn replica_list_v1(
     topic: Option<String>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     if let Some(name) = topic.as_deref() {
         if !g.svc.topic_access(&bctx, name).0 {
             return Err(ProtocolError::new(
@@ -5332,7 +5366,7 @@ async fn replica_reassign_v1(
     // Choosing which nodes hold a topic's copies is administration of that
     // topic, as moving its leadership is (`leader_transfer_v1`).
     let svc = g.svc.clone();
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let topic_for_access = topic.clone();
     let (_, _, topic_admin) =
         run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
@@ -5438,7 +5472,7 @@ async fn leader_transfer_v1(
     // changing its settings (`update_topic` authorizes `Admin` on it): a
     // topic ACL that denies someone administration must deny this too.
     let svc = g.svc.clone();
-    let bctx = bus_ctx(ctx, &g);
+    let bctx = bus_ctx(&g);
     let topic_for_access = topic.clone();
     let (_, _, topic_admin) =
         run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
@@ -6266,7 +6300,7 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str())
             .expect("gate resolves the fixture's enabled instance");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(&ctx, &g);
+        let bctx = bus_ctx(&g);
         {
             let svc = svc.clone();
             let bctx = bctx.clone();
@@ -6311,6 +6345,7 @@ mod tests {
             None,
             vec![],
             10,
+            None,
             None,
         )
         .await
@@ -6383,6 +6418,7 @@ mod tests {
             vec![],
             10,
             None,
+            None,
         )
         .await
         .expect("messages browse must succeed for bus.read even with nothing to show");
@@ -6435,7 +6471,7 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str())
             .expect("gate resolves the fixture's enabled instance");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(&ctx, &g);
+        let bctx = bus_ctx(&g);
         for (partition, count) in [(0u32, 5u32), (3u32, 3u32)] {
             let svc = svc.clone();
             let bctx = bctx.clone();
@@ -6472,6 +6508,7 @@ mod tests {
             vec![],
             10,
             Some(3),
+            None,
         )
         .await
         .expect("messages browse with a valid partition filter must succeed");
@@ -6535,6 +6572,7 @@ mod tests {
             vec![],
             10,
             Some(2),
+            None,
         )
         .await
         .expect_err("partition 2 is out of range for a 2-partition topic (0, 1)");
@@ -6584,6 +6622,7 @@ mod tests {
             vec![],
             10,
             None,
+            None,
         )
         .await
         .expect("messages browse must succeed for bus.read");
@@ -6609,9 +6648,203 @@ mod tests {
             vec![],
             10,
             None,
+            None,
         )
         .await
         .expect_err("must be denied without bus.read");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn messages_browse_with_a_correlation_id_filters_pages_and_audits_only_hits() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db.clone(), org.clone());
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        let g = gate_read(&ctx, fixture_instance_id().as_str()).expect("gate");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&g);
+        {
+            let (svc, bctx, topic_name) = (svc.clone(), bctx.clone(), topic_name.clone());
+            tokio::task::spawn_blocking(move || {
+                let record = |payload: &str, id: Option<&str>| bus::PublishRecord {
+                    key: None,
+                    headers: id
+                        .map(|id| vec![("correlation-id".to_string(), Bytes::from(id.to_string()))])
+                        .unwrap_or_default(),
+                    payload: Bytes::from(payload.to_string()),
+                    timestamp_ms: 0,
+                    schema_id: 0,
+                };
+                svc.publish(
+                    &bctx,
+                    &topic_name,
+                    bus::PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![
+                            record("a0", Some("chain-a")),
+                            record("b0", Some("chain-b")),
+                            record("a1", Some("chain-a")),
+                        ],
+                    },
+                )
+                .expect("publish")
+            })
+            .await
+            .expect("publish task");
+        }
+
+        let browse_rows = || {
+            repository::list_audit_logs(
+                &db,
+                &AuditLogFilters {
+                    action: Some("bus.messages.browse".to_string()),
+                    ..Default::default()
+                },
+                0,
+                10_000,
+            )
+            .expect("audit rows")
+            .len()
+        };
+        let browse = |limit: u32, from: Option<u64>, id: &str| {
+            let (ctx, topic, id) = (ctx.clone(), topic_name.clone(), id.to_string());
+            async move {
+                messages_browse_v1(
+                    &ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    from,
+                    vec![],
+                    limit,
+                    None,
+                    Some(id),
+                )
+                .await
+            }
+        };
+
+        let before = browse_rows();
+        let miss = match browse(10, None, "nobody").await.expect("browse") {
+            BusPayload::MessagesBrowseResponse { result } => result,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(miss.records.is_empty());
+        assert_eq!(
+            miss.partitions[0].next_offset, 3,
+            "an empty page still says how far the scan went"
+        );
+        assert!(!miss.has_more);
+        assert_eq!(
+            browse_rows(),
+            before,
+            "an empty filtered read writes no audit row"
+        );
+
+        let first = match browse(1, None, "chain-a").await.expect("browse") {
+            BusPayload::MessagesBrowseResponse { result } => result,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.records[0].offset, 0);
+        assert!(first.has_more, "chain-a has a second record past this page");
+        assert_eq!(browse_rows(), before + 1);
+
+        let second = match browse(1, Some(first.next_offset), "chain-a")
+            .await
+            .expect("browse")
+        {
+            BusPayload::MessagesBrowseResponse { result } => result,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].offset, 2, "chain-b's record is skipped");
+
+        let err = browse(10, None, "not valid!")
+            .await
+            .expect_err("an invalid id is a bad request");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn messages_browse_with_a_correlation_id_is_denied_without_bus_read_permission() {
+        let (_guard, db) = bus_fixture();
+        let org = org_context("org-y", "u-no-read", &[]);
+        let ctx = handler_ctx(db, org);
+        let err = messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "some.topic".to_string(),
+            None,
+            vec![],
+            10,
+            None,
+            Some("chain-a".to_string()),
+        )
+        .await
+        .expect_err("must be denied without bus.read");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// `bus.read` is not enough: a topic the caller is refused `read` on stays
+    /// closed to a correlation-filtered browse, with or without a match.
+    #[tokio::test]
+    async fn messages_browse_with_a_correlation_id_respects_the_topic_acl() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-acl-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let topic = format!("closed.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        acl_set_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic.clone(),
+            "user".to_string(),
+            user_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("deny read");
+        let err = messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic,
+            None,
+            vec![],
+            10,
+            None,
+            Some("chain-a".to_string()),
+        )
+        .await
+        .expect_err("the topic ACL must refuse the filtered read");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
     }
 
@@ -6816,7 +7049,7 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str())
             .expect("gate resolves the fixture's enabled instance");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(&ctx, &g);
+        let bctx = bus_ctx(&g);
 
         // `BusService::publish`/`open_consumer`/`ConsumerHandle::fetch`/
         // `commit` are synchronous and BLOCK (this file's own module-level
@@ -6957,7 +7190,7 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str())
             .expect("gate resolves the fixture's enabled instance");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(&ctx, &g);
+        let bctx = bus_ctx(&g);
 
         // A real, visible group.
         svc.open_consumer(
@@ -7052,7 +7285,7 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str())
             .expect("gate resolves the fixture's enabled instance");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(&ctx, &g);
+        let bctx = bus_ctx(&g);
 
         // 3 records, each exhausting its single allowed delivery attempt —
         // the REAL failure path, not a raw publish into the DLQ topic.
@@ -9305,7 +9538,7 @@ mod tests {
     async fn publish_records(ctx: &HandlerContext, topic: &str, records: Vec<(String, i64)>) {
         let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
         let svc = g.svc.clone();
-        let bctx = bus_ctx(ctx, &g);
+        let bctx = bus_ctx(&g);
         let topic = topic.to_string();
         tokio::task::spawn_blocking(move || {
             // Another test in this module may have installed a fake
@@ -9414,7 +9647,7 @@ mod tests {
         let svc = g.svc.clone();
         {
             let (svc, bctx, group, topic) =
-                (svc.clone(), bus_ctx(&ctx, &g), group.clone(), topic.clone());
+                (svc.clone(), bus_ctx(&g), group.clone(), topic.clone());
             tokio::task::spawn_blocking(move || {
                 svc.open_consumer(
                     &bctx,
@@ -9981,7 +10214,7 @@ mod tests {
         .await
         .expect("topic create");
         let g = gate_read(ctx, inst.as_str()).expect("gate");
-        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.clone());
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.clone());
         tokio::task::spawn_blocking(move || {
             for i in 0..failed {
                 let payload = Bytes::from(format!("payload-{i}"));
@@ -10031,7 +10264,7 @@ mod tests {
 
     async fn source_high_watermark(ctx: &HandlerContext, topic: &str) -> u64 {
         let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
-        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.to_string());
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.to_string());
         tokio::task::spawn_blocking(move || svc.partition_stats(&bctx, &t, 0).unwrap().high_watermark)
             .await
             .unwrap()
@@ -10295,7 +10528,7 @@ mod tests {
         .await
         .expect("topic create");
         let g = gate_read(ctx, inst.as_str()).expect("gate");
-        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.clone());
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.clone());
         tokio::task::spawn_blocking(move || {
             for (key, failed_payload) in failures {
                 let key = Bytes::from_static(key.as_bytes());
@@ -10502,7 +10735,7 @@ mod tests {
         let topic = topic_with_rejected_records(&ctx, 3).await;
         let dlq_topic = dlq::dlq_topic_name(&topic);
         let g = gate_read(&ctx, fixture_instance_id().as_str()).expect("gate");
-        let (bctx, t) = (bus_ctx(&ctx, &g), dlq_topic.clone());
+        let (bctx, t) = (bus_ctx(&g), dlq_topic.clone());
         let before = browsed_records(&db, &dlq_topic);
         let (picked, skipped) = tokio::task::spawn_blocking(move || {
             retryable_dlq_records(&bctx, &t, 1, 10, 2).expect("pick")
@@ -10526,7 +10759,7 @@ mod tests {
             two_partition_topic_with_failures(&ctx, BusTopicOptionsWire::default(), failures).await;
         let dlq_topic = dlq::dlq_topic_name(&topic);
         let g = gate_read(&ctx, fixture_instance_id().as_str()).expect("gate");
-        let (bctx, t) = (bus_ctx(&ctx, &g), dlq_topic.clone());
+        let (bctx, t) = (bus_ctx(&g), dlq_topic.clone());
         let before = browsed_records(&db, &dlq_topic);
         let (picked, _) = tokio::task::spawn_blocking(move || {
             retryable_dlq_records(&bctx, &t, 2, 10, 4).expect("pick")
@@ -10635,7 +10868,7 @@ mod tests {
         let svc = g.svc.clone();
         {
             let (svc, bctx, group, topic) =
-                (svc.clone(), bus_ctx(&ctx, &g), group.clone(), topic.clone());
+                (svc.clone(), bus_ctx(&g), group.clone(), topic.clone());
             tokio::task::spawn_blocking(move || {
                 svc.open_consumer(
                     &bctx,
@@ -12376,7 +12609,7 @@ mod tests {
         .expect("topic create");
         let payload = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
         let g = gate_read(&ctx, inst.as_str()).expect("gate");
-        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&ctx, &g), topic.clone());
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.clone());
         tokio::task::spawn_blocking(move || {
             svc.local_partition(&bctx, &t, 0).expect("partition").open_leader_writes();
             svc.publish(
@@ -12491,7 +12724,7 @@ mod tests {
         let inst = fixture_instance_id();
         // The caller reads through its own rule (a, b): the browse carries the
         // id of that sub-schema.
-        let browse = messages_browse_v1(&f.ctx, inst.as_str(), f.topic.clone(), None, vec![], 10, None)
+        let browse = messages_browse_v1(&f.ctx, inst.as_str(), f.topic.clone(), None, vec![], 10, None, None)
             .await
             .expect("browse");
         let BusPayload::MessagesBrowseResponse { result } = browse else { panic!("unexpected") };
@@ -13101,7 +13334,7 @@ mod tests {
         let f = preview_fixture(&db).await;
         let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
         let g = gate_read(&f.ctx, fixture_instance_id().as_str()).expect("gate");
-        let (svc, bctx, topic) = (g.svc.clone(), bus_ctx(&f.ctx, &g), f.topic.clone());
+        let (svc, bctx, topic) = (g.svc.clone(), bus_ctx(&g), f.topic.clone());
         tokio::task::spawn_blocking(move || {
             let cfg = topics::get_topic(svc.db(), bctx.instance_id.as_str(), &bctx.org_id, &topic)
                 .unwrap()

@@ -803,6 +803,7 @@ fn run_go2_call(
                 None,
                 ROBOT_BLOCK_FUEL,
                 None,
+                None,
             )?;
             serde_json::from_slice::<serde_json::Value>(&raw)
                 .map_err(|e| anyhow::anyhow!("decode block result: {e}"))

@@ -150,6 +150,7 @@ impl NodeAdapter for AddonNodeAdapter {
         let addon_id = self.addon_id.clone();
         let block_type = self.block_type.clone();
         let user_id = ctx.user_id.clone();
+        let correlation_id = ctx.correlation_id.clone();
         let node_type = self.node_type.clone();
 
         let response_bytes = tokio::task::spawn_blocking(move || {
@@ -161,6 +162,7 @@ impl NodeAdapter for AddonNodeAdapter {
                 None,
                 fuel,
                 deadline,
+                correlation_id,
             )
         })
         .await

@@ -698,6 +698,10 @@ pub struct ToolDefinition {
 pub struct AddonCallProvenance {
     pub origin: crate::flow_engine::dispatcher::FlowOrigin,
     pub actor: Option<crate::flow_engine::dispatcher::FlowActor>,
+    /// Correlation id of the run the call belongs to (TB-02). `bus_publish_v1`
+    /// stamps it on records that carry no `correlation-id` header of their
+    /// own; `None` makes the host mint one per record.
+    pub correlation_id: Option<String>,
 }
 
 impl AddonCallProvenance {
@@ -707,7 +711,14 @@ impl AddonCallProvenance {
         Self {
             origin: crate::flow_engine::dispatcher::FlowOrigin::Addon,
             actor: None,
+            correlation_id: None,
         }
+    }
+
+    /// Ties the call to the correlation chain of the run that made it.
+    pub fn with_correlation_id(mut self, correlation_id: Option<String>) -> Self {
+        self.correlation_id = correlation_id;
+        self
     }
 
     /// An Admin Scheduler tick firing an addon tool. The actor is the JOB, not
@@ -719,6 +730,7 @@ impl AddonCallProvenance {
             actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
                 job_id,
             )),
+            correlation_id: None,
         }
     }
 
@@ -731,6 +743,7 @@ impl AddonCallProvenance {
             actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
                 request_id,
             )),
+            correlation_id: None,
         }
     }
 
@@ -3663,6 +3676,7 @@ impl AddonManager {
         org_id: Option<String>,
         fuel_budget: u64,
         deadline: Option<std::time::Instant>,
+        correlation_id: Option<String>,
     ) -> Result<Vec<u8>> {
         info!(
             "Wywolanie flow blocku '{}.{}' (user_id={:?}, fuel={}, deadline={:?})",
@@ -3708,7 +3722,9 @@ impl AddonManager {
             is_system_call: user_id.is_none(),
             // A flow `addon.*` block runs the addon on the flow's behalf; the
             // flow's own §2.5 stamp travels with the flow, not through here.
-            call_provenance: AddonCallProvenance::addon(),
+            // Only its correlation id does, so a `bus_publish_v1` from the
+            // block stays in the run's chain.
+            call_provenance: AddonCallProvenance::addon().with_correlation_id(correlation_id),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),

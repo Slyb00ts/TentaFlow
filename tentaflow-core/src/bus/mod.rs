@@ -89,6 +89,7 @@
 
 mod binary_projection;
 pub mod codec;
+pub mod correlation;
 pub mod db;
 pub mod dedup;
 pub mod dlq;
@@ -116,6 +117,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use tentaflow_protocol::bus::TF_CORRELATION_ID_HEADER;
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use crate::auth::actor::ActorKind;
@@ -247,13 +249,19 @@ pub fn running_instances() -> Vec<Arc<BusService>> {
 
 /// Any incoming header using this prefix is silently STRIPPED before the
 /// broker's own provenance headers (`tf.org`/`tf.actor`/
-/// `tf.correlation_id`/`tf.origin`/`tf.content_type`/`tf.env`) are stamped
-///. A consumer/UI reading `tf.*` needs the guarantee that it was
-/// never caller-controllable — without this, `record.headers` was appended
+/// `tf.correlation_id`/`tf.origin`/`tf.content_type`/`tf.env`) are stamped.
+/// A consumer/UI reading `tf.*` needs the guarantee that it was never
+/// caller-controllable — without this, `record.headers` was appended
 /// FIRST, then the broker's own `tf.*` pushed again, so a forged
 /// `tf.actor` from the wire sat right next to the real one with no
 /// deduplication; whichever a reader happened to pick first on a
 /// duplicate-key lookup could be the forged value.
+///
+/// The one nuance is `tf.correlation_id`: it means "validated,
+/// caller-asserted". The broker derives it from the record's input
+/// `correlation-id` header (else `BusCallContext::correlation_id`) after
+/// `correlation::validate`, so it is a label the caller chose, never proof of
+/// identity (attribution is `tf.actor`/`tf.org`).
 ///
 /// STRIP rather than REJECT (the task's other option) because `publish` is
 /// also used internally to re-thread an already-published record forward —
@@ -1966,6 +1974,43 @@ pub struct PeekResult {
     pub records: Vec<FetchedRecordMeta>,
     pub high_watermark: u64,
     pub earliest_offset: u64,
+    /// `Some` only for a correlation-filtered read (`peek_filtered`): the
+    /// offset after the last record EXAMINED, which is where the next page
+    /// resumes. The scan is bounded, so it can end well before the page is
+    /// full or the partition is exhausted.
+    pub next_offset: Option<u64>,
+}
+
+/// A correlation-filtered read examines at most this many records per
+/// request (all partitions together).
+pub const PEEK_FILTER_SCAN_MAX_RECORDS: usize = 10_000;
+
+/// A correlation-filtered read examines at most this many bytes of record
+/// payload and headers per request (all partitions together).
+pub const PEEK_FILTER_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// What is left of a correlation-filtered read's scan allowance. One budget
+/// is shared by every partition a request walks, so a topic with many
+/// partitions cannot multiply the work a single request may cause.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanBudget {
+    pub records: usize,
+    pub bytes: usize,
+}
+
+impl Default for ScanBudget {
+    fn default() -> Self {
+        Self {
+            records: PEEK_FILTER_SCAN_MAX_RECORDS,
+            bytes: PEEK_FILTER_SCAN_MAX_BYTES,
+        }
+    }
+}
+
+impl ScanBudget {
+    pub fn is_spent(&self) -> bool {
+        self.records == 0 || self.bytes == 0
+    }
 }
 
 /// `peek`'s hard ceiling on records per call, regardless of what a caller
@@ -6369,6 +6414,14 @@ impl BusService {
         let mut seen_this_call: HashSet<Bytes> = HashSet::new();
 
         let node_env = self.cached_environment();
+        // Validated once per publish: an invalid ctx id is not stamped.
+        let ctx_correlation_id = ctx.correlation_id.as_deref().filter(|id| {
+            let ok = correlation::validate(id);
+            if !ok {
+                tracing::warn!("bus: ignoring invalid correlation id on the call context");
+            }
+            ok
+        });
         let mut acks: Vec<PartitionAck> = Vec::with_capacity(groups.len());
         let mut total_accepted = 0u32;
         let mut total_accepted_bytes = 0u64;
@@ -6520,8 +6573,13 @@ impl BusService {
                     // are both bare strings.
                     rec = rec.with_header("tf.actor_kind", ctx.actor_kind.as_str());
                 }
-                if let Some(cid) = &ctx.correlation_id {
-                    rec = rec.with_header("tf.correlation_id", cid.clone());
+                // Record header wins over the ctx id; an invalid header
+                // was never promoted (see `correlation::from_headers`).
+                if let Some(cid) = correlation::from_headers(&r.headers).or(ctx_correlation_id) {
+                    rec = rec.with_header(
+                        tentaflow_protocol::bus::TF_CORRELATION_ID_HEADER,
+                        cid.to_string(),
+                    );
                 }
                 rec = rec.with_header("tf.origin", ctx.origin.clone());
                 rec = rec.with_header("tf.content_type", cfg.content_type.clone());
@@ -7656,6 +7714,63 @@ impl BusService {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PeekResult, BusServiceError> {
+        self.peek_filtered(
+            ctx,
+            topic,
+            partition,
+            from_offset,
+            max_records,
+            max_bytes,
+            None,
+        )
+    }
+
+    /// `peek_filtered_within` with a fresh default `ScanBudget`: one
+    /// partition, one budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peek_filtered(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        correlation_id: Option<&str>,
+    ) -> Result<PeekResult, BusServiceError> {
+        self.peek_filtered_within(
+            ctx,
+            topic,
+            partition,
+            from_offset,
+            max_records,
+            max_bytes,
+            correlation_id,
+            &mut ScanBudget::default(),
+        )
+    }
+
+    /// `peek` that keeps only the records stamped with `correlation_id`
+    /// (`tf.correlation_id`; TB-02). There is no per-record index: the scan
+    /// reads the log from `from_offset` and is BOUNDED by `budget`, which the
+    /// scan spends down so a caller can share one budget across partitions.
+    /// A page can come back short or empty well before the partition ends;
+    /// `PeekResult::next_offset` says how far it got (`from_offset` when the
+    /// budget was already spent). Authorization, leader rule, projection and
+    /// audit are `peek`'s (the audit row is written only when at least one
+    /// record is returned, and names the filter). `None` is exactly `peek`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peek_filtered_within(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        correlation_id: Option<&str>,
+        budget: &mut ScanBudget,
+    ) -> Result<PeekResult, BusServiceError> {
         let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
         let max_records = max_records.min(PEEK_MAX_RECORDS);
         let max_bytes = max_bytes.min(PEEK_MAX_BYTES);
@@ -7663,26 +7778,83 @@ impl BusService {
         let reader = part.open_reader();
         let high_watermark = reader.high_watermark();
         let earliest_offset = reader.earliest_offset();
-        let batches = reader
-            .fetch_from_offset(from_offset, max_bytes)
-            .map_err(|e| map_engine_error(e, topic, partition))?;
 
         let mut records = Vec::new();
-        'batches: for view in &batches {
-            for rv in view.records_from(from_offset) {
-                if records.len() >= max_records {
-                    break 'batches;
+        let mut next_offset = None;
+        match correlation_id {
+            None => {
+                let batches = reader
+                    .fetch_from_offset(from_offset, max_bytes)
+                    .map_err(|e| map_engine_error(e, topic, partition))?;
+                'batches: for view in &batches {
+                    for rv in view.records_from(from_offset) {
+                        if records.len() >= max_records {
+                            break 'batches;
+                        }
+                        records.push(fetched_record(topic, partition, view, rv?));
+                    }
                 }
-                records.push(fetched_record(topic, partition, view, rv?));
+            }
+            Some(_) if budget.is_spent() => next_offset = Some(from_offset),
+            Some(wanted) => {
+                let wanted = wanted.as_bytes();
+                let mut cursor = from_offset;
+                // The first fetch always runs, so an offset out of range
+                // fails exactly like an unfiltered `peek`.
+                'scan: loop {
+                    let batches = reader
+                        .fetch_from_offset(cursor, max_bytes)
+                        .map_err(|e| map_engine_error(e, topic, partition))?;
+                    let before = cursor;
+                    for view in &batches {
+                        for rv in view.records_from(cursor) {
+                            let rv = rv?;
+                            let offset = view.header().base_offset + rv.offset_delta as u64;
+                            cursor = offset + 1;
+                            budget.records = budget.records.saturating_sub(1);
+                            budget.bytes = budget.bytes.saturating_sub(
+                                rv.payload.len()
+                                    + rv.headers
+                                        .iter()
+                                        .map(|(k, v)| k.len() + v.len())
+                                        .sum::<usize>(),
+                            );
+                            let matches = rv.headers.iter().any(|(k, v)| {
+                                k.as_ref() == TF_CORRELATION_ID_HEADER.as_bytes()
+                                    && v.as_ref() == wanted
+                            });
+                            if matches {
+                                let mut rec = fetched_record(topic, partition, view, rv);
+                                // Copied so the fetched batch is freed
+                                // instead of pinned by a small match.
+                                rec.payload = Bytes::copy_from_slice(&rec.payload);
+                                records.push(rec);
+                                if records.len() >= max_records {
+                                    break 'scan;
+                                }
+                            }
+                            if budget.is_spent() {
+                                break 'scan;
+                            }
+                        }
+                    }
+                    if cursor == before || cursor >= high_watermark {
+                        break;
+                    }
+                }
+                next_offset = Some(cursor);
             }
         }
 
         if !records.is_empty() {
+            let filter = correlation_id
+                .map(|id| format!(" correlation_id={id}"))
+                .unwrap_or_default();
             self.audit_browse(
                 ctx,
                 topic,
                 &format!(
-                    "partition={partition} from_offset={from_offset} count={}",
+                    "partition={partition} from_offset={from_offset} count={}{filter}",
                     records.len()
                 ),
             );
@@ -7700,6 +7872,7 @@ impl BusService {
             records,
             high_watermark,
             earliest_offset,
+            next_offset,
         })
     }
 
@@ -7779,6 +7952,7 @@ impl BusService {
             records,
             high_watermark,
             earliest_offset,
+            next_offset: None,
         })
     }
 
@@ -14129,6 +14303,418 @@ mod tests {
             "the caller-supplied 'tf.actor' copy must be stripped, not just appended alongside"
         );
         assert_eq!(actor_headers[0].1, Bytes::from_static(b"tester"));
+    }
+
+    // ---- correlation id stamping (TB-02) ----------------------------
+
+    /// Publishes `record` on a fresh one-partition topic under `ctx` and
+    /// returns the `tf.correlation_id` values the stored record carries.
+    fn stamped_correlation_ids(ctx: &BusCallContext, mut record: PublishRecord) -> Vec<Bytes> {
+        let (_tmp, svc) = test_service();
+        svc.create_topic(
+            ctx,
+            "events.corr",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        record.timestamp_ms = 1;
+        svc.publish(
+            ctx,
+            "events.corr",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record],
+            },
+        )
+        .unwrap();
+        let handle = svc
+            .open_consumer(
+                ctx,
+                "g1",
+                &["events.corr".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let fetched = handle.fetch(1024, 20).unwrap();
+        assert_eq!(fetched.records.len(), 1);
+        fetched.records[0]
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "tf.correlation_id")
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    fn with_header(mut r: PublishRecord, name: &str, value: &str) -> PublishRecord {
+        r.headers
+            .push((name.to_string(), Bytes::from(value.to_string())));
+        r
+    }
+
+    #[test]
+    fn a_valid_record_header_wins_over_the_context_correlation_id() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        let r = with_header(record("p"), "correlation-id", "from-header");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"from-header")]
+        );
+    }
+
+    #[test]
+    fn an_invalid_record_header_falls_back_to_the_context_id() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        let r = with_header(record("p"), "correlation-id", "not valid!");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"from-ctx")]
+        );
+    }
+
+    #[test]
+    fn the_context_id_is_stamped_when_the_record_has_no_header() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        assert_eq!(
+            stamped_correlation_ids(&ctx, record("p")),
+            vec![Bytes::from_static(b"from-ctx")]
+        );
+    }
+
+    #[test]
+    fn an_invalid_context_id_is_not_stamped() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("has space".to_string());
+        assert!(stamped_correlation_ids(&ctx, record("p")).is_empty());
+    }
+
+    #[test]
+    fn no_correlation_id_means_no_stamp() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        assert!(stamped_correlation_ids(&ctx, record("p")).is_empty());
+    }
+
+    #[test]
+    fn a_forged_tf_correlation_id_is_still_stripped() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        let r = with_header(record("p"), "tf.correlation_id", "forged");
+        assert!(stamped_correlation_ids(&ctx, r).is_empty());
+
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("real".to_string());
+        let r = with_header(record("p"), "tf.correlation_id", "forged");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"real")],
+            "exactly the broker's own value, never the forged copy beside it"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_correlation_id_header_is_an_input() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        for name in ["x-correlation-id", "traceparent", "Correlation-Id"] {
+            let r = with_header(record("p"), name, "abc-1");
+            assert!(
+                stamped_correlation_ids(&ctx, r).is_empty(),
+                "{name} must not be promoted"
+            );
+        }
+    }
+
+    // ---- correlation-filtered peek (TB-02) --------------------------
+
+    fn publish_correlated(
+        svc: &BusService,
+        ctx: &BusCallContext,
+        topic: &str,
+        payload: &str,
+        id: Option<&str>,
+    ) {
+        let r = match id {
+            Some(id) => with_header(record(payload), "correlation-id", id),
+            None => record(payload),
+        };
+        svc.publish(
+            ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![r],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn peek_filtered_returns_only_matching_records_and_how_far_it_scanned() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peekc",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (payload, id) in [
+            ("a0", Some("chain-a")),
+            ("b0", Some("chain-b")),
+            ("n0", None),
+            ("a1", Some("chain-a")),
+            ("b1", Some("chain-b")),
+        ] {
+            publish_correlated(&svc, &ctx, "events.peekc", payload, id);
+        }
+
+        let hit = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        let payloads: Vec<_> = hit.records.iter().map(|r| r.payload.clone()).collect();
+        assert_eq!(
+            payloads,
+            vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
+        );
+        assert_eq!(hit.next_offset, Some(5), "the whole partition was examined");
+
+        // A page that fills up resumes right after its last match.
+        let page = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                1,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.next_offset, Some(1));
+        let rest = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                page.next_offset.unwrap(),
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        assert_eq!(rest.records.len(), 1);
+        assert_eq!(rest.records[0].payload, Bytes::from_static(b"a1"));
+
+        let miss = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("nobody"),
+            )
+            .unwrap();
+        assert!(miss.records.is_empty());
+        assert_eq!(miss.next_offset, Some(5));
+
+        // `None` is the plain peek.
+        let plain = svc
+            .peek_filtered(&ctx, "events.peekc", 0, 0, 10, PEEK_MAX_BYTES, None)
+            .unwrap();
+        assert_eq!(plain.records.len(), 5);
+        assert_eq!(plain.next_offset, None);
+    }
+
+    #[test]
+    fn a_shared_scan_budget_is_spent_across_calls_and_a_spent_one_scans_nothing() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peekb",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (payload, id) in [
+            ("n0", None),
+            ("n1", None),
+            ("n2", None),
+            ("a0", Some("chain-a")),
+        ] {
+            publish_correlated(&svc, &ctx, "events.peekb", payload, id);
+        }
+        let mut budget = ScanBudget {
+            records: 3,
+            bytes: usize::MAX,
+        };
+        let first = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut budget,
+            )
+            .unwrap();
+        assert!(first.records.is_empty(), "the match lies past the budget");
+        assert_eq!(first.next_offset, Some(3));
+        assert!(budget.is_spent());
+        assert!(first.next_offset.unwrap() < first.high_watermark);
+
+        // A spent budget examines nothing and reports where it stood.
+        let second = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                3,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut budget,
+            )
+            .unwrap();
+        assert!(second.records.is_empty());
+        assert_eq!(second.next_offset, Some(3));
+
+        let mut fresh = ScanBudget::default();
+        let resumed = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                3,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut fresh,
+            )
+            .unwrap();
+        assert_eq!(resumed.records.len(), 1);
+        assert_eq!(resumed.next_offset, Some(4));
+    }
+
+    #[test]
+    fn peek_filtered_audits_only_a_read_that_returns_records() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peeka",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        publish_correlated(&svc, &ctx, "events.peeka", "a0", Some("chain-a"));
+        let browse_rows = |svc: &BusService| {
+            crate::db::repository::list_audit_logs(
+                &svc.db,
+                &crate::db::models::AuditLogFilters {
+                    action: Some("bus.messages.browse".to_string()),
+                    ..Default::default()
+                },
+                0,
+                1000,
+            )
+            .unwrap()
+            .len()
+        };
+        let before = browse_rows(&svc);
+        svc.peek_filtered(
+            &ctx,
+            "events.peeka",
+            0,
+            0,
+            10,
+            PEEK_MAX_BYTES,
+            Some("nobody"),
+        )
+        .unwrap();
+        assert_eq!(
+            browse_rows(&svc),
+            before,
+            "an empty filtered read is not audited"
+        );
+        svc.peek_filtered(
+            &ctx,
+            "events.peeka",
+            0,
+            0,
+            10,
+            PEEK_MAX_BYTES,
+            Some("chain-a"),
+        )
+        .unwrap();
+        assert_eq!(browse_rows(&svc), before + 1);
+    }
+
+    #[test]
+    fn peek_filtered_is_refused_without_read_permission() {
+        let (_tmp, bus_dir) = test_bus_dir();
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir,
+            db,
+            authorizer: Arc::new(DenyAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+        })
+        .expect("bus service");
+        let ctx = test_ctx("org-1");
+        let err = svc
+            .peek_filtered(
+                &ctx,
+                "events.denied",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::PermissionDenied { .. }),
+            "{err:?}"
+        );
     }
 
     // ---- topic config cache -----------------------------------------

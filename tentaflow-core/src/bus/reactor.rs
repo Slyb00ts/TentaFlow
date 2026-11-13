@@ -82,8 +82,10 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 
 use crate::agents::{AgentPrincipal, FlowDispatcherReactorDispatch, ReactorFlowDispatch};
+use crate::bus::correlation;
 use crate::bus::dlq::DlqReason;
 use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
@@ -359,6 +361,56 @@ fn end_offsets(records: &[FetchedRecordMeta]) -> Vec<(TopicPartition, u64)> {
         .collect()
 }
 
+/// The correlation id a reactive run carries, and the member ids when the
+/// batch mixed several chains.
+#[derive(Debug, PartialEq, Eq)]
+struct BatchCorrelation {
+    /// The run's correlation id: the records' shared id, or a minted one.
+    id: String,
+    /// Distinct member ids of a batch whose records carry different ids
+    /// (`id` is then a minted batch id). `None` otherwise.
+    member_ids: Option<Vec<String>>,
+}
+
+/// TB-02 D6. One record, or every record with the same id: that id. Mixed ids:
+/// a minted batch id plus the distinct member ids. No record id at all (a
+/// legacy producer): one minted id per dispatch. Delivery semantics do not
+/// change: the batch is still one run.
+fn resolve_batch_correlation(records: &[FetchedRecordMeta]) -> BatchCorrelation {
+    let mut distinct: Vec<String> = Vec::new();
+    let mut any_missing = false;
+    for r in records {
+        match correlation::from_fetched_headers(&r.headers) {
+            Some(id) if !distinct.contains(&id) => distinct.push(id),
+            Some(_) => {}
+            None => any_missing = true,
+        }
+    }
+    match (distinct.len(), any_missing) {
+        (1, false) => BatchCorrelation {
+            id: distinct.remove(0),
+            member_ids: None,
+        },
+        (0, _) => BatchCorrelation {
+            id: correlation::mint(),
+            member_ids: None,
+        },
+        _ => BatchCorrelation {
+            id: correlation::mint(),
+            member_ids: Some(distinct),
+        },
+    }
+}
+
+fn apply_correlation_meta(env: &mut FlowEnvelope, corr: &BatchCorrelation) {
+    env.meta
+        .insert("bus_correlation_id".into(), serde_json::json!(corr.id));
+    if let Some(ids) = &corr.member_ids {
+        env.meta
+            .insert("bus_correlation_ids".into(), serde_json::json!(ids));
+    }
+}
+
 /// Builds the seed envelope a `bus_consume` entry emits (PLAN §6.3): a single
 /// decoded record's JSON for `batch_size == 1` (matching `bus_consume`'s own
 /// `active_output_ports`, which activates "message" for a non-array Json
@@ -461,6 +513,7 @@ async fn handle_batch_failure(
     records: &[FetchedRecordMeta],
     reason: DlqReason,
     message: &str,
+    run_correlation_id: Option<&str>,
 ) -> AfterFailure {
     match config.on_error {
         OnError::Halt => {
@@ -489,9 +542,14 @@ async fn handle_batch_failure(
         OnError::Dlq => {
             drop(handle);
             for record in records {
+                // The record's own chain; a legacy record without one joins the
+                // run it failed in (when a run was resolved).
+                let mut record_ctx = bctx.clone();
+                record_ctx.correlation_id = correlation::from_fetched_headers(&record.headers)
+                    .or_else(|| run_correlation_id.map(str::to_string));
                 let outcome = note_failure(
                     svc.clone(),
-                    bctx.clone(),
+                    record_ctx,
                     config.group.clone(),
                     record.clone(),
                     reason,
@@ -524,6 +582,24 @@ async fn run_cycle(
     flow_id: &str,
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
+) -> AfterFailure {
+    let span = tracing::info_span!(
+        "bus_reactor_cycle",
+        flow_id = %flow_id,
+        topic = %config.topic,
+        correlation_id = tracing::field::Empty,
+    );
+    run_cycle_in(svc, flow_id, config, dispatch, &span)
+        .instrument(span.clone())
+        .await
+}
+
+async fn run_cycle_in(
+    svc: &Arc<BusService>,
+    flow_id: &str,
+    config: &ConsumeConfig,
+    dispatch: &Arc<dyn ReactorFlowDispatch>,
+    span: &tracing::Span,
 ) -> AfterFailure {
     let bctx = BusCallContext {
         instance_id: svc.typed_instance_id(),
@@ -586,18 +662,23 @@ async fn run_cycle(
                 &records,
                 DlqReason::SchemaViolation,
                 &msg,
+                None,
             )
             .await;
         }
     };
 
-    let envelope = build_envelope(config, &records, &values);
+    let batch_corr = resolve_batch_correlation(&records);
+    span.record("correlation_id", batch_corr.id.as_str());
+    let mut envelope = build_envelope(config, &records, &values);
+    apply_correlation_meta(&mut envelope, &batch_corr);
     let principal = AgentPrincipal::new(
         None,
         Some(config.org_id.clone()),
         FlowOrigin::Bus,
         FlowActor::system(),
-    );
+    )
+    .with_correlation_id(Some(batch_corr.id.clone()));
 
     match dispatch
         .dispatch(flow_id.to_string(), envelope, principal)
@@ -629,6 +710,7 @@ async fn run_cycle(
                 &records,
                 DlqReason::ConsumerError,
                 &msg,
+                Some(batch_corr.id.as_str()),
             )
             .await
         }
@@ -1498,6 +1580,257 @@ mod tests {
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
         let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
         assert_eq!(dlq_records.len(), 1, "one record landed in the DLQ");
+    }
+
+    fn record_with_correlation(offset: u64, id: Option<&str>) -> FetchedRecordMeta {
+        let mut r = record("t", 0, offset, "{}");
+        if let Some(id) = id {
+            r.headers.push((
+                Bytes::from_static(b"tf.correlation_id"),
+                Bytes::from(id.to_string()),
+            ));
+        }
+        r
+    }
+
+    #[test]
+    fn batch_correlation_uses_the_shared_id_of_uniform_records() {
+        let one = resolve_batch_correlation(&[record_with_correlation(0, Some("c-1"))]);
+        assert_eq!(one.id, "c-1");
+        assert!(one.member_ids.is_none());
+        let same = resolve_batch_correlation(&[
+            record_with_correlation(0, Some("c-1")),
+            record_with_correlation(1, Some("c-1")),
+        ]);
+        assert_eq!(same.id, "c-1");
+        assert!(same.member_ids.is_none());
+    }
+
+    #[test]
+    fn batch_correlation_mints_a_batch_id_for_mixed_records() {
+        let mixed = resolve_batch_correlation(&[
+            record_with_correlation(0, Some("c-1")),
+            record_with_correlation(1, Some("c-2")),
+            record_with_correlation(2, Some("c-1")),
+        ]);
+        assert!(correlation::validate(&mixed.id));
+        assert!(mixed.id != "c-1" && mixed.id != "c-2");
+        assert_eq!(
+            mixed.member_ids,
+            Some(vec!["c-1".to_string(), "c-2".to_string()])
+        );
+        let partial = resolve_batch_correlation(&[
+            record_with_correlation(0, Some("c-1")),
+            record_with_correlation(1, None),
+        ]);
+        assert_ne!(partial.id, "c-1");
+        assert_eq!(partial.member_ids, Some(vec!["c-1".to_string()]));
+    }
+
+    #[test]
+    fn batch_correlation_mints_one_id_for_legacy_records() {
+        let legacy = resolve_batch_correlation(&[record_with_correlation(0, None)]);
+        assert!(correlation::validate(&legacy.id));
+        assert!(legacy.member_ids.is_none());
+    }
+
+    /// Records the principal and envelope meta of every dispatch.
+    struct CapturingDispatch {
+        seen: Mutex<Vec<(Option<String>, serde_json::Map<String, serde_json::Value>)>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ReactorFlowDispatch for CapturingDispatch {
+        async fn dispatch(
+            &self,
+            _flow_id: String,
+            initial: FlowEnvelope,
+            principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
+            let meta = initial
+                .meta
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((principal.correlation_id, meta));
+            if self.fail {
+                anyhow::bail!("scripted dispatch failure");
+            }
+            Ok(())
+        }
+    }
+
+    async fn publish_with_correlation(
+        svc: &Arc<BusService>,
+        ctx: &BusCallContext,
+        topic: &str,
+        records: Vec<(&str, Option<&str>)>,
+    ) {
+        let svc = svc.clone();
+        let ctx = ctx.clone();
+        let topic = topic.to_string();
+        let records: Vec<PublishRecord> = records
+            .into_iter()
+            .map(|(payload, id)| PublishRecord {
+                key: None,
+                headers: id
+                    .map(|id| vec![("correlation-id".to_string(), Bytes::from(id.to_string()))])
+                    .unwrap_or_default(),
+                payload: Bytes::from(payload.to_string()),
+                timestamp_ms: 0,
+                schema_id: 0,
+            })
+            .collect();
+        blocking(move || {
+            svc.publish(
+                &ctx,
+                &topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records,
+                },
+            )
+        })
+        .await
+        .expect("publish");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_carries_the_record_correlation_id_into_the_run() {
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(&svc, &ctx, "orders.raw", TopicOptions::default()).await;
+        publish_with_correlation(
+            &svc,
+            &ctx,
+            "orders.raw",
+            vec![(r#"{"id":1}"#, Some("chain-7"))],
+        )
+        .await;
+
+        let spy = Arc::new(CapturingDispatch {
+            seen: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .unwrap();
+        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.as_deref(), Some("chain-7"));
+        assert_eq!(seen[0].1.get("bus_correlation_id"), Some(&json!("chain-7")));
+        assert!(seen[0].1.get("bus_correlation_ids").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_cycle_mints_a_batch_id_and_lists_members_for_a_mixed_batch() {
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(&svc, &ctx, "orders.raw", TopicOptions::default()).await;
+        publish_with_correlation(
+            &svc,
+            &ctx,
+            "orders.raw",
+            vec![("{}", Some("chain-a")), ("{}", Some("chain-b"))],
+        )
+        .await;
+
+        let spy = Arc::new(CapturingDispatch {
+            seen: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1",
+            "max_wait_ms": 20, "batch_size": 10
+        }))
+        .unwrap();
+        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "a mixed batch is still one run");
+        let batch_id = seen[0].0.clone().expect("a batch id is minted");
+        assert!(batch_id != "chain-a" && batch_id != "chain-b");
+        assert_eq!(seen[0].1.get("bus_correlation_id"), Some(&json!(batch_id)));
+        assert_eq!(
+            seen[0].1.get("bus_correlation_ids"),
+            Some(&json!(["chain-a", "chain-b"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_mints_an_id_for_a_legacy_record_without_one() {
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(&svc, &ctx, "orders.raw", TopicOptions::default()).await;
+        publish_one(&svc, &ctx, "orders.raw", r#"{"id":1}"#).await;
+
+        let spy = Arc::new(CapturingDispatch {
+            seen: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .unwrap();
+        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+
+        let seen = spy.seen.lock().unwrap();
+        let minted = seen[0].0.as_deref().expect("an id is minted");
+        assert!(correlation::validate(minted));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_dlq_keeps_the_record_correlation_id() {
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &svc,
+            &ctx,
+            "orders.raw",
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        publish_with_correlation(
+            &svc,
+            &ctx,
+            "orders.raw",
+            vec![(r#"{"id":1}"#, Some("chain-dlq"))],
+        )
+        .await;
+
+        let spy = Arc::new(CapturingDispatch {
+            seen: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy;
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1",
+            "max_wait_ms": 20, "on_error": "dlq"
+        }))
+        .unwrap();
+        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+
+        let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
+        let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
+        assert_eq!(dlq_records.len(), 1);
+        assert_eq!(
+            correlation::from_fetched_headers(&dlq_records[0].headers).as_deref(),
+            Some("chain-dlq")
+        );
     }
 
     /// F4 B7 review R1 P2-2: the flow reads through the reader's field-policy

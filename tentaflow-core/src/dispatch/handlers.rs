@@ -1652,6 +1652,9 @@ pub fn flow_executions_list(
             status: e.status.unwrap_or_else(|| "unknown".into()),
             started_at_epoch: e.started_at.as_deref().map(parse_ts).unwrap_or(0),
             completed_at_epoch: e.finished_at.as_deref().map(parse_ts),
+            request_id: e.request_id,
+            correlation_id: e.correlation_id,
+            origin: e.origin,
         })
         .collect();
     Ok(MessageBody::FlowExecutionsListResponse {
@@ -12622,5 +12625,87 @@ mod bus_instance_save_validation_tests {
         .to_string();
         validate_flow_json_str(&c, &flow_json)
             .expect("a flow with no bus_* node must not be gated by the TentaBus instance check");
+    }
+}
+
+#[cfg(test)]
+mod flow_executions_list_tests {
+    //! `FlowExecutionsListResponse` carries the request id, the correlation id
+    //! and the origin of each run (TB-02), so a screen can jump from a run to
+    //! its chain.
+    use super::*;
+    use crate::db::models::NewFlowExecution;
+
+    fn ctx() -> HandlerContext {
+        HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [7u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: crate::dispatch::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        }
+    }
+
+    #[test]
+    fn the_list_names_request_correlation_and_origin() {
+        let ctx = ctx();
+        let flow_id = repository::create_flow(
+            &ctx.state.db,
+            &crate::db::models::FlowParams {
+                name: "tb02-list",
+                description: None,
+                is_default: false,
+                service_type: Some("chat"),
+                flow_json: r#"{"nodes":[],"edges":[]}"#,
+                status: "active",
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("create flow");
+        let flow_id = flow_id.as_str();
+        for (request_id, correlation_id) in [("run-1", Some("chain-1")), ("run-2", None)] {
+            repository::create_flow_execution(
+                &ctx.state.db,
+                &NewFlowExecution {
+                    flow_id,
+                    request_id,
+                    status: "completed",
+                    parent_execution_id: None,
+                    origin: "bus",
+                    actor_kind: "system",
+                    actor_id: None,
+                    actor_user_id: None,
+                    correlation_id,
+                },
+            )
+            .expect("insert run");
+        }
+        let response = flow_executions_list(
+            &MessageBody::FlowExecutionsListRequest {
+                flow_id: flow_id.to_string(),
+            },
+            &ctx,
+        )
+        .expect("list");
+        let MessageBody::FlowExecutionsListResponse { executions } = response else {
+            panic!("unexpected response");
+        };
+        let by_request: std::collections::HashMap<_, _> = executions
+            .iter()
+            .map(|e| (e.request_id.clone().unwrap_or_default(), e))
+            .collect();
+        assert_eq!(by_request.len(), 2);
+        assert_eq!(
+            by_request["run-1"].correlation_id.as_deref(),
+            Some("chain-1")
+        );
+        assert_eq!(by_request["run-1"].origin.as_deref(), Some("bus"));
+        assert_eq!(by_request["run-2"].correlation_id, None);
     }
 }

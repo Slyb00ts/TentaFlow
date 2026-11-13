@@ -741,6 +741,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Korelacja end to end (TB-02, backend): jeden `correlation_id` przechodzi przez
+  łańcuch temat → przepływ → temat. Nagłówek rekordu `correlation-id` (ASCII
+  `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) broker waliduje i zapisuje jako
+  `tf.correlation_id`; nagłówki `tf.*` od wołającego nadal są usuwane, a
+  `x-correlation-id` i `traceparent` nie są wejściem. Reaktor przenosi id rekordu do
+  przebiegu (partia z mieszanymi id dostaje nowe id partii i `bus_correlation_ids` w
+  meta), przebiegi z magistrali trafiają teraz zawsze do osi czasu zdarzeń, a ponowienie
+  z DLQ zachowuje oryginalne id. REST przyjmuje i zwraca nagłówek `X-Correlation-Id`
+  (nieprawidłowy daje 400; bez niego każdy rekord dostaje własne id, a odpowiedź
+  publikacji niesie `correlation_id` i `correlation_ids`); wynika z tego, że wyrażenie
+  `idempotency_key` czytające nagłówek `correlation-id` nie rozpozna ponowionego
+  żądania REST bez `X-Correlation-Id`, bo każde ponowienie dostaje nowe id. Wartości
+  nagłówków w NDJSON są kodowane base64. Dashboard nadaje UUID na operację zamiast
+  numeru ramki WS. Sub-agenty uruchamiane reaktorem zapisują teraz oś czasu zdarzeń.
+  `MessagesBrowseRequest` ma opcjonalny `correlation_id` (ograniczony skan: jeden
+  budżet 10 000 rekordów albo 8 MiB na całe żądanie, wspólny dla partycji;
+  `next_offset` partycji mówi, dokąd doszedł, a partycja, do której budżet nie
+  dotarł, zgłasza swój początek), a `FlowExecutionSummary` — `request_id`,
+  `correlation_id` i `origin`. Widoczność zdarzeń: przeglądarka jest zawsze
+  ograniczona do organizacji wołającego (także odczyt osi czasu i treści kroku
+  pojedynczego przebiegu); poza nią czyta tylko administrator platformy (wcześniej
+  `events.read_all` pozwalało czytać cudzą organizację przez `org_id` w żądaniu).
+  Zwykłe `events.read` nadal widzi własne przebiegi, także bez organizacji. Przebiegi
+  z magistrali nie zapisują treści kroków (`step_io`) ani lustra audytu w outboxie;
+  zostają oś czasu i czasy kroków.
 - Dashboard: ukrywanie danych na tematach z wzorem **Avro, Protobuf albo Thrift**
   (F4 B6 UI). Blokada „treść binarna” zostaje tylko dla tematu bez wzoru, z wycofanym
   wzorem, z nieczytelną listą pól albo na starszym serwerze (`binaryFieldActions`

@@ -33,6 +33,18 @@
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+/// Record header a producer sets to propagate a correlation id. The broker
+/// validates it and stamps it as [`TF_CORRELATION_ID_HEADER`]; the original
+/// header is kept on the record. Only this exact key is read as input.
+pub const CORRELATION_ID_HEADER: &str = "correlation-id";
+
+/// Broker-stamped header carrying the validated, caller-asserted correlation
+/// id. A caller-supplied `tf.*` header is always stripped on publish.
+pub const TF_CORRELATION_ID_HEADER: &str = "tf.correlation_id";
+
+/// Longest accepted correlation id, in bytes.
+pub const CORRELATION_ID_MAX_LEN: usize = 128;
+
 // =============================================================================
 // Topic config (mirrors `bus::topics::{TopicConfig, TopicOptions}` 1:1,
 // field-for-field, as plain strings/numbers)
@@ -1163,6 +1175,14 @@ pub enum BusPayload {
         /// built before this field existed still decodes.
         #[serde(default)]
         partition: Option<u32>,
+        /// Keep only the records stamped with this correlation id
+        /// (`tf.correlation_id`; TB-02). A bounded scan, not an index: a page
+        /// can be short or empty before the partition is exhausted, and each
+        /// partition's `next_offset` says how far the scan got. `None` keeps
+        /// the unfiltered read. `#[serde(default)]` so a peer built before
+        /// this field existed still decodes.
+        #[serde(default)]
+        correlation_id: Option<String>,
     },
     MessagesBrowseResponse {
         result: BusMessagesBrowseResultWire,
@@ -1991,6 +2011,7 @@ mod tests {
             ],
             limit: 50,
             partition: Some(1),
+            correlation_id: Some("chain-1".to_string()),
         });
         round_trip(BusPayload::MessagesBrowseResponse {
             result: BusMessagesBrowseResultWire {
@@ -2373,6 +2394,7 @@ mod tests {
                 from_offsets: vec![],
                 limit: 10,
                 partition: None,
+                correlation_id: None,
             }
         );
     }
@@ -2409,6 +2431,7 @@ mod tests {
                 from_offsets: vec![],
                 limit: 10,
                 partition: None,
+                correlation_id: None,
             }
         );
     }

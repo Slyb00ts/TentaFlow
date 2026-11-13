@@ -90,16 +90,7 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
             .dispatcher
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("flow dispatcher dropped (shutdown)"))?;
-        let request_id = uuid::Uuid::new_v4().to_string();
-        // §2.5 — a reactive run is not a fresh anonymous request: it continues
-        // the finished child's work, so it carries that run's provenance.
-        let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
-            request_id,
-            principal.origin,
-            principal.actor.clone(),
-        );
-        meta.user_id = principal.user_id.clone();
-        meta.org_id = principal.org_id.clone();
+        let meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
         let outcome = dispatcher
             .dispatch_by_flow_id_background(
                 crate::flow_engine::dispatcher::FlowRef::live(flow_id),
@@ -113,6 +104,33 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
         }
         Ok(())
     }
+}
+
+/// The request meta of a reactive run (sub-agent completion or bus record).
+///
+/// §2.5 — a reactive run is not a fresh anonymous request: it continues the
+/// finished child's work, so it carries that run's provenance, including the
+/// correlation id. The progress sink puts the run on the `run_events`
+/// timeline (without a sink the run is silent, and a bus-triggered chain
+/// would be invisible in the Events browser).
+pub fn reactive_run_meta(
+    request_id: String,
+    principal: &AgentPrincipal,
+) -> crate::flow_engine::dispatcher::FlowRequestMeta {
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        request_id,
+        principal.origin,
+        principal.actor.clone(),
+    );
+    meta.user_id = principal.user_id.clone();
+    meta.org_id = principal.org_id.clone();
+    meta.correlation_id = principal.correlation_id.clone();
+    meta.progress_sink = Some(Arc::new(
+        crate::flow_engine::progress_broker::BrokerProgressSink::new(
+            crate::flow_engine::progress_broker::global_broker(),
+        ),
+    ));
+    meta
 }
 
 /// One flow subscribed to sub-agent completions: its id + parsed filter.
@@ -414,6 +432,27 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn reactive_run_meta_carries_the_correlation_id_and_a_progress_sink() {
+        let principal = AgentPrincipal::new(
+            Some("u1".into()),
+            Some("org-1".into()),
+            FlowOrigin::Bus,
+            FlowActor::system(),
+        )
+        .with_correlation_id(Some("chain-1".into()));
+        let meta = reactive_run_meta("req-1".into(), &principal);
+        assert_eq!(meta.correlation_id.as_deref(), Some("chain-1"));
+        assert_eq!(meta.org_id.as_deref(), Some("org-1"));
+        assert_eq!(meta.user_id.as_deref(), Some("u1"));
+        assert!(meta.progress_sink.is_some());
+
+        let bare = AgentPrincipal::new(None, None, FlowOrigin::Bus, FlowActor::system());
+        assert!(reactive_run_meta("req-2".into(), &bare)
+            .correlation_id
+            .is_none());
+    }
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");

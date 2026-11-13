@@ -8,7 +8,9 @@
 // VISIBILITY is the load-bearing part of this file, so it is stated once here
 // and enforced in exactly two places below.
 //
-//   `events.read_all` -> every run on the node.
+//   `events.read_all` -> every run of the caller's organisation (the browse is
+//                        pinned to it; only the platform super-admin, the
+//                        account role `admin`, browses across organisations).
 //   `events.read`     -> ONLY runs whose `actor_user_id` is the calling
 //                        principal. `actor_user_id`, not `actor_id`: a run made
 //                        by an API key bound to this user is this user's run,
@@ -93,6 +95,55 @@ fn resolve_scope(ctx: &HandlerContext) -> Result<Scope, ProtocolError> {
             "this operation requires a logged-in user session",
         )),
     }
+}
+
+/// The organisation a browse page is restricted to.
+///
+/// Always the caller's own, whatever the request names and whatever scope the
+/// caller holds: `events.read_all` widens WHICH RUNS OF THE ORGANISATION are
+/// visible, not which organisation. Only the platform super-admin (the account
+/// role `admin`, as `tentanas` reads it) may browse across organisations, and
+/// then the request's `org_id` filter applies as before (`None` = every
+/// organisation). Without the pin a `read_all` holder of one organisation read
+/// another's runs by naming it.
+fn browse_org_filter(
+    ctx: &HandlerContext,
+    requested: Option<&str>,
+) -> Result<Option<String>, ProtocolError> {
+    if super::SessionAuthKind::Admin.session_satisfies(&ctx.session) {
+        return Ok(requested.map(str::to_string));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    Ok(Some(org.org_id.clone()))
+}
+
+/// `Scope::Node` reads one run only inside the caller's organisation, the same
+/// pin as the browse; the super-admin is exempt. A run of another organisation,
+/// a run without one and a run that does not exist answer identically.
+fn ensure_run_in_callers_org(
+    ctx: &HandlerContext,
+    scope: &Scope,
+    pool: &crate::db::DbPool,
+    run_id: &str,
+    not_found: impl Fn() -> ProtocolError,
+) -> Result<(), ProtocolError> {
+    if !matches!(scope, Scope::Node)
+        || super::SessionAuthKind::Admin.session_satisfies(&ctx.session)
+    {
+        return Ok(());
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    let run_org = events::run_org_id(pool, run_id)
+        .map_err(|e| db_error("run_org", e))?
+        .ok_or_else(&not_found)?;
+    if run_org.as_deref() != Some(org.org_id.as_str()) {
+        return Err(not_found());
+    }
+    Ok(())
 }
 
 fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
@@ -270,10 +321,17 @@ fn browse(ctx: &HandlerContext, req: &EventsBrowseRequest) -> Result<MessageBody
         Scope::Node => None,
         Scope::OwnRuns(user_id) => Some(user_id.as_str()),
     };
+    // The pin is a `Scope::Node` rule; a plain `events.read` holder is already
+    // narrowed to their own runs, NULL-org ones included.
+    let requested_org = req.org_id.as_deref().filter(|s| !s.is_empty());
+    let org_id = match &scope {
+        Scope::Node => browse_org_filter(ctx, requested_org)?,
+        Scope::OwnRuns(_) => requested_org.map(str::to_string),
+    };
     let filter = EventFilter {
         origins: origins.as_deref(),
         actor_id: req.actor_id.as_deref().filter(|s| !s.is_empty()),
-        org_id: req.org_id.as_deref().filter(|s| !s.is_empty()),
+        org_id: org_id.as_deref(),
         session_id: req.session_id.as_deref().filter(|s| !s.is_empty()),
         correlation_id: req.correlation_id.as_deref().filter(|s| !s.is_empty()),
         from_ms: req.from_ms,
@@ -333,6 +391,7 @@ fn run_timeline(
             return Err(not_found());
         }
     }
+    ensure_run_in_callers_org(ctx, &scope, &pool, &req.run_id, not_found)?;
 
     let limit = if req.limit == 0 {
         DEFAULT_PAGE
@@ -380,6 +439,7 @@ fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBod
             return Err(not_found());
         }
     }
+    ensure_run_in_callers_org(ctx, &scope, &pool, &req.run_id, not_found)?;
 
     let row = events::read_run(&pool, &req.run_id, req.seq - 1, 1)
         .map_err(|e| db_error("read_run", e))?
@@ -541,7 +601,26 @@ mod tests {
                 &FlowActor::user(who),
                 request_started(),
             )
-            .with_session(session_id),
+            .with_session(session_id)
+            .with_org("org-test"),
+        )
+        .expect("append");
+    }
+
+    /// Like `seed_run`, in another organisation.
+    fn seed_run_in_org(ctx: &HandlerContext, run_id: &str, session_id: &str, org_id: &str) {
+        append(
+            &events_pool(),
+            &ctx.state.db,
+            RunEvent::new(
+                run_id,
+                300,
+                FlowOrigin::Chat,
+                &FlowActor::user("someone"),
+                request_started(),
+            )
+            .with_session(session_id)
+            .with_org(org_id),
         )
         .expect("append");
     }
@@ -662,6 +741,181 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// `events.read_all` widens the runs of the caller's organisation, never the
+    /// organisation: naming another one in the request does not reach it.
+    #[tokio::test]
+    async fn read_all_is_pinned_to_the_callers_organisation() {
+        let auditor = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
+        seed_run(&auditor_ctx, "run-own-org", &session, "anna", 100);
+        seed_run_in_org(&auditor_ctx, "run-other-org", &session, "org-other");
+
+        let unnamed = expect_browse(
+            browse(
+                &auditor_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = unnamed.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-own-org"]);
+
+        let named = expect_browse(
+            browse(
+                &auditor_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    org_id: Some("org-other".into()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = named.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            runs,
+            vec!["run-own-org"],
+            "naming another organisation must not reach its runs"
+        );
+    }
+
+    /// The platform super-admin (account role `admin`) is the one caller who
+    /// browses across organisations: unnamed it sees all, named it filters.
+    #[tokio::test]
+    async fn the_platform_admin_browses_across_organisations() {
+        let admin = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let mut admin_ctx = ctx_with(&admin, &[PERM_READ_ALL]);
+        admin_ctx.session = SessionAuth::UserSession {
+            user_id: admin.bytes,
+            role: Some("admin".to_string()),
+        };
+        seed_run(&admin_ctx, "run-own-org", &session, "anna", 100);
+        seed_run_in_org(&admin_ctx, "run-other-org", &session, "org-other");
+
+        let all = expect_browse(
+            browse(
+                &admin_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let mut runs: Vec<&str> = all.rows.iter().map(|r| r.run_id.as_str()).collect();
+        runs.sort();
+        assert_eq!(runs, vec!["run-other-org", "run-own-org"]);
+
+        let other = expect_browse(
+            browse(
+                &admin_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    org_id: Some("org-other".into()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = other.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-other-org"]);
+    }
+
+    /// `events.read_all` reads a run only inside the caller's organisation, on
+    /// both single-run RPCs; a run of another organisation, one without an
+    /// organisation and one that does not exist all answer `not_found`. The
+    /// super-admin is exempt.
+    #[tokio::test]
+    async fn single_run_reads_are_pinned_to_the_callers_organisation() {
+        let auditor = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
+        let own = format!("run-own-{}", uuid::Uuid::new_v4());
+        let foreign = format!("run-foreign-{}", uuid::Uuid::new_v4());
+        seed_run(&auditor_ctx, &own, &session, "anna", 100);
+        seed_run_in_org(&auditor_ctx, &foreign, &session, "org-other");
+
+        let timeline = |ctx: &HandlerContext, run: &str| {
+            run_timeline(
+                ctx,
+                &EventsRunRequest {
+                    run_id: run.to_string(),
+                    ..EventsRunRequest::default()
+                },
+            )
+        };
+        let content = |ctx: &HandlerContext, run: &str| {
+            step_io(
+                ctx,
+                &EventsStepIoRequest {
+                    run_id: run.to_string(),
+                    seq: 1,
+                },
+            )
+        };
+        assert!(timeline(&auditor_ctx, &own).is_ok());
+        for run in [foreign.as_str(), "run-that-does-not-exist"] {
+            assert_eq!(
+                timeline(&auditor_ctx, run).unwrap_err().code,
+                ProtocolErrorCode::NotFound,
+                "timeline of {run}"
+            );
+            assert_eq!(
+                content(&auditor_ctx, run).unwrap_err().code,
+                ProtocolErrorCode::NotFound,
+                "step content of {run}"
+            );
+        }
+
+        let admin = principal();
+        let mut admin_ctx = ctx_with(&admin, &[PERM_READ_ALL]);
+        admin_ctx.session = SessionAuth::UserSession {
+            user_id: admin.bytes,
+            role: Some("admin".to_string()),
+        };
+        assert!(timeline(&admin_ctx, &foreign).is_ok(), "super-admin passes");
+    }
+
+    /// The org pin is a `Scope::Node` rule: a plain `events.read` user keeps
+    /// seeing their own runs, including one recorded without an organisation.
+    #[tokio::test]
+    async fn an_own_run_without_an_organisation_stays_visible_to_events_read() {
+        let anna = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        append(
+            &events_pool(),
+            &anna_ctx.state.db,
+            RunEvent::new(
+                "run-null-org",
+                100,
+                FlowOrigin::Chat,
+                &FlowActor::user(&anna.uuid),
+                request_started(),
+            )
+            .with_session(&session),
+        )
+        .expect("append");
+        let page = expect_browse(
+            browse(
+                &anna_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = page.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-null-org"]);
+        assert!(page.scoped_to_self);
     }
 
     /// The criterion the whole feature exists to satisfy: the visibility scope
@@ -946,7 +1200,8 @@ mod tests {
                     completion_tokens: None,
                 },
             )
-            .with_session(&session),
+            .with_session(&session)
+            .with_org("org-test"),
         )
         .expect("append step io");
 

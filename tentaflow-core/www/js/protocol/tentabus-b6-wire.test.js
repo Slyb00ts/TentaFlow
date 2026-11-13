@@ -170,3 +170,31 @@ test('the capabilities name what a rule on a binary topic may do', { skip }, () 
   assert.deepEqual(answer({ ...base, binary_field_actions: ['hide'] }).binaryFieldActions, ['hide']);
   assert.equal(answer(base).binaryFieldActions, undefined);
 });
+
+test('a message browse carries the correlation filter only when one is asked for (TB-02)', { skip }, () => {
+  const filtered = sentEnvelope('busMessagesBrowseRequest', {
+    instanceId: INSTANCE, topic: 'wyniki', limit: 50, correlationId: 'req-42',
+  });
+  assert.equal(filtered.payload.MessagesBrowseRequest.correlation_id, 'req-42');
+  assert.equal(filtered.payload.MessagesBrowseRequest.topic, 'wyniki');
+  for (const none of [undefined, null, '']) {
+    const plain = sentEnvelope('busMessagesBrowseRequest', {
+      instanceId: INSTANCE, topic: 'wyniki', limit: 50, correlationId: none,
+    });
+    assert.equal(plain.payload.MessagesBrowseRequest.correlation_id ?? null, null);
+  }
+});
+
+test('a flow execution answer decodes with and without the correlation fields (TB-02)', { skip }, () => {
+  const full = decodeBody({ FlowExecutionsListResponse: { executions: [{
+    id: '1', flow_id: 'f', status: 'completed', started_at_epoch: 5, completed_at_epoch: 6,
+    request_id: 'run-1', correlation_id: 'req-42', origin: 'bus',
+  }] } });
+  assert.equal(full.executions[0].correlationId, 'req-42');
+  assert.equal(full.executions[0].requestId, 'run-1');
+  assert.equal(full.executions[0].origin, 'bus');
+  const legacy = decodeBody({ FlowExecutionsListResponse: { executions: [{
+    id: '1', flow_id: 'f', status: 'completed', started_at_epoch: 5, completed_at_epoch: null,
+  }] } });
+  assert.equal(legacy.executions[0].correlationId ?? null, null);
+});

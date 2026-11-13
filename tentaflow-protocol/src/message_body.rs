@@ -1003,6 +1003,16 @@ pub struct FlowExecutionSummary {
     pub status: String,
     pub started_at_epoch: u64,
     pub completed_at_epoch: Option<u64>,
+    /// The run's request id, which is also the `run_id` of its Events
+    /// timeline. `None` on a peer built before this field existed.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Correlation id of the chain the run belongs to (TB-02).
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Where the run entered the system (`bus`, `chat`, `api`, ...).
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 // =============================================================================
@@ -10441,5 +10451,33 @@ mod tests {
             "zakodowany rozmiar {} B sugeruje array-of-ints zamiast byte-string",
             buf.len()
         );
+    }
+
+    /// `FlowExecutionSummary` gained `request_id`, `correlation_id` and
+    /// `origin` at the END (TB-02): a peer built before them still decodes.
+    #[test]
+    fn flow_execution_summary_decodes_without_the_correlation_fields() {
+        #[derive(serde::Serialize)]
+        struct LegacySummary {
+            id: String,
+            flow_id: String,
+            status: String,
+            started_at_epoch: u64,
+            completed_at_epoch: Option<u64>,
+        }
+        let legacy = LegacySummary {
+            id: "1".into(),
+            flow_id: "f".into(),
+            status: "completed".into(),
+            started_at_epoch: 5,
+            completed_at_epoch: Some(6),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).expect("encode");
+        let decoded: FlowExecutionSummary = ciborium::de::from_reader(&buf[..]).expect("decode");
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.correlation_id, None);
+        assert_eq!(decoded.origin, None);
+        assert_eq!(decoded.completed_at_epoch, Some(6));
     }
 }

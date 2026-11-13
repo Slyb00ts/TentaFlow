@@ -27,9 +27,9 @@ use anyhow::Result;
 
 pub use browse::{browse, EventCursor, EventFilter, EventPage};
 pub use store::{
-    append, append_in_tx, assistant_body_setting_key, read_run, run_actor_user_id, AppendedEvent,
-    AuditEnvelope, BodyOmission, EventKind, EventPayload, ResponseBody, RunEvent, StoredEvent,
-    MAX_READ_LIMIT,
+    append, append_in_tx, assistant_body_setting_key, read_run, run_actor_user_id, run_org_id,
+    AppendedEvent, AuditEnvelope, BodyOmission, EventKind, EventPayload, ResponseBody, RunEvent,
+    StoredEvent, MAX_READ_LIMIT,
 };
 
 /// Opens `<data>/events.db`, publishes the pool and STARTS everything the log

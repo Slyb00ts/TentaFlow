@@ -352,7 +352,11 @@ struct RestActor {
 }
 
 impl RestActor {
-    fn call_context(&self, instance_id: BusInstanceId) -> BusCallContext {
+    fn call_context(
+        &self,
+        instance_id: BusInstanceId,
+        correlation_id: Option<String>,
+    ) -> BusCallContext {
         let (actor, actor_kind) = match &self.caller {
             RestCaller::User { user_id } => (user_id.clone(), ActorKind::User),
             RestCaller::ApiKey { uid } => (uid.clone(), ActorKind::ApiKey),
@@ -362,7 +366,7 @@ impl RestActor {
             org_id: self.org_id.clone(),
             actor: Some(actor),
             actor_kind,
-            correlation_id: None,
+            correlation_id,
             origin: "v1.bus.rest".to_string(),
         }
     }
@@ -738,6 +742,22 @@ struct NdjsonRecord {
     payload_b64: String,
 }
 
+/// HTTP request/response header carrying a correlation id (TB-02). Distinct
+/// from the record-level `correlation-id` header.
+const CORRELATION_ID_HTTP_HEADER: &str = "x-correlation-id";
+
+/// The validated `X-Correlation-Id` request header: `Ok(None)` when absent,
+/// `Err` when present but not a valid id.
+fn request_correlation_id(headers: &hyper::HeaderMap) -> std::result::Result<Option<String>, ()> {
+    let Some(raw) = headers.get(CORRELATION_ID_HTTP_HEADER) else {
+        return Ok(None);
+    };
+    match raw.to_str() {
+        Ok(id) if bus::correlation::validate(id) => Ok(Some(id.to_string())),
+        _ => Err(()),
+    }
+}
+
 fn decode_b64(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
@@ -835,7 +855,13 @@ where
 {
     let (peer_ip, user_agent) = request_origin(&req);
     let mut facts = KeyAuditFacts::default();
-    let response = serve_publish(req, db, instance, topic, &mut facts).await;
+    let echoed = request_correlation_id(req.headers()).ok().flatten();
+    let mut response = serve_publish(req, db, instance, topic, &mut facts).await;
+    if let Some(id) = echoed.and_then(|id| hyper::header::HeaderValue::from_str(&id).ok()) {
+        response
+            .headers_mut()
+            .insert(CORRELATION_ID_HTTP_HEADER, id);
+    }
     audit_key_request(
         db,
         "bus.rest.publish",
@@ -885,6 +911,18 @@ where
     if let Err(resp) = precheck_api_key(db, &actor, instance, topic, BusAction::Produce, facts) {
         return resp;
     }
+    let header_correlation_id = match request_correlation_id(req.headers()) {
+        Ok(id) => id,
+        Err(()) => {
+            facts.reason = Some("invalid_correlation_id".to_string());
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid X-Correlation-Id header: expected 1-128 ASCII characters \
+                 [A-Za-z0-9._:-] starting with a letter or digit",
+            );
+        }
+    };
     // Resolved (and the running engine looked up) before touching the
     // request body — §3.2: a request addressed to instance B must never
     // fall back to A, and a malformed/unavailable instance should fail as
@@ -909,7 +947,7 @@ where
         }
     };
 
-    let (records, create_if_missing) = if is_cbor {
+    let (mut records, create_if_missing) = if is_cbor {
         let input: BusPublishInput = match minicbor::decode(&body_bytes) {
             Ok(v) => v,
             Err(e) => {
@@ -956,8 +994,10 @@ where
         );
     }
     facts.records = Some(records.len());
+    let record_correlation_ids =
+        bus::correlation::settle_records(&mut records, header_correlation_id.as_deref());
 
-    let ctx = actor.call_context(instance_id);
+    let ctx = actor.call_context(instance_id, header_correlation_id.clone());
     let batch = PublishBatch {
         partition: None,
         producer: None,
@@ -992,7 +1032,9 @@ where
             // DLQ under `validation = dlq`; `schema_dropped`: records that
             // failed validation and whose quarantine copy could not be
             // written — lost. Both additive, always present.
-            let body = publish_response_json(&r);
+            let mut body = publish_response_json(&r);
+            body["correlation_id"] = serde_json::json!(header_correlation_id);
+            body["correlation_ids"] = serde_json::json!(record_correlation_ids);
             json_response(
                 StatusCode::OK,
                 serde_json::to_vec(&body).unwrap_or_default(),
@@ -1131,7 +1173,7 @@ fn serve_record_schema<B>(
             return resp;
         }
     };
-    let ctx = actor.call_context(instance_id);
+    let ctx = actor.call_context(instance_id, None);
     let schema = match tokio::task::block_in_place(|| svc.schema_for_reader(&ctx, topic, schema_id))
     {
         Ok(schema) => schema,
@@ -1261,7 +1303,7 @@ fn serve_consume<B>(
         .saturating_mul(CONSUME_RECORD_BYTE_ESTIMATE)
         .max(64 * 1024);
 
-    let ctx = actor.call_context(instance_id);
+    let ctx = actor.call_context(instance_id, None);
     // Blocking too, though not through the `blocking_recv` that `bus::mod`'s
     // BLOCKING note names for `publish`/`fetch`: `open_consumer` opens a full
     // `Partition` — writer thread and directory flock included — for every
@@ -1988,9 +2030,27 @@ mod tests {
             query: &str,
             body: &str,
         ) -> Reply {
+            self.send_with_headers(instance, topic, method, principal, query, body, &[])
+        }
+
+        /// `send_to` with extra request headers.
+        #[allow(clippy::too_many_arguments)]
+        fn send_with_headers(
+            &self,
+            instance: &str,
+            topic: &str,
+            method: &str,
+            principal: Option<Principal>,
+            query: &str,
+            body: &str,
+            headers: &[(&str, &str)],
+        ) -> Reply {
             let mut builder = Request::builder().method(method).uri(format!(
                 "/v1/bus/instances/{instance}/topics/{topic}/records?{query}"
             ));
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
             if let Some(p) = principal {
                 builder = builder.extension(p);
             }
@@ -2016,6 +2076,11 @@ mod tests {
                 .await
                 .expect("request task");
                 let status = resp.status();
+                let correlation_header = resp
+                    .headers()
+                    .get("x-correlation-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let bytes = resp
                     .into_body()
                     .collect()
@@ -2025,6 +2090,7 @@ mod tests {
                 Reply {
                     status,
                     json: serde_json::from_slice(&bytes).expect("json body"),
+                    correlation_header,
                 }
             })
         }
@@ -2046,6 +2112,8 @@ mod tests {
     struct Reply {
         status: StatusCode,
         json: serde_json::Value,
+        /// The `X-Correlation-Id` response header.
+        correlation_header: Option<String>,
     }
 
     fn key_principal(uid: &str) -> Option<Principal> {
@@ -2196,6 +2264,135 @@ mod tests {
         );
         assert_eq!(own.status, StatusCode::OK, "{}", own.json);
         assert_eq!(payloads(&own), vec![serde_json::json!({"id": 1})]);
+    }
+
+    /// The `tf.correlation_id` each consumed record carries, in order.
+    fn stamped_ids(reply: &Reply) -> Vec<Option<String>> {
+        reply.json["records"]
+            .as_array()
+            .expect("records array")
+            .iter()
+            .map(|r| {
+                r["headers"]["tf.correlation_id"].as_str().map(|b64| {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap();
+                    String::from_utf8(raw).unwrap()
+                })
+            })
+            .collect()
+    }
+
+    fn two_records() -> String {
+        format!("{}\n{}", ndjson(r#"{"id":1}"#), ndjson(r#"{"id":2}"#))
+    }
+
+    /// Without `X-Correlation-Id` each record gets its own id (owner decision
+    /// 2), and the response lists them.
+    #[test]
+    fn rest_publish_mints_a_correlation_id_per_record() {
+        let fx = key_fixture("cccc3a10");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &two_records());
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert!(published.json["correlation_id"].is_null());
+        assert!(published.correlation_header.is_none());
+        let reported: Vec<String> = published.json["correlation_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reported.len(), 2);
+        assert_ne!(reported[0], reported[1]);
+
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert_eq!(
+            stamped_ids(&own),
+            vec![Some(reported[0].clone()), Some(reported[1].clone())],
+            "the stored records carry exactly the reported ids"
+        );
+    }
+
+    /// A valid `X-Correlation-Id` becomes the id of every record without one of
+    /// its own, and is echoed; a record's own valid header still wins.
+    #[test]
+    fn rest_publish_applies_and_echoes_the_request_correlation_id() {
+        let fx = key_fixture("cccc3a11");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        let own_header = base64::engine::general_purpose::STANDARD.encode("rec-own");
+        let body = format!(
+            "{}\n{}",
+            ndjson(r#"{"id":1}"#),
+            format!(
+                r#"{{"payload_b64":"{}","headers":{{"correlation-id":"{own_header}"}}}}"#,
+                base64::engine::general_purpose::STANDARD.encode(r#"{"id":2}"#)
+            )
+        );
+        let published = fx.send_with_headers(
+            fx.instance.as_str(),
+            TOPIC,
+            "POST",
+            key_principal(&writer),
+            &org_query(),
+            &body,
+            &[("X-Correlation-Id", "req-42")],
+        );
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert_eq!(published.json["correlation_id"], "req-42");
+        assert_eq!(published.correlation_header.as_deref(), Some("req-42"));
+        assert_eq!(
+            published.json["correlation_ids"],
+            serde_json::json!(["req-42", "rec-own"])
+        );
+
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert_eq!(
+            stamped_ids(&own),
+            vec![Some("req-42".to_string()), Some("rec-own".to_string())]
+        );
+    }
+
+    /// An invalid `X-Correlation-Id` is a 400, and nothing is published.
+    #[test]
+    fn rest_publish_refuses_an_invalid_correlation_header() {
+        let fx = key_fixture("cccc3a12");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        for bad in ["has space", "-lead", &"a".repeat(129)] {
+            let reply = fx.send_with_headers(
+                fx.instance.as_str(),
+                TOPIC,
+                "POST",
+                key_principal(&writer),
+                &org_query(),
+                &ndjson(r#"{"id":1}"#),
+                &[("X-Correlation-Id", bad)],
+            );
+            assert_eq!(
+                reply.status,
+                StatusCode::BAD_REQUEST,
+                "{bad}: {}",
+                reply.json
+            );
+            assert_eq!(reply.json["error"]["code"], "invalid_request_error");
+        }
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert!(
+            payloads(&own).is_empty(),
+            "a refused publish stores nothing"
+        );
     }
 
     /// A grant belongs to one organisation; the call must name one.
@@ -2483,7 +2680,11 @@ mod tests {
                 .unwrap();
                 let status = resp.status();
                 let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-                Reply { status, json: serde_json::from_slice(&bytes).expect("json body") }
+                Reply {
+                    status,
+                    json: serde_json::from_slice(&bytes).expect("json body"),
+                    correlation_header: None,
+                }
             })
         };
         let served = fetch_schema(schema_id, key_principal(&key));

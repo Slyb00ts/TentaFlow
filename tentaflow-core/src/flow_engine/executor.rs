@@ -15,6 +15,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::db::models::NewFlowExecution;
 use crate::db::{repository, DbPool};
@@ -147,6 +148,30 @@ pub struct StreamingExecution {
 /// jednego gotowego noda naraz (zachowanie jak topo loop). continue_on_error
 /// z trigger.config kontroluje czy błąd przerywa flow.
 pub async fn execute_blocking(
+    db: DbPool,
+    compiled: Arc<CompiledFlow>,
+    initial: FlowEnvelope,
+    ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<FlowExecutionOutcome> {
+    let span = flow_run_span(&compiled.flow_id, &ctx);
+    execute_blocking_inner(db, compiled, initial, ctx, adapters)
+        .instrument(span)
+        .await
+}
+
+/// The span every flow run executes under, so a log line from any node
+/// carries the run's flow, request and correlation id.
+fn flow_run_span(flow_id: &str, ctx: &ExecutionContext) -> tracing::Span {
+    tracing::info_span!(
+        "flow_run",
+        flow_id = %flow_id,
+        request_id = %ctx.request_id,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+    )
+}
+
+async fn execute_blocking_inner(
     db: DbPool,
     compiled: Arc<CompiledFlow>,
     initial: FlowEnvelope,
@@ -1640,7 +1665,23 @@ fn attribute_usage(ctx: &ExecutionContext, trace: &mut [TraceStep]) {
 /// producenta strumienia (LLM, harness loop/subflow, addon stream block lub
 /// inline loop region — codex-style live token streaming), spawnuje finalizer i
 /// zwraca StreamingExecution natychmiast.
+///
+/// The `flow_run` span covers the setup up to the returned handle; the
+/// spawned stream finalizer runs outside it.
 pub async fn execute_streaming(
+    db: DbPool,
+    compiled: Arc<CompiledFlow>,
+    initial: FlowEnvelope,
+    ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<StreamingExecution> {
+    let span = flow_run_span(&compiled.flow_id, &ctx);
+    execute_streaming_inner(db, compiled, initial, ctx, adapters)
+        .instrument(span)
+        .await
+}
+
+async fn execute_streaming_inner(
     db: DbPool,
     compiled: Arc<CompiledFlow>,
     initial: FlowEnvelope,

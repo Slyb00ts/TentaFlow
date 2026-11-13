@@ -317,6 +317,12 @@ impl ScopeState {
         let Some((input, output)) = self.pending_io.remove(node_id) else {
             return;
         };
+        // A bus-origin run handles records the publisher's field policies may
+        // hide: no content is kept (the steps and timings are). The record is
+        // reachable through its coordinates in the TentaBus preview.
+        if provenance.origin == crate::flow_engine::dispatcher::FlowOrigin::Bus {
+            return;
+        }
         match crate::events::step_io::pack(
             input.as_deref().unwrap_or(""),
             output.as_deref().unwrap_or(""),
@@ -638,9 +644,13 @@ mod tests {
 
     impl Harness {
         fn start(run_id: &str) -> Self {
+            Self::start_with(provenance(run_id))
+        }
+
+        fn start_with(provenance: RunProvenance) -> Self {
             let (dir, pool) = crate::events::test_support::events_db();
             let broker = Arc::new(ProgressBroker::new());
-            broker.bind_run_provenance(SCOPE, provenance(run_id));
+            broker.bind_run_provenance(SCOPE, provenance);
             let log = RunEventLog::new(
                 pool.clone(),
                 crate::events::test_support::main_db(),
@@ -679,6 +689,75 @@ mod tests {
         fn drop(&mut self) {
             self.log.stop();
         }
+    }
+
+    fn bus_provenance(run_id: &str) -> RunProvenance {
+        let mut meta = FlowRequestMeta::new(run_id, FlowOrigin::Bus, FlowActor::system());
+        meta.org_id = Some("org-3".into());
+        meta.session_id = Some(SCOPE.into());
+        RunProvenance::from_meta(&meta, descriptor())
+    }
+
+    async fn run_one_step_with_io(
+        h: &Harness,
+        run_id: &str,
+        expect_step_io: bool,
+    ) -> (Vec<StoredEvent>, i64) {
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "bus_consume".into(),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "n1".into(),
+            input: Some(r#"{"secret":"record body"}"#.into()),
+            output: Some(r#"{"secret":"record body"}"#.into()),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "n1".into(),
+            status: "ok".into(),
+        });
+        let rows = h.rows(run_id, if expect_step_io { 4 } else { 3 }).await;
+        // Let any row the log would still write land before counting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = read_run(&h.pool, run_id, 0, 1000).unwrap_or(rows);
+        let queued: i64 = h
+            .pool
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT COUNT(*) FROM audit_outbox WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )
+            .expect("count outbox");
+        (rows, queued)
+    }
+
+    /// Decisions 8 and 10 (TB-02): a bus-origin run keeps its timeline (opening
+    /// row, steps) but stores no step content and is not mirrored into the audit
+    /// outbox; the same events of any other origin keep both.
+    #[tokio::test]
+    async fn a_bus_run_keeps_the_timeline_but_no_content_and_no_audit_mirror() {
+        let bus = Harness::start_with(bus_provenance("run-bus"));
+        let (rows, queued) = run_one_step_with_io(&bus, "run-bus", false).await;
+        let kinds: Vec<_> = rows.iter().map(|r| r.payload.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::events::EventKind::RequestStarted,
+                crate::events::EventKind::StepStart,
+                crate::events::EventKind::StepEnd,
+            ],
+            "steps and timings stay, content does not: {rows:?}"
+        );
+        assert_eq!(queued, 0, "a bus-origin opening row is not mirrored");
+
+        let other = Harness::start("run-api");
+        let (rows, queued) = run_one_step_with_io(&other, "run-api", true).await;
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.payload, EventPayload::StepIo { .. })));
+        assert_eq!(queued, 1, "any other origin is still mirrored");
     }
 
     /// A scope with no bound run stores nothing at all — provenance is a

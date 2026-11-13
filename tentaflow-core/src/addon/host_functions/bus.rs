@@ -274,7 +274,8 @@ fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
             .unwrap_or_else(|| DEFAULT_ORG_ID.to_string()),
         actor: Some(state.addon_id.clone()),
         actor_kind: crate::auth::actor::ActorKind::Addon,
-        correlation_id: None,
+        // The id of the flow run the block executes in, when there is one.
+        correlation_id: state.call_provenance.correlation_id.clone(),
         origin: bus::ADDON_ORIGIN.to_string(),
     }
 }
@@ -502,7 +503,7 @@ pub fn bus_publish_v1(
     let bctx = call_context(caller.data(), &svc);
     let create_if_missing = input.create_if_missing.unwrap_or(false);
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let records: Vec<PublishRecord> = input
+    let mut records: Vec<PublishRecord> = input
         .records
         .into_iter()
         .map(|r| PublishRecord {
@@ -517,6 +518,9 @@ pub fn bus_publish_v1(
             schema_id: 0,
         })
         .collect();
+    // Records without an id of their own take the run's (through `bctx`), or,
+    // outside a run, are each minted one.
+    bus::correlation::settle_records(&mut records, bctx.correlation_id.as_deref());
     let batch = PublishBatch {
         partition: None,
         producer: None,
@@ -1317,6 +1321,22 @@ mod tests {
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
         }
+    }
+
+    /// The call context carries the correlation id of the run the block
+    /// executes in (TB-02), and none when there is no run behind the call.
+    #[test]
+    fn call_context_carries_the_runs_correlation_id() {
+        let (_tmp, svc) = test_bus_service("tentabus-0c0aab01");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        let mut state = make_addon_state(db);
+        assert_eq!(call_context(&state, &svc).correlation_id, None);
+        state.call_provenance = crate::addon::AddonCallProvenance::addon()
+            .with_correlation_id(Some("run-corr-1".to_string()));
+        assert_eq!(
+            call_context(&state, &svc).correlation_id.as_deref(),
+            Some("run-corr-1")
+        );
     }
 
     /// A real, running `BusService` registered in the process-global registry

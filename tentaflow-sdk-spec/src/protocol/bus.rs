@@ -24,6 +24,14 @@ use minicbor::{Decode, Encode};
 // Shared record shapes
 // -----------------------------------------------------------------------------
 
+/// Record header an addon sets to join a correlation chain. The broker
+/// validates it (ASCII `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) and stamps the
+/// accepted value as `tf.correlation_id`. A consumer that republishes a
+/// record it read must send that `tf.correlation_id` value back as this
+/// header: the broker strips every caller-supplied `tf.*` header. Without
+/// one, the publish inherits the id of the run the addon block executes in.
+pub const CORRELATION_ID_HEADER: &str = "correlation-id";
+
 /// One message header. Values travel as raw bytes (never assumed UTF-8) —
 /// mirrors `tentaflow_core::bus::PublishRecord::headers`'s own `(String,
 /// Bytes)` shape.
