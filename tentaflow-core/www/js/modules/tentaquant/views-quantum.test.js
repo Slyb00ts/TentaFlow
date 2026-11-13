@@ -2,7 +2,7 @@
 // File: modules/tentaquant/views-quantum.test.js
 // Description: The two quantum screens painting under happy-dom: the circuit
 // Studio skeleton (Q07) and the notebook cell column (Q06). The browser
-// simulator is not available in Node, which is exactly one of the states these
+// simulator may or may not be built, and its absence is one of the states these
 // screens must render honestly — so the assertions cover the markup contract
 // (one toolbar, the mockup's two-column layout, the components instead of raw
 // controls) and the absence of every tier that has no backend.
@@ -447,15 +447,24 @@ test('a viewer gets a read-only grid and no save actions', () => {
   cleanup();
 });
 
-test('the Studio says so when this build has no browser simulator', async () => {
+test('the Studio reports the browser simulator exactly when this build lacks it', async () => {
+  // Whether the wasm module exists depends on the local build, so the test
+  // asks the same loader the Studio asks and checks the matching outcome.
+  const { available } = await import('/js/quantum/index.js');
+  const hasSimulator = await available();
   const screen = fakeScreen();
   const host = window.document.createElement('div');
   screen.root.appendChild(host);
   const view = drawStudio(screen, host);
   await view.init();
+  assert.equal(view.engineMissing, !hasSimulator);
   const alert = host.querySelector('#tq-studio-status tf-alert');
-  assert.ok(alert, 'the missing wasm module is reported, not hidden');
-  assert.equal(alert.getAttribute('tone'), 'warning');
+  if (hasSimulator) {
+    assert.equal(alert, null, 'a working simulator raises no warning');
+  } else {
+    assert.ok(alert, 'the missing wasm module is reported, not hidden');
+    assert.equal(alert.getAttribute('tone'), 'warning');
+  }
   cleanup();
 });
 
@@ -464,9 +473,11 @@ test('a status banner outlives a mode switch — the state panel does not own it
   const host = window.document.createElement('div');
   screen.root.appendChild(host);
   const view = drawStudio(screen, host);
-  await view.init();
-  // Node has no browser simulator, so init raises the banner; painting the
-  // state on every mode switch must not wipe a condition that is still true.
+  // The missing-simulator condition is set directly so the test does not
+  // depend on whether this build produced the wasm module; painting the state
+  // on every mode switch must not wipe a condition that is still true.
+  view.engineMissing = true;
+  view.paintStatus();
   screen.studio.mode = 'step';
   view.applyMode();
   screen.studio.mode = 'edit';
@@ -830,6 +841,8 @@ function fakeSim(numQubits) {
       return new Float64Array(2 ** (numQubits + 1));
     },
     blochVectors() { return new Float64Array(numQubits * 3); },
+    // The Studio frees whatever simulator it holds when it replaces it.
+    free() {},
   };
 }
 
