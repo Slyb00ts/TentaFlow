@@ -653,6 +653,8 @@ export class BinaryWsClient {
         console.debug('[ws] reconnect attempt failed:', err?.message);
       });
     }, delay);
+    // A pending retry must not keep a Node process (tests, tooling) alive; browsers return a number here.
+    this._reconnectTimer.unref?.();
   }
 }
 
