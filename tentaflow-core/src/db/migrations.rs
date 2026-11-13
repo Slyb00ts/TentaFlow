@@ -1555,9 +1555,10 @@ END;
 /// settled without a push (resolved before delivery, recipient without access).
 /// The rows go with their incident (and with its instance) through the foreign
 /// key. Any later rebuild of `bpmn_incidents`, `bpmn_instances` or
-/// `bpmn_definitions` drops the trigger with the table and must recreate it,
-/// and must keep this table's foreign key valid; the ladder test asserts the
-/// trigger exists at the head.
+/// `bpmn_definitions` drops the triggers with the table and must recreate them
+/// (this one and `bpmn_incidents_queue_notices_when_retries_end` of v210), and
+/// must keep this table's foreign key valid; the ladder test asserts both
+/// triggers exist at the head.
 const BPMN_INCIDENT_NOTICES: &str = r#"
 CREATE TABLE bpmn_incident_notices (
     incident_id TEXT NOT NULL REFERENCES bpmn_incidents(incident_id) ON DELETE CASCADE,
@@ -17253,6 +17254,17 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(queue_trigger, 1, "a rebuild of bpmn_incidents must recreate the notice trigger");
+            let retry_end_trigger: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='bpmn_incidents_queue_notices_when_retries_end' AND tbl_name='bpmn_incidents'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retry_end_trigger, 1,
+                "a rebuild of bpmn_incidents must recreate the notice trigger for incidents whose retries end"
+            );
         }
     }
 

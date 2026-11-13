@@ -485,6 +485,40 @@ fn an_uncaught_business_error_ends_the_run_in_error_like_production() {
 }
 
 #[test]
+fn a_policy_never_arms_an_incident_of_a_simulation() {
+    let mut model = chain_model(
+        ActivityVerification::Condition { expression: "true".into() },
+        Some(
+            r#"{"outcome":"Error","code":"OUT_OF_STOCK","summary":"none left","outputs":{},"evidence":[]}"#,
+        ),
+        ServiceImplementation::default(),
+    );
+    for node in &mut model.nodes {
+        if let ProcessNodeKind::ServiceTask { retry, .. } = &mut node.kind {
+            *retry = Some(tentaflow_protocol::processes::ProcessRetryPolicy {
+                max_attempts: 3,
+                delay_seconds: 30,
+                backoff: tentaflow_protocol::processes::ProcessRetryBackoff::Fixed,
+            });
+        }
+    }
+    let mut store = started(model);
+    drive_to_service(&mut store);
+    let ended = store
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
+        .expect("resolve");
+    assert_eq!(ended.instance.as_ref().expect("instance").status, ProcessInstanceStatus::Incident);
+    // The run keeps its single attempt: no limit, no deadline, and no retry event.
+    let incident = ended.incidents.first().expect("the incident of the failed step");
+    assert!(incident.attempts.is_none(), "{incident:?}");
+    assert!(
+        kinds(&ended).iter().all(|kind| !kind.starts_with("job_retr")),
+        "{:?}",
+        kinds(&ended)
+    );
+}
+
+#[test]
 fn an_unbound_step_is_refused_before_the_run_exists() {
     let model = chain_model(
         ActivityVerification::Human,

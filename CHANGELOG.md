@@ -662,6 +662,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   tym w formularzu. Inspektor ma sekcję ponowień w zakładce „Czas”
   (pięć języków); przy kroku agenta ostrzega, że każde ponowienie uruchamia agenta
   od nowa i zużywa jego model, czas i budżet.
+  Poprawki po przeglądzie B4.6: ponowienie odłożone, bo źródło lub aktywacja są
+  chwilowo niedostępne, nie zużywa limitu (zdarzenie `job_retry_deferred`, termin
+  przesuwa się o opóźnienie polityki, po 20 odłożeniach albo 24 h silnik rezygnuje
+  z powodem `deferral_limit`); przejściowy błąd bazy (zajęta, zablokowana, I/O)
+  nie rozbraja ponowienia, a nieudane rozbrojenie nie blokuje reszty strony;
+  `job_retries_exhausted` zapisuje się raz, przy przejściu z uzbrojenia, a zatrzymanie
+  przez kod (np. niepewny wynik) zapisuje `job_retry_stopped` z powodem; rozwiązany
+  incydent traci termin; opóźnienie wykładnicze zaokrągla w górę, więc 1 s rośnie;
+  import Camundy czyta też listę `PT10M,PT17M,PT20M` (jeden interwał to jedno
+  ponowienie), oznacza przycięte i nieregularne cykle jako przybliżone i ostrzega
+  (`CAMUNDA_RETRY_CYCLE_NO_JOB`), gdy cykl leży na zadaniu bez joba; UI pokazuje
+  bezwzględny termin zamiast „za 30 s”; poprawiono podpowiedź o ponowieniach
+  w pięciu językach.
 - Bramka AI i limity tokenów. Wyczerpany limit tokenów zatrzymuje teraz wywołanie
   modelu w każdym przepływie (zwykłym, systemowym i strumieniowym), a nie tylko w
   kroku procesu; wcześniej zwykły przepływ tylko logował odmowę i działał dalej bez

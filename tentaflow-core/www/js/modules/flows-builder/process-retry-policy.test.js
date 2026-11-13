@@ -67,11 +67,13 @@ test('every field that breaks a limit is named with the limit it breaks', () => 
 test('attempts are put into words with the plural forms of the language', async () => {
   const incident = (attempts) => ({ attempts });
   assert.equal(retryAttemptsText({}), null, 'a step without a policy says nothing');
-  assert.equal(retryAttemptsText(incident({ made: 1, limit: 5, nextAttemptAtMs: 130_000 }), 100_000),
-    'Automatic retry 2 of 5 starts in 30 s.');
-  assert.equal(retryAttemptsText(incident({ made: 0, limit: 3, nextAttemptAtMs: 100_000 + 5 * 60_000 }), 100_000),
-    'Automatic retry 1 of 3 starts in 5 min.');
-  assert.match(retryAttemptsText(incident({ made: 1, limit: 3, nextAttemptAtMs: 50_000 }), 100_000), /starts in 0 s/, 'a past deadline never goes negative');
+  const planned = (ms) => new Date(ms).toLocaleString('en');
+  assert.equal(retryAttemptsText(incident({ made: 1, limit: 5, nextAttemptAtMs: 130_000 })),
+    `Automatic retry 2 of 5 is planned for ${planned(130_000)}.`);
+  assert.equal(retryAttemptsText(incident({ made: 0, limit: 3, nextAttemptAtMs: 400_000 })),
+    `Automatic retry 1 of 3 is planned for ${planned(400_000)}.`);
+  assert.equal(retryAttemptsText(incident({ made: 1, limit: 3, nextAttemptAtMs: 50_000 })), `Automatic retry 2 of 3 is planned for ${planned(50_000)}.`,
+    'the sentence carries a moment, not a countdown, so it never goes stale on a screen nobody redraws');
   assert.equal(retryAttemptsText(incident({ made: 1, limit: 3, nextAttemptAtMs: null })), '1 retry made, up to 3 allowed. Nothing more starts by itself.');
   assert.equal(retryAttemptsText(incident({ made: 3, limit: 3 })), '3 retries made, up to 3 allowed. Nothing more starts by itself.');
   await I18n.setLanguage('pl');
@@ -91,8 +93,10 @@ test('the five languages carry every key of the retry policy', async () => {
   const keys = ['tab_time', 'tab_time_title', 'timeout_hint', 'attempts_pending', 'attempts_ended', 'retry_policy_title', 'retry_attempts',
     'retry_attempts_invalid', 'retry_delay', 'retry_delay_invalid', 'retry_backoff', 'retry_backoff_fixed', 'retry_backoff_exponential',
     'retry_factor', 'retry_factor_invalid', 'retry_max_delay', 'retry_max_delay_invalid', 'retry_policy_hint', 'retry_agent_cost_hint', 'simulation_retry_skipped',
-    'event_job_retry_scheduled', 'event_job_retries_exhausted', 'event_job_retry_stopped', 'retry_stopped_initiator_unavailable',
-    'retry_stopped_retry_unavailable', 'retry_stopped_not_retryable', 'retry_stopped_engine_error', 'diag_CAMUNDA_RETRY_CYCLE_APPROXIMATED'];
+    'event_job_retry_scheduled', 'event_job_retry_deferred', 'event_job_retries_exhausted', 'event_job_retry_stopped', 'retry_stopped_initiator_unavailable',
+    'retry_stopped_retry_unavailable', 'retry_stopped_not_retryable', 'retry_stopped_engine_error', 'retry_stopped_deferral_limit', 'retry_stopped_outcome_uncertain',
+    'retry_deferred_source_unavailable', 'retry_deferred_activation_busy', 'retry_deferred_execution_unavailable',
+    'diag_CAMUNDA_RETRY_CYCLE_APPROXIMATED', 'diag_CAMUNDA_RETRY_CYCLE_NO_JOB'];
   for (const language of ['de', 'en', 'es', 'fr', 'pl']) {
     const table = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;
     for (const key of keys) assert.equal(typeof table[key], 'string', `${language} ${key}`);

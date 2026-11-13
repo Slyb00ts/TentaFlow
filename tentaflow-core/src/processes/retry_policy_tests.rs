@@ -106,7 +106,11 @@ fn the_schedule_is_fixed_or_grows_by_the_factor_up_to_the_cap() {
         schedule(&growing(7, 30, 200, 600)),
         [30, 60, 120, 240, 480, 600, 600]
     );
-    assert_eq!(schedule(&growing(4, 100, 150, 1000)), [100, 150, 225, 337]);
+    assert_eq!(schedule(&growing(4, 100, 150, 1000)), [100, 150, 225, 338]);
+    // A wait is rounded up, so a small delay still grows: truncation would hold 1 s at 1 s.
+    assert_eq!(schedule(&growing(5, 1, 150, 100)), [1, 2, 3, 5, 8]);
+    assert_eq!(schedule(&growing(4, 1, 101, 10)), [1, 2, 3, 4]);
+    assert_eq!(schedule(&growing(4, 2, 110, 100)), [2, 3, 4, 5]);
     // The largest factor on the largest delay saturates at the cap instead of overflowing.
     assert_eq!(schedule(&growing(10, 86_400, 1000, 86_400)), [86_400; 10]);
 }
@@ -287,6 +291,12 @@ async fn a_failure_with_a_policy_is_repeated_by_the_engine_and_stays_one_inciden
         "the budget was spent: nothing is armed again"
     );
     assert_eq!(notices(db), 1);
+    assert_eq!(
+        events(db, "job_retries_exhausted"),
+        1,
+        "reopening a spent incident ends nothing, so it says nothing again"
+    );
+    assert_eq!(events(db, "job_retry_stopped"), 0);
     assert_eq!(
         repository::drain_automatic_retries(db, t2 + 10_000_000, 32).unwrap(),
         0
@@ -541,6 +551,418 @@ async fn an_uncertain_outcome_on_the_last_repeat_records_that_the_retries_ran_ou
     assert_eq!(events(&fixture.db, "job_retry_scheduled"), 1);
     assert_eq!(
         repository::drain_automatic_retries(&fixture.db, t1 + 100_000_000, 32).unwrap(),
+        0
+    );
+}
+
+/// Two attempts of a three-repeat policy: the engine made the first repeat, and
+/// the second attempt ran past its dispatch boundary before it was interrupted.
+#[tokio::test]
+async fn an_uncertain_outcome_with_repeats_left_records_why_the_engine_stopped() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    assert_eq!(
+        repository::drain_automatic_retries(db, t0 + 10_000, 32).unwrap(),
+        1
+    );
+
+    let t1 = t0 + 10_001;
+    let claimed = claim(db, "w", t1);
+    assert!(repository::commit_job_dispatch_boundary(db, &claimed, "w", t1).unwrap());
+    interrupt(db, &claimed, "w", t1 + 1);
+
+    assert_eq!(
+        incident_state(db),
+        (1, 1, 1, Some(3), None),
+        "one of three repeats made"
+    );
+    assert_eq!(
+        events(db, "job_retries_exhausted"),
+        0,
+        "the budget was not spent"
+    );
+    assert_eq!(events(db, "job_retry_stopped"), 1);
+    let reason: String = db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT json_extract(data_json,'$.reason') FROM bpmn_events WHERE kind='job_retry_stopped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "outcome_uncertain");
+    assert_eq!(notices(db), 1);
+}
+
+// ----- a repeat that cannot start yet is put off, not spent -----
+
+fn deferral_reasons(db: &DbPool) -> Vec<String> {
+    let conn = db.read().unwrap();
+    let mut statement = conn
+        .prepare("SELECT json_extract(data_json,'$.reason') FROM bpmn_events WHERE kind='job_retry_deferred' ORDER BY seq")
+        .unwrap();
+    statement
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn set_flows(db: &DbPool, status: &str) {
+    db.write()
+        .unwrap()
+        .execute("UPDATE flows SET status=?1", [status])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_repeat_put_off_because_the_source_is_away_does_not_spend_the_budget() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(2, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    set_flows(db, "draft");
+
+    for round in 1..=3_i64 {
+        let due = t0 + round * 10_000;
+        assert_eq!(repository::drain_automatic_retries(db, due, 32).unwrap(), 0);
+        assert_eq!(
+            incident_state(db),
+            (1, 1, 0, Some(2), Some(due + 10_000)),
+            "round {round}: nothing was made, the deadline moved by the policy delay"
+        );
+        assert_eq!(events(db, "job_retry_deferred"), round);
+    }
+    assert_eq!(deferral_reasons(db), ["source_unavailable"; 3]);
+    assert_eq!(
+        events(db, "job_retries_exhausted"),
+        0,
+        "an unspent budget is not exhausted"
+    );
+    assert_eq!(events(db, "job_retry_stopped"), 0);
+    assert_eq!(
+        notices(db),
+        0,
+        "the person is not told while the engine still waits"
+    );
+
+    // The source is back: the first real repeat is repeat one of two.
+    set_flows(db, "active");
+    let due = t0 + 40_000;
+    assert_eq!(repository::drain_automatic_retries(db, due, 32).unwrap(), 1);
+    assert_eq!(incident_state(db), (1, 0, 1, Some(2), None));
+}
+
+#[tokio::test]
+async fn a_repeat_put_off_because_another_step_is_running_waits_the_delay_of_the_repeat_still_to_come(
+) {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let instance = started(&fixture, Some(growing(3, 10, 200, 600)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    assert_eq!(
+        repository::drain_automatic_retries(db, t0 + 10_000, 32).unwrap(),
+        1
+    );
+    let t1 = t0 + 10_001;
+    fail_next_attempt(db, "w", t1);
+    assert_eq!(incident_state(db), (1, 1, 1, Some(3), Some(t1 + 20_000)));
+
+    db.write()
+        .unwrap()
+        .execute(
+            "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('stray',?1,?1,'Start_1',NULL,'[]','ready',1)",
+            [&instance.instance_id],
+        )
+        .unwrap();
+    let due = t1 + 20_000;
+    assert_eq!(repository::drain_automatic_retries(db, due, 32).unwrap(), 0);
+    assert_eq!(
+        incident_state(db),
+        (1, 1, 1, Some(3), Some(due + 20_000)),
+        "one repeat made, still one of three left, and the wait of the second repeat"
+    );
+    assert_eq!(deferral_reasons(db), ["activation_busy"]);
+    assert_eq!(events(db, "job_retries_exhausted"), 0);
+
+    db.write()
+        .unwrap()
+        .execute("DELETE FROM bpmn_tokens WHERE token_id='stray'", [])
+        .unwrap();
+    assert_eq!(
+        repository::drain_automatic_retries(db, due + 20_000, 32).unwrap(),
+        1
+    );
+    assert_eq!(incident_state(db), (1, 0, 2, Some(3), None));
+}
+
+#[tokio::test]
+async fn a_source_that_never_comes_back_ends_the_automatic_repeats_after_the_bound() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    set_flows(db, "draft");
+
+    let mut due = t0 + 10_000;
+    for _ in 0..repository::MAX_RETRY_DEFERRALS {
+        assert_eq!(repository::drain_automatic_retries(db, due, 32).unwrap(), 0);
+        due += 10_000;
+    }
+    assert_eq!(
+        events(db, "job_retry_deferred"),
+        i64::from(repository::MAX_RETRY_DEFERRALS)
+    );
+    assert_eq!(notices(db), 0);
+    assert_eq!(repository::drain_automatic_retries(db, due, 32).unwrap(), 0);
+    assert_eq!(
+        incident_state(db),
+        (1, 1, 0, Some(3), None),
+        "disarmed, budget untouched"
+    );
+    assert_eq!(events(db, "job_retry_stopped"), 1);
+    assert_eq!(events(db, "job_retries_exhausted"), 0);
+    let reason: String = db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT json_extract(data_json,'$.reason') FROM bpmn_events WHERE kind='job_retry_stopped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "deferral_limit");
+    assert_eq!(
+        notices(db),
+        1,
+        "the person is told once the engine gives up"
+    );
+}
+
+#[tokio::test]
+async fn a_repeat_put_off_for_longer_than_the_window_ends_the_automatic_repeats() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    set_flows(db, "draft");
+    assert_eq!(
+        repository::drain_automatic_retries(db, t0 + repository::MAX_RETRY_DEFERRAL_WINDOW_MS, 32)
+            .unwrap(),
+        0
+    );
+    assert_eq!(events(db, "job_retry_deferred"), 0);
+    assert_eq!(events(db, "job_retry_stopped"), 1);
+    assert_eq!(incident_state(db), (1, 1, 0, Some(3), None));
+    assert_eq!(notices(db), 1);
+}
+
+// ----- the pass over due repeats -----
+
+#[test]
+fn only_a_store_failure_a_later_pass_can_get_past_is_transient() {
+    let sqlite = |code: i32| {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    };
+    for transient in [
+        sqlite(rusqlite::ffi::SQLITE_BUSY),
+        sqlite(rusqlite::ffi::SQLITE_LOCKED),
+        sqlite(rusqlite::ffi::SQLITE_INTERRUPT),
+        sqlite(rusqlite::ffi::SQLITE_IOERR),
+        anyhow::Error::from(std::io::Error::other("disk")),
+        sqlite(rusqlite::ffi::SQLITE_BUSY).context("while repeating a step"),
+    ] {
+        assert!(
+            super::repository::is_transient_retry_error_for_tests(&transient),
+            "{transient:#}"
+        );
+    }
+    for permanent in [
+        anyhow::anyhow!("the step lost its model"),
+        sqlite(rusqlite::ffi::SQLITE_CONSTRAINT),
+        sqlite(rusqlite::ffi::SQLITE_CORRUPT),
+        anyhow::Error::from(rusqlite::Error::QueryReturnedNoRows),
+    ] {
+        assert!(
+            !super::repository::is_transient_retry_error_for_tests(&permanent),
+            "{permanent:#}"
+        );
+    }
+}
+
+/// A second armed incident that is due before the real one, so a pass meets it first.
+fn add_earlier_incident(db: &DbPool, id: &str, next_attempt_at_ms: i64) {
+    let conn = db.write().unwrap();
+    // The extra row names a job that does not exist: only the scan and the injected step ever look at it.
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute(
+        "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,attempt_limit,next_attempt_at_ms) \
+         SELECT ?1,instance_id,scope_id,node_id,'ghost-'||?1,code,message,at_ms,attempt_limit,?2 FROM bpmn_incidents LIMIT 1",
+        params![id, next_attempt_at_ms],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+}
+
+fn next_attempt_of(db: &DbPool, id: &str) -> Option<i64> {
+    db.read()
+        .unwrap()
+        .query_row(
+            "SELECT next_attempt_at_ms FROM bpmn_incidents WHERE incident_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_transient_failure_keeps_the_repeat_armed_and_the_rest_of_the_page_runs() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    add_earlier_incident(db, "00-busy", t0 + 5_000);
+
+    let step = |pool: &DbPool,
+                incident: &str,
+                instance: &str,
+                job: &str,
+                now: i64|
+     -> anyhow::Result<bool> {
+        if incident == "00-busy" {
+            return Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )));
+        }
+        repository::retry_due_incident_for_tests(pool, incident, instance, job, now)
+    };
+    let repeated = repository::drain_due_incidents_for_tests(db, t0 + 10_000, 32, &step).unwrap();
+    assert_eq!(repeated, 1, "the incident behind the busy one was repeated");
+    assert_eq!(
+        next_attempt_of(db, "00-busy"),
+        Some(t0 + 5_000),
+        "the busy one keeps its deadline"
+    );
+    assert_eq!(
+        events(db, "job_retry_stopped"),
+        0,
+        "a transient failure disarms nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_error_disarms_only_its_own_incident_and_a_failed_disarm_does_not_block_the_page()
+{
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    add_earlier_incident(db, "00-broken", t0 + 5_000);
+    add_earlier_incident(db, "01-stuck", t0 + 6_000);
+    // The disarm of the stuck incident cannot be written.
+    db.write()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_disarm BEFORE UPDATE OF next_attempt_at_ms ON bpmn_incidents \
+             WHEN NEW.next_attempt_at_ms IS NULL AND OLD.incident_id='01-stuck' \
+             BEGIN SELECT RAISE(ABORT,'disarm refused'); END;",
+        )
+        .unwrap();
+
+    let step = |pool: &DbPool,
+                incident: &str,
+                instance: &str,
+                job: &str,
+                now: i64|
+     -> anyhow::Result<bool> {
+        if incident.starts_with('0') {
+            anyhow::bail!("the engine could not start {incident}");
+        }
+        repository::retry_due_incident_for_tests(pool, incident, instance, job, now)
+    };
+    let repeated = repository::drain_due_incidents_for_tests(db, t0 + 10_000, 32, &step).unwrap();
+    assert_eq!(
+        repeated, 1,
+        "the real incident was repeated after both failures"
+    );
+    assert_eq!(
+        next_attempt_of(db, "00-broken"),
+        None,
+        "the broken one is disarmed"
+    );
+    assert_eq!(
+        next_attempt_of(db, "01-stuck"),
+        Some(t0 + 6_000),
+        "its disarm failed and was only logged"
+    );
+    assert_eq!(events(db, "job_retry_stopped"), 1);
+}
+
+#[tokio::test]
+async fn two_passes_on_the_same_deadline_make_the_repeat_once() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let _instance = started(&fixture, Some(fixed(3, 10)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+
+    let results: Vec<u32> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| repository::drain_automatic_retries(db, t0 + 10_000, 32).unwrap())
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(results.iter().sum::<u32>(), 1, "{results:?}");
+    assert_eq!(incident_state(db), (1, 0, 1, Some(3), None));
+    assert_eq!(
+        count(db, "SELECT COUNT(*) FROM bpmn_jobs WHERE status='queued'"),
+        1,
+        "one new attempt, not two"
+    );
+}
+
+// ----- the row after the incident ends -----
+
+#[tokio::test]
+async fn cancelling_the_instance_clears_the_deadline_of_a_waiting_incident() {
+    let fixture = Fixture::new();
+    let db = &fixture.db;
+    let instance = started(&fixture, Some(fixed(3, 600)));
+    let t0 = super::jobs::now_ms();
+    fail_next_attempt(db, "w", t0);
+    assert_eq!(incident_state(db).4, Some(t0 + 600_000));
+    let shown = repository::get_instance(db, &fixture.owner, &instance.instance_id, None).unwrap();
+    repository::cancel_instance(
+        db,
+        &fixture.owner,
+        &stamp("cancel"),
+        &instance.instance_id,
+        shown.revision,
+    )
+    .unwrap();
+    assert_eq!(
+        count(db, "SELECT COUNT(*) FROM bpmn_incidents WHERE resolved_at_ms IS NOT NULL AND next_attempt_at_ms IS NULL"),
+        1,
+        "a resolved incident waits for nothing"
+    );
+    assert_eq!(
+        repository::drain_automatic_retries(db, t0 + 100_000_000, 32).unwrap(),
         0
     );
 }

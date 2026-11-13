@@ -295,6 +295,7 @@ export function processEventText(event) {
   });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
   if (event.kind === 'job_retry_scheduled') return text('event_job_retry_scheduled', { node, attempt: event.data.attempt, limit: event.data.limit, time: date(event.data.next_attempt_at_ms) });
+  if (event.kind === 'job_retry_deferred') return text('event_job_retry_deferred', { node, reason: text(`retry_deferred_${event.data.reason}`), time: date(event.data.next_attempt_at_ms) });
   if (event.kind === 'job_retries_exhausted') return text('event_job_retries_exhausted', { node, made: event.data.made, limit: event.data.limit });
   if (event.kind === 'job_retry_stopped') return text('event_job_retry_stopped', { node, reason: text(`retry_stopped_${event.data.reason}`) });
   return text(`event_${event.kind}`, { node });

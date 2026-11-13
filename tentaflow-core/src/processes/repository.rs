@@ -6248,7 +6248,10 @@ fn incident_on(
             can_retry,
             retry,
             attempts: attempt_limit.map(|limit| ProcessIncidentAttempts {
-                made: attempts_made, limit, next_attempt_at_ms,
+                made: attempts_made, limit,
+                // A resolved incident waits for nothing, whatever a row of an
+                // older build still carries.
+                next_attempt_at_ms: next_attempt_at_ms.filter(|_| resolved_at_ms.is_none()),
             }),
         },
         resolved_at_ms,
@@ -23946,7 +23949,7 @@ fn apply_plan_with_mode_on(
                 "cancelled Service incident has ambiguous resolution ownership");
             continue;
         }
-        let affected = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL",params![at_ms,incident_id,instance_id])?;
+        let affected = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1,next_attempt_at_ms=NULL WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL",params![at_ms,incident_id,instance_id])?;
         ensure!(affected == 1, "process incident changed before transition");
     }
     for closed in &plan.closed_service_dispatches {
@@ -26525,6 +26528,12 @@ pub(crate) fn cancel_instance_on(
     tx.execute("UPDATE bpmn_repetition_occurrences SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND status IN ('pending','active','awaiting_verification','retryable_error')",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_repetition_groups SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND terminal_capacity=0 AND status IN ('open','incident')",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE instance_id=?2 AND resolved_at_ms IS NULL AND incident_id NOT IN (SELECT terminal_incident_id FROM bpmn_repetition_groups WHERE instance_id=?2 AND terminal_capacity=1)",params![at_ms,instance_id])?;
+    // This function also runs inside the old migration that cancels instances over
+    // capacity, on a schema that predates the retry columns, so they are touched
+    // only where they exist.
+    if incident_retry_columns_exist_on(tx)? {
+        tx.execute("UPDATE bpmn_incidents SET next_attempt_at_ms=NULL WHERE instance_id=?1 AND resolved_at_ms IS NOT NULL AND next_attempt_at_ms IS NOT NULL",params![instance_id])?;
+    }
     let children = scopes_on(tx, instance_id, &model)?;
     for child in children.into_iter().filter(|scope| {
         scope.parent_scope_id.is_some()
@@ -26998,6 +27007,13 @@ fn reopen_incident_on(
     )? == 1)
 }
 
+/// Whether `bpmn_incidents` has the retry columns of migration 210.
+fn incident_retry_columns_exist_on(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bpmn_incidents') WHERE name='next_attempt_at_ms')",
+        [], |row| row.get(0))?)
+}
+
 /// Whether this database is a private simulation one, where no policy of a step
 /// ever repeats it: a simulation runs the step once, on its virtual clock.
 fn is_simulation_db(conn: &Connection) -> Result<bool> {
@@ -27111,17 +27127,29 @@ fn note_retry_decision_on(
     incident_id: &str,
     now_ms: i64,
 ) -> Result<()> {
-    let (job_id, made, limit, next): (String, u32, Option<u32>, Option<i64>) = tx.query_row(
-        "SELECT job_id,attempt_count,attempt_limit,next_attempt_at_ms FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
+    let (job_id, code, made, limit, next): (String, String, u32, Option<u32>, Option<i64>) = tx.query_row(
+        "SELECT job_id,code,attempt_count,attempt_limit,next_attempt_at_ms FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![incident_id, instance_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+    // Only the failure that ends the automatic repeats is recorded, once: the
+    // reopen that spends the last repeat of the budget says "exhausted"; a
+    // reopen with repeats left that the code or the missing proof refuses says
+    // "stopped" and why. A reopen after the budget was spent (a person retried
+    // by hand past the limit) ends nothing, because nothing was armed.
     let (kind, data) = match (limit, next) {
         (Some(limit), Some(next)) => ("job_retry_scheduled", serde_json::json!({
             "incident_id": incident_id, "job_id": job_id, "attempt": made + 1,
             "limit": limit, "next_attempt_at_ms": next,
         })),
-        (Some(limit), None) if made >= limit => ("job_retries_exhausted", serde_json::json!({
+        (Some(limit), None) if made == limit => ("job_retries_exhausted", serde_json::json!({
             "incident_id": incident_id, "job_id": job_id, "made": made, "limit": limit,
+        })),
+        (Some(limit), None) if made < limit => ("job_retry_stopped", serde_json::json!({
+            "incident_id": incident_id, "job_id": job_id,
+            "reason": match classify_code(&code) {
+                Some(RetryClass::JobUncertain) => "outcome_uncertain",
+                _ => "not_retryable",
+            },
         })),
         _ => return Ok(()),
     };
@@ -27679,7 +27707,7 @@ fn record_job_observation_on(
                 "resolved Service uncertainty lacks its exact cancelled activation history");
         } else {
             let changed = tx.execute(
-                "UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND resolved_at_ms IS NULL",
+                "UPDATE bpmn_incidents SET resolved_at_ms=?1,next_attempt_at_ms=NULL WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND resolved_at_ms IS NULL",
                 params![at_ms,incident_id,instance_id,scope_id,target.job_id])?;
             ensure!(changed == 1, "original uncertainty incident was not open");
         }
@@ -30343,15 +30371,46 @@ pub fn retry_job(
 /// Rows one pass over due automatic retries takes.
 pub const AUTOMATIC_RETRY_PAGE: i64 = 32;
 
+/// Most times one failure's repeat may be put off because what the step stands
+/// on is away (source, activation, execution authority). A put-off does not
+/// spend the budget, so without a bound a source that never comes back would
+/// keep the incident waiting forever and never tell the person.
+pub const MAX_RETRY_DEFERRALS: u32 = 20;
+
+/// Longest a failure's repeat may wait in put-offs altogether, counted from the
+/// failure: a day, the same as the longest delay a policy can ask for. Whichever
+/// of the two bounds is reached first ends the automatic repeats.
+pub const MAX_RETRY_DEFERRAL_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// A store failure that a later pass can get past (busy or locked database, an
+/// exhausted pool, an interrupted or failed I/O). It says nothing about the
+/// incident, so the repeat stays armed and is looked at again on the next pass.
+fn is_transient_retry_error(error: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked, OperationInterrupted, SystemIoFailure};
+    is_store_busy(error)
+        || error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|failure|
+            matches!(failure, rusqlite::Error::SqliteFailure(code, _)
+                if matches!(code.code, DatabaseBusy | DatabaseLocked | OperationInterrupted | SystemIoFailure))))
+        || error.chain().any(|cause| cause.is::<std::io::Error>())
+}
+
 /// Starts again, in the initiator's name, every Service step whose retry policy
 /// has a repeat due, through the same path a person's retry takes. The deadline
 /// is on the incident row, so a repeat that came due while the node was down is
 /// made once on the first pass after it starts, and a repeat already made is
-/// not due any more. A repeat the engine cannot make (the initiator or the
-/// source is gone, the step is busy, anything unexpected) stops being automatic
-/// and stays an ordinary incident a person can read and retry. Returns how many
-/// repeats were made.
+/// not due any more. A repeat the engine cannot make (the initiator is gone,
+/// the step cannot be repeated, an unexpected engine error) stops being
+/// automatic and stays an ordinary incident a person can read and retry. A repeat
+/// whose source or activation is away for now is put off without spending the
+/// budget (see `defer_automatic_retry_on`), and a transient store failure leaves
+/// the repeat armed for the next pass. Returns how many repeats were made.
 pub fn drain_automatic_retries(pool: &DbPool, now_ms: i64, page: i64) -> Result<u32> {
+    drain_due_incidents(pool, now_ms, page, &retry_due_incident)
+}
+
+type DueAttempt<'a> = &'a dyn Fn(&DbPool, &str, &str, &str, i64) -> Result<bool>;
+
+fn drain_due_incidents(pool: &DbPool, now_ms: i64, page: i64, attempt: DueAttempt<'_>) -> Result<u32> {
     let due: Vec<(String, String, String)> = {
         let conn = pool.read()?;
         let mut statement = conn.prepare(
@@ -30365,20 +30424,60 @@ pub fn drain_automatic_retries(pool: &DbPool, now_ms: i64, page: i64) -> Result<
     };
     let mut repeated = 0;
     for (incident_id, instance_id, job_id) in due {
-        match retry_due_incident(pool, &incident_id, &instance_id, &job_id, now_ms) {
+        match attempt(pool, &incident_id, &instance_id, &job_id, now_ms) {
             Ok(true) => repeated += 1,
             Ok(false) => {}
+            Err(error) if is_transient_retry_error(&error) => {
+                tracing::warn!(error_len = error.to_string().len(),
+                    "automatic retry of a process step met a transient store failure; it stays armed");
+            }
             Err(error) => {
                 tracing::error!(error_len = error.to_string().len(),
                     "automatic retry of a process step failed; it is left to a person");
-                let mut conn = pool.write()?;
-                let tx = conn.transaction()?;
-                stop_automatic_retry_on(&tx, &incident_id, &instance_id, "engine_error", now_ms)?;
-                tx.commit()?;
+                // One stuck row must not block the rows behind it, so a failed
+                // disarm is logged and the pass goes on.
+                if let Err(disarm) = disarm_after_engine_error(pool, &incident_id, &instance_id, now_ms) {
+                    tracing::error!(error_len = disarm.to_string().len(),
+                        "could not disarm an automatic retry after an engine error");
+                }
             }
         }
     }
     Ok(repeated)
+}
+
+#[cfg(test)]
+pub(super) fn is_transient_retry_error_for_tests(error: &anyhow::Error) -> bool {
+    is_transient_retry_error(error)
+}
+
+#[cfg(test)]
+pub(super) fn retry_due_incident_for_tests(
+    pool: &DbPool,
+    incident_id: &str,
+    instance_id: &str,
+    job_id: &str,
+    now_ms: i64,
+) -> Result<bool> {
+    retry_due_incident(pool, incident_id, instance_id, job_id, now_ms)
+}
+
+#[cfg(test)]
+pub(super) fn drain_due_incidents_for_tests(
+    pool: &DbPool,
+    now_ms: i64,
+    page: i64,
+    attempt: DueAttempt<'_>,
+) -> Result<u32> {
+    drain_due_incidents(pool, now_ms, page, attempt)
+}
+
+fn disarm_after_engine_error(pool: &DbPool, incident_id: &str, instance_id: &str, now_ms: i64) -> Result<()> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    stop_automatic_retry_on(&tx, incident_id, instance_id, "engine_error", now_ms)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn retry_due_incident(
@@ -30413,12 +30512,14 @@ fn retry_due_incident(
     let access = instance_access_on(&tx, &initiator, instance_id, AccessReach::Observers)?;
     let (offered, retry) = incident_retry_on(&tx, access, instance_id, &code, Some(job_id), None)?;
     let instance = instance_state_on(&tx, &initiator, instance_id, None, access)?;
-    if !offered && matches!(retry.denied_reason, Some(ProcessRetryDenied::SourceUnavailable
-        | ProcessRetryDenied::ActivationBusy | ProcessRetryDenied::ExecutionUnavailable)) {
+    if let (false, Some(away @ (ProcessRetryDenied::SourceUnavailable
+        | ProcessRetryDenied::ActivationBusy | ProcessRetryDenied::ExecutionUnavailable))) =
+        (offered, retry.denied_reason)
+    {
         // What the step stands on is away for now (its flow switched off, an
-        // addon down, another step running): the wait was spent without running
-        // anything, and the next one is planned or, with none left, a person is told.
-        defer_automatic_retry_on(&tx, incident_id, instance_id, made, now_ms)?;
+        // addon down, another step running): the repeat is put off by the
+        // policy's delay and the budget is left as it was.
+        defer_automatic_retry_on(&tx, incident_id, instance_id, away, now_ms)?;
         tx.commit()?;
         return Ok(false);
     }
@@ -30440,30 +30541,53 @@ fn retry_due_incident(
     Ok(true)
 }
 
-/// Spends the repeat that came due without running it and plans the next, as
-/// if the repeat had been made and had failed at once.
+/// Puts off a repeat that came due while the step's source or activation was
+/// away. Nothing ran, so no repeat was made: `attempt_count` is left alone and
+/// the budget is not spent; only the deadline moves, by the policy's delay for
+/// the repeat still to come, and the history says why. The put-offs are bounded
+/// (`MAX_RETRY_DEFERRALS`, `MAX_RETRY_DEFERRAL_WINDOW_MS` from the failure):
+/// when either is reached the automatic repeats stop with `deferral_limit` and
+/// the person is told.
 fn defer_automatic_retry_on(
     tx: &Transaction<'_>,
     incident_id: &str,
     instance_id: &str,
-    made: u32,
+    reason: ProcessRetryDenied,
     now_ms: i64,
 ) -> Result<()> {
-    let (scope_id, node_id, limit): (String, String, u32) = tx.query_row(
-        "SELECT scope_id,node_id,attempt_limit FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
-        params![incident_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-    let spent = made + 1;
-    let next = if spent < limit {
-        let policy = retry_policy_of_step_on(tx, instance_id, &scope_id, &node_id)?
-            .context("an armed incident belongs to a step with a retry policy")?;
-        Some(now_ms + i64::from(retry_delay_seconds(&policy, spent + 1)) * 1000)
-    } else {
-        None
-    };
+    let (scope_id, node_id, job_id, made, failed_at_ms): (String, String, String, u32, i64) = tx.query_row(
+        "SELECT scope_id,node_id,job_id,attempt_count,at_ms FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
+        params![incident_id, instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+    let deferred: u32 = tx.query_row(
+        "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND kind='job_retry_deferred' \
+           AND json_extract(data_json,'$.incident_id')=?2 AND at_ms>=?3",
+        params![instance_id, incident_id, failed_at_ms], |row| row.get(0))?;
+    if deferred >= MAX_RETRY_DEFERRALS || now_ms.saturating_sub(failed_at_ms) >= MAX_RETRY_DEFERRAL_WINDOW_MS {
+        return stop_automatic_retry_on(tx, incident_id, instance_id, "deferral_limit", now_ms);
+    }
+    let policy = retry_policy_of_step_on(tx, instance_id, &scope_id, &node_id)?
+        .context("an armed incident belongs to a step with a retry policy")?;
+    let next = now_ms + i64::from(retry_delay_seconds(&policy, made + 1)) * 1000;
     tx.execute(
-        "UPDATE bpmn_incidents SET attempt_count=?1,next_attempt_at_ms=?2 WHERE incident_id=?3 AND instance_id=?4",
-        params![spent, next, incident_id, instance_id])?;
-    note_retry_decision_on(tx, instance_id, &scope_id, &node_id, incident_id, now_ms)
+        "UPDATE bpmn_incidents SET next_attempt_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3",
+        params![next, incident_id, instance_id])?;
+    let next_seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [instance_id], |row| row_u64(row, 0))?;
+    let reason = match reason {
+        ProcessRetryDenied::SourceUnavailable => "source_unavailable",
+        ProcessRetryDenied::ActivationBusy => "activation_busy",
+        _ => "execution_unavailable",
+    };
+    insert_event_on(tx, instance_id, next_seq, None, &PlannedEvent {
+        scope_id, kind: "job_retry_deferred".into(), node_id: Some(node_id),
+        data: serde_json::json!({
+            "incident_id": incident_id, "job_id": job_id, "reason": reason,
+            "made": made, "next_attempt_at_ms": next, "deferrals": deferred + 1,
+        }),
+    }, now_ms, None)?;
+    Ok(())
 }
 
 /// Ends the automatic repeats of an incident that still waits for one, leaving
@@ -31035,7 +31159,7 @@ fn resolve_recovery_incident_on(
         "SELECT incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
         [&row.invocation_id], |r| r.get(0)).optional()?.flatten();
     let Some(incident_id) = incident else { return Ok(()) };
-    let closed = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND resolved_at_ms IS NULL",
+    let closed = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1,next_attempt_at_ms=NULL WHERE incident_id=?2 AND resolved_at_ms IS NULL",
         params![now_ms, incident_id])?;
     tx.execute("UPDATE bpmn_result_recovery SET incident_id=NULL WHERE invocation_id=?1",
         [&row.invocation_id])?;

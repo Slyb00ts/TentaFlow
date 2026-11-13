@@ -1072,6 +1072,15 @@ impl<'a> Importer<'a> {
             );
             return;
         }
+        // Camunda runs `failedJobRetryTimeCycle` only for a job: an external
+        // task keeps its retries on the worker's failure call and a synchronous
+        // task has no job at all, so there the cycle never fired.
+        let camunda_job = kind.as_deref() != Some("external")
+            && ["asyncBefore", "asyncAfter"].iter().any(|name| {
+                node.attrs
+                    .get(&(CAMUNDA_NAMESPACE.to_string(), (*name).to_string()))
+                    .is_some_and(|value| value == "true")
+            });
         let origin = if let Some(class) = class {
             format!("class:{class}")
         } else if let Some(delegate) = delegate {
@@ -1128,6 +1137,19 @@ impl<'a> Importer<'a> {
             children.push(json_element("outputMapping", &output, offset));
         }
         if let Some(cycle) = retry_cycle.take() {
+            if !camunda_job {
+                self.report(
+                    Severity::Warning,
+                    "CAMUNDA_RETRY_CYCLE_NO_JOB",
+                    node,
+                    format!(
+                        "retry cycle {} sits on a task Camunda would not retry (external task, or \
+                         no asyncBefore/asyncAfter); in TentaFlow the step repeats after a failure \
+                         once the policy is imported",
+                        clip(&cycle)
+                    ),
+                );
+            }
             match map_retry_cycle(&cycle) {
                 RetryCycle::Exact(policy) => {
                     children.extend(policy.map(|policy| retry_element(&policy, offset)));
@@ -2199,20 +2221,27 @@ enum RetryCycle {
     Unmappable(&'static str),
 }
 
+/// Maps `failedJobRetryTimeCycle`. Two shapes are read: `R<n>/<intervals>`
+/// (`n` counts the first run too, so `n - 1` retries) and, from Camunda 7.7, the
+/// plain list `<interval>,<interval>,...` where each interval is one retry, so
+/// the retries are as many as the intervals. A cycle that asks for more than a
+/// step can have (over `MAX_RETRY_ATTEMPTS` retries, or more intervals than
+/// `R<n>` has retries) is cut, and a series that is not a steady factor gets the
+/// closest policy; both are `Approximated`, never `Exact`.
 fn map_retry_cycle(text: &str) -> RetryCycle {
     use RetryCycle::{Approximated, Exact, Unmappable};
     let parts: Vec<&str> = text.split('/').collect();
-    let [repeat, intervals] = parts.as_slice() else {
-        return Unmappable("only R<n>/<interval>[,<interval>...] is mapped");
+    let (runs, intervals) = match parts.as_slice() {
+        [intervals] => (None, *intervals),
+        [repeat, intervals] => {
+            let Some(runs) = repeat.strip_prefix('R').and_then(|n| n.parse::<u32>().ok()).filter(|n| *n >= 1)
+            else {
+                return Unmappable("the repeat count is not R<n> with n of at least 1");
+            };
+            (Some(runs), *intervals)
+        }
+        _ => return Unmappable("only [R<n>/]<interval>[,<interval>...] is mapped"),
     };
-    let Some(runs) = repeat.strip_prefix('R').and_then(|n| n.parse::<u32>().ok()).filter(|n| *n >= 1)
-    else {
-        return Unmappable("the repeat count is not R<n> with n of at least 1");
-    };
-    let retries = runs - 1;
-    if retries > u32::from(MAX_RETRY_ATTEMPTS) {
-        return Unmappable("the cycle asks for more retries than a step can have");
-    }
     let mut delays = Vec::new();
     for interval in intervals.split(',') {
         match iso_interval_seconds(interval.trim()) {
@@ -2222,39 +2251,59 @@ fn map_retry_cycle(text: &str) -> RetryCycle {
             _ => return Unmappable("an interval is not a duration between one second and 24 hours"),
         }
     }
-    if retries == 0 {
+    let requested = match runs {
+        Some(runs) => runs - 1,
+        None => delays.len() as u32,
+    };
+    if requested == 0 {
         return Exact(None);
     }
+    let retries = requested.min(u32::from(MAX_RETRY_ATTEMPTS));
+    let cut = requested > retries || (runs.is_some() && delays.len() as u32 > requested);
     // The i-th interval waits before the i-th retry and the last one repeats.
     let wanted: Vec<u32> = (0..retries as usize)
         .map(|i| delays[i.min(delays.len() - 1)])
         .collect();
     let max_attempts = retries as u8;
-    if wanted.iter().all(|delay| *delay == wanted[0]) {
-        return Exact(Some(ProcessRetryPolicy {
-            max_attempts,
-            delay_seconds: wanted[0],
-            backoff: ProcessRetryBackoff::Fixed,
-        }));
-    }
     let first = wanted[0];
-    let cap = *wanted.iter().max().expect("at least one retry");
-    let factor = (u64::from(wanted[1]) * 100 + u64::from(first) / 2) / u64::from(first);
-    let growing = wanted[1] > first
-        && (u64::from(MIN_RETRY_FACTOR_PERCENT)..=u64::from(MAX_RETRY_FACTOR_PERCENT)).contains(&factor);
-    if !growing {
-        return Unmappable("the intervals neither repeat nor grow by a steady factor");
+    let longest = *wanted.iter().max().expect("at least one retry");
+    let finish = |policy: ProcessRetryPolicy, steady: bool| {
+        if steady && !cut { Exact(Some(policy)) } else { Approximated(policy) }
+    };
+    if wanted.iter().all(|delay| *delay == first) {
+        return finish(ProcessRetryPolicy {
+            max_attempts,
+            delay_seconds: first,
+            backoff: ProcessRetryBackoff::Fixed,
+        }, true);
     }
+    if longest <= first {
+        // Waits that shrink or never rise: the longest wait is the safe stand-in.
+        return Approximated(ProcessRetryPolicy {
+            max_attempts,
+            delay_seconds: longest,
+            backoff: ProcessRetryBackoff::Fixed,
+        });
+    }
+    // A steady series rises from the first step; otherwise the factor is the
+    // one that carries the first wait to the longest across all the steps.
+    let factor = if wanted[1] > first {
+        (u64::from(wanted[1]) * 100 + u64::from(first) / 2) / u64::from(first)
+    } else {
+        let steps = (wanted.len() - 1) as f64;
+        (100.0 * (f64::from(longest) / f64::from(first)).powf(1.0 / steps)).round() as u64
+    }
+    .clamp(u64::from(MIN_RETRY_FACTOR_PERCENT), u64::from(MAX_RETRY_FACTOR_PERCENT));
     let policy = ProcessRetryPolicy {
         max_attempts,
         delay_seconds: first,
         backoff: ProcessRetryBackoff::Exponential {
             factor_percent: factor as u32,
-            max_delay_seconds: cap,
+            max_delay_seconds: longest,
         },
     };
     let schedule: Vec<u32> = (1..=retries).map(|n| retry_delay_seconds(&policy, n)).collect();
-    if schedule == wanted { Exact(Some(policy)) } else { Approximated(policy) }
+    finish(policy, schedule == wanted)
 }
 
 /// `PT10M`, `PT1H30M`, `P1DT2H`, `PT45S`: days, hours, minutes and seconds only

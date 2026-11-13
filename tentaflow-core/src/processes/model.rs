@@ -2682,7 +2682,7 @@ fn validate_retry_policy(node_id: &str, retry: Option<&ProcessRetryPolicy>) -> R
 
 /// Seconds to wait before automatic retry number `retry_number` (1 is the
 /// first repeat) of a failure. Integer arithmetic that saturates at the cap, so
-/// a large factor cannot overflow.
+/// a large factor cannot overflow. Each step rounds up to a whole second.
 pub(super) fn retry_delay_seconds(policy: &ProcessRetryPolicy, retry_number: u32) -> u32 {
     match &policy.backoff {
         ProcessRetryBackoff::Fixed => policy.delay_seconds,
@@ -2690,7 +2690,9 @@ pub(super) fn retry_delay_seconds(policy: &ProcessRetryPolicy, retry_number: u32
             let cap = u64::from(*max_delay_seconds);
             let mut delay = u64::from(policy.delay_seconds).min(cap);
             for _ in 1..retry_number {
-                delay = (delay * u64::from(*factor_percent) / 100).min(cap);
+                // Rounded up, so a factor above 100 percent always grows the
+                // wait: truncation would keep a 1 s delay at 1 s forever.
+                delay = (delay * u64::from(*factor_percent)).div_ceil(100).min(cap);
             }
             delay as u32
         }

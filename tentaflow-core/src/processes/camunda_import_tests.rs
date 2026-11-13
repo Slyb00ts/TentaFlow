@@ -2369,9 +2369,10 @@ fn a_leading_byte_order_mark_is_not_a_column() {
 
 // ----- failedJobRetryTimeCycle -> retry policy -----
 
+/// A job-backed task (asyncBefore), the only kind whose retry cycle Camunda runs.
 fn cycle_task(cycle: &str) -> String {
     linear(&format!(
-        r#"<bpmn:serviceTask id="Task_1" camunda:class="x.Y"><bpmn:extensionElements><camunda:failedJobRetryTimeCycle>{cycle}</camunda:failedJobRetryTimeCycle></bpmn:extensionElements></bpmn:serviceTask>"#
+        r#"<bpmn:serviceTask id="Task_1" camunda:class="x.Y" camunda:asyncBefore="true"><bpmn:extensionElements><camunda:failedJobRetryTimeCycle>{cycle}</camunda:failedJobRetryTimeCycle></bpmn:extensionElements></bpmn:serviceTask>"#
     ))
 }
 
@@ -2384,6 +2385,10 @@ fn a_retry_cycle_that_maps_exactly_becomes_the_policy_without_a_diagnostic() {
         ("R11/PT1H30M", policy(10, 5400, ProcessRetryBackoff::Fixed)),
         ("R2/P1D", policy(1, 86_400, ProcessRetryBackoff::Fixed)),
         ("R4/PT30S,PT30S,PT30S", policy(3, 30, ProcessRetryBackoff::Fixed)),
+        // Camunda 7.7+: without R<n> every interval is one retry.
+        ("PT10M", policy(1, 600, ProcessRetryBackoff::Fixed)),
+        ("PT5M,PT5M,PT5M", policy(3, 300, ProcessRetryBackoff::Fixed)),
+        ("PT10S,PT20S,PT40S", policy(3, 10, grown(200, 40))),
         // The list repeats its last interval, so a cycle that grows and then holds is exponential with a cap.
         ("R5/PT1M,PT5M,PT15M", policy(4, 60, grown(500, 900))),
         ("R4/PT10S,PT20S,PT40S", policy(3, 10, grown(200, 40))),
@@ -2417,18 +2422,112 @@ fn a_list_of_intervals_that_is_not_a_steady_series_is_approximated_and_says_so()
 }
 
 #[test]
+fn a_plain_list_of_intervals_has_one_retry_per_interval() {
+    let imported = import_camunda_xml(&cycle_task("PT10M,PT17M,PT20M"));
+    let model = assert_clean_import(&imported);
+    let policy = retry_of(model, "Task_1").expect("the three intervals are three retries");
+    // 600, 1020, 1200: a factor of 170 percent that reaches its cap on the third wait, so it is exact.
+    assert_eq!(
+        policy,
+        ProcessRetryPolicy {
+            max_attempts: 3,
+            delay_seconds: 600,
+            backoff: ProcessRetryBackoff::Exponential { factor_percent: 170, max_delay_seconds: 1200 },
+        }
+    );
+    assert!(diagnostics(&imported, "CAMUNDA_RETRY_CYCLE_APPROXIMATED").is_empty());
+    assert!(diagnostics(&imported, "CAMUNDA_RETRY_CYCLE_SKIPPED").is_empty());
+
+    let imported = import_camunda_xml(&cycle_task("PT10M,PT20M,PT25M,PT40M"));
+    let model = assert_clean_import(&imported);
+    assert_eq!(retry_of(model, "Task_1").map(|p| p.max_attempts), Some(4));
+    only(&imported, "CAMUNDA_RETRY_CYCLE_APPROXIMATED");
+}
+
+#[test]
+fn cutting_a_cycle_down_to_what_a_step_can_have_is_an_approximation_not_an_exact_map() {
+    let long_list = (1..=12).map(|n| format!("PT{n}M")).collect::<Vec<_>>().join(",");
+    for (cycle, attempts) in [
+        // More runs than a step has retries: capped at ten.
+        ("R12/PT10M", 10),
+        ("R30/PT10M", 10),
+        // More intervals than R<n> has retries: the extra ones are dropped.
+        ("R3/PT10M,PT10M,PT10M", 2),
+        ("R2/PT1M,PT2M", 1),
+        (long_list.as_str(), 10),
+    ] {
+        let imported = import_camunda_xml(&cycle_task(cycle));
+        let model = assert_clean_import(&imported);
+        let policy = retry_of(model, "Task_1").unwrap_or_else(|| panic!("{cycle}: no policy"));
+        assert_eq!(policy.max_attempts, attempts, "{cycle}");
+        let note = only(&imported, "CAMUNDA_RETRY_CYCLE_APPROXIMATED");
+        assert!(note.message.contains(&clip_for_test(cycle)), "{cycle}: {}", note.message);
+        assert!(diagnostics(&imported, "CAMUNDA_RETRY_CYCLE_SKIPPED").is_empty(), "{cycle}");
+    }
+}
+
+fn clip_for_test(cycle: &str) -> String {
+    cycle.chars().take(20).collect()
+}
+
+#[test]
+fn a_series_that_does_not_start_rising_is_approximated_not_dropped() {
+    for (cycle, delay_seconds, grows) in [
+        ("R4/PT10S,PT10S,PT20S", 10, true),
+        ("R3/PT10M,PT5M", 600, false),
+        ("R4/PT40S,PT20S,PT10S", 40, false),
+        ("R3/PT1S,PT10H", 1, true),
+    ] {
+        let imported = import_camunda_xml(&cycle_task(cycle));
+        let model = assert_clean_import(&imported);
+        let policy = retry_of(model, "Task_1").unwrap_or_else(|| panic!("{cycle}: no policy"));
+        assert_eq!(policy.delay_seconds, delay_seconds, "{cycle}");
+        assert_eq!(
+            matches!(policy.backoff, ProcessRetryBackoff::Exponential { .. }),
+            grows,
+            "{cycle}: {policy:?}"
+        );
+        only(&imported, "CAMUNDA_RETRY_CYCLE_APPROXIMATED");
+        assert!(diagnostics(&imported, "CAMUNDA_RETRY_CYCLE_SKIPPED").is_empty(), "{cycle}");
+    }
+}
+
+#[test]
+fn a_retry_cycle_on_a_task_camunda_would_not_retry_is_warned_about() {
+    let cycle = "<bpmn:extensionElements><camunda:failedJobRetryTimeCycle>R3/PT10M</camunda:failedJobRetryTimeCycle></bpmn:extensionElements>";
+    for (attributes, warned) in [
+        (r#"camunda:class="x.Y""#, true),
+        (r#"camunda:type="external" camunda:topic="t" camunda:asyncBefore="true""#, true),
+        (r#"camunda:class="x.Y" camunda:asyncBefore="false""#, true),
+        (r#"camunda:class="x.Y" camunda:asyncBefore="true""#, false),
+        (r#"camunda:class="x.Y" camunda:asyncAfter="true""#, false),
+    ] {
+        let imported = import_camunda_xml(&linear(&format!(
+            r#"<bpmn:serviceTask id="Task_1" {attributes}>{cycle}</bpmn:serviceTask>"#
+        )));
+        let model = assert_clean_import(&imported);
+        let found = diagnostics(&imported, "CAMUNDA_RETRY_CYCLE_NO_JOB");
+        assert_eq!(found.len(), usize::from(warned), "{attributes}");
+        if let Some(warning) = found.first() {
+            assert_eq!(warning.severity, Some(Severity::Warning));
+            assert_eq!(warning.element_id.as_deref(), Some("Task_1"));
+        }
+        assert!(retry_of(model, "Task_1").is_some(), "the policy is still imported: {attributes}");
+    }
+}
+
+#[test]
 fn a_retry_cycle_that_cannot_be_mapped_keeps_its_warning_and_imports_no_policy() {
     for cycle in [
         "R3/2024-01-01T00:00:00Z/PT10M",
-        "PT10M",
         "R0/PT10M",
-        "R12/PT10M",
         "R3/PT0S",
         "R3/P2D",
         "R3/P1M",
-        "R3/PT10M,PT5M",
         "R3/${retryInterval}",
         "R3/",
+        "PT10M,",
+        "${retryInterval}",
     ] {
         let imported = import_camunda_xml(&cycle_task(cycle));
         let model = assert_clean_import(&imported);

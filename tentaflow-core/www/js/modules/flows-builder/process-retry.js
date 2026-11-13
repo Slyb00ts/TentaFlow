@@ -1,7 +1,6 @@
 // ============ File: flows-builder/process-retry.js — what an incident says about its retry: the offer and, when there is none, the reason in words ============
 
 import { I18n } from '/js/i18n.js';
-import { fmtDuration } from '/js/utils.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 
@@ -67,18 +66,22 @@ export function retryRefusal(incident) {
   return null;
 }
 
+/** A moment as the reader's locale writes it; the same form the monitor uses for every other time. */
+const retryTime = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
+
 /**
  * What the retry policy has done to this incident, in one sentence: the repeat
- * that is waiting (its number among the allowed ones and how long until it
- * starts) or, once none will start by itself, how many were made. Null for a
+ * that is waiting (its number among the allowed ones and the moment it is planned
+ * for) or, once none will start by itself, how many were made. The moment is
+ * absolute, so the sentence stays true on a screen nobody redraws. Null for a
  * step without a policy.
  */
-export function retryAttemptsText(incident, nowMs = Date.now()) {
+export function retryAttemptsText(incident) {
   const attempts = incident.attempts;
   if (!attempts) return null;
   if (attempts.nextAttemptAtMs != null) {
     return text('attempts_pending', { number: attempts.made + 1, limit: attempts.limit,
-      wait: fmtDuration(Math.max(0, attempts.nextAttemptAtMs - nowMs)) });
+      time: retryTime(attempts.nextAttemptAtMs) });
   }
   return text('attempts_ended', { made: attempts.made, limit: attempts.limit });
 }
