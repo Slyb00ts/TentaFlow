@@ -3042,6 +3042,21 @@ impl PartitionReader {
     /// first batch through `BatchView::records_from(from_offset)` rather
     /// than assuming every record in the result is `>= from_offset`.
     pub fn fetch_from_offset(&self, from_offset: u64, max_bytes: usize) -> Result<Vec<BatchView>> {
+        self.fetch_from_offset_limited(from_offset, max_bytes, usize::MAX)
+    }
+
+    /// `fetch_from_offset` that also stops reading once the returned batches
+    /// hold at least `max_records` records at or after `from_offset`. Still
+    /// whole batches (and at least one when data is available), so the last
+    /// batch may carry more records than asked for; the caller trims. Bounds
+    /// the disk read and decode work to about what the caller will use
+    /// instead of `max_bytes` worth of batches.
+    pub fn fetch_from_offset_limited(
+        &self,
+        from_offset: u64,
+        max_bytes: usize,
+        max_records: usize,
+    ) -> Result<Vec<BatchView>> {
         if self.state.detached.load(Ordering::Acquire) {
             return Err(BusError::PartitionDetached);
         }
@@ -3056,7 +3071,7 @@ impl PartitionReader {
         // takes. Re-taken (see the ENOENT retry below) if retention
         // deletes a segment out from under this snapshot.
         let segments: Vec<Arc<SegmentDescriptor>> = self.state.segments.read().clone();
-        self.fetch_from_offset_with_snapshot(segments, from_offset, max_bytes)
+        self.fetch_from_offset_with_snapshot(segments, from_offset, max_bytes, max_records)
     }
 
     /// Core of `fetch_from_offset`, parameterized over the starting segment
@@ -3069,6 +3084,7 @@ impl PartitionReader {
         mut segments: Vec<Arc<SegmentDescriptor>>,
         from_offset: u64,
         max_bytes: usize,
+        max_records: usize,
     ) -> Result<Vec<BatchView>> {
         if self.state.detached.load(Ordering::Acquire) {
             return Err(BusError::PartitionDetached);
@@ -3094,6 +3110,7 @@ impl PartitionReader {
 
         let mut out = Vec::new();
         let mut consumed = 0usize;
+        let mut records_read = 0usize;
         let mut want_offset = from_offset;
         let mut readbuf = ReadBuf::new();
         // Bounds the ENOENT-retry branch below to exactly one re-snapshot
@@ -3169,8 +3186,14 @@ impl PartitionReader {
 
                 let view = BatchView::parse(raw)?;
                 consumed += view.wire_len();
+                records_read = records_read.saturating_add(
+                    header
+                        .next_offset()
+                        .saturating_sub(header.base_offset.max(from_offset))
+                        as usize,
+                );
                 out.push(view);
-                if consumed >= max_bytes {
+                if consumed >= max_bytes || records_read >= max_records {
                     return Ok(out);
                 }
                 pos += total;
@@ -3547,6 +3570,40 @@ mod tests {
         assert_eq!(offsets4, vec![4, 5]);
     }
 
+    /// `fetch_from_offset_limited` stops after the batch that reaches the
+    /// record bound (whole batches, at least one), counting only records at or
+    /// after the requested offset.
+    #[test]
+    fn fetch_limited_stops_once_the_record_bound_is_reached() {
+        let dir = temp_dir("partition-read-limited");
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        for i in 0..6i64 {
+            part.append_batch(one_record_batch(i * 10, 8)).unwrap();
+        }
+        let reader = part.open_reader();
+        let bases = |views: Vec<BatchView>| -> Vec<u64> {
+            views.iter().map(|v| v.header().base_offset).collect()
+        };
+
+        let limited = reader
+            .fetch_from_offset_limited(0, 1024 * 1024, 2)
+            .unwrap();
+        assert_eq!(bases(limited), vec![0, 1]);
+
+        // A bound of one still returns one batch; offsets below `from` do not
+        // count towards the bound.
+        let one = reader
+            .fetch_from_offset_limited(3, 1024 * 1024, 1)
+            .unwrap();
+        assert_eq!(bases(one), vec![3]);
+
+        // The unbounded call is the old behaviour.
+        let all = reader
+            .fetch_from_offset_limited(0, 1024 * 1024, usize::MAX)
+            .unwrap();
+        assert_eq!(all.len(), 6);
+    }
+
     /// M1 retention (PLAN §2.5): only sealed segments are listed/deletable,
     /// never the active one, and a deleted segment's records become
     /// unreadable while the rest of the log stays intact.
@@ -3762,7 +3819,7 @@ mod tests {
         // I/O error, even though the stale snapshot's own `earliest_offset`
         // check would pass (it still contains segment 0).
         let err = reader
-            .fetch_from_offset_with_snapshot(stale_segments.clone(), 0, 1024 * 1024)
+            .fetch_from_offset_with_snapshot(stale_segments.clone(), 0, 1024 * 1024, usize::MAX)
             .unwrap_err();
         assert!(
             matches!(
@@ -3780,7 +3837,7 @@ mod tests {
         // must succeed by refreshing past the deleted segment 0 entry
         // instead of raising ENOENT for it.
         let batches = reader
-            .fetch_from_offset_with_snapshot(stale_segments, 3, 1024 * 1024)
+            .fetch_from_offset_with_snapshot(stale_segments, 3, 1024 * 1024, usize::MAX)
             .unwrap();
         let offsets: Vec<u64> = batches.iter().map(|v| v.header().base_offset).collect();
         assert_eq!(offsets, vec![3, 4, 5]);

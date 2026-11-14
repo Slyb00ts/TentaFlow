@@ -16,13 +16,33 @@
 // here — redelivery on failure is the intended at-least-once behavior, not a
 // bug this reactor works around.
 //
-// Fresh `ConsumerHandle` every poll cycle, never reused across cycles: `fetch`
-// advances its handle's in-memory `next_offset` independently of `commit()`
-// (`commit` only ever clamps `next_offset` upward), so a long-lived handle
-// that skips `commit()` after a failed batch would never re-fetch those
-// records from the SAME handle again. `open_consumer` seeds `next_offset` from
-// the durable `committed_offset` at open time, so reopening every cycle is
-// what makes "do not commit on failure" actually redeliver next time.
+// A `ConsumerHandle` is kept across cycles (`ConsumerSlot`) only while the
+// cycle ends clean: `fetch` advances its handle's in-memory `next_offset`
+// independently of `commit()` (`commit` only ever clamps `next_offset`
+// upward), so a handle that skips `commit()` after a failed batch would never
+// re-fetch those records from the SAME handle again. `open_consumer` seeds
+// `next_offset` from the durable `committed_offset` at open time, so every
+// cycle that did not commit (dispatch failure, DLQ, halt, failed commit, any
+// fetch error) drops the handle and the next cycle reopens it: "do not commit
+// on failure" still redelivers. A cycle that committed (or `AtMostOnce`, which
+// committed inside `fetch`) hands the handle back, saving the per-cycle open.
+//
+// A kept handle must not outlive its engine or its topic: `open_consumer`
+// fixes the partition list, so a reuse first requires the engine to be running
+// and each topic to have the incarnation and partition count the handle was
+// opened with (`BusService::consumer_is_current`); the subscription loop also
+// drops the handle whenever its instance is not running, so a stopped engine's
+// partition writers and directory locks are released.
+//
+// A kept handle must not outlive the service account's authority: every cycle
+// that reuses one first repeats the checks the pre-start check makes (the key
+// row is active and general, `check_consume_access`: the read right and the
+// field-policy lookup). When either fails the handle is dropped and a fresh
+// `open_consumer` runs, so the refusal, its reason and the
+// `bus.consume.denied` audit row are exactly those of the open-every-cycle
+// design. Fetching itself re-authorizes on a permission-generation change as
+// before. A handle is also dropped when the subscription resolves a different
+// `BusService` (instance restarted).
 //
 // `commit_mode` interaction (`bus::groups::CommitMode`): `AutoAfterSuccess`
 // (the default) is this reactor committing after a successful dispatch, or
@@ -43,13 +63,11 @@
 // it can be stored — the skip here only catches rows that bypassed that
 // check.
 //
-// `batch_size` vs `fetch`'s byte bound: `ConsumerHandle::fetch` has no
-// message-count parameter, only `max_bytes` — round-robining every subscribed
-// partition up to that bound. This reactor requests a generous fixed
-// `FETCH_MAX_BYTES` and truncates the result to `config.batch_size` itself.
-// Records beyond the truncation point are simply never committed — the
-// SAME "fresh handle every cycle" property above means they are naturally
-// re-fetched (redundantly, not incorrectly) on the next cycle.
+// `batch_size` vs `fetch`'s bounds: the reactor calls
+// `ConsumerHandle::fetch_up_to(FETCH_MAX_BYTES, batch_size, ..)`. The record
+// bound stops the engine read at about `batch_size` records and moves the
+// cursor only past the records returned, so nothing is read twice. The byte
+// bound is only a ceiling for batches of very large records.
 //
 // Attribution: a bus-triggered run has no natural human principal (unlike
 // `on_subagent_complete`, which inherits a finished run's own stamp). It runs
@@ -116,9 +134,8 @@ use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::bus_consume::{self, ConsumeConfig, OnError};
 use crate::flow_engine::types::FlowDefinition;
 
-/// Byte bound passed to `ConsumerHandle::fetch` on every poll cycle. Not
-/// `config.batch_size` (a message count `fetch` has no parameter for) — the
-/// module doc above explains the truncate-after-fetch strategy this enables.
+/// Byte ceiling passed to `ConsumerHandle::fetch_up_to` on every poll cycle;
+/// `config.batch_size` is the record bound that normally ends the read first.
 const FETCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// How often the supervisor rescans the active flow set for `bus_consume`
@@ -800,10 +817,10 @@ fn build_envelope(
 }
 
 /// Runs `handle.commit` off the async runtime (BLOCKING, see `ConsumerHandle::
-/// fetch`'s own doc). Consumes `handle` — the caller's poll cycle is over
-/// either way, so the next cycle opens a fresh one.
+/// fetch`'s own doc). The caller decides whether the handle survives into the
+/// next cycle (see the module doc).
 async fn commit_offsets(
-    handle: ConsumerHandle,
+    handle: Arc<ConsumerHandle>,
     offsets: Vec<(TopicPartition, u64)>,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || handle.commit(&offsets))
@@ -856,14 +873,42 @@ enum AfterFailure {
     Backoff,
 }
 
+/// The consumer a subscription keeps between poll cycles, with the engine it
+/// was opened on.
+struct CachedConsumer {
+    svc: Arc<BusService>,
+    handle: Arc<ConsumerHandle>,
+}
+
+type ConsumerSlot = Option<CachedConsumer>;
+
+/// Whether a kept consumer may still be used: the engine and the topic are
+/// the ones it was opened on (`BusService::consumer_is_current`: same
+/// incarnation, same partition count), and the checks of the pre-start check
+/// still pass, repeated per cycle because a kept handle skips
+/// `open_consumer`'s authorization. DB reads only, no audit row.
+fn still_usable(
+    svc: &BusService,
+    handle: &ConsumerHandle,
+    bctx: &BusCallContext,
+    topic: &str,
+    group: &str,
+    service_account: &str,
+) -> bool {
+    svc.consumer_is_current(handle)
+        && service_account_refusal(svc.db(), service_account).is_none()
+        && svc.check_consume_access(bctx, topic, group).is_ok()
+}
+
 /// Routes a failed batch (JSON decode failure OR a failed flow dispatch)
 /// through `config.on_error` (`bus_consume::OnError`'s own doc). Consumes
-/// `handle` — every branch either commits it, hands it to a blocking call, or
-/// simply drops it; the next cycle opens a fresh one regardless.
+/// `handle` — every branch drops it except a committed skip, which hands it
+/// back through `keep` (the cursor equals the committed offset again).
 async fn handle_batch_failure(
     svc: &Arc<BusService>,
     bctx: &BusCallContext,
-    handle: ConsumerHandle,
+    handle: Arc<ConsumerHandle>,
+    keep: &mut Option<Arc<ConsumerHandle>>,
     flow_id: &str,
     config: &ConsumeConfig,
     group: &str,
@@ -888,8 +933,11 @@ async fn handle_batch_failure(
             );
             if config.commit_mode == CommitMode::AutoAfterSuccess {
                 let offsets = end_offsets(records);
-                if let Err(e) = commit_offsets(handle, offsets).await {
-                    tracing::warn!("bus reactor: flow '{flow_id}' skip-commit failed: {e}");
+                match commit_offsets(handle.clone(), offsets).await {
+                    Ok(()) => *keep = Some(handle),
+                    Err(e) => {
+                        tracing::warn!("bus reactor: flow '{flow_id}' skip-commit failed: {e}")
+                    }
                 }
             } else {
                 drop(handle);
@@ -932,8 +980,8 @@ async fn handle_batch_failure(
     }
 }
 
-/// One full poll cycle for a subscription: opens a fresh `ConsumerHandle`,
-/// fetches, and either dispatches the decoded batch reactively or routes a
+/// One full poll cycle for a subscription: reuses the kept `ConsumerHandle`
+/// (or opens one), fetches, and either dispatches the decoded batch reactively or routes a
 /// failure through `on_error` — see this module's doc for the full design.
 /// Takes `svc` as a parameter (rather than resolving `config.instance_id`
 /// itself, which `subscription_loop` does before calling this) so it is
@@ -946,6 +994,7 @@ async fn run_cycle(
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
     status: &StatusStore,
+    slot: &mut ConsumerSlot,
 ) -> AfterFailure {
     let span = tracing::info_span!(
         "bus_reactor_cycle",
@@ -953,7 +1002,7 @@ async fn run_cycle(
         topic = %config.topic,
         correlation_id = tracing::field::Empty,
     );
-    let after = run_cycle_in(svc, flow_id, config, dispatch, status, &span)
+    let after = run_cycle_in(svc, flow_id, config, dispatch, status, slot, &span)
         .instrument(span.clone())
         .await;
     match after {
@@ -1016,6 +1065,7 @@ async fn run_cycle_in(
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
     status: &StatusStore,
+    slot: &mut ConsumerSlot,
     span: &tracing::Span,
 ) -> AfterFailure {
     let (Some(service_account), Some(group)) =
@@ -1031,21 +1081,33 @@ async fn run_cycle_in(
     };
     let bctx = consumer_context(svc.typed_instance_id(), config, service_account);
 
-    let (handle, mut records) = {
+    let kept = slot
+        .take()
+        .filter(|c| Arc::ptr_eq(&c.svc, svc))
+        .map(|c| c.handle);
+    let (handle, records) = {
         let task_svc = svc.clone();
         let open_bctx = bctx.clone();
         let group = group.clone();
         let topic = config.topic.clone();
         let commit_mode = config.commit_mode;
         let max_wait_ms = config.max_wait_ms;
+        let batch_size = config.batch_size as usize;
+        let task_account = service_account.to_string();
         let joined = tokio::task::spawn_blocking(move || {
-            let handle = task_svc.open_consumer(
-                &open_bctx,
-                &group,
-                &[topic],
-                ConsumerConfig { commit_mode },
-            )?;
-            let batch = handle.fetch(FETCH_MAX_BYTES, max_wait_ms)?;
+            let kept = kept.filter(|handle| {
+                still_usable(&task_svc, handle, &open_bctx, &topic, &group, &task_account)
+            });
+            let handle = match kept {
+                Some(handle) => handle,
+                None => Arc::new(task_svc.open_consumer(
+                    &open_bctx,
+                    &group,
+                    &[topic],
+                    ConsumerConfig { commit_mode },
+                )?),
+            };
+            let batch = handle.fetch_up_to(FETCH_MAX_BYTES, batch_size, max_wait_ms)?;
             Ok::<_, BusServiceError>((handle, batch))
         })
         .await;
@@ -1073,22 +1135,24 @@ async fn run_cycle_in(
 
     if records.is_empty() {
         // `fetch` already long-polled up to `max_wait_ms` internally.
+        restore_slot(slot, svc, Some(handle));
         return AfterFailure::Continue;
     }
-    records.truncate(config.batch_size as usize);
 
     let decoded: Result<Vec<serde_json::Value>, serde_json::Error> = records
         .iter()
         .map(|r| serde_json::from_slice::<serde_json::Value>(&r.payload))
         .collect();
+    let mut keep = None;
     let values = match decoded {
         Ok(values) => values,
         Err(e) => {
             let msg = format!("payload is not valid JSON: {e}");
-            return handle_batch_failure(
+            let after = handle_batch_failure(
                 svc,
                 &bctx,
                 handle,
+                &mut keep,
                 flow_id,
                 config,
                 &group,
@@ -1098,6 +1162,8 @@ async fn run_cycle_in(
                 None,
             )
             .await;
+            restore_slot(slot, svc, keep);
+            return after;
         }
     };
 
@@ -1120,24 +1186,29 @@ async fn run_cycle_in(
         Ok(()) => {
             if config.commit_mode == CommitMode::AutoAfterSuccess {
                 let offsets = end_offsets(&records);
-                if let Err(e) = commit_offsets(handle, offsets).await {
-                    tracing::warn!(
+                match commit_offsets(handle.clone(), offsets).await {
+                    Ok(()) => keep = Some(handle),
+                    Err(e) => tracing::warn!(
                         "bus reactor: flow '{flow_id}' commit after successful dispatch failed: {e}"
-                    );
+                    ),
                 }
+            } else {
+                keep = Some(handle);
             }
             // `AtMostOnce` already committed inside `fetch()`; `Explicit`
             // cannot reach here — `ConsumeConfig::from_config` rejects it, so
             // `build_subscriptions` never builds such a subscription. See
             // this module's doc.
+            restore_slot(slot, svc, keep);
             AfterFailure::Continue
         }
         Err(e) => {
             let msg = e.to_string();
-            handle_batch_failure(
+            let after = handle_batch_failure(
                 svc,
                 &bctx,
                 handle,
+                &mut keep,
                 flow_id,
                 config,
                 &group,
@@ -1146,9 +1217,23 @@ async fn run_cycle_in(
                 &msg,
                 Some(batch_corr.id.as_str()),
             )
-            .await
+            .await;
+            restore_slot(slot, svc, keep);
+            after
         }
     }
+}
+
+/// Keeps `handle` for the next cycle, when the cycle left one worth keeping.
+fn restore_slot(
+    slot: &mut ConsumerSlot,
+    svc: &Arc<BusService>,
+    handle: Option<Arc<ConsumerHandle>>,
+) {
+    *slot = handle.map(|handle| CachedConsumer {
+        svc: svc.clone(),
+        handle,
+    });
 }
 
 /// One subscription's background poll loop: waits for `config.instance_id`'s
@@ -1171,9 +1256,14 @@ async fn subscription_loop(
     dispatch: Arc<dyn ReactorFlowDispatch>,
     status: Arc<StatusStore>,
 ) {
+    let mut slot = ConsumerSlot::None;
     loop {
         let Some(svc) = crate::bus::instance(&config.instance_id) else {
-            // Disabled, uninstalled, or not started yet: back off.
+            // Disabled, uninstalled, or not started yet: back off. The kept
+            // consumer goes first: it holds the stopped engine's partition
+            // writers and directory locks, and a re-init of the instance on
+            // the same directory would fail while it lives.
+            slot = ConsumerSlot::None;
             status.record(
                 &flow_id,
                 ConsumerState::Waiting,
@@ -1183,7 +1273,7 @@ async fn subscription_loop(
             tokio::time::sleep(ERROR_BACKOFF).await;
             continue;
         };
-        let after = run_cycle(&svc, &flow_id, &config, &dispatch, &status).await;
+        let after = run_cycle(&svc, &flow_id, &config, &dispatch, &status, &mut slot).await;
         if !continue_after(after).await {
             break;
         }
@@ -1956,7 +2046,15 @@ mod tests {
         let started = std::time::Instant::now();
         let mut cycles = 0;
         while started.elapsed() < Duration::from_millis(ERROR_BACKOFF.as_millis() as u64 + 500) {
-            let after = run_cycle(&svc, "flow-dlq", &config, &dispatch, &status).await;
+            let after = run_cycle(
+                &svc,
+                "flow-dlq",
+                &config,
+                &dispatch,
+                &status,
+                &mut ConsumerSlot::None,
+            )
+            .await;
             assert!(matches!(after, AfterFailure::Backoff), "cycle {cycles}");
             assert_eq!(
                 status_of(&status, "flow-dlq"),
@@ -2009,15 +2107,26 @@ mod tests {
     /// module in this crate's `--lib` binary).
     fn registry_bus_service(id: BusInstanceId) -> (tempfile::TempDir, Arc<BusService>) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let svc =
+            registry_bus_service_at(id, dir.path().join("bus")).expect("init registry instance");
+        (dir, svc)
+    }
+
+    /// `registry_bus_service` on a given bus directory, with the init result
+    /// visible (a second init on a directory still locked fails).
+    fn registry_bus_service_at(
+        id: BusInstanceId,
+        bus_dir: std::path::PathBuf,
+    ) -> Result<Arc<BusService>, BusServiceError> {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
         crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
         let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
         crate::bus::db::migrate(&local_conn).expect("migrate local db");
         let local_db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
-        let svc = crate::bus::init_instance(BusInitConfig {
+        crate::bus::init_instance(BusInitConfig {
             instance_id: id,
             local_db,
-            bus_dir: dir.path().join("bus"),
+            bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),
             retention_interval: None,
@@ -2028,8 +2137,6 @@ mod tests {
                 &[7u8; 32],
             ))),
         })
-        .expect("init registry instance");
-        (dir, svc)
     }
 
     /// Runs a blocking `BusService`/`ConsumerHandle` call off the async
@@ -2130,7 +2237,15 @@ mod tests {
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        let after = run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Continue));
         {
             let calls = scripted.calls.lock().unwrap();
@@ -2139,7 +2254,15 @@ mod tests {
         }
 
         // Second cycle: nothing new (short max_wait_ms keeps this fast).
-        let after2 = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        let after2 = run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after2, AfterFailure::Continue));
         assert_eq!(
             scripted.calls.lock().unwrap().len(),
@@ -2168,7 +2291,15 @@ mod tests {
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        let after = run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Halt(_)));
 
         // Uncommitted: a fresh handle in the flow's own group still sees the
@@ -2210,7 +2341,15 @@ mod tests {
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        let after = run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Continue));
 
         let group = config.effective_group().unwrap();
@@ -2365,7 +2504,15 @@ mod tests {
             "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
 
         let seen = spy.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -2397,7 +2544,15 @@ mod tests {
             "max_wait_ms": 20, "batch_size": 10
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
 
         let seen = spy.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "a mixed batch is still one run");
@@ -2426,7 +2581,15 @@ mod tests {
             "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
 
         let seen = spy.seen.lock().unwrap();
         let minted = seen[0].0.as_deref().expect("an id is minted");
@@ -2465,7 +2628,15 @@ mod tests {
             "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
 
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
         let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
@@ -2536,7 +2707,15 @@ mod tests {
             "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "cards.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
+        let after = run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &StatusStore::default(),
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Continue));
         assert_eq!(
             scripted.calls.lock().unwrap()[0].1,
@@ -2778,7 +2957,15 @@ mod tests {
         let status = StatusStore::default();
         let config = consume_config(&key, json!({}));
 
-        let after = run_cycle(&fx.svc, "flow-real-ok", &config, &dispatch, &status).await;
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-ok",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Continue));
         assert_eq!(
             *spy.actors.lock().unwrap(),
@@ -2795,7 +2982,15 @@ mod tests {
         assert!(fetch_once(&fx.svc, &key_ctx(&key), &group, "orders.raw")
             .await
             .is_empty());
-        run_cycle(&fx.svc, "flow-real-ok", &config, &dispatch, &status).await;
+        run_cycle(
+            &fx.svc,
+            "flow-real-ok",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert_eq!(spy.actors.lock().unwrap().len(), 1, "no redelivery");
     }
 
@@ -2814,6 +3009,7 @@ mod tests {
             &consume_config(&key, json!({})),
             &dispatch,
             &status,
+            &mut ConsumerSlot::None,
         )
         .await;
         assert!(matches!(after, AfterFailure::Refused));
@@ -2840,6 +3036,7 @@ mod tests {
             &consume_config(&key, json!({})),
             &dispatch,
             &status,
+            &mut ConsumerSlot::None,
         )
         .await;
         assert!(matches!(after, AfterFailure::Refused));
@@ -2858,7 +3055,15 @@ mod tests {
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
         let status = StatusStore::default();
         let config = consume_config(&key, json!({}));
-        let first = run_cycle(&fx.svc, "flow-real-revoked", &config, &dispatch, &status).await;
+        let first = run_cycle(
+            &fx.svc,
+            "flow-real-revoked",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(first, AfterFailure::Continue));
         assert_eq!(spy.actors.lock().unwrap().len(), 1);
 
@@ -2870,7 +3075,15 @@ mod tests {
             r#"{"id":2}"#,
         )
         .await;
-        let second = run_cycle(&fx.svc, "flow-real-revoked", &config, &dispatch, &status).await;
+        let second = run_cycle(
+            &fx.svc,
+            "flow-real-revoked",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(second, AfterFailure::Refused));
         assert_eq!(
             status_of(&status, "flow-real-revoked"),
@@ -2884,6 +3097,478 @@ mod tests {
             1,
             "nothing read after revoke"
         );
+    }
+
+    /// Records the `id` of every record in every run, in order.
+    struct IdSpy {
+        runs: Mutex<Vec<Vec<i64>>>,
+        fail: bool,
+    }
+
+    impl IdSpy {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                runs: Mutex::new(Vec::new()),
+                fail,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ReactorFlowDispatch for IdSpy {
+        async fn dispatch(
+            &self,
+            _flow_id: String,
+            initial: FlowEnvelope,
+            _principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
+            let FlowValue::Json(value) = initial.payload else {
+                anyhow::bail!("expected a JSON payload");
+            };
+            let ids = match value {
+                serde_json::Value::Array(items) => items.iter().map(|v| v["id"].as_i64()).collect(),
+                single => vec![single["id"].as_i64()],
+            };
+            self.runs
+                .lock()
+                .unwrap()
+                .push(ids.into_iter().map(|id| id.unwrap_or(-1)).collect());
+            if self.fail {
+                anyhow::bail!("scripted dispatch failure");
+            }
+            Ok(())
+        }
+    }
+
+    async fn publish_ids(fx: &RealAuth, ids: std::ops::RangeInclusive<i64>) {
+        for id in ids {
+            publish_one(
+                &fx.svc,
+                &test_ctx("org-default"),
+                "orders.raw",
+                &format!(r#"{{"id":{id}}}"#),
+            )
+            .await;
+        }
+    }
+
+    /// The kept consumer reads each record once: `batch_size` bounds the
+    /// fetch and the cursor stops after the last record returned.
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_reads_each_record_once_in_batches() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        publish_ids(&fx, 2..=5).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = IdSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({"batch_size": 2}));
+        let mut slot = ConsumerSlot::None;
+        for _ in 0..4 {
+            let after =
+                run_cycle(&fx.svc, "flow-kept", &config, &dispatch, &status, &mut slot).await;
+            assert!(matches!(after, AfterFailure::Continue));
+            assert!(slot.is_some(), "a clean cycle keeps the consumer");
+        }
+        assert_eq!(
+            *spy.runs.lock().unwrap(),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+    }
+
+    /// A cycle that did not commit drops the kept consumer, so the batch is
+    /// delivered again.
+    #[tokio::test]
+    async fn real_authorizer_a_failed_batch_drops_the_kept_consumer_and_redelivers() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        publish_ids(&fx, 2..=3).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let config = consume_config(&key, json!({"batch_size": 2, "on_error": "halt"}));
+        let status = StatusStore::default();
+        let mut slot = ConsumerSlot::None;
+        let ok = IdSpy::new(false);
+        let ok_dispatch: Arc<dyn ReactorFlowDispatch> = ok.clone();
+        run_cycle(
+            &fx.svc,
+            "flow-kept",
+            &config,
+            &ok_dispatch,
+            &status,
+            &mut slot,
+        )
+        .await;
+        assert!(slot.is_some());
+
+        let failing = IdSpy::new(true);
+        let failing_dispatch: Arc<dyn ReactorFlowDispatch> = failing.clone();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-kept",
+            &config,
+            &failing_dispatch,
+            &status,
+            &mut slot,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Halt(_)));
+        assert!(
+            slot.is_none(),
+            "an uncommitted cycle must not keep the consumer"
+        );
+
+        run_cycle(
+            &fx.svc,
+            "flow-kept",
+            &config,
+            &ok_dispatch,
+            &status,
+            &mut slot,
+        )
+        .await;
+        assert_eq!(*failing.runs.lock().unwrap(), vec![vec![3]]);
+        assert_eq!(*ok.runs.lock().unwrap(), vec![vec![1, 2], vec![3]]);
+    }
+
+    /// `bus.consume.denied` audit rows written for `orders.raw`.
+    fn denied_rows(db: &DbPool) -> Vec<crate::db::models::AuditLogEntry> {
+        repository::list_audit_logs(
+            db,
+            &crate::db::models::AuditLogFilters {
+                action: Some("bus.consume.denied".to_string()),
+                ..Default::default()
+            },
+            0,
+            50,
+        )
+        .expect("audit rows")
+        .into_iter()
+        .filter(|row| row.resource.as_deref() == Some("orders.raw"))
+        .collect()
+    }
+
+    /// What ends a kept consumer's authority between two cycles: the next
+    /// cycle is refused with the same reason a fresh open would give, writes
+    /// `expected_denied_rows` denial audit rows (a fresh open writes one for a
+    /// denied right, none for a field-policy refusal), and reads nothing.
+    async fn assert_kept_consumer_is_refused_after(
+        change: impl FnOnce(&RealAuth, &str),
+        expected_reason: &'static str,
+        expected_denied_rows: usize,
+    ) {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = IdSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({}));
+        let mut slot = ConsumerSlot::None;
+        let first = run_cycle(&fx.svc, "flow-kept", &config, &dispatch, &status, &mut slot).await;
+        assert!(matches!(first, AfterFailure::Continue));
+        assert!(slot.is_some());
+        assert!(
+            denied_rows(&fx.db).is_empty(),
+            "no denial before the change"
+        );
+
+        change(&fx, &key);
+        publish_ids(&fx, 2..=2).await;
+        let second = run_cycle(&fx.svc, "flow-kept", &config, &dispatch, &status, &mut slot).await;
+        assert!(matches!(second, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-kept"),
+            (ConsumerState::Refused, Some(expected_reason))
+        );
+        assert!(slot.is_none());
+        assert_eq!(
+            *spy.runs.lock().unwrap(),
+            vec![vec![1]],
+            "nothing read after the change"
+        );
+        let denied = denied_rows(&fx.db);
+        assert_eq!(denied.len(), expected_denied_rows, "{denied:?}");
+    }
+
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_is_refused_after_the_key_is_deleted() {
+        assert_kept_consumer_is_refused_after(
+            |fx, key| {
+                repository::delete_api_key_by_uid(&fx.db, key).expect("delete");
+            },
+            reason::SERVICE_ACCOUNT_NOT_FOUND,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_is_refused_after_the_key_is_disabled() {
+        assert_kept_consumer_is_refused_after(
+            |fx, key| {
+                repository::set_api_key_active(&fx.db, key, false).expect("disable");
+            },
+            reason::SERVICE_ACCOUNT_DISABLED,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_is_refused_after_the_read_right_is_removed() {
+        assert_kept_consumer_is_refused_after(
+            |fx, key| {
+                repository::resource_permissions::clear(
+                    &fx.db,
+                    "topic",
+                    &crate::services::bus_authorizer::topic_acl_resource_id(
+                        REAL_INSTANCE,
+                        "org-default",
+                        "orders.raw",
+                    ),
+                    "api_key",
+                    key,
+                )
+                .expect("clear right")
+            },
+            reason::READ_DENIED,
+            1,
+        )
+        .await;
+    }
+
+    /// A field policy for another subject appears while the consumer is kept:
+    /// the key now needs a topic-wide rule.
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_is_refused_after_a_policy_for_another_subject_appears()
+    {
+        use crate::bus::field_policies as fp;
+        assert_kept_consumer_is_refused_after(
+            |fx, _key| {
+                let names = |v: &[&str]| {
+                    v.iter()
+                        .map(|s| s.to_string())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                fp::set_policy(
+                    &fx.db,
+                    REAL_INSTANCE,
+                    "org-default",
+                    "orders.raw",
+                    "user",
+                    "someone-else",
+                    fp::Direction::Read,
+                    &names(&["id"]),
+                    &names(&[]),
+                    &names(&[]),
+                    &names(&[]),
+                    crate::db::repository::BusFieldPolicyExpect::Any,
+                )
+                .expect("rule for another subject");
+            },
+            reason::NEEDS_TOPIC_WIDE_RULE,
+            0,
+        )
+        .await;
+    }
+
+    /// `open_consumer` fixes the partition list, so a topic that grows
+    /// partitions under a kept consumer must make the next cycle reopen it.
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_follows_a_topic_that_grows_partitions() {
+        let fx = real_auth_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &fx.svc,
+            &ctx,
+            "orders.raw",
+            TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        publish_ids(&fx, 1..=1).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = IdSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({}));
+        let mut slot = ConsumerSlot::None;
+        run_cycle(&fx.svc, "flow-grow", &config, &dispatch, &status, &mut slot).await;
+        assert!(slot.is_some());
+
+        let svc = fx.svc.clone();
+        let grow_ctx = ctx.clone();
+        blocking(move || {
+            svc.update_topic(
+                &grow_ctx,
+                "orders.raw",
+                TopicOptions {
+                    partitions: Some(2),
+                    ..Default::default()
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("grow partitions");
+        let svc = fx.svc.clone();
+        blocking(move || {
+            svc.publish(
+                &ctx,
+                "orders.raw",
+                PublishBatch {
+                    partition: Some(1),
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(r#"{"id":2}"#),
+                        timestamp_ms: 0,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("publish to the new partition");
+
+        run_cycle(&fx.svc, "flow-grow", &config, &dispatch, &status, &mut slot).await;
+        assert_eq!(*spy.runs.lock().unwrap(), vec![vec![1], vec![2]]);
+    }
+
+    /// A kept consumer must not outlive a stopped engine: it holds the
+    /// partition writers and directory locks, so the instance could not start
+    /// again on the same directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_instance_releases_the_kept_consumer_so_it_can_start_again() {
+        let id = BusInstanceId::parse("tentabus-8b000008").expect("valid instance id");
+        let (dir, svc) = registry_bus_service(id.clone());
+        let ctx = BusCallContext {
+            instance_id: id.clone(),
+            ..test_ctx("org-default")
+        };
+        create_topic(&svc, &ctx, "orders.raw", TopicOptions::default()).await;
+        publish_one(&svc, &ctx, "orders.raw", r#"{"id":1}"#).await;
+        let key = seed_general_key(svc.db());
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": id.as_str(), "service_account": key,
+            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .expect("config");
+
+        let spy = IdSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let task = spawn_subscription(
+            "flow-stop".to_string(),
+            config,
+            dispatch,
+            Arc::new(StatusStore::default()),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while spy.runs.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no delivery");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(svc);
+        crate::bus::stop_instance(&id);
+        let bus_dir = dir.path().join("bus");
+        let mut restarted = None;
+        while std::time::Instant::now() < deadline {
+            match registry_bus_service_at(id.clone(), bus_dir.clone()) {
+                Ok(svc) => {
+                    restarted = Some(svc);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        drop(task);
+        crate::bus::stop_instance(&id);
+        assert!(
+            restarted.is_some(),
+            "the instance could not start again on its directory"
+        );
+    }
+
+    /// `AtMostOnce` committed inside `fetch`, so its handle is kept too.
+    #[tokio::test]
+    async fn real_authorizer_an_at_most_once_consumer_is_kept_and_reads_each_record_once() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        publish_ids(&fx, 2..=3).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = IdSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(
+            &key,
+            json!({"batch_size": 2, "commit_mode": "at_most_once"}),
+        );
+        let mut slot = ConsumerSlot::None;
+        for _ in 0..3 {
+            let after =
+                run_cycle(&fx.svc, "flow-amo", &config, &dispatch, &status, &mut slot).await;
+            assert!(matches!(after, AfterFailure::Continue));
+            assert!(slot.is_some());
+        }
+        assert_eq!(*spy.runs.lock().unwrap(), vec![vec![1, 2], vec![3]]);
+    }
+
+    /// A skipped failure commits, so the handle is kept and the next cycle
+    /// continues after the skipped records.
+    #[tokio::test]
+    async fn real_authorizer_a_kept_consumer_continues_after_a_skipped_batch() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        publish_ids(&fx, 2..=4).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let config = consume_config(&key, json!({"batch_size": 2, "on_error": "skip"}));
+        let status = StatusStore::default();
+        let mut slot = ConsumerSlot::None;
+        let failing = IdSpy::new(true);
+        let failing_dispatch: Arc<dyn ReactorFlowDispatch> = failing.clone();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-skip",
+            &config,
+            &failing_dispatch,
+            &status,
+            &mut slot,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Continue));
+        assert!(slot.is_some(), "a committed skip keeps the consumer");
+
+        let ok = IdSpy::new(false);
+        let ok_dispatch: Arc<dyn ReactorFlowDispatch> = ok.clone();
+        run_cycle(
+            &fx.svc,
+            "flow-skip",
+            &config,
+            &ok_dispatch,
+            &status,
+            &mut slot,
+        )
+        .await;
+        assert_eq!(*failing.runs.lock().unwrap(), vec![vec![1, 2]]);
+        assert_eq!(*ok.runs.lock().unwrap(), vec![vec![3, 4]]);
     }
 
     #[tokio::test]
@@ -2902,6 +3587,7 @@ mod tests {
             &consume_config(&key, json!({})),
             &dispatch,
             &status,
+            &mut ConsumerSlot::None,
         )
         .await;
         assert!(matches!(after, AfterFailure::Refused));
@@ -2931,6 +3617,7 @@ mod tests {
             &consume_config(&key, json!({})),
             &dispatch,
             &status,
+            &mut ConsumerSlot::None,
         )
         .await;
         assert!(matches!(after, AfterFailure::Refused));
@@ -2984,7 +3671,15 @@ mod tests {
         let config = consume_config(&key, json!({}));
         let dispatch: Arc<dyn ReactorFlowDispatch> = ActorSpy::new(false);
         let status = StatusStore::default();
-        let after = run_cycle(&fx.svc, "flow-real-rules", &config, &dispatch, &status).await;
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-rules",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Refused));
         assert_eq!(
             status_of(&status, "flow-real-rules"),
@@ -3019,7 +3714,15 @@ mod tests {
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
         let status = StatusStore::default();
         let config = consume_config(&key, json!({"on_error": "dlq"}));
-        let after = run_cycle(&fx.svc, "flow-real-dlq", &config, &dispatch, &status).await;
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-dlq",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
         assert!(matches!(after, AfterFailure::Continue));
 
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");

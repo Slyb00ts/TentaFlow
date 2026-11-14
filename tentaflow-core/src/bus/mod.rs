@@ -7609,6 +7609,7 @@ impl BusService {
                     cursor: parking_lot::Mutex::new(ConsumerCursor::new(committed, applied_reset)),
                     environment: env_byte,
                     gap_audited: std::sync::atomic::AtomicBool::new(false),
+                    topic_generation: topic_cfg.generation,
                 });
             }
         }
@@ -7653,6 +7654,7 @@ impl BusService {
             group: group.to_string(),
             commit_mode: cfg.commit_mode,
             partitions,
+            next_start: std::sync::atomic::AtomicUsize::new(0),
             offsets: Arc::clone(&self.offsets),
             db: self.db.clone(),
             local_db: self.local_db.clone(),
@@ -8160,6 +8162,39 @@ impl BusService {
         ) {
             tracing::warn!("__bus.metrics: publish failed: {e}");
         }
+    }
+
+    /// Whether `handle` still matches this engine and its topics: the engine
+    /// is running, and every topic the handle subscribed to still has the same
+    /// incarnation and partition count it was opened with. `open_consumer`
+    /// fixes the partition list, so a kept handle must be dropped once a topic
+    /// grew partitions or was deleted and recreated (the new incarnation may
+    /// carry different access rules). A topic that cannot be read counts as
+    /// changed.
+    pub fn consumer_is_current(&self, handle: &ConsumerHandle) -> bool {
+        if self.sweeper_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut checked: Vec<&str> = Vec::new();
+        for cp in &handle.partitions {
+            let topic = cp.topic.as_str();
+            if checked.contains(&topic) {
+                continue;
+            }
+            checked.push(topic);
+            let Ok(cfg) = self.topic_config(&handle.org_id, topic) else {
+                return false;
+            };
+            let opened = handle
+                .partitions
+                .iter()
+                .filter(|other| other.topic == topic)
+                .count();
+            if cfg.generation != cp.topic_generation || cfg.partitions as usize != opened {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether `ctx` may consume `topic` under `group`: the instance, name and
@@ -9464,6 +9499,9 @@ struct ConsumerPartition {
     /// `seek_to_earliest`, since a later gap (a second retention pass) is a
     /// new occurrence worth auditing again.
     gap_audited: AtomicBool,
+    /// `TopicConfig::generation` (the topic incarnation) this partition was
+    /// opened under — compared by `BusService::consumer_is_current`.
+    topic_generation: u64,
 }
 
 pub struct ConsumerHandle {
@@ -9473,6 +9511,9 @@ pub struct ConsumerHandle {
     pub group: String,
     pub commit_mode: groups::CommitMode,
     partitions: Vec<ConsumerPartition>,
+    /// Where the next `fetch` call starts its partition scan, advanced by one
+    /// per call so a backlog on one partition cannot starve the others.
+    next_start: std::sync::atomic::AtomicUsize,
     offsets: Arc<groups::GroupOffsetStore>,
     /// The shared platform database — audit rows, field policies, topic
     /// config: everything except `bus_groups`. See `BusService::db`.
@@ -9678,8 +9719,10 @@ impl ConsumerHandle {
         Ok(cursor.advance(from, new_next))
     }
 
-    /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition
-    /// round-robin up to `max_bytes` total, long-polling up to
+    /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition up
+    /// to `max_bytes` total, starting each call one partition further along
+    /// (round-robin ACROSS calls, so a backlog on one partition cannot
+    /// starve the rest when a bound ends the scan early), long-polling up to
     /// `max_wait_ms` if nothing is available yet.
     ///
     /// BLOCKING: this calls `PartitionReader::fetch_from_offset`,
@@ -9691,6 +9734,20 @@ impl ConsumerHandle {
     pub fn fetch(
         &self,
         max_bytes: usize,
+        max_wait_ms: u32,
+    ) -> Result<FetchedBatch, BusServiceError> {
+        self.fetch_up_to(max_bytes, usize::MAX, max_wait_ms)
+    }
+
+    /// `fetch` that also returns at most `max_records` records in total
+    /// (across all subscribed partitions). The cursor advances only past the
+    /// records returned, so the rest is read by the next fetch, and the
+    /// engine read stops at about `max_records` instead of `max_bytes`.
+    /// Same BLOCKING contract as `fetch`.
+    pub fn fetch_up_to(
+        &self,
+        max_bytes: usize,
+        max_records: usize,
         max_wait_ms: u32,
     ) -> Result<FetchedBatch, BusServiceError> {
         self.revalidate()?;
@@ -9726,20 +9783,25 @@ impl ConsumerHandle {
             self.apply_offset_resets_locked()?;
         }
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
+        let partition_count = self.partitions.len().max(1);
+        let start = self.next_start.fetch_add(1, Ordering::Relaxed) % partition_count;
         loop {
             let mut records = Vec::new();
             let mut consumed = 0usize;
-            for cp in &self.partitions {
-                if consumed >= max_bytes {
+            for offset in 0..self.partitions.len() {
+                let cp = &self.partitions[(start + offset) % partition_count];
+                if consumed >= max_bytes || records.len() >= max_records {
                     break;
                 }
+                let remaining = max_records - records.len();
                 self.check_environment(cp)?;
                 check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
                 let from = cp.cursor.lock().next;
-                let batches = match cp
-                    .reader
-                    .fetch_from_offset(from, max_bytes.saturating_sub(consumed))
-                {
+                let batches = match cp.reader.fetch_from_offset_limited(
+                    from,
+                    max_bytes.saturating_sub(consumed),
+                    remaining,
+                ) {
                     Ok(b) => b,
                     Err(tentaflow_bus::BusError::OffsetOutOfRange {
                         requested,
@@ -9780,10 +9842,16 @@ impl ConsumerHandle {
                 };
                 let (records_before, consumed_before) = (records.len(), consumed);
                 let mut new_next = from;
-                for view in &batches {
+                'batches: for view in &batches {
                     for rv in view.records_from(from) {
                         let rv = rv?;
                         let offset = view.header().base_offset + rv.offset_delta as u64;
+                        if records.len() - records_before == remaining {
+                            // Cut inside this batch: the cursor stops at the
+                            // first record not returned.
+                            new_next = offset;
+                            break 'batches;
+                        }
                         consumed += rv.payload.len();
                         records.push(FetchedRecordMeta {
                             topic: cp.topic.clone(),
@@ -12480,6 +12548,104 @@ mod tests {
 
         svc.resume_group(&ctx, "g1", "orders.paused-fetch").unwrap();
         assert_eq!(handle.fetch(1024, 20).unwrap().records.len(), 1);
+    }
+
+    /// `fetch_up_to` cuts inside a multi-record batch: the cursor stops at the
+    /// first record not returned, so the next fetch continues exactly there.
+    #[test]
+    fn fetch_up_to_returns_at_most_max_records_and_resumes_after_them() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.bounded",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payloads: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        for chunk in payloads.chunks(4) {
+            svc.publish(
+                &ctx,
+                "orders.bounded",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: chunk.iter().map(|p| record(p)).collect(),
+                },
+            )
+            .unwrap();
+        }
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.bounded".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        for expected in [3usize, 3, 1] {
+            let batch = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+            assert_eq!(batch.records.len(), expected);
+            seen.extend(batch.records.iter().map(|r| r.offset));
+        }
+        assert_eq!(seen, (0..7).collect::<Vec<u64>>());
+        assert!(handle.fetch_up_to(1024 * 1024, 3, 20).unwrap().records.is_empty());
+    }
+
+    /// A backlog on partition 0 must not starve partition 1: each fetch call
+    /// starts its scan one partition further along.
+    #[test]
+    fn fetch_up_to_rotates_the_starting_partition_so_a_backlog_cannot_starve_the_rest() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.fair",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (partition, count) in [(0u32, 6usize), (1, 2)] {
+            for i in 0..count {
+                svc.publish(
+                    &ctx,
+                    "orders.fair",
+                    PublishBatch {
+                        partition: Some(partition),
+                        producer: None,
+                        records: vec![record(&format!("p{partition}-{i}"))],
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.fair".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let first = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+        let second = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+        let from_p1 = |b: &FetchedBatch| b.records.iter().filter(|r| r.partition == 1).count();
+        assert_eq!(first.records.len(), 3);
+        assert_eq!(from_p1(&first), 0, "the first call starts on partition 0");
+        assert!(
+            from_p1(&second) > 0,
+            "the second call must reach partition 1 despite the backlog on 0"
+        );
     }
 
     // ---- OffsetOutOfRange after retention + deliberate recovery ----
