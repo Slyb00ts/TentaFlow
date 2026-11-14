@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { busConsumerText } from '/js/modules/flows-builder/bus-consumer.js';
+import { busConsumerText, busGroupProblem } from '/js/modules/flows-builder/bus-consumer.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
@@ -2055,6 +2055,7 @@ export class FlowConfig {
     const cfg = this.node?.config || {};
     const uid = String(cfg.service_account || '').trim();
     const group = String(cfg.group || '').trim();
+    if (group && busGroupProblem(group)) return I18n.t('flows_config.group_invalid');
     if (!uid || !group) return I18n.t('flows_config.effective_group_pending');
     return I18n.t('flows_config.effective_group', { group: `k:${uid}.${group}` });
   }
@@ -2062,7 +2063,8 @@ export class FlowConfig {
   _renderBusConsumeNote(key) {
     if (this.node?.type !== 'bus_consume') return '';
     if (key === 'group') {
-      return `<div class="fb-field-hint" data-role="bus-effective-group">${escapeHtml(this._busEffectiveGroupText())}</div>`;
+      const bad = busGroupProblem(this.node?.config?.group) ? ' fb-map-warn' : '';
+      return `<div class="fb-field-hint${bad}" data-role="bus-effective-group" aria-live="polite">${escapeHtml(this._busEffectiveGroupText())}</div>`;
     }
     if (key === 'service_account') {
       // Shown while the account differs from the one in the last loaded or
@@ -2072,7 +2074,7 @@ export class FlowConfig {
       const savedConfig = this.opts?.getSavedNodeConfig?.(this.node?.id);
       const saved = String((savedConfig ? savedConfig.service_account : live) || '').trim();
       const hidden = live === saved ? ' hidden' : '';
-      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" data-saved-account="${escapeAttr(saved)}"${hidden}>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
+      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" aria-live="polite" data-saved-account="${escapeAttr(saved)}"${hidden}>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
     }
     return '';
   }
@@ -2107,7 +2109,7 @@ export class FlowConfig {
     if (Array.isArray(def.enum)) {
       const opts = def.enum.map((opt) => {
         const v = typeof opt === 'object' ? opt.value : opt;
-        const l = typeof opt === 'object' ? opt.label : opt;
+        const l = typeof opt === 'object' ? (opt.label_key ? I18n.t(opt.label_key) : opt.label) : opt;
         const sel = String(curVal) === String(v) ? 'selected' : '';
         return `<option value="${escapeAttr(v)}" ${sel}>${escapeHtml(l)}</option>`;
       }).join('');
@@ -2263,6 +2265,20 @@ export class FlowConfig {
       }
       const type = el.dataset.type;
       // tf-input/tf-textarea/tf-select all expose `.value` and emit `change`.
+      // The group line and its check follow the typing, not only the blur.
+      if (node.type === 'bus_consume' && key === 'group') {
+        el.addEventListener('input', () => {
+          const line = body.querySelector('[data-role="bus-effective-group"]');
+          if (!line) return;
+          const group = String(el.value || '').trim();
+          const cfg = this.node?.config || {};
+          const uid = String(cfg.service_account || '').trim();
+          line.textContent = busGroupProblem(group)
+            ? I18n.t('flows_config.group_invalid')
+            : (uid && group ? I18n.t('flows_config.effective_group', { group: `k:${uid}.${group}` }) : I18n.t('flows_config.effective_group_pending'));
+          line.classList.toggle('fb-map-warn', !!busGroupProblem(group));
+        });
+      }
       el.addEventListener('change', () => {
         let v = el.value;
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
@@ -2270,7 +2286,10 @@ export class FlowConfig {
         this._refreshPreview();
         if (node.type === 'bus_consume' && (key === 'group' || key === 'service_account')) {
           const line = body.querySelector('[data-role="bus-effective-group"]');
-          if (line) line.textContent = this._busEffectiveGroupText();
+          if (line) {
+            line.textContent = this._busEffectiveGroupText();
+            line.classList.toggle('fb-map-warn', !!busGroupProblem(this.node?.config?.group));
+          }
           const warning = body.querySelector('[data-role="bus-new-group-warning"]');
           if (warning && key === 'service_account') {
             warning.hidden = String(v || '').trim() === warning.dataset.savedAccount;

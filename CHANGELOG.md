@@ -741,6 +741,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- PowerUser może edytować flow: `FlowUpdateRequest`, `FlowVersionRestoreRequest`
+  i `FlowFactoryRestoreRequest` wymagają teraz roli PowerUser lub Admin (wcześniej
+  tylko Admin). Pozostałe ograniczenia bez zmian: flow systemowe są tylko do
+  odczytu, domyślny flow czatu musi być aktywny, kolizje nazwy publikacji są
+  odrzucane, a każde sprawdzenie konta usługowego nadal wymaga, by zapisujący
+  osobiście miał prawa do tematu. User i Viewer nadal są odrzucani.
+- Odbiór z magistrali: gdy kolejka błędów (DLQ) nie przyjmuje jeszcze zapisu,
+  odbiór czeka 2 s i wraca ze stanem „oczekuje” (powód `dlq_unavailable`) zamiast
+  w pętli uruchamiać flow od nowa; odmowy zapisu flow z kontem usługowym niosą
+  nazwę węzła i klucza (nie identyfikator) i są tłumaczone w interfejsie na pięć
+  języków; import środowiska zwraca nazwy flow zapisanych jako szkice, a interfejs
+  je pokazuje.
+- Flow z historią uruchomień nie da się usunąć: `FlowDeleteRequest` odmawia przed
+  jakimkolwiek zapisem (zamiast kończyć się błędem klucza obcego w bazie) i
+  proponuje dezaktywację; historia wykonań zostaje nietknięta, migracji brak.
+  Flow bez historii usuwa się jak dotąd i nadal zapisuje audyt odpięcia konta.
 - Naprawa: flow z węzłem `bus_consume` nigdy niczego nie czytał, bo reaktor
   konsumował bez tożsamości, a autoryzator odmawia wołającemu bez aktora. Teraz
   węzeł wskazuje konto usługowe (`service_account`: uid aktywnego klucza ogólnego,

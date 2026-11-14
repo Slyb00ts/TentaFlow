@@ -776,6 +776,7 @@ pub fn environment_import_apply(
         EnvironmentPromotionPayload::ImportApplyResponse(EnvironmentImportApplyResponse {
             applied: true,
             imported_count: result.imported_count,
+            demoted_flows: imported_bindings.demoted_names(),
         }),
     ))
 }
@@ -1170,6 +1171,16 @@ mod tests {
         )
         .await;
         assert!(!is_err, "unexpected error body: {body:?}");
+        match &body {
+            MessageBody::EnvironmentPromotionBody(
+                EnvironmentPromotionPayload::ImportApplyResponse(r),
+            ) => assert_eq!(
+                r.demoted_flows,
+                vec!["donor flow".to_string()],
+                "the response names the flow saved as a draft"
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
 
         let flow = repository::get_flow(&ctx.state.db, "donor-bound")
             .unwrap()

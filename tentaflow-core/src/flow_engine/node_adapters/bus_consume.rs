@@ -175,8 +175,13 @@ impl ConsumeConfig {
             .to_string();
         // The group becomes the `.name` part of the key's consumer group, so
         // it must satisfy the broker's group-name charset.
-        topics::validate_user_topic_name(&group)
-            .map_err(|e| anyhow!("bus_consume: invalid 'group' '{group}': {e}"))?;
+        topics::validate_user_topic_name(&group).map_err(|_| {
+            anyhow!(
+                "bus_consume: invalid 'group' '{group}': a group name takes 2-121 \
+                     characters (lowercase letters, digits, '.' and '-'), starting with a \
+                     letter or digit"
+            )
+        })?;
         let service_account = match config
             .get("service_account")
             .and_then(|v| v.as_str())

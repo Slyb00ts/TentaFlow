@@ -981,7 +981,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Reaktywny punkt wejścia: flow startuje, gdy reaktor magistrali (TentaBus) pobierze nową partię rekordów z subskrybowanego tematu/grupy",
             r#"{"instance_id":"","service_account":"","topic":"","group":"","batch_size":1,"max_wait_ms":1000,"commit_mode":"auto_after_success","on_error":"dlq"}"#,
             "inbox",
-            r#"{"properties":{"instance_id":{"type":"string","title":"Instancja TentaBus","description":"Zainstalowana i włączona instancja TentaBus. Wymagane — brak domyślnej instancji.","dynamic_enum":{"source":"bus_instances"}},"service_account":{"type":"string","title":"Konto usługowe (klucz ogólny)","title_key":"flows_config.service_account_title","description":"Klucz dostępu typu ogólnego, z którego prawami flow czyta temat i publikuje. Prawa nadaje administrator w Kluczach dostępu.","description_key":"flows_config.service_account_hint","dynamic_enum":{"source":"bus_service_accounts"}},"topic":{"type":"string","title":"Temat"},"group":{"type":"string","title":"Grupa konsumentów"},"batch_size":{"type":"integer","title":"Rozmiar partii","minimum":1,"maximum":1000,"default":1},"max_wait_ms":{"type":"integer","title":"Maks. czas oczekiwania (ms)","minimum":1,"maximum":60000,"default":1000},"commit_mode":{"type":"string","title":"Tryb zatwierdzania","enum":[{"value":"auto_after_success","label":"Automatycznie po sukcesie"},{"value":"at_most_once","label":"Najwyżej raz"}],"default":"auto_after_success"},"on_error":{"type":"string","title":"Przy błędzie","enum":[{"value":"dlq","label":"Do DLQ"},{"value":"skip","label":"Pomiń"},{"value":"halt","label":"Zatrzymaj subskrypcję"}],"default":"dlq"},"org_id":{"type":"string","title":"Org ID (opcjonalnie)","description":"Puste = organizacja domyślna"}},"required":["instance_id","service_account","topic","group"],"order":["instance_id","service_account","topic","group","batch_size","max_wait_ms","commit_mode","on_error","org_id"]}"#,
+            r#"{"properties":{"instance_id":{"type":"string","title":"Instancja TentaBus","description":"Zainstalowana i włączona instancja TentaBus. Wymagane — brak domyślnej instancji.","dynamic_enum":{"source":"bus_instances"},"title_key":"flows_config.bc_instance","description_key":"flows_config.bc_instance_hint"},"service_account":{"type":"string","title":"Konto usługowe (klucz ogólny)","title_key":"flows_config.service_account_title","description":"Klucz dostępu typu ogólnego, z którego prawami flow czyta temat i publikuje. Prawa nadaje administrator w Kluczach dostępu.","description_key":"flows_config.service_account_hint","dynamic_enum":{"source":"bus_service_accounts"}},"topic":{"type":"string","title":"Temat","title_key":"flows_config.bc_topic"},"group":{"type":"string","title":"Grupa konsumentów","title_key":"flows_config.bc_group"},"batch_size":{"type":"integer","title":"Rozmiar partii","minimum":1,"maximum":1000,"default":1,"title_key":"flows_config.bc_batch"},"max_wait_ms":{"type":"integer","title":"Maks. czas oczekiwania (ms)","minimum":1,"maximum":60000,"default":1000,"title_key":"flows_config.bc_max_wait"},"commit_mode":{"type":"string","title":"Tryb zatwierdzania","enum":[{"value":"auto_after_success","label":"Automatycznie po sukcesie","label_key":"flows_config.bc_commit_auto"},{"value":"at_most_once","label":"Najwyżej raz","label_key":"flows_config.bc_commit_at_most_once"}],"default":"auto_after_success","title_key":"flows_config.bc_commit_mode"},"on_error":{"type":"string","title":"Przy błędzie","enum":[{"value":"dlq","label":"Do DLQ","label_key":"flows_config.bc_on_error_dlq"},{"value":"skip","label":"Pomiń","label_key":"flows_config.bc_on_error_skip"},{"value":"halt","label":"Zatrzymaj subskrypcję","label_key":"flows_config.bc_on_error_halt"}],"default":"dlq","title_key":"flows_config.bc_on_error"},"org_id":{"type":"string","title":"Org ID (opcjonalnie)","description":"Puste = organizacja domyślna","title_key":"flows_config.bc_org","description_key":"flows_config.bc_org_hint"}},"required":["instance_id","service_account","topic","group"],"order":["instance_id","service_account","topic","group","batch_size","max_wait_ms","commit_mode","on_error","org_id"]}"#,
         ),
         (
             "bus_publish",
@@ -3020,6 +3020,65 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("brak wiazania dla '{published}': {e}"));
             assert_eq!(&bound, id);
+        }
+    }
+
+    /// The bus_consume form shows its titles and options in the reader's own
+    /// language: every `title_key`, `description_key` and `label_key` of the
+    /// seeded schema resolves to a non-empty string in all five locales.
+    #[test]
+    fn bus_consume_schema_keys_exist_in_every_locale() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let schema: String = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT params_schema FROM flow_node_templates WHERE node_type = 'bus_consume'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("bus_consume template");
+        fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, child) in m {
+                        match (k.as_str(), child.as_str()) {
+                            ("title_key" | "description_key" | "label_key", Some(key)) => {
+                                out.push(key.to_string())
+                            }
+                            _ => collect(child, out),
+                        }
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|c| collect(c, out)),
+                _ => {}
+            }
+        }
+        let mut keys = Vec::new();
+        collect(
+            &serde_json::from_str(&schema).expect("schema JSON"),
+            &mut keys,
+        );
+        assert!(keys.len() >= 15, "the schema should carry keys: {keys:?}");
+        let locales = [
+            ("pl", include_str!("../../www/i18n/pl.json")),
+            ("en", include_str!("../../www/i18n/en.json")),
+            ("de", include_str!("../../www/i18n/de.json")),
+            ("es", include_str!("../../www/i18n/es.json")),
+            ("fr", include_str!("../../www/i18n/fr.json")),
+        ];
+        for (name, raw) in locales {
+            let doc: serde_json::Value = serde_json::from_str(raw).expect("locale JSON");
+            for key in &keys {
+                let mut node = &doc;
+                for part in key.split('.') {
+                    node = &node[part];
+                }
+                assert!(
+                    node.as_str().is_some_and(|t| !t.is_empty()),
+                    "{name}: missing i18n key {key}"
+                );
+            }
         }
     }
 

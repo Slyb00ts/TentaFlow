@@ -27,6 +27,7 @@ import '/js/components/tf-tabs.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-menu.js';
+import { explainServiceAccountError } from '/js/modules/flows-builder/bus-consumer.js';
 
 // Delete and undo must keep working after a click on Save or a palette Enter
 // leaves focus on a button, so only elements that consume these keys
@@ -1551,7 +1552,7 @@ const FlowBuilderScreen = {
   // Messages from the server and the codec cite elements by internal id; the
   // author sees their names.
   _explain(state, message) {
-    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData(), state.processOptions) : message;
+    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData(), state.processOptions) : explainServiceAccountError(message);
   },
 
   // A save that cannot go through says so where the author looks: the status

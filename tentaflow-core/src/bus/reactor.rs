@@ -147,6 +147,7 @@ pub mod reason {
     pub const NOT_LEADER: &str = "not_leader";
     pub const TOPIC_NOT_FOUND: &str = "topic_not_found";
     pub const BUS_ERROR: &str = "bus_error";
+    pub const DLQ_UNAVAILABLE: &str = "dlq_unavailable";
 }
 
 /// Where a flow's consumer stands on this node.
@@ -843,10 +844,16 @@ async fn note_failure(
 enum AfterFailure {
     Continue,
     /// `on_error = halt`: the loop ends and only a save of the flow resumes it.
-    Halt,
+    /// Carries the failure, which the status shows.
+    Halt(String),
     /// The consumer may not read (service account or rights): the loop ends
     /// and the supervisor's pre-start check decides when to try again.
     Refused,
+    /// The dead letter could not be written (the `__dlq.*` topic is created on
+    /// first use and has no leader for a moment). The record stays uncommitted,
+    /// so running the flow on it again at once would repeat its side effects
+    /// every cycle: the loop waits `ERROR_BACKOFF` first.
+    Backoff,
 }
 
 /// Routes a failed batch (JSON decode failure OR a failed flow dispatch)
@@ -872,7 +879,7 @@ async fn handle_batch_failure(
                  must fix and republish the flow to resume"
             );
             drop(handle);
-            AfterFailure::Halt
+            AfterFailure::Halt(message.to_string())
         }
         OnError::Skip => {
             tracing::warn!(
@@ -891,6 +898,7 @@ async fn handle_batch_failure(
         }
         OnError::Dlq => {
             drop(handle);
+            let mut dlq_failed = false;
             for record in records {
                 // The record's own chain; a legacy record without one joins the
                 // run it failed in (when a run was resolved).
@@ -907,6 +915,7 @@ async fn handle_batch_failure(
                 )
                 .await;
                 if let Err(e) = outcome {
+                    dlq_failed = true;
                     tracing::warn!(
                         "bus reactor: flow '{flow_id}' note_delivery_failure failed for \
                          offset {}: {e}",
@@ -914,7 +923,11 @@ async fn handle_batch_failure(
                     );
                 }
             }
-            AfterFailure::Continue
+            if dlq_failed {
+                AfterFailure::Backoff
+            } else {
+                AfterFailure::Continue
+            }
         }
     }
 }
@@ -943,8 +956,20 @@ async fn run_cycle(
     let after = run_cycle_in(svc, flow_id, config, dispatch, status, &span)
         .instrument(span.clone())
         .await;
-    if matches!(after, AfterFailure::Halt) {
-        status.record(flow_id, ConsumerState::Halted, None, None);
+    match after {
+        AfterFailure::Halt(ref failure) => status.record(
+            flow_id,
+            ConsumerState::Halted,
+            None,
+            Some(failure.chars().take(300).collect()),
+        ),
+        AfterFailure::Backoff => status.record(
+            flow_id,
+            ConsumerState::Waiting,
+            Some(reason::DLQ_UNAVAILABLE),
+            None,
+        ),
+        _ => {}
     }
     after
 }
@@ -1158,10 +1183,24 @@ async fn subscription_loop(
             tokio::time::sleep(ERROR_BACKOFF).await;
             continue;
         };
-        match run_cycle(&svc, &flow_id, &config, &dispatch, &status).await {
-            AfterFailure::Continue => {}
-            AfterFailure::Halt | AfterFailure::Refused => break,
+        let after = run_cycle(&svc, &flow_id, &config, &dispatch, &status).await;
+        if !continue_after(after).await {
+            break;
         }
+    }
+}
+
+/// What the subscription loop does with a finished cycle: `false` ends it, and
+/// a `Backoff` waits `ERROR_BACKOFF` before the next cycle runs the flow on the
+/// same record again.
+async fn continue_after(after: AfterFailure) -> bool {
+    match after {
+        AfterFailure::Continue => true,
+        AfterFailure::Backoff => {
+            tokio::time::sleep(ERROR_BACKOFF).await;
+            true
+        }
+        AfterFailure::Halt(_) | AfterFailure::Refused => false,
     }
 }
 
@@ -1774,6 +1813,7 @@ mod tests {
     struct ScriptedDispatch {
         calls: Mutex<Vec<(String, serde_json::Value)>>,
         fail_next: std::sync::atomic::AtomicBool,
+        always_fail: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedDispatch {
@@ -1781,6 +1821,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 fail_next: std::sync::atomic::AtomicBool::new(false),
+                always_fail: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -1801,6 +1842,7 @@ mod tests {
             if self
                 .fail_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
+                || self.always_fail.load(std::sync::atomic::Ordering::SeqCst)
             {
                 anyhow::bail!("scripted dispatch failure");
             }
@@ -1814,6 +1856,12 @@ mod tests {
     /// `dispatch::bus::tests::bus_fixture`'s own doc for why that singleton
     /// is a shared-state hazard across test modules).
     fn test_bus_service() -> (tempfile::TempDir, Arc<BusService>) {
+        test_bus_service_with(Arc::new(AllowAllAuthorizer))
+    }
+
+    fn test_bus_service_with(
+        authorizer: Arc<dyn BusAuthorizer>,
+    ) -> (tempfile::TempDir, Arc<BusService>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
         crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
@@ -1827,7 +1875,7 @@ mod tests {
                 local_db,
                 bus_dir: dir.path().join("bus"),
                 db,
-                authorizer: Arc::new(AllowAllAuthorizer),
+                authorizer,
                 retention_interval: None,
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
@@ -1839,6 +1887,92 @@ mod tests {
             .expect("bus service"),
         );
         (dir, svc)
+    }
+
+    /// Allows everything except producing to a dead-letter topic: stands in for
+    /// a `__dlq.*` topic that is not writable yet (created on first use, no
+    /// leader for a moment).
+    struct DenyDeadLetterWrites;
+    impl BusAuthorizer for DenyDeadLetterWrites {
+        fn authorize(
+            &self,
+            _ctx: &BusCallContext,
+            action: BusAction,
+            topic: &str,
+        ) -> Result<(), BusServiceError> {
+            if action == BusAction::Produce && topic.starts_with("__dlq.") {
+                return Err(BusServiceError::PermissionDenied {
+                    action: "produce",
+                    topic: topic.to_string(),
+                });
+            }
+            Ok(())
+        }
+        fn authorize_group(
+            &self,
+            _ctx: &BusCallContext,
+            _action: BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> Result<(), BusServiceError> {
+            Ok(())
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    /// A dead letter that cannot be written yet must not turn into a hot loop:
+    /// the record stays uncommitted, so without a pause every cycle ran the flow
+    /// (and its side effects) on it again, hundreds of times a second. The
+    /// cycle reports `Backoff`, the status says why, and the loop waits.
+    #[tokio::test]
+    async fn an_unwritable_dead_letter_backs_off_instead_of_rerunning_the_flow() {
+        let (_dir, svc) = test_bus_service_with(Arc::new(DenyDeadLetterWrites));
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &svc,
+            &ctx,
+            "orders.raw",
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        publish_one(&svc, &ctx, "orders.raw", r#"{"id":1}"#).await;
+
+        let scripted = Arc::new(ScriptedDispatch::new());
+        scripted
+            .always_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
+        }))
+        .unwrap();
+        let status = StatusStore::default();
+
+        let started = std::time::Instant::now();
+        let mut cycles = 0;
+        while started.elapsed() < Duration::from_millis(ERROR_BACKOFF.as_millis() as u64 + 500) {
+            let after = run_cycle(&svc, "flow-dlq", &config, &dispatch, &status).await;
+            assert!(matches!(after, AfterFailure::Backoff), "cycle {cycles}");
+            assert_eq!(
+                status_of(&status, "flow-dlq"),
+                (ConsumerState::Waiting, Some(reason::DLQ_UNAVAILABLE))
+            );
+            cycles += 1;
+            if !continue_after(after).await {
+                break;
+            }
+        }
+        let runs = scripted.calls.lock().unwrap().len();
+        assert!(
+            (1..=3).contains(&runs) && runs == cycles,
+            "the flow ran {runs} times in {cycles} cycles over {:?}",
+            started.elapsed()
+        );
     }
 
     fn test_ctx(org: &str) -> BusCallContext {
@@ -2035,7 +2169,7 @@ mod tests {
         .unwrap();
 
         let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
-        assert!(matches!(after, AfterFailure::Halt));
+        assert!(matches!(after, AfterFailure::Halt(_)));
 
         // Uncommitted: a fresh handle in the flow's own group still sees the
         // record.

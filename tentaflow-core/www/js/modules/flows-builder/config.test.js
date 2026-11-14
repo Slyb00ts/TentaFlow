@@ -14,6 +14,7 @@
 //       as ml-studio.derive-targets.test.js / code-studio.list-cells.test.js.
 // =============================================================================
 
+import { busGroupProblem } from './bus-consumer.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -210,9 +211,9 @@ function busPanel(config) {
   const note = cutMethod(source, '_renderBusConsumeNote(key) {');
   // eslint-disable-next-line no-new-func
   const methods = new Function(
-    'escapeHtml', 'escapeAttr', 'I18n',
+    'escapeHtml', 'escapeAttr', 'busGroupProblem', 'I18n',
     `return { ${effective}, ${note} };`,
-  )(escapeHtml, escapeAttr, { t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key) });
+  )(escapeHtml, escapeAttr, busGroupProblem, { t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key) });
   return Object.assign(methods, { node: { id: 'n1', type: 'bus_consume', config }, opts: {} });
 }
 

@@ -214,12 +214,18 @@ function rowDuration(row) {
 /** A bound key names its user; an unbound one is a service key and says so. */
 function bindingTag(row) {
   if (row.actorKind !== 'api_key') return '';
+  // A bus_consume flow reads as its service account on purpose: no user behind
+  // the key is the design there, not the gap this screen looks for.
+  if (!row.actorUserId && row.origin === 'bus') {
+    return `<span class="tag bound">${escapeHtml(t('key_service_account'))}</span>`;
+  }
   return row.actorUserId
     ? `<span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
     : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span>`;
 }
 
 function bindingText(row) {
+  if (!row.actorUserId && row.origin === 'bus') return t('key_service_account_text');
   if (row.actorUserId) return t('key_bound_to', { user: row.actorUserId });
   return t('key_service_no_binding');
 }
@@ -323,9 +329,12 @@ function modelKv(row) {
 
 function inspectorKeySection(row) {
   if (row.actorKind !== 'api_key') return '';
+  const serviceAccount = !row.actorUserId && row.origin === 'bus';
   const binding = row.actorUserId
     ? `${escapeHtml(row.actorUserName ?? t('actor_unresolved', { kind: t('actor_kind_user') }))} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
-    : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
+    : serviceAccount
+      ? `<span class="tag bound">${escapeHtml(t('key_service_account'))}</span> ${escapeHtml(t('key_service_account_text'))}`
+      : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
   return `<div class="ev-sec">
     <h4>${escapeHtml(t('key_section'))}</h4>
     <dl class="ev-kv">

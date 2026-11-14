@@ -153,6 +153,7 @@ function renderRow(f) {
   const consumer = busConsumerText(f.busConsumer);
   const consumerChip = consumer && consumer.state !== 'running'
     ? ` <tf-chip status="${busConsumerChipStatus(consumer.state)}" title="${escapeAttr(consumer.detail)}" data-flow-consumer="${escapeAttr(f.id)}">${escapeHtml(consumer.text)}</tf-chip>`
+      + (consumer.reason ? `<div class="flows-consumer-reason" data-flow-consumer-reason="${escapeAttr(f.id)}">${escapeHtml(consumer.reason)}</div>` : '')
     : '';
   return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
 }
@@ -249,6 +250,10 @@ async function deleteFlow(flowId, flowName) {
       toast(I18n.t('flows.delete_not_found'), 'warning');
     }
   } catch (err) {
+    if (String(err.message).includes('[flow:has_history]')) {
+      toast(I18n.t('flows.delete_has_history'), 'error');
+      return;
+    }
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
 }

@@ -269,6 +269,11 @@ pub struct EnvironmentImportApplyRequest {
 pub struct EnvironmentImportApplyResponse {
     pub applied: bool,
     pub imported_count: u32,
+    /// Names of imported flows stored as drafts instead of active because
+    /// their service-account binding did not pass the save check. Appended at
+    /// the end; an older peer's response decodes with none.
+    #[serde(default)]
+    pub demoted_flows: Vec<String>,
 }
 
 /// The whole Z12 environment/config-bundle surface behind one
