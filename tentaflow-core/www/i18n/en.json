@@ -11248,6 +11248,7 @@
     "corr_copied": "Copied",
     "corr_copy_failed": "Could not copy",
     "corr_topic": "Topic",
+    "corr_instance": "TentaBus instance",
     "corr_partition_number": "Partition / number",
     "corr_open_bus": "Open in TentaBus",
     "corr_no_coordinates": "Bus coordinates not available.",
@@ -12164,6 +12165,7 @@
         "scan_on": "Search on from {number}",
         "empty_corr": "This partition has no messages with this correlation from number {number}.",
         "from_moved": "The number from the link is no longer available — reading from the oldest message.",
+        "partition_moved": "Partition {missing} does not exist in this topic — showing partition {partition}.",
         "empty_from": "This partition has no messages from number {number}.",
         "close": "Close",
         "record_title_newest": "Newest: message {number} · partition {partition} · written {when}"

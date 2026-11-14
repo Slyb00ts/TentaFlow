@@ -11248,6 +11248,7 @@
     "corr_copied": "Skopiowano",
     "corr_copy_failed": "Nie udało się skopiować",
     "corr_topic": "Topik",
+    "corr_instance": "Instancja TentaBus",
     "corr_partition_number": "Partycja / numer",
     "corr_open_bus": "Otwórz w TentaBus",
     "corr_no_coordinates": "Współrzędne magistrali niedostępne.",
@@ -12164,6 +12165,7 @@
         "scan_on": "Szukaj dalej od {number}",
         "empty_corr": "W tej partycji nie ma wiadomości z tą korelacją od numeru {number}.",
         "from_moved": "Numer z linku nie jest już dostępny — czytam od najstarszej wiadomości.",
+        "partition_moved": "Partycja {missing} nie istnieje w tym topiku — otwieram partycję {partition}.",
         "empty_from": "W tej partycji nie ma wiadomości od numeru {number}.",
         "close": "Zamknij",
         "record_title_newest": "Najnowsza: wiadomość {number} · partycja {partition} · zapisana {when}"

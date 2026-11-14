@@ -137,14 +137,23 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     notice: '',
     // The correlation id the list is narrowed to, or `null`.
     correlation: normalizeCorrelation(initial?.correlation),
+    // The start number came from the link or the reader, so a changed filter keeps it.
+    fromExplicit: false,
   };
   if (Number.isInteger(initial?.partition) || Number.isInteger(initial?.from)) {
     state.chosen = true;
     state.deepLink = true;
     state.partition = Number.isInteger(initial.partition) ? initial.partition : 0;
     state.from = Number.isInteger(initial.from) ? initial.from : null;
+    state.fromExplicit = state.from != null;
   }
   let count = Math.max(1, Number(partitionCount) || 1, state.partition + 1);
+  // Where a read starts when nobody chose a number: the oldest retained message while a correlation is searched
+  // for (a match may be anywhere), the newest page otherwise.
+  const defaultStart = (partition) => {
+    if (!partition) return null;
+    return state.correlation ? earliest(partition) : previewStart(partition);
+  };
 
   const win = document.createElement('tf-window');
   win.className = 'tb-window tb-preview-window';
@@ -181,8 +190,8 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       <tf-table data-role="table" variant="flush">
         <tf-column key="partition" label="${escapeAttr(T('topics.preview.col_partition'))}" priority="low"></tf-column>
         <tf-column key="offset" label="${escapeAttr(T('topics.preview.col_number'))}" renderer="num"></tf-column>
-        <tf-column key="when" label="${escapeAttr(T('topics.preview.col_when'))}"></tf-column>
-        <tf-column key="correlation" label="${escapeAttr(T('topics.preview.col_correlation'))}" renderer="html" priority="low"></tf-column>
+        <tf-column key="when" label="${escapeAttr(T('topics.preview.col_when'))}" priority="low"></tf-column>
+        <tf-column key="correlation" label="${escapeAttr(T('topics.preview.col_correlation'))}" renderer="html"></tf-column>
         <tf-column key="key" label="${escapeAttr(T('topics.preview.col_key'))}" renderer="html" fill></tf-column>
       </tf-table>
     </div>
@@ -302,7 +311,8 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     state.chosen = true;
     state.notice = '';
     state.partition = Number(e.detail.value) || 0;
-    state.from = previewStart(state.known.get(state.partition));
+    state.fromExplicit = false;
+    state.from = defaultStart(state.known.get(state.partition));
     fromInput.value = state.from == null ? '' : String(state.from);
     load(false);
   });
@@ -314,6 +324,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     state.chosen = true;
     state.notice = '';
     state.from = n;
+    state.fromExplicit = n != null;
     load(false);
   };
   const applyCorrelation = () => {
@@ -321,6 +332,10 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     if (next === state.correlation) return;
     state.chosen = true;
     state.correlation = next;
+    if (!state.fromExplicit) {
+      state.from = defaultStart(state.known.get(state.partition));
+      fromInput.value = state.from == null ? '' : String(state.from);
+    }
     load(false);
   };
   corrInput.addEventListener('change', applyCorrelation);
@@ -340,16 +355,29 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
   fromInput.value = state.from == null ? '' : String(state.from);
   corrInput.value = state.correlation ?? '';
   document.body.appendChild(win);
+  // tf-input exposes its label as plain text, so the field is named on the native input.
+  corrInput.querySelector('input')?.setAttribute('aria-label', T('topics.preview.corr_label'));
   paint();
+  let movedPartition = false;
   Promise.resolve()
     .then(() => loadPartitions?.())
     .then((parts) => {
       for (const p of parts || []) state.known.set(Number(p.partition), p);
       if (!state.chosen) state.partition = pickPartition(parts);
+      else if (state.deepLink && (parts || []).length && !state.known.has(state.partition)) {
+        // The link names a partition this topic does not have: its number belongs to another partition, so start over on a real one.
+        const missing = state.partition;
+        state.partition = pickPartition(parts);
+        state.fromExplicit = false;
+        state.from = null;
+        fromInput.value = '';
+        state.notice = T('topics.preview.partition_moved', { missing: fmtCount(missing), partition: fmtCount(state.partition) });
+        movedPartition = true;
+      }
       // The topic's own partition list is the truth: a deep link may have named a partition beyond the count it was opened with.
       const listed = (parts || []).reduce((most, p) => Math.max(most, Number(p.partition) + 1), 0);
-      const wanted = Math.max(count, (parts || []).length, listed);
-      if (wanted !== count) {
+      const wanted = (parts || []).length ? listed : count;
+      if (wanted !== count || movedPartition) {
         count = wanted;
         partitionSelect.setOptions(partitionOptions(), String(state.partition));
       }
@@ -357,7 +385,13 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
     .then(() => {
       if (state.deepLink) {
         const kept = earliest(state.known.get(state.partition));
-        if (state.from != null && state.from < kept) {
+        if (movedPartition) {
+          state.from = defaultStart(state.known.get(state.partition));
+          fromInput.value = state.from == null ? '' : String(state.from);
+        } else if (state.from == null && state.correlation) {
+          state.from = defaultStart(state.known.get(state.partition));
+          fromInput.value = state.from == null ? '' : String(state.from);
+        } else if (state.from != null && state.from < kept) {
           state.from = kept;
           state.notice = T('topics.preview.from_moved');
           fromInput.value = String(kept);
@@ -368,7 +402,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       // line learns what the list said about that partition.
       if (state.chosen) { paint(); return undefined; }
       partitionSelect.value = String(state.partition);
-      state.from = previewStart(state.known.get(state.partition));
+      state.from = defaultStart(state.known.get(state.partition));
       fromInput.value = state.from == null ? '' : String(state.from);
       return load(false);
     });

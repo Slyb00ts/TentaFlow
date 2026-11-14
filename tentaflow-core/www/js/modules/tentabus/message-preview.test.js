@@ -318,3 +318,92 @@ test('a refused read of a deep-linked number is retried once from the oldest mes
   assert.equal(win.querySelector('[data-role="table"]').rows.length, 1);
   assert.match(win.querySelector('[data-role="note"]').textContent, /nie jest już dostępny/);
 });
+
+// ----- Correlation start number (decision 17) and a link to a missing partition -----
+
+const KEPT = [{ partition: 0, earliestOffset: 500, highWatermark: 30000 }];
+const emptyPage = (p = 0) => ({ records: [], partitions: [{ partition: p, earliestOffset: 500, highWatermark: 30000, nextOffset: 30000, hasMore: false }] });
+
+function openWith({ initial = null, parts = KEPT, partitionCount = 1 }) {
+  document.querySelectorAll('tf-window').forEach((w) => w.remove());
+  const requests = [];
+  const win = openMessagePreview({
+    instanceId: 'tentabus-1',
+    topic: 'wyniki',
+    partitionCount,
+    initial,
+    loadPartitions: async () => parts,
+    browse: async (req) => { requests.push(req); return emptyPage(req.partition); },
+  });
+  return { win, requests };
+}
+
+const typeCorrelation = (win, value) => {
+  const corr = win.querySelector('[data-role="corr"]');
+  corr.value = value;
+  corr.dispatchEvent(new CustomEvent('change', { detail: { value } }));
+};
+
+test('typing a correlation moves "Od numeru" to the oldest retained number, clearing it returns to the newest page', async () => {
+  const { win, requests } = openWith({});
+  await settle();
+  const from = win.querySelector('[data-role="from"]');
+  assert.equal(from.value, '29950');
+  typeCorrelation(win, CORR);
+  await settle();
+  assert.equal(from.value, '500');
+  assert.deepEqual(requests.at(-1).fromOffsets, [{ partition: 0, offset: 500 }]);
+  assert.equal(requests.at(-1).correlationId, CORR);
+  typeCorrelation(win, '');
+  await settle();
+  assert.equal(from.value, '29950');
+  assert.deepEqual(requests.at(-1).fromOffsets, [{ partition: 0, offset: 29950 }]);
+});
+
+test('a start number the reader typed survives a changed filter', async () => {
+  const { win, requests } = openWith({});
+  await settle();
+  const from = win.querySelector('[data-role="from"]');
+  from.value = '18000';
+  from.dispatchEvent(new CustomEvent('change', { detail: { value: '18000' } }));
+  await settle();
+  typeCorrelation(win, CORR);
+  await settle();
+  assert.deepEqual(requests.at(-1).fromOffsets, [{ partition: 0, offset: 18000 }]);
+});
+
+test('a link with a correlation but no number starts at the oldest retained number once the partition list is in', async () => {
+  const { win, requests } = openWith({ initial: { correlation: CORR } });
+  await settle();
+  assert.equal(requests.length, 1, 'the first read waits for the partition list');
+  assert.deepEqual(requests[0].fromOffsets, [{ partition: 0, offset: 500 }]);
+  assert.equal(requests[0].correlationId, CORR);
+  assert.equal(win.querySelector('[data-role="from"]').value, '500');
+});
+
+test('a link that carries a number keeps it', async () => {
+  const { requests } = openWith({ initial: { correlation: CORR, partition: 0, from: 12000 } });
+  await settle();
+  assert.deepEqual(requests[0].fromOffsets, [{ partition: 0, offset: 12000 }]);
+});
+
+test('a link to a partition the topic does not have lists only real partitions and says so once', async () => {
+  const { win, requests } = openWith({ initial: { correlation: CORR, partition: 1, from: 0 }, parts: KEPT, partitionCount: 1 });
+  await settle();
+  const select = win.querySelector('[data-role="partition"]');
+  assert.equal(select.value, '0');
+  assert.deepEqual([...select.querySelectorAll('option')].map((o) => o.value), ['0']);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].partition, 0);
+  assert.deepEqual(requests[0].fromOffsets, [{ partition: 0, offset: 500 }], 'the number belonged to the missing partition');
+  const text = norm(win.querySelector('[data-role="note"]').textContent);
+  assert.match(text, /Partycja 1 nie istnieje w tym topiku/);
+  assert.doesNotMatch(text, /nie jest już dostępny/);
+  assert.doesNotMatch(win.querySelector('[data-role="state"]').textContent, /poza zakresem/);
+});
+
+test('the correlation field has an accessible name', async () => {
+  const { win } = openWith({});
+  await settle();
+  assert.equal(win.querySelector('[data-role="corr"] input').getAttribute('aria-label'), 'Korelacja');
+});

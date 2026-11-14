@@ -22,6 +22,7 @@ if (typeof window.matchMedia !== 'function') window.matchMedia = globalThis.matc
 
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { default: EventsScreen } = await import('./events.js');
+const { Router } = await import('../router.js');
 
 const flush = async () => { for (let i = 0; i < 6; i += 1) await new Promise((r) => setTimeout(r, 0)); };
 const CORR = '0193c7e2-5b1a-7c3e-9a40-2f6d8e1b7a55';
@@ -153,7 +154,7 @@ test('a run with no correlation has no such section', async () => {
 
 test('every label of the correlation feature exists in all five locales', () => {
   const keys = ['corr_coordinates_not_loaded', 'correlation_label', 'correlation_placeholder', 'corr_copy', 'corr_copied', 'corr_copy_failed', 'corr_topic',
-    'corr_partition_number', 'corr_open_bus', 'corr_no_coordinates', 'corr_show_all'];
+    'corr_partition_number', 'corr_instance', 'corr_open_bus', 'corr_no_coordinates', 'corr_show_all'];
   for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
     const bundle = JSON.parse(readFileSync(new URL(`../../i18n/${language}.json`, import.meta.url), 'utf8'));
     for (const key of keys) assert.equal(typeof bundle.events[key], 'string', `${language}: events.${key}`);
@@ -161,4 +162,63 @@ test('every label of the correlation feature exists in all five locales', () => 
       assert.equal(typeof bundle.flows[key], 'string', `${language}: flows.${key}`);
     }
   }
+});
+
+test('the filter keeps the address in step: typing, the chip cross and "show everything" replace the query', async () => {
+  const written = [];
+  const realCurrent = Router.current;
+  const realReplace = Router.replaceParams;
+  Router.current = () => 'events';
+  Router.replaceParams = (params) => { written.push(params); };
+  try {
+    const inspector = await inspect([wireRow(1, 'request_started', {})]);
+    assert.equal(written.length, 0, 'opening an unfiltered screen writes nothing');
+
+    inspector.querySelector('#events-show-correlation').click();
+    await flush();
+    assert.deepEqual(written.at(-1), { correlation: CORR });
+
+    const input = document.getElementById('events-correlation-input');
+    input.value = 'igla-001';
+    input.dispatchEvent(new window.CustomEvent('change', { detail: { value: input.value } }));
+    await flush();
+    assert.deepEqual(written.at(-1), { correlation: 'igla-001' });
+
+    document.getElementById('events-correlation').dispatchEvent(new window.CustomEvent('remove'));
+    await flush();
+    assert.equal(written.at(-1), null, 'a cleared filter leaves a bare #/events');
+  } finally {
+    Router.current = realCurrent;
+    Router.replaceParams = realReplace;
+    EventsScreen.unmount();
+  }
+});
+
+test('the run inspector names the TentaBus instance, or shows its id when the roster is unavailable', async () => {
+  const bus = { instance_id: 'tentabus-8b000003', topic: 'zgloszenia.nowe', partition: 0, offset: 18402 };
+  const realList = ApiBinary.list;
+  ApiBinary.list = async () => [
+    { packageId: 'tentabus', addonId: 'tentabus-8b000003', title: 'Produkcja' },
+    { packageId: 'other', addonId: 'other-1', title: 'Cudza' },
+  ];
+  try {
+    let inspector = await inspect([wireRow(1, 'request_started', { bus_source: bus })]);
+    let section = inspector.querySelector('#events-correlation-section');
+    assert.match(section.textContent, /Instancja TentaBus\s*Produkcja/);
+    EventsScreen.unmount();
+
+    ApiBinary.list = async () => { throw new Error('forbidden'); };
+    inspector = await inspect([wireRow(1, 'request_started', { bus_source: { ...bus, instance_id: 'tentabus-unlisted' } })]);
+    section = inspector.querySelector('#events-correlation-section');
+    assert.match(section.textContent, /Instancja TentaBus\s*tentabus-unlisted/);
+  } finally {
+    ApiBinary.list = realList;
+    EventsScreen.unmount();
+  }
+});
+
+test('the correlation filter input is named for assistive tech', async () => {
+  await mount(null);
+  assert.equal(document.querySelector('#events-correlation-input input').getAttribute('aria-label'), 'Korelacja');
+  EventsScreen.unmount();
 });

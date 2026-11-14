@@ -21,6 +21,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, fmtMs, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
 import {
   normalizeRow, plotFrom, actorLabel, rowName, rowDetail,
@@ -78,6 +79,20 @@ const ROW_H = 33;
 const HEAD_H = 37;
 const ROW_H_NARROW = 52;
 const HEAD_H_NARROW = 45;
+
+// TentaBus instance names by id, for the run inspector; empty until (or unless) the roster loads.
+const busInstanceNames = new Map();
+
+async function loadBusInstanceNames() {
+  try {
+    const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
+    for (const app of Array.isArray(apps) ? apps : []) {
+      if (app.packageId !== 'tentabus' || !app.addonId) continue;
+      const name = (app.titleKey && I18n.t(app.titleKey)) || app.title;
+      if (name) busInstanceNames.set(String(app.addonId), String(name));
+    }
+  } catch { /* the inspector falls back to the instance id */ }
+}
 
 const state = {
   origins: new Set(ORIGINS),
@@ -353,6 +368,7 @@ function inspectorCorrelation(row) {
   if (row.origin === 'bus') {
     coordinates = source
       ? `<dl class="ev-kv">
+          ${source.instanceId ? kv(t('corr_instance'), `<span>${escapeHtml(busInstanceNames.get(source.instanceId) || source.instanceId)}</span>`) : ''}
           ${kv(t('corr_topic'), `<span class="ev-mono">${escapeHtml(source.topic)}</span>`)}
           ${kv(t('corr_partition_number'), `<span class="ev-mono">${escapeHtml(`${source.partition} / ${source.offset}`)}</span> <a class="ev-link" id="events-open-bus" href="${escapeAttr(busRecordHref(source, row.correlationId))}">${escapeHtml(t('corr_open_bus'))}</a>`)}
         </dl>`
@@ -743,8 +759,15 @@ function renderCorrelationChip() {
   }
 }
 
+// Keeps the address in step with the filter (replace, not push) so a reload or a copied link shows what is on screen.
+function syncCorrelationHash() {
+  if (Router.current() !== 'events') return;
+  Router.replaceParams(state.correlationId ? { correlation: state.correlationId } : null);
+}
+
 function setCorrelation(correlationId) {
   state.correlationId = normalizeCorrelation(correlationId);
+  syncCorrelationHash();
   const input = byId('events-correlation-input');
   if (input && input.value !== (state.correlationId ?? '')) input.value = state.correlationId ?? '';
   renderCorrelationChip();
@@ -810,8 +833,11 @@ const EventsScreen = {
   async mount() {
     timeline = byId('events-timeline');
     renderCorrelationChip();
+    loadBusInstanceNames();
     byId('events-correlation')?.addEventListener('remove', () => setCorrelation(null));
     const correlationInput = byId('events-correlation-input');
+    // tf-input exposes its label as plain text, so the field is named on the native input.
+    correlationInput?.querySelector('input')?.setAttribute('aria-label', t('correlation_label'));
     const applyCorrelation = () => {
       const next = normalizeCorrelation(correlationInput.value);
       if (next !== state.correlationId) setCorrelation(next);

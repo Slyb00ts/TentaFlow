@@ -68,7 +68,8 @@
 .ev-bar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
 .ev-bar .tf-select-wrap::after { right: 11px; width: 6px; height: 6px; }
 .ev-bar .tf-searchbox { height: 30px; border-radius: var(--tf-radius-sm); }
-.ev-bar .ev-corr-input { flex: 0 1 300px; min-width: 200px; font-family: var(--ev-mono); }
+.ev-bar .ev-corr-input { flex: 0 1 300px; min-width: 200px; }
+.ev-bar .ev-corr-input input.tf-input { font-family: var(--ev-mono); }
 /* The actor rows carry the API-key binding, which is the whole reason to open
    this picker; at the toolbar's field width both the name and the binding
    ellipsize away, so the popover keeps its own width and gives the binding a

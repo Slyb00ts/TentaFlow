@@ -10110,6 +10110,7 @@
     "corr_copied": "Copiado",
     "corr_copy_failed": "No se pudo copiar",
     "corr_topic": "Tópico",
+    "corr_instance": "Instancia de TentaBus",
     "corr_partition_number": "Partición / número",
     "corr_open_bus": "Abrir en TentaBus",
     "corr_no_coordinates": "Coordenadas del bus no disponibles.",
@@ -11026,6 +11027,7 @@
         "scan_on": "Seguir buscando desde {number}",
         "empty_corr": "Esta partición no tiene mensajes con esta correlación a partir del número {number}.",
         "from_moved": "El número del enlace ya no está disponible: se lee desde el mensaje más antiguo.",
+        "partition_moved": "La partición {missing} no existe en este topic: se muestra la partición {partition}.",
         "empty_from": "Esta partición no tiene mensajes a partir del número {number}.",
         "close": "Cerrar",
         "record_title_newest": "Más reciente: mensaje {number} · partición {partition} · escrito {when}"
