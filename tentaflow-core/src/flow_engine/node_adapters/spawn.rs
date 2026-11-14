@@ -586,4 +586,47 @@ mod tests {
             .unwrap();
         assert_eq!(children, 0);
     }
+
+    /// A bus flow's service account may not start sub-agents: the child would
+    /// inherit the key, and nobody vouched for what it does. The refusal sits in
+    /// `handle_agent_spawn`, so `core.agent_spawn` and `await_subagents` meet it
+    /// too; here it is reached through the node.
+    #[tokio::test]
+    async fn spawn_is_refused_for_a_service_account_run() {
+        use crate::auth::actor::ActorKind;
+        let pool = db();
+        seed_agent(&pool, "parent5", "boss5", 4);
+        seed_agent_without_tools(&pool, "worker5", "worker5");
+        let mgr = manager(pool.clone());
+        let parent = parent_run(&mgr, "parent5").await;
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("parent5"));
+        env.meta.insert("agent_run_id".into(), json!(parent));
+        let mut ctx = stub_ctx();
+        ctx.origin = crate::flow_engine::dispatcher::FlowOrigin::Bus;
+        ctx.actor_kind = ActorKind::ApiKey;
+        ctx.actor_id = Some("key-1".into());
+        ctx.actor_user_id = None;
+        let err = SpawnNodeAdapter::new(service(pool.clone()))
+            .spawn_with(
+                &mgr,
+                &node(json!({"agent_name": "worker5", "task": "x"})),
+                &env,
+                &ctx,
+            )
+            .await
+            .expect_err("a service account run must not spawn");
+        assert!(err.to_string().contains("service account"), "got: {err}");
+        let children: i64 = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE parent_run_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 0);
+    }
 }

@@ -3987,6 +3987,24 @@ fn register_engine_flows(db: &DbPool, manifest: &AddonManifest, addon_dir: &Path
             .map_err(|e| {
                 anyhow::anyhow!("[[engine_flow]] '{}': niepoprawny flow_json: {e}", spec.id)
             })?;
+        // A service account is bound by a person who holds the access it grants
+        // (checked when they save the flow). An addon ships its flow without
+        // such a person, so it may not name one.
+        if let Some(node) = parsed.nodes.iter().find(|n| {
+            n.node_type == crate::flow_engine::node_adapters::bus_consume::NODE_TYPE
+                && n.config
+                    .get("service_account")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|uid| !uid.trim().is_empty())
+        }) {
+            return Err(anyhow::anyhow!(
+                "[[engine_flow]] '{}': node '{}' binds a bus_consume service account, which an \
+                 addon flow may not do",
+                spec.id,
+                node.id
+            ));
+        }
+
         match dispatcher.as_ref() {
             Some(d) => {
                 crate::flow_engine::validation::validate(&parsed, d.registry()).map_err(|e| {
@@ -4709,6 +4727,34 @@ mod tests {
                 {{"from_node":"t","to_node":"o","from_port":"text","to_port":"text","data_type":"text"}}
             ]}}"#
         )
+    }
+
+    /// An addon ships its flow without a person who holds the access a
+    /// `bus_consume` service account grants, so it may not bind one.
+    #[test]
+    fn an_engine_flow_may_not_bind_a_bus_service_account() {
+        let db = fresh_db();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("flows")).unwrap();
+        std::fs::write(
+            dir.path().join("flows/query.flow.json"),
+            r#"{"id":"query","nodes":[{"id":"c","type":"bus_consume","config":{
+                "instance_id":"tentabus-aaaaaaaa","topic":"orders.raw","group":"gg",
+                "service_account":"3f2a6c1e-8b4d-4f0a-9a57-1c2d3e4f5a6b"}}],"edges":[]}"#,
+        )
+        .unwrap();
+        let manifest = parse_manifest_toml(
+            "[addon]\nid = \"rag-cccc\"\nname = \"RAG\"\nversion = \"0.1.0\"\nwasm_file = \"addon.wasm\"\n\
+             [[engine_flow]]\nid = \"query\"\npath = \"flows/query.flow.json\"\nservice_type = \"chat\"\n",
+        )
+        .unwrap();
+        let err = register_engine_flows(&db, &manifest, dir.path()).expect_err("refused");
+        assert!(err.to_string().contains("service account"), "{err}");
+        assert!(
+            crate::db::repository::get_flow_id_by_published_model_name(&db, "rag-cccc:query")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `[[engine_flow]]` parsuje się do `EngineFlowSpec` (id/path/service_type

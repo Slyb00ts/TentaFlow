@@ -192,6 +192,14 @@ impl ExecutionContext {
         self.alias_stack.pop();
     }
 
+    /// Whether the call acts as the service account of a `bus_consume` flow:
+    /// the bus reactor's run, under an API key bound to no user.
+    pub fn is_bus_service_account(&self) -> bool {
+        self.origin == FlowOrigin::Bus
+            && self.actor.kind() == crate::auth::actor::ActorKind::ApiKey
+            && self.actor.user_id().is_none()
+    }
+
     /// Push a flow id onto the recursion stack.
     pub fn enter_flow(&mut self, flow_id: &str) -> Result<(), ContextLimitError> {
         if self.flow_stack.len() >= MAX_FLOW_DEPTH {

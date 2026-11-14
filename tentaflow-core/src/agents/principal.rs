@@ -33,6 +33,16 @@ pub struct AgentPrincipal {
 }
 
 impl AgentPrincipal {
+    /// Whether the run acts as the service account of a `bus_consume` flow: the
+    /// bus reactor started it under an API key bound to no user. The flow was
+    /// authorised at save time for its own top-level nodes only, so such a run
+    /// may not start sub-agents (they would inherit the key unchecked).
+    pub fn is_bus_service_account(&self) -> bool {
+        self.origin == FlowOrigin::Bus
+            && self.actor.kind() == ActorKind::ApiKey
+            && self.actor.user_id().is_none()
+    }
+
     /// §2.5: `origin` and `actor` are mandatory positional arguments — there is
     /// no defaulted variant and no optional stamping step, so a caller that
     /// does not say where a run came from fails to COMPILE rather than

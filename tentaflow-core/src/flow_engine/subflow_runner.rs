@@ -38,6 +38,12 @@ pub fn nested_flow_id(node: &crate::flow_engine::types::FlowNode) -> Option<&str
         .filter(|id| !id.is_empty())
 }
 
+/// Node types a flow running as a service account may not contain, in the flow
+/// itself or in any flow it reaches: they start agents or sub-agents, whose
+/// flows and tools are chosen at run time and which inherit the key unchecked.
+pub const SERVICE_ACCOUNT_FORBIDDEN_NODES: &[&str] =
+    &["agent", "agent_context", "spawn", "await_subagents"];
+
 /// Whether the run acts as a service account of a `bus_consume` flow: started
 /// by the bus reactor under an API key bound to no user. Such a run was
 /// authorised at save time for the writes of its own top-level nodes only.
@@ -65,7 +71,10 @@ fn guard_service_account_body(
     if let Some(node) = def
         .nodes
         .iter()
-        .find(|n| n.node_type == "bus_publish" || n.node_type == "agent")
+        .find(|n| {
+            n.node_type == "bus_publish"
+                || SERVICE_ACCOUNT_FORBIDDEN_NODES.contains(&n.node_type.as_str())
+        })
     {
         return Err(anyhow!(
             "subflow_runner: flow '{flow_id}' has a '{}' node '{}', which a flow running as a \

@@ -105,7 +105,11 @@ fn init_bus(inst: &bus::instance::BusInstanceId, bus_dir: std::path::PathBuf, db
         instance_id: inst.clone(),
         local_db,
         bus_dir,
-        authorizer: Arc::new(InstanceBusAuthorizer::new(db.clone(), inst.clone(), checker)),
+        authorizer: Arc::new(InstanceBusAuthorizer::new(
+            db.clone(),
+            inst.clone(),
+            checker,
+        )),
         db,
         retention_interval: None,
         dedup_expected_rate_per_sec: 10_000,
@@ -347,8 +351,18 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
         .expect("create topics task");
     }
     // Each flow runs as its own key, holding exactly what its flow needs.
-    let k1 = service_account(&db, &inst, "tb02-k1", &[(TOPIC_A, "read"), (TOPIC_B, "write")]);
-    let k2 = service_account(&db, &inst, "tb02-k2", &[(TOPIC_B, "read"), (TOPIC_C, "write")]);
+    let k1 = service_account(
+        &db,
+        &inst,
+        "tb02-k1",
+        &[(TOPIC_A, "read"), (TOPIC_B, "write")],
+    );
+    let k2 = service_account(
+        &db,
+        &inst,
+        "tb02-k2",
+        &[(TOPIC_B, "read"), (TOPIC_C, "write")],
+    );
     let (f1, f1_json) = seed_relay_flow(&inst, &db, "tb02-f1", (TOPIC_A, TOPIC_B), "tb02-g1", &k1);
     let (f2, f2_json) = seed_relay_flow(&inst, &db, "tb02-f2", (TOPIC_B, TOPIC_C), "tb02-g2", &k2);
     let mut compiled = HashMap::new();
@@ -584,7 +598,14 @@ async fn a_flow_cannot_publish_where_its_service_account_may_not_write() {
         .expect("create topics task");
     }
     let k1 = service_account(&db, &inst, "tb02-k1-readonly", &[(TOPIC_A, "read")]);
-    let (f1, f1_json) = seed_relay_flow(&inst, &db, "tb02-f1-denied", (TOPIC_A, TOPIC_B), "tb02-g1", &k1);
+    let (f1, f1_json) = seed_relay_flow(
+        &inst,
+        &db,
+        "tb02-f1-denied",
+        (TOPIC_A, TOPIC_B),
+        "tb02-g1",
+        &k1,
+    );
     let mut compiled = HashMap::new();
     compiled.insert(
         f1.clone(),
@@ -626,19 +647,30 @@ async fn a_flow_cannot_publish_where_its_service_account_may_not_write() {
     let cancel = CancellationToken::new();
     let _reactor = bus::reactor::start(db.clone(), dispatch, cancel.clone());
 
-    // F1 ran (so the read worked) and its run did not complete.
+    // F1 ran (so the read worked) and its run failed at bus_publish with a
+    // permission denial on B, not for some other reason.
     let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
+    let failed = loop {
         let rows = repository::list_flow_executions_for_flow(&db, &f1, 10).expect("rows");
-        if rows
-            .iter()
-            .any(|r| r.status.as_deref().is_some_and(|s| s != "completed" && s != "running"))
-        {
-            break;
+        if let Some(row) = rows.into_iter().find(|r| {
+            r.status
+                .as_deref()
+                .is_some_and(|s| s != "completed" && s != "running")
+        }) {
+            break row;
         }
-        assert!(Instant::now() < deadline, "F1's run never failed: {rows:?}");
+        assert!(Instant::now() < deadline, "F1's run never failed");
         tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    };
+    let log = failed.execution_log.clone().unwrap_or_default();
+    assert!(
+        log.contains("bus_publish") || log.contains("\"p\""),
+        "the failure must name the bus_publish node: {failed:?}"
+    );
+    assert!(
+        log.contains("permission denied") && log.contains(TOPIC_B),
+        "the failure must be a permission denial on {TOPIC_B}: {failed:?}"
+    );
     cancel.cancel();
 
     let on_b = {

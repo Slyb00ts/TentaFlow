@@ -769,8 +769,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   węzła `agent`): klucz działa jedną tożsamością w całym przebiegu, więc zapis
   odmawia, a `SubflowRunner` odmawia w czasie wykonania ciała edytowanego po
   powiązaniu. Import środowiska sprawdza flow tak jak zapis; flow, który nie
-  przejdzie, trafia jako szkic (audyt `flow.service_account.import_demoted`).
-  Audyt zna też `flow.service_account.unbind`. Znane ograniczenia: lista kluczy
+  przejdzie, trafia jako szkic (audyt `flow.service_account.import_demoted`),
+  a zreplikowany zapis niesie ten status, nazwę, opis i typ usługi. Sprawdzenie
+  idzie szerzej niż węzły najwyższego poziomu: przeszukiwanie podflow, pętli i map
+  jest wszerz (płytsza ścieżka wygrywa), a brakujący lub nieczytelny podflow to
+  odmowa (przy imporcie dzieci bierze się najpierw z paczki). Węzły uruchamiające
+  agentów (`agent`, `agent_context`, `spawn`, `await_subagents`) są odrzucane, a
+  `core.agent_spawn` odmawia w czasie wykonania dla przebiegu konta usługowego;
+  model będący opublikowanym flow też nie jest dla niego dostępny. Flow dostarczony
+  przez addon nie może wskazać konta usługowego. Zapis sprawdza też regułę
+  ukrywania pól po stronie zapisu dla celów `bus_publish`, a błąd odczytu reguły
+  jest błędem zapisu. Audyt zna `flow.service_account.unbind` (usunięcie
+  powiązania, dezaktywacja, usunięcie flow) i porównuje węzeł, klucz, temat,
+  instancję i organizację. Ostrzeżenie o nowej grupie porównuje z ostatnio
+  zapisanym flow, nie z edytowanym węzłem. Znane ograniczenia: lista kluczy
   nie jest zawężona do organizacji (klucze nie mają organizacji), a stan
   „wstrzymany” jest tylko w pamięci procesu (po restarcie reaktor ustala go od
   nowa). Bez migracji.

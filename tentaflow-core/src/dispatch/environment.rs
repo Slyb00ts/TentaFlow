@@ -1020,6 +1020,27 @@ mod tests {
         donor_flow_id: &str,
         donor_environment: NodeEnvironment,
     ) -> String {
+        // A structurally valid minimal flow (one trigger -> one output) —
+        // `apply_bundle` runs it through the SAME R1-R8 validation a manual
+        // flow save does, so an empty `{}` body would be (correctly) rejected
+        // before ever reaching the diff/apply assertions this fixture exists
+        // for.
+        const MINIMAL_VALID_FLOW_JSON: &str = r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#;
+        start_file_pull_with_flow(
+            receiver_ctx,
+            donor_flow_id,
+            donor_environment,
+            MINIMAL_VALID_FLOW_JSON,
+        )
+        .await
+    }
+
+    async fn start_file_pull_with_flow(
+        receiver_ctx: &HandlerContext,
+        donor_flow_id: &str,
+        donor_environment: NodeEnvironment,
+        flow_json: &str,
+    ) -> String {
         let donor_pool = {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             crate::db::migrations::run(&conn).unwrap();
@@ -1027,16 +1048,10 @@ mod tests {
         };
         env_settings::set_node_environment(&donor_pool, donor_environment).unwrap();
         {
-            // A structurally valid minimal flow (one trigger -> one output) —
-            // `apply_bundle` runs it through the SAME R1-R8 validation a
-            // manual flow save does, so an empty `{}` body would be
-            // (correctly) rejected before ever reaching the diff/apply
-            // assertions this fixture exists for.
-            const MINIMAL_VALID_FLOW_JSON: &str = r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#;
             let conn = donor_pool.write().unwrap();
             conn.execute(
                 "INSERT INTO flows (id, name, flow_json, status) VALUES (?1, 'donor flow', ?2, 'active')",
-                rusqlite::params![donor_flow_id, MINIMAL_VALID_FLOW_JSON],
+                rusqlite::params![donor_flow_id, flow_json],
             )
             .unwrap();
         }
@@ -1117,6 +1132,74 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// An imported flow that binds a service account must pass the same check
+    /// as a save. The acting admin here has no organisation context, so the
+    /// check fails closed: the flow lands as a DRAFT, and the replicated
+    /// capture carries that status (and the other columns) so no other node
+    /// activates it.
+    #[tokio::test]
+    async fn import_apply_demotes_a_bound_flow_and_replicates_the_draft() {
+        let (ctx, _env_lock) = ctx_admin();
+        let bound = serde_json::json!({
+            "nodes": [
+                {"id": "c", "type": "bus_consume", "config": {
+                    "instance_id": "tentabus-aaaaaaaa",
+                    "service_account": uuid::Uuid::new_v4().to_string(),
+                    "topic": "orders.raw", "group": "gg"
+                }},
+                {"id": "t", "type": "bus_transform", "config": {
+                    "instance_id": "tentabus-aaaaaaaa", "expression": "payload"
+                }}
+            ],
+            "edges": [{"from": "c", "to": "t", "from_port": "message", "to_port": "in"}]
+        })
+        .to_string();
+        let pull_id =
+            start_file_pull_with_flow(&ctx, "donor-bound", NodeEnvironment::Prod, &bound).await;
+        let (body, is_err) = crate::dispatch::dispatch(
+            &MessageBody::EnvironmentPromotionBody(
+                EnvironmentPromotionPayload::ImportApplyRequest(EnvironmentImportApplyRequest {
+                    pull_id,
+                    confirm_environment_name: Some("PROD".to_string()),
+                    selected_resource_keys: vec!["flows:donor-bound".to_string()],
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        assert!(!is_err, "unexpected error body: {body:?}");
+
+        let flow = repository::get_flow(&ctx.state.db, "donor-bound")
+            .unwrap()
+            .expect("imported");
+        assert_eq!(flow.status, "draft", "the failing binding must not go live");
+
+        let conn = ctx.state.db.read().unwrap();
+        let capture_ids: Vec<String> = conn
+            .prepare("SELECT capture_id FROM __tentaflow_core_sync_captures WHERE resource_id = ?1")
+            .unwrap()
+            .query_map(["donor-bound"], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(capture_ids.len(), 1);
+        let capture = crate::sync::core_capture::load_core_write_capture(&conn, &capture_ids[0])
+            .unwrap()
+            .expect("capture");
+        use crate::sync::ledger::FieldValue;
+        assert_eq!(
+            capture.changed_fields.get("status"),
+            Some(&FieldValue::String("draft".to_string()))
+        );
+        assert_eq!(
+            capture.changed_fields.get("name"),
+            Some(&FieldValue::String("donor flow".to_string()))
+        );
+        assert!(capture.changed_fields.contains_key("flow_json"));
+        assert!(capture.changed_fields.contains_key("description"));
+        assert!(capture.changed_fields.contains_key("service_type"));
     }
 
     /// Same-rank pull (donor Dev -> receiver Dev — NOT an upward promotion,

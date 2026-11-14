@@ -589,4 +589,41 @@ mod tests {
             "wrapped blocking result must carry a terminal finish_reason"
         );
     }
+
+    /// The run-time guard, reached through the real `subflow` adapter: a bus
+    /// flow's service account may not run a body that publishes, but the same
+    /// body runs for any other caller.
+    #[tokio::test]
+    async fn a_service_account_run_may_not_enter_a_publishing_body() {
+        use crate::auth::actor::ActorKind;
+        let pool = db();
+        let child_id = "ffff0000-subf-guard-0000-000000000001";
+        let publishing = json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "p", "type": "bus_publish", "config": {
+                    "instance_id": "tentabus-aaaaaaaa", "topic": "orders.done"
+                }}
+            ],
+            "edges": []
+        })
+        .to_string();
+        insert_flow(&pool, child_id, "publishing-body", &publishing, "active");
+        let (_registry, slot) = registry_and_runner(pool.clone());
+
+        let mut ctx = stub_ctx();
+        ctx.origin = crate::flow_engine::dispatcher::FlowOrigin::Bus;
+        ctx.actor_kind = ActorKind::ApiKey;
+        ctx.actor_id = Some("key-1".into());
+        ctx.actor_user_id = None;
+        let err = SubflowNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"flow_id": child_id})),
+                &[input(FlowEnvelope::empty())],
+                &ctx,
+            )
+            .await
+            .expect_err("a service account must not run a publishing body");
+        assert!(err.to_string().contains("service account"), "got: {err}");
+    }
 }

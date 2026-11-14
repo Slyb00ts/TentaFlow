@@ -383,11 +383,20 @@ pub fn apply_bundle(
                 f.status,
             ],
         )?;
+        // Every column the INSERT above wrote travels with the capture. The
+        // status matters most: a flow the importing node demoted to a draft
+        // must not become active again on the nodes that replicate it.
+        use crate::sync::ledger::FieldValue;
+        let optional = |v: &Option<String>| v.clone().map_or(FieldValue::Null, FieldValue::String);
         let mut changed_fields = BTreeMap::new();
+        changed_fields.insert("name".to_string(), FieldValue::String(f.name.clone()));
+        changed_fields.insert("description".to_string(), optional(&f.description));
+        changed_fields.insert("service_type".to_string(), optional(&f.service_type));
         changed_fields.insert(
             "flow_json".to_string(),
-            crate::sync::ledger::FieldValue::String(f.flow_json.clone()),
+            FieldValue::String(f.flow_json.clone()),
         );
+        changed_fields.insert("status".to_string(), FieldValue::String(f.status.clone()));
         repository::record_core_capture_for_org_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::Flow,

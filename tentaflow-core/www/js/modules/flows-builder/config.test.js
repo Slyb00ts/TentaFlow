@@ -213,7 +213,7 @@ function busPanel(config) {
     'escapeHtml', 'escapeAttr', 'I18n',
     `return { ${effective}, ${note} };`,
   )(escapeHtml, escapeAttr, { t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key) });
-  return Object.assign(methods, { node: { type: 'bus_consume', config } });
+  return Object.assign(methods, { node: { id: 'n1', type: 'bus_consume', config }, opts: {} });
 }
 
 test('the group line shows the key namespace plus the plain group', () => {
@@ -232,6 +232,17 @@ test('the new-group warning starts hidden and remembers the account the node ope
   const html = panel._renderBusConsumeNote('service_account');
   assert.match(html, /flows_config\.service_account_new_group_warning/);
   assert.match(html, /data-saved-account="uid-1"[^>]* hidden>/);
+});
+
+test('the warning compares with the saved flow, so switching nodes and back keeps it', () => {
+  const panel = busPanel({ service_account: 'uid-2' });
+  panel.opts.getSavedNodeConfig = (id) => (id === 'n1' ? { service_account: 'uid-1' } : null);
+  const html = panel._renderBusConsumeNote('service_account');
+  assert.match(html, /data-saved-account="uid-1"/);
+  assert.doesNotMatch(html, / hidden>/);
+
+  panel.node.config.service_account = 'uid-1';
+  assert.match(panel._renderBusConsumeNote('service_account'), / hidden>/);
 });
 
 test('the service account field carries the warning, other fields and nodes carry nothing', () => {

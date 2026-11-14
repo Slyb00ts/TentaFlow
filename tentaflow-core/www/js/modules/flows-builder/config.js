@@ -2065,10 +2065,14 @@ export class FlowConfig {
       return `<div class="fb-field-hint" data-role="bus-effective-group">${escapeHtml(this._busEffectiveGroupText())}</div>`;
     }
     if (key === 'service_account') {
-      // Hidden until the account differs from the one the node opened with: a
+      // Shown while the account differs from the one in the last loaded or
+      // saved flow (not from the live node, which already holds the edit): a
       // flow reading under an unchanged account keeps its group and position.
-      const saved = String(this.node?.config?.service_account || '').trim();
-      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" data-saved-account="${escapeAttr(saved)}" hidden>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
+      const live = String(this.node?.config?.service_account || '').trim();
+      const savedConfig = this.opts?.getSavedNodeConfig?.(this.node?.id);
+      const saved = String((savedConfig ? savedConfig.service_account : live) || '').trim();
+      const hidden = live === saved ? ' hidden' : '';
+      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" data-saved-account="${escapeAttr(saved)}"${hidden}>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
     }
     return '';
   }

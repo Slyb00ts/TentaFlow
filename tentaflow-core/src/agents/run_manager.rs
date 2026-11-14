@@ -576,6 +576,11 @@ impl AgentRunManager {
     /// be exceeded fail the call (the model sees a recoverable tool error), they
     /// do not silently drop tasks.
     pub async fn handle_agent_spawn(&self, caller: &CallerRun, args: &Value) -> Result<Value> {
+        if caller.principal.is_bus_service_account() {
+            return Err(anyhow!(
+                "agent_spawn: a flow running as a service account may not start sub-agents"
+            ));
+        }
         let tasks = parse_spawn_tasks(args)?;
         if tasks.is_empty() {
             return Err(anyhow!("agent_spawn: no tasks provided"));

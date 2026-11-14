@@ -42,6 +42,20 @@ use crate::services::runtime::tool_calling::{self, ToolCallMode};
 /// (kazdy backend transport produkuje inny typ wewnetrznie).
 pub type ExecutorChunkStream = Pin<Box<dyn Stream<Item = CoreResult<ChatCompletionChunk>> + Send>>;
 
+/// A model that resolves onto a published flow runs that flow under the
+/// caller's identity. For a `bus_consume` flow's service account nobody vouched
+/// for what that flow does (it may publish, spawn agents, call further flows),
+/// so the hop is refused.
+fn refuse_flow_target_as_service_account(ctx: &ExecutionContext) -> Result<(), ExecutorError> {
+    if ctx.is_bus_service_account() {
+        return Err(ExecutorError::Internal(
+            "a flow running as a service account may not call a model that is a published flow"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Errors visible to the caller. Every variant maps onto a user-facing
 /// outcome — `model_capability_unsupported` from the resolver, transport
 /// failures with the failing target's tag for diagnostics.
@@ -1317,6 +1331,7 @@ impl ModelRuntimeExecutor {
                 flow_id,
                 published_name: _,
             } => {
+                refuse_flow_target_as_service_account(ctx)?;
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
@@ -1904,6 +1919,7 @@ impl ModelRuntimeExecutor {
                 // key carries the vector payload. Anything else → reject
                 // with Internal so the operator notices a mis-shaped flow
                 // instead of getting an empty embedding.
+                refuse_flow_target_as_service_account(ctx)?;
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
@@ -2080,6 +2096,7 @@ impl ModelRuntimeExecutor {
                 flow_id,
                 published_name: _,
             } => {
+                refuse_flow_target_as_service_account(ctx)?;
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
@@ -2760,6 +2777,7 @@ impl ModelRuntimeExecutor {
                 flow_id,
                 published_name: _,
             } => {
+                refuse_flow_target_as_service_account(ctx)?;
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
@@ -3157,6 +3175,7 @@ impl ModelRuntimeExecutor {
                 }
             }
             ResolvedExecutionTarget::Flow { flow_id, .. } => {
+                refuse_flow_target_as_service_account(ctx)?;
                 let dispatcher = self
                     .flow_dispatcher
                     .as_ref()
@@ -5433,6 +5452,42 @@ mod tests {
             .dispatch_embeddings_blocking(&target, make_request("any"), &mut ctx)
             .await
             .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    /// A bus flow's service account may not reach a published flow through a
+    /// model name: every flow-target arm refuses before touching the dispatcher.
+    #[tokio::test]
+    async fn a_service_account_run_may_not_call_a_flow_target() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: "1".to_string(),
+            published_name: "embed-flow".into(),
+        };
+        let mut service_account = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Bus,
+            crate::flow_engine::dispatcher::FlowActor::api_key("key-1", None),
+        );
+        let err = exec
+            .dispatch_embeddings_blocking(&target, make_request("any"), &mut service_account)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, ExecutorError::Internal(m) if m.contains("service account")),
+            "{err:?}"
+        );
+
+        // Any other caller reaches the dispatcher check as before.
+        let mut user_key = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Bus,
+            crate::flow_engine::dispatcher::FlowActor::api_key("key-1", Some("u-1".into())),
+        );
+        let err = exec
+            .dispatch_embeddings_blocking(&target, make_request("any"), &mut user_key)
+            .await
+            .expect_err("no dispatcher");
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
     }
 

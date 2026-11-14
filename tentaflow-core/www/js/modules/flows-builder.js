@@ -337,6 +337,16 @@ const FlowBuilderScreen = {
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
       getBusConsumer: () => state.busConsumer ?? null,
+      // A node's config in the last loaded or saved flow: what the running
+      // flow reads under, as opposed to the edit in progress.
+      getSavedNodeConfig: (id) => {
+        try {
+          const graph = JSON.parse(state.flow?.flow_json || '{}');
+          return (graph.nodes || []).find((n) => n.id === id)?.config ?? null;
+        } catch {
+          return null;
+        }
+      },
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : [])
         .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: processDiagnosticDetail(diagnostic) })),
