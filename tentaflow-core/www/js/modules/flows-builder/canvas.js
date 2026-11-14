@@ -10,6 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
+import { busConsumerText } from '/js/modules/flows-builder/bus-consumer.js';
 import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processRetryRefusalText, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
@@ -1923,7 +1924,7 @@ export class FlowCanvas {
           ? `<span class="fb-node-error-icon" title="${escapeAttr(I18n.t('flows_builder.node_error_tooltip', { fields: missingNames }))}"><svg><use href="#i-alert"/></svg></span>`
           : `<span class="fb-node-type">${escapeHtml(cat)}</span>`}
       </div>
-      <div class="fb-node-body">${this._renderMissingRows(missing)}${this._renderNodeSummary(n, missing.length === 0)}</div>
+      <div class="fb-node-body">${this._renderConsumerRow(n)}${this._renderMissingRows(missing)}${this._renderNodeSummary(n, missing.length === 0)}</div>
       ${inPortsHtml}
       ${outPortsHtml}
     `;
@@ -2065,6 +2066,24 @@ export class FlowCanvas {
     const cls = `fb-port fb-port-${side === 'in' ? 'in' : 'out'} fb-port-type-${portType}`
       + (unsupported ? ' fb-port-unsupported' : '');
     return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-type="${escapeAttr(portType)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
+  }
+
+  /**
+   * Consumer status of the flow (`busConsumer` of its detail response), drawn on
+   * its `bus_consume` node: a refused or waiting subscription reads nothing, and
+   * the node is where the author looks for why.
+   */
+  setBusConsumer(status) {
+    this.busConsumer = status || null;
+    if (!this.nodesLayer) return;
+    for (const node of this.nodes) if (node.type === 'bus_consume') this._renderSingleNode(node);
+  }
+
+  _renderConsumerRow(n) {
+    if (n.type !== 'bus_consume') return '';
+    const info = busConsumerText(this.busConsumer);
+    if (!info) return '';
+    return `<div class="fb-node-row fb-node-consumer" data-state="${escapeAttr(info.state)}" title="${escapeAttr(info.detail)}"><span class="fb-key">${escapeHtml(info.text)}</span></div>`;
   }
 
   _renderNodeSummary(n, withPlaceholder = true) {

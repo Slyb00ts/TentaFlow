@@ -24,6 +24,59 @@ use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, UsageS
 /// `ctx.subflow_depth` before invoking the runner.
 pub const MAX_SUBFLOW_DEPTH: u8 = 4;
 
+/// Id of the flow a `subflow`, `loop` or `map` node runs as its body, when the
+/// node names one.
+pub fn nested_flow_id(node: &crate::flow_engine::types::FlowNode) -> Option<&str> {
+    let key = match node.node_type.as_str() {
+        "subflow" => "flow_id",
+        "loop" | "map" => "body_flow_id",
+        _ => return None,
+    };
+    node.config
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether the run acts as a service account of a `bus_consume` flow: started
+/// by the bus reactor under an API key bound to no user. Such a run was
+/// authorised at save time for the writes of its own top-level nodes only.
+pub fn is_bus_service_account_run(ctx: &ExecutionContext) -> bool {
+    use crate::auth::actor::ActorKind;
+    use crate::flow_engine::dispatcher::FlowOrigin;
+    ctx.origin == FlowOrigin::Bus
+        && ctx.actor_kind == ActorKind::ApiKey
+        && ctx.actor_user_id.is_none()
+}
+
+/// Refuses a flow body that can write to the bus, or run an agent, under a
+/// service-account run. Nobody vouched for those nodes when the flow was
+/// bound, and a body flow can be edited afterwards.
+fn guard_service_account_body(
+    ctx: &ExecutionContext,
+    flow_id: &str,
+    flow_json: &str,
+) -> Result<()> {
+    if !is_bus_service_account_run(ctx) {
+        return Ok(());
+    }
+    let def: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
+        .map_err(|e| anyhow!("subflow_runner: flow '{flow_id}' is not valid JSON: {e}"))?;
+    if let Some(node) = def
+        .nodes
+        .iter()
+        .find(|n| n.node_type == "bus_publish" || n.node_type == "agent")
+    {
+        return Err(anyhow!(
+            "subflow_runner: flow '{flow_id}' has a '{}' node '{}', which a flow running as a \
+             service account may not run in a nested flow",
+            node.node_type,
+            node.id
+        ));
+    }
+    Ok(())
+}
+
 /// Late-bound `SubflowRunner` slot (§3.5.0), mirroring `AgentServiceSlot` /
 /// `ModelRuntimeSlot`. Filled in `FlowDispatcher::new` (the dispatcher already
 /// holds the DbPool and the registry Arc), so the slot is populated before any
@@ -212,6 +265,8 @@ impl SubflowRunner {
             ));
         }
 
+        guard_service_account_body(parent_ctx, flow_id, &flow.flow_json)?;
+
         let compiled = CompiledFlow::from_json(&flow.id, &flow.flow_json, &registry)
             .map_err(|e| anyhow!("subflow_runner: compile flow '{flow_id}': {e}"))?;
 
@@ -398,6 +453,75 @@ mod tests {
             .expect("seed flow");
         }
         pool
+    }
+
+    /// A flow bound to a service account was authorised at save time for the
+    /// writes of its own top-level nodes only; a body that can publish (or run
+    /// an agent) is refused when the run is the bus reactor's, whether the
+    /// caller is a subflow, loop or map (they all go through `prepare`).
+    #[tokio::test]
+    async fn a_service_account_run_refuses_a_body_that_publishes_or_runs_an_agent() {
+        let publishing = r#"{"nodes":[
+            {"id":"t1","type":"trigger","config":{}},
+            {"id":"p1","type":"bus_publish","config":{"instance_id":"tentabus-aaaaaaaa","topic":"x"}}
+        ],"edges":[]}"#;
+        let agentic = r#"{"nodes":[{"id":"a1","type":"agent","config":{}}],"edges":[]}"#;
+        let harmless = r#"{"nodes":[
+            {"id":"t1","type":"trigger","config":{}},
+            {"id":"o1","type":"output","config":{}}
+        ],"edges":[{"from":"t1","to":"o1","from_port":"text","to_port":"text"}]}"#;
+        let db = db_with_flow("pub-body", publishing);
+        {
+            let conn = db.write().expect("lock");
+            for (id, json) in [("agent-body", agentic), ("plain-body", harmless)] {
+                conn.execute(
+                    "INSERT INTO flows (id, name, flow_json, status) VALUES (?1, 'b', ?2, 'active')",
+                    rusqlite::params![id, json],
+                )
+                .expect("seed");
+            }
+        }
+        let registry = Arc::new(build_registry_for_test());
+        let runner = SubflowRunner::new(db, Arc::downgrade(&registry));
+
+        let bus_run = crate::flow_engine::dispatcher::make_test_context(&FlowRequestMeta::new(
+            "req-bus",
+            FlowOrigin::Bus,
+            FlowActor::api_key("key-1", None),
+        ));
+        for id in ["pub-body", "agent-body"] {
+            let err = runner
+                .prepare(id, &bus_run, 1, false)
+                .await
+                .err()
+                .expect("refused");
+            assert!(err.to_string().contains("service account"), "{err}");
+        }
+        runner
+            .prepare("plain-body", &bus_run, 1, false)
+            .await
+            .expect("a harmless body still runs");
+
+        // The same body is fine for any other run: a key bound to a user, or
+        // a run the bus reactor did not start.
+        let user_key_run =
+            crate::flow_engine::dispatcher::make_test_context(&FlowRequestMeta::new(
+                "req-user",
+                FlowOrigin::Bus,
+                FlowActor::api_key("key-1", Some("u-1".to_string())),
+            ));
+        let other_origin =
+            crate::flow_engine::dispatcher::make_test_context(&FlowRequestMeta::new(
+                "req-chat",
+                FlowOrigin::CodeStudio,
+                FlowActor::api_key("key-1", None),
+            ));
+        for ctx in [&user_key_run, &other_origin] {
+            assert!(
+                runner.prepare("pub-body", ctx, 1, false).await.is_ok(),
+                "only a service-account bus run is restricted"
+            );
+        }
     }
 
     /// §2.5 — a sub-flow (and every `loop` / `map` / `agent` body, which share

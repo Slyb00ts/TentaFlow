@@ -51,15 +51,30 @@
 // SAME "fresh handle every cycle" property above means they are naturally
 // re-fetched (redundantly, not incorrectly) on the next cycle.
 //
-// Attribution: a bus-triggered run has no natural principal (unlike
-// `on_subagent_complete`, which inherits a finished run's own stamp) — there
-// is no human/service identity behind "a message landed on a topic". Per the
-// "never fabricate a principal" rule, this reactor states one explicitly:
-// `AgentPrincipal::new(None, Some(config.org_id), FlowOrigin::Bus,
-// FlowActor::system())`. `org_id` comes from `bus_consume`'s own config field
-// (not PLAN §6.3's literal list — `DbFlow` carries no org scope, so a
-// subscription cannot otherwise address an org-scoped topic; see
-// `bus_consume.rs::ConsumeConfig::from_config`'s doc).
+// Attribution: a bus-triggered run has no natural human principal (unlike
+// `on_subagent_complete`, which inherits a finished run's own stamp). It runs
+// as the SERVICE ACCOUNT its `bus_consume` node names: the uid of a general API
+// key (`ConsumeConfig::service_account`). Both the consumer's `BusCallContext`
+// and the run's principal carry that key (`ActorKind::ApiKey`, no bound
+// user), so the topic ACL and the data-hiding rules judge the flow exactly as
+// they judge the key, and every audit row names `api_key:<uid>`. The
+// reactor never holds the key's token, only its uid, and there is no fallback
+// identity: a node without a service account, or whose key is missing,
+// disabled, user-bound or lacks the read right, is REFUSED (see
+// `ConsumerStatus`) and consumes nothing. The key consumes under its own
+// `k:<uid>.<group>` namespace (`ConsumeConfig::effective_group`) — the only
+// one the authorizer lets a key use. `org_id` comes from `bus_consume`'s own
+// config field (`DbFlow` carries no org scope, so a subscription cannot
+// otherwise address an org-scoped topic; see `bus_consume.rs::ConsumeConfig::
+// from_config`'s doc).
+//
+// Status: every flow's consumer state (`Running`/`Waiting`/`Refused`/`Halted`,
+// with a reason) is kept in memory per node (`StatusStore`) and exposed via
+// `consumer_status`, so the UI can say why a flow reads nothing. A refusal is
+// logged once when it starts and once when it recovers, never on every
+// retry. The supervisor repeats its cheap pre-start check on every reconcile,
+// so a fixed cause (a right granted, a key re-bound) resumes consumption
+// within one `RECONCILE_INTERVAL`.
 //
 // Multi-instance (plan-app-platform §3.5): `ConsumeConfig::instance_id`
 // (REQUIRED, no fallback) names which running `BusService` a subscription
@@ -76,8 +91,8 @@
 // its flow consumers within one `RECONCILE_INTERVAL` even when no flow
 // config changed. =====
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -85,6 +100,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::agents::{AgentPrincipal, FlowDispatcherReactorDispatch, ReactorFlowDispatch};
+use crate::auth::actor::ActorKind;
 use crate::bus::correlation;
 use crate::bus::dlq::DlqReason;
 use crate::bus::groups::CommitMode;
@@ -116,11 +132,263 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// a tight error loop hammering the same failure.
 const ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Why a flow's consumer is not reading right now. Stable strings: the UI
+/// maps them to localized text.
+pub mod reason {
+    pub const SERVICE_ACCOUNT_MISSING: &str = "service_account_missing";
+    pub const SERVICE_ACCOUNT_NOT_FOUND: &str = "service_account_not_found";
+    pub const SERVICE_ACCOUNT_DISABLED: &str = "service_account_disabled";
+    pub const SERVICE_ACCOUNT_NOT_SERVICE_KEY: &str = "service_account_not_service_key";
+    pub const SERVICE_ACCOUNT_LOOKUP_FAILED: &str = "service_account_lookup_failed";
+    pub const READ_DENIED: &str = "read_denied";
+    pub const NEEDS_TOPIC_WIDE_RULE: &str = "needs_topic_wide_rule";
+    pub const MALFORMED_CONFIG: &str = "malformed_config";
+    pub const INSTANCE_NOT_RUNNING: &str = "instance_not_running";
+    pub const NOT_LEADER: &str = "not_leader";
+    pub const TOPIC_NOT_FOUND: &str = "topic_not_found";
+    pub const BUS_ERROR: &str = "bus_error";
+}
+
+/// Where a flow's consumer stands on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerState {
+    /// Fetching.
+    Running,
+    /// Not reading yet, and expected to on its own (instance not up, this
+    /// node is not the partition leader, a transient bus error).
+    Waiting,
+    /// Will not read until something is fixed (config, key, rights); the
+    /// supervisor re-checks every reconcile.
+    Refused,
+    /// `on_error = halt` stopped it; only a save of the flow resumes it.
+    Halted,
+}
+
+impl ConsumerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsumerState::Running => "running",
+            ConsumerState::Waiting => "waiting",
+            ConsumerState::Refused => "refused",
+            ConsumerState::Halted => "halted",
+        }
+    }
+
+    fn is_blocked(self) -> bool {
+        !matches!(self, ConsumerState::Running)
+    }
+}
+
+/// One flow's consumer status on this node. Per node on purpose: refusals
+/// come from replicated data and read the same everywhere, only "not leader"
+/// differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerStatus {
+    pub state: ConsumerState,
+    pub reason: Option<&'static str>,
+    pub detail: Option<String>,
+    /// Unix seconds when `state`/`reason` last changed.
+    pub since_epoch: u64,
+}
+
+/// What `StatusStore::set` found.
+struct Transition {
+    changed: bool,
+    was_blocked: bool,
+}
+
+/// In-memory flow id -> `ConsumerStatus`. The process-wide one backs
+/// `consumer_status`; tests use a private one so parallel tests never see each
+/// other's flows.
+#[derive(Default)]
+pub struct StatusStore {
+    inner: Mutex<HashMap<String, ConsumerStatus>>,
+}
+
+impl StatusStore {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, ConsumerStatus>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, flow_id: &str) -> Option<ConsumerStatus> {
+        self.map().get(flow_id).cloned()
+    }
+
+    /// Stores the status; `since_epoch` moves only when state or reason
+    /// changed, so repeating the same refusal is free.
+    fn set(
+        &self,
+        flow_id: &str,
+        state: ConsumerState,
+        reason: Option<&'static str>,
+        detail: Option<String>,
+    ) -> Transition {
+        let mut map = self.map();
+        let previous = map.get(flow_id);
+        let changed = previous.map_or(true, |p| p.state != state || p.reason != reason);
+        let was_blocked = previous.is_some_and(|p| p.state.is_blocked());
+        let since_epoch = match previous {
+            Some(p) if !changed => p.since_epoch,
+            _ => now_epoch_secs(),
+        };
+        map.insert(
+            flow_id.to_string(),
+            ConsumerStatus {
+                state,
+                reason,
+                detail,
+                since_epoch,
+            },
+        );
+        Transition {
+            changed,
+            was_blocked,
+        }
+    }
+
+    /// Drops the status of every flow not in `live`.
+    fn retain_flows(&self, live: &HashSet<&str>) {
+        self.map()
+            .retain(|flow_id, _| live.contains(flow_id.as_str()));
+    }
+
+    /// Records a status and logs the transition: a refusal or wait when it
+    /// starts, a recovery when a blocked flow reads again. A repeat of the
+    /// same status logs nothing.
+    fn record(
+        &self,
+        flow_id: &str,
+        state: ConsumerState,
+        reason: Option<&'static str>,
+        detail: Option<String>,
+    ) {
+        let log_detail = detail.clone().unwrap_or_default();
+        let t = self.set(flow_id, state, reason, detail);
+        let reason_str = reason.unwrap_or("-");
+        match state {
+            ConsumerState::Refused if t.changed => tracing::warn!(
+                "bus reactor: flow '{flow_id}' consumption refused ({reason_str}) {log_detail}"
+            ),
+            ConsumerState::Waiting if t.changed => tracing::warn!(
+                "bus reactor: flow '{flow_id}' is waiting ({reason_str}) {log_detail}"
+            ),
+            ConsumerState::Running if t.was_blocked => {
+                tracing::info!("bus reactor: flow '{flow_id}' consumes again")
+            }
+            _ => {}
+        }
+    }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+static GLOBAL_STATUS: std::sync::OnceLock<Arc<StatusStore>> = std::sync::OnceLock::new();
+
+fn global_status() -> Arc<StatusStore> {
+    GLOBAL_STATUS.get_or_init(Arc::default).clone()
+}
+
+/// The consumer status of `flow_id` on this node, `None` when the reactor
+/// knows nothing about it (not a `bus_consume` flow, not active, not scanned
+/// yet).
+pub fn consumer_status(flow_id: &str) -> Option<ConsumerStatus> {
+    global_status().get(flow_id)
+}
+
+/// Why `service_account` cannot act as a flow's identity, from its key row,
+/// or `None` when it can: it must exist, be a general key (no user or group
+/// binding, which would bring that subject's rights back in) and be active.
+fn service_account_refusal(db: &DbPool, service_account: &str) -> Option<&'static str> {
+    use crate::services::bus_authorizer::{service_account_problem, ServiceAccountProblem};
+    service_account_problem(db, service_account).map(|problem| match problem {
+        ServiceAccountProblem::NotFound => reason::SERVICE_ACCOUNT_NOT_FOUND,
+        ServiceAccountProblem::NotServiceKey => reason::SERVICE_ACCOUNT_NOT_SERVICE_KEY,
+        ServiceAccountProblem::Disabled => reason::SERVICE_ACCOUNT_DISABLED,
+        ServiceAccountProblem::LookupFailed => reason::SERVICE_ACCOUNT_LOOKUP_FAILED,
+    })
+}
+
+/// A refusal and its optional detail.
+type Refusal = (&'static str, Option<String>);
+
+/// The bus call context of a flow consuming as its service account.
+fn consumer_context(
+    instance_id: BusInstanceId,
+    config: &ConsumeConfig,
+    service_account: &str,
+) -> BusCallContext {
+    BusCallContext {
+        instance_id,
+        org_id: config.org_id.clone(),
+        actor: Some(service_account.to_string()),
+        actor_kind: ActorKind::ApiKey,
+        correlation_id: None,
+        origin: FlowOrigin::Bus.as_str().to_string(),
+    }
+}
+
+/// The cheap pre-start check `reconcile` repeats every cycle: DB reads only,
+/// no consumer opened, no audit row. `svc` is the running engine of the
+/// subscription's instance, when there is one; without it only the key itself
+/// can be judged.
+fn precheck(
+    db: &DbPool,
+    config: &ConsumeConfig,
+    svc: Option<&Arc<BusService>>,
+) -> Result<(), Refusal> {
+    let Some(service_account) = config.service_account.as_deref() else {
+        return Err((reason::SERVICE_ACCOUNT_MISSING, None));
+    };
+    if let Some(refusal) = service_account_refusal(db, service_account) {
+        return Err((refusal, None));
+    }
+    let (Some(svc), Some(group)) = (svc, config.effective_group()) else {
+        return Ok(());
+    };
+    let bctx = consumer_context(config.instance_id.clone(), config, service_account);
+    match svc.check_consume_access(&bctx, &config.topic, &group) {
+        Ok(()) => Ok(()),
+        Err(BusServiceError::PermissionDenied { .. }) => Err((reason::READ_DENIED, None)),
+        Err(BusServiceError::KeyNeedsTopicWideRule { .. }) => {
+            Err((reason::NEEDS_TOPIC_WIDE_RULE, None))
+        }
+        Err(
+            e @ (BusServiceError::InvalidArgument(_) | BusServiceError::InvalidTopicName { .. }),
+        ) => Err((reason::MALFORMED_CONFIG, Some(e.to_string()))),
+        // Anything else (instance still starting, not the leader) is the
+        // loop's to classify once it runs.
+        Err(_) => Ok(()),
+    }
+}
+
 /// One `bus_consume` node's subscription: its flow id and parsed config.
 #[derive(Debug, Clone)]
 struct Subscription {
     flow_id: String,
+    /// `flows.version` the config was read at: a save bumps it, which is how
+    /// a halted subscription learns it may run again even when the config
+    /// itself did not change.
+    version: i64,
     config: ConsumeConfig,
+}
+
+/// An active flow as the registry reads it: id, `flow_json`, `flows.version`.
+type ActiveFlow = (String, String, i64);
+
+/// A flow whose `bus_consume` entry cannot become a subscription: its id and
+/// why.
+type MalformedFlow = (String, String);
+
+/// What `build_subscriptions` found in the active flow set.
+#[derive(Debug, Default)]
+struct SubscriptionScan {
+    subs: Vec<Subscription>,
+    malformed: Vec<MalformedFlow>,
 }
 
 /// Cached set of subscriptions, rebuilt only when the active-flow signature
@@ -128,7 +396,7 @@ struct Subscription {
 struct SubscriptionRegistry {
     db: DbPool,
     signature: Option<String>,
-    subs: Vec<Subscription>,
+    scan: SubscriptionScan,
 }
 
 impl SubscriptionRegistry {
@@ -136,15 +404,15 @@ impl SubscriptionRegistry {
         Self {
             db,
             signature: None,
-            subs: Vec::new(),
+            scan: SubscriptionScan::default(),
         }
     }
 
-    fn current(&mut self) -> &[Subscription] {
+    fn current(&mut self) -> &SubscriptionScan {
         match self.compute_signature_and_flows() {
             Ok((sig, flows)) => {
                 if self.signature.as_deref() != Some(sig.as_str()) {
-                    self.subs = build_subscriptions(&flows);
+                    self.scan = build_subscriptions(&flows);
                     self.signature = Some(sig);
                 }
             }
@@ -152,10 +420,10 @@ impl SubscriptionRegistry {
                 tracing::warn!("bus reactor: flow scan failed: {e}");
             }
         }
-        &self.subs
+        &self.scan
     }
 
-    fn compute_signature_and_flows(&self) -> anyhow::Result<(String, Vec<(String, String)>)> {
+    fn compute_signature_and_flows(&self) -> anyhow::Result<(String, Vec<ActiveFlow>)> {
         let flows = repository::list_flows(&self.db, 0, 10_000)?;
         let mut sig = String::new();
         let mut out = Vec::new();
@@ -167,7 +435,7 @@ impl SubscriptionRegistry {
             sig.push(':');
             sig.push_str(&f.version.to_string());
             sig.push(';');
-            out.push((f.id, f.flow_json));
+            out.push((f.id, f.flow_json, f.version));
         }
         Ok((sig, out))
     }
@@ -175,8 +443,12 @@ impl SubscriptionRegistry {
 
 /// Parses each active flow's JSON and keeps those whose entry node is
 /// `bus_consume` with a well-formed config. A malformed config (missing or
-/// malformed `instance_id`, missing `topic`/`group`, unknown `commit_mode`/
-/// `on_error`) or unparseable flow is skipped with a warning.
+/// malformed `instance_id`, missing `topic`/`group`, a `group` outside the
+/// broker's charset, a `service_account` that is no key uid, unknown
+/// `commit_mode`/`on_error`) or unparseable flow is skipped and reported in
+/// `SubscriptionScan::malformed`, which `reconcile` turns into a `Refused`
+/// status. A node with no `service_account` at all is NOT malformed: it
+/// parses, and `reconcile` refuses it with its own reason.
 ///
 /// The four flow-save handlers run this SAME parse before storing anything
 /// (`dispatch::handlers::validate_flow_json_str` ->
@@ -184,7 +456,7 @@ impl SubscriptionRegistry {
 /// flow that still reaches here malformed is one that bypassed that check —
 /// e.g. a row written straight through `repository::create_flow` (integration
 /// fixtures do exactly that), or a row stored before the check existed. For
-/// those the warning below is the operator's ONLY signal: the flow stays
+/// those the status is the operator's signal: the flow stays
 /// `status='active'` and simply never consumes. That is why the save path
 /// rejects instead of relying on it.
 ///
@@ -192,9 +464,9 @@ impl SubscriptionRegistry {
 /// `ConsumeConfig::from_config` already returns `Err` for it exactly like any
 /// other required field, and the `match` below already skips-and-warns on any
 /// `Err`.
-fn build_subscriptions(flows: &[(String, String)]) -> Vec<Subscription> {
-    let mut subs = Vec::new();
-    for (flow_id, flow_json) in flows {
+fn build_subscriptions(flows: &[ActiveFlow]) -> SubscriptionScan {
+    let mut scan = SubscriptionScan::default();
+    for (flow_id, flow_json, version) in flows {
         let def: FlowDefinition = match serde_json::from_str(flow_json) {
             Ok(d) => d,
             Err(e) => {
@@ -210,28 +482,25 @@ fn build_subscriptions(flows: &[(String, String)]) -> Vec<Subscription> {
             continue;
         };
         match ConsumeConfig::from_config(&entry.config) {
-            Ok(config) => subs.push(Subscription {
+            Ok(config) => scan.subs.push(Subscription {
                 flow_id: flow_id.clone(),
+                version: *version,
                 config,
             }),
-            Err(e) => {
-                tracing::warn!(
-                    "bus reactor: flow '{flow_id}' has a malformed bus_consume config, \
-                     skipping: {e}"
-                );
-            }
+            Err(e) => scan.malformed.push((flow_id.clone(), e.to_string())),
         }
     }
-    subs
+    scan
 }
 
-/// A running per-subscription poll task, keyed by flow id. `config` is kept
-/// alongside the handle so `reconcile` can detect an edit (a save that
-/// changes topic/group/batch_size/…) and restart rather than leave a stale
-/// task running against the old subscription.
+/// A running per-subscription poll task, keyed by flow id. `config` and
+/// `version` are kept alongside the handle so `reconcile` can detect an edit
+/// or a re-save and restart rather than leave a stale task running against
+/// the old subscription.
 struct RunningSubscription {
     config: ConsumeConfig,
-    _handle: AbortOnDropHandle<()>,
+    version: i64,
+    handle: AbortOnDropHandle<()>,
 }
 
 /// Owns the cached registry and the set of currently running per-subscription
@@ -240,36 +509,70 @@ struct RunningSubscription {
 struct BusReactor {
     registry: SubscriptionRegistry,
     dispatch: Arc<dyn ReactorFlowDispatch>,
+    status: Arc<StatusStore>,
     running: HashMap<String, RunningSubscription>,
 }
 
 impl BusReactor {
     fn new(db: DbPool, dispatch: Arc<dyn ReactorFlowDispatch>) -> Self {
+        Self::with_status(db, dispatch, global_status())
+    }
+
+    fn with_status(
+        db: DbPool,
+        dispatch: Arc<dyn ReactorFlowDispatch>,
+        status: Arc<StatusStore>,
+    ) -> Self {
         Self {
             registry: SubscriptionRegistry::new(db),
             dispatch,
+            status,
             running: HashMap::new(),
         }
     }
 
-    /// Starts newly-added or config-changed subscriptions, stops removed or
-    /// changed ones (dropping a `RunningSubscription` aborts its task via
+    fn reconcile(&mut self) {
+        self.reconcile_with(&|id| crate::bus::instance(id));
+    }
+
+    /// Starts newly-added or changed subscriptions, stops removed or changed
+    /// ones (dropping a `RunningSubscription` aborts its task via
     /// `AbortOnDropHandle`) — a changed config gets a fresh task rather than
     /// an in-place update since any in-flight retry/backoff state is tied to
-    /// the old subscription anyway. Also stops (and refuses to start) a
-    /// subscription whose `instance_id` is no longer enabled — an instance
-    /// being disabled/uninstalled is not a flow-config change, so it would
-    /// never otherwise be caught by the `wanted != running` comparison above;
-    /// this makes disabling an instance stop its flow consumers within one
-    /// `RECONCILE_INTERVAL` (plan-app-platform §3.5).
-    fn reconcile(&mut self) {
+    /// the old subscription anyway. A re-save (version bump) restarts too,
+    /// which is what lets a halted subscription run again. Also stops (and
+    /// refuses to start) a subscription whose `instance_id` is no longer
+    /// enabled — an instance being disabled/uninstalled is not a flow-config
+    /// change, so it would never otherwise be caught by the `wanted !=
+    /// running` comparison; this makes disabling an instance stop its flow
+    /// consumers within one `RECONCILE_INTERVAL` (plan-app-platform §3.5).
+    ///
+    /// Before starting a subscription the service account is checked (`precheck`),
+    /// and a refused one is not started. The check repeats on every
+    /// reconcile, so a task that ended `Refused` comes back by itself once its
+    /// cause is fixed. A task that ended `Halted` stays stopped.
+    ///
+    /// `resolve` finds the running engine of an instance (`bus::instance` in
+    /// production).
+    fn reconcile_with(&mut self, resolve: &dyn Fn(&BusInstanceId) -> Option<Arc<BusService>>) {
         let db = self.registry.db.clone();
-        let wanted: HashMap<String, ConsumeConfig> = self
-            .registry
-            .current()
+        let status = self.status.clone();
+        let scan = self.registry.current();
+        let wanted: HashMap<String, (ConsumeConfig, i64)> = scan
+            .subs
             .iter()
-            .map(|s| (s.flow_id.clone(), s.config.clone()))
+            .map(|s| (s.flow_id.clone(), (s.config.clone(), s.version)))
             .collect();
+        let malformed: Vec<MalformedFlow> = scan.malformed.clone();
+
+        for (flow_id, detail) in &malformed {
+            status.record(
+                flow_id,
+                ConsumerState::Refused,
+                Some(reason::MALFORMED_CONFIG),
+                Some(detail.clone()),
+            );
+        }
 
         // Resolve each DISTINCT instance's enabled state ONCE per reconcile
         // call, not once per subscription: most subscriptions in a real
@@ -280,7 +583,7 @@ impl BusReactor {
         // would delay noticing a disable past the one-`RECONCILE_INTERVAL`
         // guarantee §3.5 asks for.
         let mut enabled: HashMap<BusInstanceId, bool> = HashMap::new();
-        for config in wanted.values() {
+        for (config, _) in wanted.values() {
             enabled
                 .entry(config.instance_id.clone())
                 .or_insert_with(|| instance_enabled(&db, &config.instance_id));
@@ -292,7 +595,10 @@ impl BusReactor {
         }
 
         self.running.retain(|flow_id, running| {
-            if wanted.get(flow_id) != Some(&running.config) {
+            let unchanged = wanted.get(flow_id).is_some_and(|(config, version)| {
+                *config == running.config && *version == running.version
+            });
+            if !unchanged {
                 return false;
             }
             if !enabled[&running.config.instance_id] {
@@ -303,10 +609,18 @@ impl BusReactor {
                 );
                 return false;
             }
+            if running.handle.is_finished() {
+                // A halted task stays put (same config and version) until the
+                // flow is saved again; any other ended task (refused, or a
+                // panic) is dropped so the checks below decide on a restart.
+                return status
+                    .get(flow_id)
+                    .is_some_and(|s| s.state == ConsumerState::Halted);
+            }
             true
         });
-        for (flow_id, config) in wanted {
-            if self.running.contains_key(&flow_id) {
+        for (flow_id, (config, version)) in wanted.iter() {
+            if self.running.contains_key(flow_id) {
                 continue;
             }
             if !enabled[&config.instance_id] {
@@ -315,17 +629,41 @@ impl BusReactor {
                      its subscription",
                     config.instance_id
                 );
+                status.record(
+                    flow_id,
+                    ConsumerState::Waiting,
+                    Some(reason::INSTANCE_NOT_RUNNING),
+                    None,
+                );
                 continue;
             }
-            let handle = spawn_subscription(flow_id.clone(), config.clone(), self.dispatch.clone());
+            let svc = resolve(&config.instance_id);
+            if let Err((why, detail)) = precheck(&db, config, svc.as_ref()) {
+                status.record(flow_id, ConsumerState::Refused, Some(why), detail);
+                continue;
+            }
+            let handle = spawn_subscription(
+                flow_id.clone(),
+                config.clone(),
+                self.dispatch.clone(),
+                self.status.clone(),
+            );
             self.running.insert(
-                flow_id,
+                flow_id.clone(),
                 RunningSubscription {
-                    config,
-                    _handle: handle,
+                    config: config.clone(),
+                    version: *version,
+                    handle,
                 },
             );
         }
+
+        let live: HashSet<&str> = wanted
+            .keys()
+            .map(String::as_str)
+            .chain(malformed.iter().map(|(id, _)| id.as_str()))
+            .collect();
+        status.retain_flows(&live);
     }
 }
 
@@ -340,8 +678,9 @@ fn spawn_subscription(
     flow_id: String,
     config: ConsumeConfig,
     dispatch: Arc<dyn ReactorFlowDispatch>,
+    status: Arc<StatusStore>,
 ) -> AbortOnDropHandle<()> {
-    let handle = tokio::spawn(subscription_loop(flow_id, config, dispatch));
+    let handle = tokio::spawn(subscription_loop(flow_id, config, dispatch, status));
     AbortOnDropHandle::new(handle)
 }
 
@@ -429,8 +768,12 @@ fn build_envelope(
         .insert("bus_instance".into(), serde_json::json!(config.instance_id));
     env.meta
         .insert("bus_topic".into(), serde_json::json!(config.topic));
-    env.meta
-        .insert("bus_group".into(), serde_json::json!(config.group));
+    env.meta.insert(
+        "bus_group".into(),
+        serde_json::json!(config
+            .effective_group()
+            .unwrap_or_else(|| config.group.clone())),
+    );
     if let ([record], [value]) = (records, values) {
         env.payload = FlowValue::Json(value.clone());
         env.meta
@@ -499,7 +842,11 @@ async fn note_failure(
 /// Whether a poll cycle should keep going after `on_error` handling.
 enum AfterFailure {
     Continue,
+    /// `on_error = halt`: the loop ends and only a save of the flow resumes it.
     Halt,
+    /// The consumer may not read (service account or rights): the loop ends
+    /// and the supervisor's pre-start check decides when to try again.
+    Refused,
 }
 
 /// Routes a failed batch (JSON decode failure OR a failed flow dispatch)
@@ -512,6 +859,7 @@ async fn handle_batch_failure(
     handle: ConsumerHandle,
     flow_id: &str,
     config: &ConsumeConfig,
+    group: &str,
     records: &[FetchedRecordMeta],
     reason: DlqReason,
     message: &str,
@@ -552,7 +900,7 @@ async fn handle_batch_failure(
                 let outcome = note_failure(
                     svc.clone(),
                     record_ctx,
-                    config.group.clone(),
+                    group.to_string(),
                     record.clone(),
                     reason,
                     message.to_string(),
@@ -584,6 +932,7 @@ async fn run_cycle(
     flow_id: &str,
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
+    status: &StatusStore,
 ) -> AfterFailure {
     let span = tracing::info_span!(
         "bus_reactor_cycle",
@@ -591,9 +940,49 @@ async fn run_cycle(
         topic = %config.topic,
         correlation_id = tracing::field::Empty,
     );
-    run_cycle_in(svc, flow_id, config, dispatch, &span)
+    let after = run_cycle_in(svc, flow_id, config, dispatch, status, &span)
         .instrument(span.clone())
-        .await
+        .await;
+    if matches!(after, AfterFailure::Halt) {
+        status.record(flow_id, ConsumerState::Halted, None, None);
+    }
+    after
+}
+
+/// How a failed `open_consumer`/`fetch` shows up in the consumer status.
+fn classify_open_error(
+    db: &DbPool,
+    service_account: &str,
+    error: &BusServiceError,
+) -> (ConsumerState, &'static str, Option<String>) {
+    match error {
+        // The authorizer's answer does not say why; the key row does.
+        BusServiceError::PermissionDenied { .. } => (
+            ConsumerState::Refused,
+            service_account_refusal(db, service_account).unwrap_or(reason::READ_DENIED),
+            None,
+        ),
+        BusServiceError::KeyNeedsTopicWideRule { .. } => {
+            (ConsumerState::Refused, reason::NEEDS_TOPIC_WIDE_RULE, None)
+        }
+        BusServiceError::InvalidArgument(_) | BusServiceError::InvalidTopicName { .. } => (
+            ConsumerState::Refused,
+            reason::MALFORMED_CONFIG,
+            Some(error.to_string()),
+        ),
+        BusServiceError::NotLeader { .. } => (ConsumerState::Waiting, reason::NOT_LEADER, None),
+        BusServiceError::NotInitialized => {
+            (ConsumerState::Waiting, reason::INSTANCE_NOT_RUNNING, None)
+        }
+        BusServiceError::TopicNotFound { .. } => {
+            (ConsumerState::Waiting, reason::TOPIC_NOT_FOUND, None)
+        }
+        other => (
+            ConsumerState::Waiting,
+            reason::BUS_ERROR,
+            Some(other.to_string()),
+        ),
+    }
 }
 
 async fn run_cycle_in(
@@ -601,35 +990,51 @@ async fn run_cycle_in(
     flow_id: &str,
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
+    status: &StatusStore,
     span: &tracing::Span,
 ) -> AfterFailure {
-    let bctx = BusCallContext {
-        instance_id: svc.typed_instance_id(),
-        org_id: config.org_id.clone(),
-        actor: None,
-        actor_kind: crate::auth::actor::ActorKind::System,
-        correlation_id: None,
-        origin: FlowOrigin::Bus.as_str().to_string(),
+    let (Some(service_account), Some(group)) =
+        (config.service_account.as_deref(), config.effective_group())
+    else {
+        status.record(
+            flow_id,
+            ConsumerState::Refused,
+            Some(reason::SERVICE_ACCOUNT_MISSING),
+            None,
+        );
+        return AfterFailure::Refused;
     };
+    let bctx = consumer_context(svc.typed_instance_id(), config, service_account);
 
     let (handle, mut records) = {
-        let svc = svc.clone();
+        let task_svc = svc.clone();
         let open_bctx = bctx.clone();
-        let group = config.group.clone();
+        let group = group.clone();
         let topic = config.topic.clone();
         let commit_mode = config.commit_mode;
         let max_wait_ms = config.max_wait_ms;
         let joined = tokio::task::spawn_blocking(move || {
-            let handle =
-                svc.open_consumer(&open_bctx, &group, &[topic], ConsumerConfig { commit_mode })?;
+            let handle = task_svc.open_consumer(
+                &open_bctx,
+                &group,
+                &[topic],
+                ConsumerConfig { commit_mode },
+            )?;
             let batch = handle.fetch(FETCH_MAX_BYTES, max_wait_ms)?;
             Ok::<_, BusServiceError>((handle, batch))
         })
         .await;
         match joined {
-            Ok(Ok((handle, batch))) => (handle, batch.records),
+            Ok(Ok((handle, batch))) => {
+                status.record(flow_id, ConsumerState::Running, None, None);
+                (handle, batch.records)
+            }
             Ok(Err(e)) => {
-                tracing::warn!("bus reactor: flow '{flow_id}' open_consumer/fetch failed: {e}");
+                let (state, why, detail) = classify_open_error(svc.db(), service_account, &e);
+                status.record(flow_id, state, Some(why), detail);
+                if state == ConsumerState::Refused {
+                    return AfterFailure::Refused;
+                }
                 tokio::time::sleep(ERROR_BACKOFF).await;
                 return AfterFailure::Continue;
             }
@@ -661,6 +1066,7 @@ async fn run_cycle_in(
                 handle,
                 flow_id,
                 config,
+                &group,
                 &records,
                 DlqReason::SchemaViolation,
                 &msg,
@@ -678,7 +1084,7 @@ async fn run_cycle_in(
         None,
         Some(config.org_id.clone()),
         FlowOrigin::Bus,
-        FlowActor::system(),
+        FlowActor::api_key(service_account, None),
     )
     .with_correlation_id(Some(batch_corr.id.clone()));
 
@@ -709,6 +1115,7 @@ async fn run_cycle_in(
                 handle,
                 flow_id,
                 config,
+                &group,
                 &records,
                 DlqReason::ConsumerError,
                 &msg,
@@ -720,7 +1127,9 @@ async fn run_cycle_in(
 }
 
 /// One subscription's background poll loop: waits for `config.instance_id`'s
-/// engine to be running, then runs `run_cycle` until it signals a halt.
+/// engine to be running, then runs `run_cycle` until it signals a halt or a
+/// refusal (the supervisor restarts a refused one once its pre-start check
+/// passes again).
 ///
 /// Resolves through `bus::instance(&config.instance_id)` — the SPECIFIC
 /// instance this subscription was configured for — never `bus::global()`.
@@ -735,19 +1144,23 @@ async fn subscription_loop(
     flow_id: String,
     config: ConsumeConfig,
     dispatch: Arc<dyn ReactorFlowDispatch>,
+    status: Arc<StatusStore>,
 ) {
     loop {
         let Some(svc) = crate::bus::instance(&config.instance_id) else {
-            tracing::warn!(
-                "bus reactor: flow '{flow_id}' bus instance '{}' is not running (disabled, \
-                 uninstalled, or not started yet) — backing off",
-                config.instance_id
+            // Disabled, uninstalled, or not started yet: back off.
+            status.record(
+                &flow_id,
+                ConsumerState::Waiting,
+                Some(reason::INSTANCE_NOT_RUNNING),
+                None,
             );
             tokio::time::sleep(ERROR_BACKOFF).await;
             continue;
         };
-        if let AfterFailure::Halt = run_cycle(&svc, &flow_id, &config, &dispatch).await {
-            break;
+        match run_cycle(&svc, &flow_id, &config, &dispatch, &status).await {
+            AfterFailure::Continue => {}
+            AfterFailure::Halt | AfterFailure::Refused => break,
         }
     }
 }
@@ -812,6 +1225,32 @@ fn flows_missing_instance_id(flows: &[(String, String)]) -> Vec<(String, String,
     missing
 }
 
+/// Ids of the active flows whose `bus_consume` entry has no `service_account`:
+/// they have never read anything (the reactor used to consume with no identity
+/// at all) and stay refused until an operator binds a key. Pure and DB-free,
+/// like `flows_missing_instance_id`.
+fn flows_missing_service_account(flows: &[(String, String)]) -> Vec<String> {
+    flows
+        .iter()
+        .filter(|(_, flow_json)| {
+            serde_json::from_str::<FlowDefinition>(flow_json)
+                .ok()
+                .and_then(|def| {
+                    def.nodes
+                        .into_iter()
+                        .find(|n| n.node_type == bus_consume::NODE_TYPE)
+                })
+                .is_some_and(|node| {
+                    node.config
+                        .get("service_account")
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |s| s.trim().is_empty())
+                })
+        })
+        .map(|(flow_id, _)| flow_id.clone())
+        .collect()
+}
+
 /// Fetches every active flow and logs `flows_missing_instance_id`'s findings,
 /// one warning line per (flow, node) — the migration aid that makes
 /// `instance_id` going from absent to required survivable: never auto-fills
@@ -830,6 +1269,12 @@ fn log_flows_missing_instance_id(db: &DbPool) {
         .filter(|f| f.status == "active")
         .map(|f| (f.id, f.flow_json))
         .collect();
+    for flow_id in flows_missing_service_account(&active) {
+        tracing::warn!(
+            "bus reactor: flow '{flow_id}' has a bus_consume entry with no 'service_account' — \
+             it reads nothing until an operator picks a general API key for it and saves the flow"
+        );
+    }
     for (flow_id, node_id, node_type) in flows_missing_instance_id(&active) {
         tracing::warn!(
             "bus reactor: flow '{flow_id}' node '{node_id}' (type '{node_type}') has no \
@@ -927,6 +1372,29 @@ mod tests {
         .expect("seed bus instance row");
     }
 
+    /// A well-formed key uid for tests whose authorizer allows everything and
+    /// that never read the key row.
+    const TEST_KEY_UID: &str = "0b9e6a6e-7f0c-4a53-9d1a-3a1f2f6c8b11";
+
+    /// A general API key row in `pool`; returns its uid.
+    fn seed_general_key(pool: &DbPool) -> String {
+        seed_key(pool, "general", None)
+    }
+
+    fn seed_key(pool: &DbPool, key_type: &str, subject: Option<&str>) -> String {
+        let (_, uid) = repository::create_api_key(
+            pool,
+            &format!("verifier-{}", uuid::Uuid::new_v4()),
+            "sk-...abcdef",
+            "Flow service account",
+            key_type,
+            subject,
+            60,
+        )
+        .expect("create key");
+        uid
+    }
+
     /// Inserts an active flow whose entry is `bus_consume` with the given
     /// config and returns its id.
     fn seed_consume_flow(pool: &DbPool, name: &str, config: serde_json::Value) -> String {
@@ -975,23 +1443,42 @@ mod tests {
         let flow_id = seed_consume_flow(
             &pool,
             "react",
-            json!({"instance_id": "tentabus-8b000001", "topic": "orders.raw", "group": "g1"}),
+            json!({
+                "instance_id": "tentabus-8b000001", "service_account": TEST_KEY_UID,
+                "topic": "orders.raw", "group": "g1"
+            }),
         );
-        let flows = vec![(
-            flow_id.clone(),
-            repository::list_flows(&pool, 0, 10)
-                .unwrap()
-                .into_iter()
-                .find(|f| f.id == flow_id)
-                .unwrap()
-                .flow_json,
-        )];
-        let subs = build_subscriptions(&flows);
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].flow_id, flow_id);
-        assert_eq!(subs[0].config.instance_id.as_str(), "tentabus-8b000001");
-        assert_eq!(subs[0].config.topic, "orders.raw");
-        assert_eq!(subs[0].config.group, "g1");
+        let flow = repository::get_flow(&pool, &flow_id).unwrap().unwrap();
+        let scan = build_subscriptions(&[(flow_id.clone(), flow.flow_json, flow.version)]);
+        assert_eq!(scan.subs.len(), 1);
+        assert!(scan.malformed.is_empty());
+        let sub = &scan.subs[0];
+        assert_eq!(sub.flow_id, flow_id);
+        assert_eq!(sub.version, flow.version);
+        assert_eq!(sub.config.instance_id.as_str(), "tentabus-8b000001");
+        assert_eq!(sub.config.topic, "orders.raw");
+        assert_eq!(sub.config.group, "g1");
+        assert_eq!(
+            sub.config.effective_group().unwrap(),
+            format!("k:{TEST_KEY_UID}.g1")
+        );
+    }
+
+    /// A legacy node without a service account still parses: the supervisor
+    /// refuses it with its own reason instead of the scan dropping it silently.
+    #[test]
+    fn build_subscriptions_keeps_a_node_without_a_service_account() {
+        let flow_json = json!({
+            "nodes": [{
+                "id": "c", "type": bus_consume::NODE_TYPE,
+                "config": {"instance_id": "tentabus-8b000001", "topic": "orders.raw", "group": "g1"}
+            }],
+            "edges": []
+        })
+        .to_string();
+        let scan = build_subscriptions(&[("f1".to_string(), flow_json, 1)]);
+        assert_eq!(scan.subs.len(), 1);
+        assert_eq!(scan.subs[0].config.service_account, None);
     }
 
     /// plan-app-platform §3.3/§3.5: a `bus_consume` node with no `instance_id`
@@ -1009,11 +1496,13 @@ mod tests {
             "edges": []
         })
         .to_string();
-        let subs = build_subscriptions(&[("f1".to_string(), flow_json)]);
+        let scan = build_subscriptions(&[("f1".to_string(), flow_json, 1)]);
         assert!(
-            subs.is_empty(),
+            scan.subs.is_empty(),
             "missing instance_id must be skipped, not panic"
         );
+        assert_eq!(scan.malformed.len(), 1);
+        assert_eq!(scan.malformed[0].0, "f1");
     }
 
     /// plan-app-platform §9 (R8): the startup migration scan finds a
@@ -1024,7 +1513,7 @@ mod tests {
     fn flows_missing_instance_id_finds_every_bus_node_type() {
         let flow_json = json!({
             "nodes": [
-                {"id": "c", "type": "bus_consume", "config": {"instance_id": "", "topic": "t", "group": "g"}},
+                {"id": "c", "type": "bus_consume", "config": {"instance_id": "", "topic": "t", "group": "gg"}},
                 {"id": "p", "type": "bus_publish", "config": {"topic": "t"}},
                 {"id": "x", "type": "bus_transform", "config": {"expression": "payload"}}
             ],
@@ -1046,7 +1535,7 @@ mod tests {
         let flow_json = json!({
             "nodes": [
                 {"id": "c", "type": "bus_consume", "config": {
-                    "instance_id": "tentabus-aaaaaaaa", "topic": "t", "group": "g"
+                    "instance_id": "tentabus-aaaaaaaa", "topic": "t", "group": "gg"
                 }},
                 {"id": "o", "type": "output", "config": {}}
             ],
@@ -1064,8 +1553,9 @@ mod tests {
             "edges": []
         })
         .to_string();
-        let subs = build_subscriptions(&[("f1".to_string(), flow_json)]);
-        assert!(subs.is_empty());
+        let scan = build_subscriptions(&[("f1".to_string(), flow_json, 1)]);
+        assert!(scan.subs.is_empty());
+        assert!(scan.malformed.is_empty());
     }
 
     #[test]
@@ -1075,11 +1565,12 @@ mod tests {
             "edges": []
         })
         .to_string();
-        let subs = build_subscriptions(&[("f1".to_string(), flow_json)]);
+        let scan = build_subscriptions(&[("f1".to_string(), flow_json, 1)]);
         assert!(
-            subs.is_empty(),
+            scan.subs.is_empty(),
             "missing topic/group must be skipped, not panic"
         );
+        assert_eq!(scan.malformed.len(), 1);
     }
 
     #[test]
@@ -1115,7 +1606,7 @@ mod tests {
     #[test]
     fn build_envelope_single_record_uses_message_shape() {
         let config = ConsumeConfig::from_config(
-            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "g"}),
+            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "gg"}),
         )
         .unwrap();
         let records = vec![record("t", 0, 3, "x")];
@@ -1134,7 +1625,7 @@ mod tests {
     #[test]
     fn build_envelope_multi_record_uses_batch_shape() {
         let config = ConsumeConfig::from_config(
-            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "g"}),
+            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "gg"}),
         )
         .unwrap();
         let records = vec![record("t", 0, 1, "x"), record("t", 0, 2, "y")];
@@ -1167,6 +1658,7 @@ mod tests {
     async fn reconcile_starts_and_stops_tasks_as_flows_change() {
         let pool = db();
         install_bus_instance(&pool, "tentabus-8b000003", true);
+        let key = seed_general_key(&pool);
         let mut reactor = BusReactor::new(pool.clone(), Arc::new(NoopDispatch));
 
         reactor.reconcile();
@@ -1175,7 +1667,10 @@ mod tests {
         let flow_id = seed_consume_flow(
             &pool,
             "react",
-            json!({"instance_id": "tentabus-8b000003", "topic": "t", "group": "g"}),
+            json!({
+                "instance_id": "tentabus-8b000003", "service_account": key,
+                "topic": "t", "group": "gg"
+            }),
         );
         reactor.reconcile();
         assert_eq!(reactor.running.len(), 1);
@@ -1225,7 +1720,10 @@ mod tests {
         seed_consume_flow(
             &pool,
             "react",
-            json!({"instance_id": "tentabus-8b000004", "topic": "t", "group": "g"}),
+            json!({
+                "instance_id": "tentabus-8b000004", "service_account": TEST_KEY_UID,
+                "topic": "t", "group": "gg"
+            }),
         );
         reactor.reconcile();
         assert!(
@@ -1242,12 +1740,16 @@ mod tests {
     async fn reconcile_stops_a_running_subscription_when_its_instance_is_disabled() {
         let pool = db();
         install_bus_instance(&pool, "tentabus-8b000005", true);
+        let key = seed_general_key(&pool);
         let mut reactor = BusReactor::new(pool.clone(), Arc::new(NoopDispatch));
 
         seed_consume_flow(
             &pool,
             "react",
-            json!({"instance_id": "tentabus-8b000005", "topic": "t", "group": "g"}),
+            json!({
+                "instance_id": "tentabus-8b000005", "service_account": key,
+                "topic": "t", "group": "gg"
+            }),
         );
         reactor.reconcile();
         assert_eq!(
@@ -1388,7 +1890,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("init registry instance");
         (dir, svc)
@@ -1488,11 +1992,11 @@ mod tests {
         let scripted = Arc::new(ScriptedDispatch::new());
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
         assert!(matches!(after, AfterFailure::Continue));
         {
             let calls = scripted.calls.lock().unwrap();
@@ -1501,7 +2005,7 @@ mod tests {
         }
 
         // Second cycle: nothing new (short max_wait_ms keeps this fast).
-        let after2 = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        let after2 = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
         assert!(matches!(after2, AfterFailure::Continue));
         assert_eq!(
             scripted.calls.lock().unwrap().len(),
@@ -1526,15 +2030,17 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted;
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "halt"
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "halt"
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
         assert!(matches!(after, AfterFailure::Halt));
 
-        // Uncommitted: a fresh handle still sees the record.
-        let records = fetch_once(&svc, &ctx, "g1", "orders.raw").await;
+        // Uncommitted: a fresh handle in the flow's own group still sees the
+        // record.
+        let group = config.effective_group().unwrap();
+        let records = fetch_once(&svc, &ctx, &group, "orders.raw").await;
         assert_eq!(records.len(), 1, "halted cycle must not commit");
     }
 
@@ -1566,14 +2072,15 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted;
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
 
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
         assert!(matches!(after, AfterFailure::Continue));
 
-        let records = fetch_once(&svc, &ctx, "g1", "orders.raw").await;
+        let group = config.effective_group().unwrap();
+        let records = fetch_once(&svc, &ctx, &group, "orders.raw").await;
         assert!(
             records.is_empty(),
             "DLQ escalation must advance the source offset past the poison record"
@@ -1721,10 +2228,10 @@ mod tests {
         });
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
 
         let seen = spy.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -1752,11 +2259,11 @@ mod tests {
         });
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1",
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1",
             "max_wait_ms": 20, "batch_size": 10
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
 
         let seen = spy.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "a mixed batch is still one run");
@@ -1782,10 +2289,10 @@ mod tests {
         });
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
 
         let seen = spy.seen.lock().unwrap();
         let minted = seen[0].0.as_deref().expect("an id is minted");
@@ -1820,11 +2327,11 @@ mod tests {
         });
         let dispatch: Arc<dyn ReactorFlowDispatch> = spy;
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1",
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1",
             "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
-        run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
 
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
         let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
@@ -1858,7 +2365,11 @@ mod tests {
         let raw = r#"{"id":"7","card":"4111111111111111","name":"Jan"}"#;
         publish_one(&svc, &ctx, "cards.raw", raw).await;
         let set = |masked: &[&str], hashed: &[&str]| {
-            let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+            let names = |v: &[&str]| {
+                v.iter()
+                    .map(|s| s.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
             fp::set_policy(
                 svc.db(),
                 svc.instance_id(),
@@ -1888,10 +2399,10 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "instance_id": "tentabus-00000001", "topic": "cards.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "cards.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
-        let after = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        let after = run_cycle(&svc, "flow-1", &config, &dispatch, &StatusStore::default()).await;
         assert!(matches!(after, AfterFailure::Continue));
         assert_eq!(
             scripted.calls.lock().unwrap()[0].1,
@@ -1962,7 +2473,12 @@ mod tests {
         }))
         .unwrap();
 
-        let _handle = spawn_subscription("flow-cross".to_string(), config, dispatch);
+        let _handle = spawn_subscription(
+            "flow-cross".to_string(),
+            config,
+            dispatch,
+            Arc::new(StatusStore::default()),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             scripted.calls.lock().unwrap().is_empty(),
@@ -1971,5 +2487,606 @@ mod tests {
         );
 
         crate::bus::stop_instance(&id_a);
+    }
+
+    // ---- Service-account consumption behind the REAL authorizer ------------
+    //
+    // Every test above uses an allow-all authorizer, which is why a reactor
+    // that consumed with no identity at all went unnoticed. These run the
+    // production `InstanceBusAuthorizer` on the same database the reactor reads.
+
+    const REAL_INSTANCE: &str = "tentabus-00000001";
+
+    struct RealAuth {
+        _dir: tempfile::TempDir,
+        db: DbPool,
+        svc: Arc<BusService>,
+    }
+
+    /// A `BusService` behind `InstanceBusAuthorizer`, with the user `tester`
+    /// holding every matrix permission (it creates and fills topics).
+    fn real_auth_bus_service() -> RealAuth {
+        use crate::addon::permissions::PermissionChecker;
+        use crate::services::bus_authorizer::InstanceBusAuthorizer;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
+        let id = BusInstanceId::parse(REAL_INSTANCE).expect("valid instance id");
+        let checker = Arc::new(PermissionChecker::new(db.clone()));
+        for perm in ["bus.read", "bus.write", "bus.admin"] {
+            repository::upsert_permission(
+                &db,
+                REAL_INSTANCE,
+                "user",
+                "tester",
+                perm,
+                "allow",
+                None,
+            )
+            .expect("grant");
+        }
+        checker.refresh_addon(REAL_INSTANCE);
+        let svc = Arc::new(
+            BusService::new(BusInitConfig {
+                instance_id: id.clone(),
+                local_db,
+                bus_dir: dir.path().join("bus"),
+                db: db.clone(),
+                authorizer: Arc::new(InstanceBusAuthorizer::new(db.clone(), id, checker)),
+                retention_interval: None,
+                dedup_expected_rate_per_sec: 10_000,
+                partition_handle_lru: None,
+                publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            })
+            .expect("bus service"),
+        );
+        install_bus_instance(&db, REAL_INSTANCE, true);
+        RealAuth { _dir: dir, db, svc }
+    }
+
+    fn topic_right(db: &DbPool, key_uid: &str, topic: &str, action: &str) {
+        repository::resource_permissions::set_with_action(
+            db,
+            "topic",
+            &crate::services::bus_authorizer::topic_acl_resource_id(
+                REAL_INSTANCE,
+                "org-default",
+                topic,
+            ),
+            "api_key",
+            key_uid,
+            action,
+            "allow",
+        )
+        .expect("topic right");
+    }
+
+    fn key_ctx(key_uid: &str) -> BusCallContext {
+        BusCallContext {
+            actor: Some(key_uid.to_string()),
+            actor_kind: ActorKind::ApiKey,
+            ..test_ctx("org-default")
+        }
+    }
+
+    fn consume_config(key_uid: &str, extra: serde_json::Value) -> ConsumeConfig {
+        let mut config = json!({
+            "instance_id": REAL_INSTANCE, "service_account": key_uid,
+            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        ConsumeConfig::from_config(&config).expect("config")
+    }
+
+    /// Records the actor of every run principal.
+    struct ActorSpy {
+        actors: Mutex<Vec<FlowActor>>,
+        fail: bool,
+    }
+
+    impl ActorSpy {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                actors: Mutex::new(Vec::new()),
+                fail,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ReactorFlowDispatch for ActorSpy {
+        async fn dispatch(
+            &self,
+            _flow_id: String,
+            _initial: FlowEnvelope,
+            principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
+            self.actors.lock().unwrap().push(principal.actor);
+            if self.fail {
+                anyhow::bail!("scripted dispatch failure");
+            }
+            Ok(())
+        }
+    }
+
+    /// A topic `orders.raw` holding one record, made by the user `tester`.
+    async fn real_topic_with_record(fx: &RealAuth, opts: TopicOptions) {
+        let ctx = test_ctx("org-default");
+        create_topic(&fx.svc, &ctx, "orders.raw", opts).await;
+        publish_one(&fx.svc, &ctx, "orders.raw", r#"{"id":1}"#).await;
+    }
+
+    fn status_of(status: &StatusStore, flow: &str) -> (ConsumerState, Option<&'static str>) {
+        let s = status.get(flow).expect("a status was recorded");
+        (s.state, s.reason)
+    }
+
+    /// THE regression guard: the reactor used to consume with no actor, which
+    /// the production authorizer refuses, so no `bus_consume` flow ever read.
+    /// Now the flow reads as its service account: the run carries the key, the
+    /// offset is committed under the key's own group, and nothing redelivers.
+    #[tokio::test]
+    async fn real_authorizer_a_service_account_with_read_rights_consumes() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = ActorSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({}));
+
+        let after = run_cycle(&fx.svc, "flow-real-ok", &config, &dispatch, &status).await;
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            *spy.actors.lock().unwrap(),
+            vec![FlowActor::api_key(key.clone(), None)]
+        );
+        assert_eq!(
+            status_of(&status, "flow-real-ok"),
+            (ConsumerState::Running, None)
+        );
+
+        // Committed under the key's group: a fresh consumer there sees nothing,
+        // and so does the next cycle.
+        let group = format!("k:{key}.g1");
+        assert!(fetch_once(&fx.svc, &key_ctx(&key), &group, "orders.raw")
+            .await
+            .is_empty());
+        run_cycle(&fx.svc, "flow-real-ok", &config, &dispatch, &status).await;
+        assert_eq!(spy.actors.lock().unwrap().len(), 1, "no redelivery");
+    }
+
+    #[tokio::test]
+    async fn real_authorizer_a_key_without_read_rights_is_refused_and_reads_nothing() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+
+        let spy = ActorSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-denied",
+            &consume_config(&key, json!({})),
+            &dispatch,
+            &status,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-real-denied"),
+            (ConsumerState::Refused, Some(reason::READ_DENIED))
+        );
+        assert!(spy.actors.lock().unwrap().is_empty());
+    }
+
+    /// A write right is not a read right.
+    #[tokio::test]
+    async fn real_authorizer_a_write_only_key_cannot_consume() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "write");
+
+        let dispatch: Arc<dyn ReactorFlowDispatch> = ActorSpy::new(false);
+        let status = StatusStore::default();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-write-only",
+            &consume_config(&key, json!({})),
+            &dispatch,
+            &status,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Refused));
+    }
+
+    /// A revoked key stops the next cycle, and the loop ends instead of
+    /// retrying every backoff.
+    #[tokio::test]
+    async fn real_authorizer_a_revoked_key_ends_the_consumer() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = ActorSpy::new(false);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({}));
+        let first = run_cycle(&fx.svc, "flow-real-revoked", &config, &dispatch, &status).await;
+        assert!(matches!(first, AfterFailure::Continue));
+        assert_eq!(spy.actors.lock().unwrap().len(), 1);
+
+        repository::delete_api_key_by_uid(&fx.db, &key).expect("revoke");
+        publish_one(
+            &fx.svc,
+            &test_ctx("org-default"),
+            "orders.raw",
+            r#"{"id":2}"#,
+        )
+        .await;
+        let second = run_cycle(&fx.svc, "flow-real-revoked", &config, &dispatch, &status).await;
+        assert!(matches!(second, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-real-revoked"),
+            (
+                ConsumerState::Refused,
+                Some(reason::SERVICE_ACCOUNT_NOT_FOUND)
+            )
+        );
+        assert_eq!(
+            spy.actors.lock().unwrap().len(),
+            1,
+            "nothing read after revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_authorizer_a_disabled_key_is_refused() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+        repository::set_api_key_active(&fx.db, &key, false).expect("disable");
+
+        let dispatch: Arc<dyn ReactorFlowDispatch> = ActorSpy::new(false);
+        let status = StatusStore::default();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-disabled",
+            &consume_config(&key, json!({})),
+            &dispatch,
+            &status,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-real-disabled"),
+            (
+                ConsumerState::Refused,
+                Some(reason::SERVICE_ACCOUNT_DISABLED)
+            )
+        );
+    }
+
+    /// A key bound to a user acts as that user elsewhere, so it can never be a
+    /// flow's identity, whatever rights rows it carries.
+    #[tokio::test]
+    async fn real_authorizer_a_user_bound_key_is_refused() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_key(&fx.db, "user", Some("u-owner"));
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let dispatch: Arc<dyn ReactorFlowDispatch> = ActorSpy::new(false);
+        let status = StatusStore::default();
+        let after = run_cycle(
+            &fx.svc,
+            "flow-real-user-key",
+            &consume_config(&key, json!({})),
+            &dispatch,
+            &status,
+        )
+        .await;
+        assert!(matches!(after, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-real-user-key"),
+            (
+                ConsumerState::Refused,
+                Some(reason::SERVICE_ACCOUNT_NOT_SERVICE_KEY)
+            )
+        );
+    }
+
+    /// A topic that hides data from chosen subjects only is closed to a key
+    /// until the topic-wide rule exists: reading it would be the one access
+    /// those rules were never written for.
+    #[tokio::test]
+    async fn real_authorizer_a_key_needs_the_topic_wide_rule_when_rules_exist() {
+        use crate::bus::field_policies as fp;
+        let fx = real_auth_bus_service();
+        real_topic_with_record(
+            &fx,
+            TopicOptions {
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+        let names = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        fp::set_policy(
+            &fx.db,
+            REAL_INSTANCE,
+            "org-default",
+            "orders.raw",
+            "user",
+            "someone-else",
+            fp::Direction::Read,
+            &names(&["id"]),
+            &names(&[]),
+            &names(&[]),
+            &names(&[]),
+            crate::db::repository::BusFieldPolicyExpect::Any,
+        )
+        .expect("rule for another subject");
+
+        let config = consume_config(&key, json!({}));
+        let dispatch: Arc<dyn ReactorFlowDispatch> = ActorSpy::new(false);
+        let status = StatusStore::default();
+        let after = run_cycle(&fx.svc, "flow-real-rules", &config, &dispatch, &status).await;
+        assert!(matches!(after, AfterFailure::Refused));
+        assert_eq!(
+            status_of(&status, "flow-real-rules"),
+            (ConsumerState::Refused, Some(reason::NEEDS_TOPIC_WIDE_RULE))
+        );
+        // The pre-start check sees the same without opening a consumer.
+        assert!(matches!(
+            precheck(&fx.db, &config, Some(&fx.svc)),
+            Err((reason::NEEDS_TOPIC_WIDE_RULE, _))
+        ));
+    }
+
+    /// `on_error = dlq` must work for a key too: it holds no right on the
+    /// reserved `__dlq.*` topic, so the broker writes the dead letter itself,
+    /// once the key's read right on the source was checked. This failed before
+    /// the broker did that.
+    #[tokio::test]
+    async fn real_authorizer_dlq_on_error_lands_the_record_in_the_dlq() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(
+            &fx,
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+
+        let spy = ActorSpy::new(true);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let status = StatusStore::default();
+        let config = consume_config(&key, json!({"on_error": "dlq"}));
+        let after = run_cycle(&fx.svc, "flow-real-dlq", &config, &dispatch, &status).await;
+        assert!(matches!(after, AfterFailure::Continue));
+
+        let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
+        let dlq_records =
+            fetch_once(&fx.svc, &test_ctx("org-default"), "dlq-reader", &dlq_topic).await;
+        assert_eq!(dlq_records.len(), 1, "the dead letter landed");
+        let group = format!("k:{key}.g1");
+        assert!(
+            fetch_once(&fx.svc, &key_ctx(&key), &group, "orders.raw")
+                .await
+                .is_empty(),
+            "the source offset moved past the poison record"
+        );
+    }
+
+    /// The broker's dead-letter write is no way for a key to write `__` topics
+    /// itself: asked directly, the key is still refused there.
+    #[tokio::test]
+    async fn real_authorizer_a_key_still_cannot_write_the_dlq_itself() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        topic_right(&fx.db, &key, "orders.raw", "read");
+        topic_right(&fx.db, &key, "orders.raw", "write");
+
+        let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
+        let svc = fx.svc.clone();
+        let ctx = key_ctx(&key);
+        let result = blocking(move || {
+            svc.publish(
+                &ctx,
+                &dlq_topic,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from_static(b"{}"),
+                        timestamp_ms: 0,
+                        schema_id: 0,
+                    }],
+                },
+            )
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(BusServiceError::PermissionDenied { .. })
+        ));
+    }
+
+    // ---- reconcile ---------------------------------------------------------
+
+    /// A legacy node (no service account) starts nothing and says why.
+    #[tokio::test]
+    async fn reconcile_refuses_a_flow_without_a_service_account() {
+        let fx = real_auth_bus_service();
+        let flow_id = seed_consume_flow(
+            &fx.db,
+            "legacy",
+            json!({"instance_id": REAL_INSTANCE, "topic": "orders.raw", "group": "g1"}),
+        );
+        let status = Arc::new(StatusStore::default());
+        let mut reactor =
+            BusReactor::with_status(fx.db.clone(), Arc::new(NoopDispatch), status.clone());
+        let svc = fx.svc.clone();
+        reactor.reconcile_with(&move |_| Some(svc.clone()));
+        assert!(reactor.running.is_empty());
+        assert_eq!(
+            status_of(&status, &flow_id),
+            (
+                ConsumerState::Refused,
+                Some(reason::SERVICE_ACCOUNT_MISSING)
+            )
+        );
+    }
+
+    /// A refused flow starts by itself once the right is granted, with no save.
+    #[tokio::test]
+    async fn reconcile_starts_a_refused_flow_once_the_right_is_granted() {
+        let fx = real_auth_bus_service();
+        real_topic_with_record(&fx, TopicOptions::default()).await;
+        let key = seed_general_key(&fx.db);
+        let flow_id = seed_consume_flow(
+            &fx.db,
+            "sa-flow",
+            json!({
+                "instance_id": REAL_INSTANCE, "service_account": key,
+                "topic": "orders.raw", "group": "g1"
+            }),
+        );
+        let status = Arc::new(StatusStore::default());
+        let mut reactor =
+            BusReactor::with_status(fx.db.clone(), Arc::new(NoopDispatch), status.clone());
+        let svc = fx.svc.clone();
+        let resolve = move |_: &BusInstanceId| Some(svc.clone());
+
+        reactor.reconcile_with(&resolve);
+        assert!(reactor.running.is_empty());
+        assert_eq!(
+            status_of(&status, &flow_id),
+            (ConsumerState::Refused, Some(reason::READ_DENIED))
+        );
+
+        topic_right(&fx.db, &key, "orders.raw", "read");
+        reactor.reconcile_with(&resolve);
+        assert!(reactor.running.contains_key(&flow_id));
+    }
+
+    /// A save bumps the flow version; a halted subscription stays stopped
+    /// until then, and a re-save with the very same config restarts it.
+    #[tokio::test]
+    async fn reconcile_restarts_a_halted_subscription_only_after_a_resave() {
+        let pool = db();
+        install_bus_instance(&pool, "tentabus-8b000008", true);
+        let key = seed_general_key(&pool);
+        let config = json!({
+            "instance_id": "tentabus-8b000008", "service_account": key,
+            "topic": "t", "group": "gg"
+        });
+        let flow_id = seed_consume_flow(&pool, "halting", config.clone());
+        let status = Arc::new(StatusStore::default());
+        let mut reactor =
+            BusReactor::with_status(pool.clone(), Arc::new(NoopDispatch), status.clone());
+
+        // Stand in for a task that ended on `on_error = halt`.
+        reactor.reconcile();
+        let flow = repository::get_flow(&pool, &flow_id).unwrap().unwrap();
+        let ended = tokio::spawn(async {});
+        while !ended.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        reactor.running.get_mut(&flow_id).unwrap().handle = AbortOnDropHandle::new(ended);
+        status.record(&flow_id, ConsumerState::Halted, None, None);
+
+        reactor.reconcile();
+        assert!(
+            reactor.running[&flow_id].handle.is_finished(),
+            "a halted subscription stays stopped while the flow is unchanged"
+        );
+
+        repository::update_flow(
+            &pool,
+            &flow_id,
+            flow.version,
+            &FlowParams {
+                name: "halting",
+                description: None,
+                is_default: false,
+                service_type: Some("chat"),
+                flow_json: &flow.flow_json,
+                status: "active",
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("re-save with the same config");
+        reactor.reconcile();
+        assert!(
+            !reactor.running[&flow_id].handle.is_finished(),
+            "a re-save restarts the subscription"
+        );
+    }
+
+    #[test]
+    fn flows_missing_service_account_names_only_bus_consume_flows_without_one() {
+        let consume = |config: serde_json::Value| {
+            json!({"nodes": [{"id": "c", "type": "bus_consume", "config": config}], "edges": []})
+                .to_string()
+        };
+        let flows = vec![
+            (
+                "none".to_string(),
+                consume(json!({"topic": "t", "group": "gg"})),
+            ),
+            (
+                "blank".to_string(),
+                consume(json!({"service_account": "  "})),
+            ),
+            (
+                "bound".to_string(),
+                consume(json!({"service_account": TEST_KEY_UID})),
+            ),
+            (
+                "other".to_string(),
+                json!({"nodes": [{"id": "t", "type": "trigger", "config": {}}], "edges": []})
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(flows_missing_service_account(&flows), vec!["none", "blank"]);
+    }
+
+    #[test]
+    fn a_repeated_status_logs_nothing_and_keeps_its_time() {
+        let store = StatusStore::default();
+        let first = store.set("f", ConsumerState::Refused, Some(reason::READ_DENIED), None);
+        assert!(first.changed);
+        let again = store.set("f", ConsumerState::Refused, Some(reason::READ_DENIED), None);
+        assert!(!again.changed);
+        let recovered = store.set("f", ConsumerState::Running, None, None);
+        assert!(recovered.changed && recovered.was_blocked);
     }
 }

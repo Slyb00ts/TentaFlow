@@ -1306,6 +1306,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::ServiceAccountListRequest (unit). */
+  serviceAccountListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = requests.encodeServiceAccountListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::ApiKeyScopeListRequest { keyUid } */
   apiKeyScopeListRequest(correlationId, { keyUid }, sequence = 1) {
     assertReady();

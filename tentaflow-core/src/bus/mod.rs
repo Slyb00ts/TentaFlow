@@ -8162,6 +8162,44 @@ impl BusService {
         }
     }
 
+    /// Whether `ctx` may consume `topic` under `group`: the instance, name and
+    /// authorizer checks `open_consumer` makes, plus (for an API key) the
+    /// field-policy lookup a fetch would fail on, with no side effect and no
+    /// audit row. It does not cover what only opening can tell (the topic
+    /// existing, the instance leading). For a supervisor that re-asks on a
+    /// timer (the flow reactor's pre-start check) and must neither open a
+    /// consumer nor fill the audit log.
+    pub fn check_consume_access(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        group: &str,
+    ) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        validate_group_name(group)?;
+        self.authorizer
+            .authorize_group(ctx, BusAction::Consume, topic, group)
+            .map_err(|_| deny(BusAction::Consume, topic))?;
+        // A key that meets data-hiding rules only for other subjects is
+        // refused at fetch time (`KeyNeedsTopicWideRule`); asking here lets a
+        // supervisor see it without opening a consumer.
+        if ctx.actor_kind == crate::auth::actor::ActorKind::ApiKey {
+            field_policies::resolve(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                topic,
+                field_policies::PolicySubject::Actor(
+                    ctx.actor_kind,
+                    ctx.actor.as_deref().unwrap_or(""),
+                ),
+                field_policies::Direction::Read,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Records one failed delivery attempt for (group, topic, partition,
     /// offset). Below `max_delivery_attempts` this only returns the retry
     /// backoff the caller should honor; at/above it, a copy of `record` is
@@ -8286,8 +8324,23 @@ impl BusService {
             &original,
         );
         let dlq_topic_name = dlq::dlq_topic_name(topic);
+        // The caller's Consume right on the source topic was verified above.
+        // A general API key holds no right on a reserved `__dlq.*` topic
+        // (`api_key_topic_allows` refuses every `__` topic), so the broker
+        // writes the dead letter itself, under the same internal context as
+        // the schema quarantine. It is a write to broker infrastructure that
+        // exists only on the strength of the key's own read right; the
+        // `bus.dlq.sent` audit row below still names the key.
+        let dead_letter_ctx = match ctx.actor_kind {
+            crate::auth::actor::ActorKind::ApiKey => BusCallContext {
+                actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+                actor_kind: crate::auth::actor::ActorKind::System,
+                ..ctx.clone()
+            },
+            _ => ctx.clone(),
+        };
         self.publish_dead_letter(
-            ctx,
+            &dead_letter_ctx,
             &dlq_topic_name,
             PublishBatch {
                 partition: None,

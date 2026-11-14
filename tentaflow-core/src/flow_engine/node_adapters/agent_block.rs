@@ -128,6 +128,12 @@ impl AgentNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("agent: SubflowRunner slot not wired"))?;
 
+        if crate::flow_engine::subflow_runner::is_bus_service_account_run(ctx) {
+            return Err(anyhow!(
+                "agent: an agent cannot run in a flow that runs as a service account"
+            ));
+        }
+
         let agent = service
             .get_agent(&agent_id)?
             .ok_or_else(|| anyhow!("agent: agent '{agent_id}' not found"))?;

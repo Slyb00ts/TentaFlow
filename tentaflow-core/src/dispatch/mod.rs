@@ -1723,6 +1723,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
         },
         MessageBody::Error(_) => "Error",
+        MessageBody::ServiceAccountListRequest => "ServiceAccountListRequest",
+        MessageBody::ServiceAccountListResponse { .. } => "ServiceAccountListResponse",
         MessageBody::ApiKeyScopeListRequest { .. } => "ApiKeyScopeListRequest",
         MessageBody::ApiKeyScopeListResponse { .. } => "ApiKeyScopeListResponse",
         MessageBody::ApiKeyScopeSetRequest { .. } => "ApiKeyScopeSetRequest",

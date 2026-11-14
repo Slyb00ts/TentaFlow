@@ -169,3 +169,75 @@ test('_bindAdvancedInputs writes pasted JSON to the node it was bound to', () =>
   raw.fire();
   assert.deepEqual(written, [['node-a', { topic: 'orders' }]]);
 });
+
+// ---------------------------------------------------------------------------
+// bus_consume runs as a service account: the picker lists active general keys,
+// and the author sees the consumer group the broker will really use.
+// ---------------------------------------------------------------------------
+
+function loaderWith(apiBinary) {
+  const fnSrc = cutMethod(source, 'async function loadDynamicEnumOptions(source, category) {');
+  // eslint-disable-next-line no-new-func
+  return new Function(
+    'ApiBinary', 'I18n', '_dynamicEnumCache', 'CV_SEED_ALIASES',
+    `${fnSrc}\nreturn loadDynamicEnumOptions;`,
+  )(apiBinary, { t: (key) => key }, new Map(), []);
+}
+
+test('bus_service_accounts loader asks the picker request and offers uid and name', async () => {
+  const calls = [];
+  const load = loaderWith({
+    list: async (kind, options) => {
+      calls.push([kind, options]);
+      return [{ keyId: 'k-1', name: 'Laboratorium LIS' }, { keyId: '', name: 'ignored' }, { keyId: 'k-2' }];
+    },
+  });
+  const options = await load('bus_service_accounts', '');
+  assert.deepEqual(calls, [['serviceAccountListRequest', { arrayKey: 'accounts' }]]);
+  assert.deepEqual(options, [
+    { value: 'k-1', label: 'Laboratorium LIS' },
+    { value: 'k-2', label: 'k-2' },
+  ]);
+});
+
+test('bus_service_accounts loader lets a failure through instead of showing an empty list', async () => {
+  const load = loaderWith({ list: async () => { throw new Error('denied'); } });
+  await assert.rejects(() => load('bus_service_accounts', ''), /denied/);
+});
+
+function busPanel(config) {
+  const effective = cutMethod(source, '_busEffectiveGroupText() {');
+  const note = cutMethod(source, '_renderBusConsumeNote(key) {');
+  // eslint-disable-next-line no-new-func
+  const methods = new Function(
+    'escapeHtml', 'escapeAttr', 'I18n',
+    `return { ${effective}, ${note} };`,
+  )(escapeHtml, escapeAttr, { t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key) });
+  return Object.assign(methods, { node: { type: 'bus_consume', config } });
+}
+
+test('the group line shows the key namespace plus the plain group', () => {
+  const panel = busPanel({ service_account: 'uid-1', group: 'billing' });
+  assert.equal(panel._busEffectiveGroupText(), 'flows_config.effective_group:{"group":"k:uid-1.billing"}');
+  assert.match(panel._renderBusConsumeNote('group'), /data-role="bus-effective-group"/);
+});
+
+test('the group line asks for a service account first while one is missing', () => {
+  const panel = busPanel({ group: 'billing' });
+  assert.equal(panel._busEffectiveGroupText(), 'flows_config.effective_group_pending');
+});
+
+test('the new-group warning starts hidden and remembers the account the node opened with', () => {
+  const panel = busPanel({ service_account: 'uid-1' });
+  const html = panel._renderBusConsumeNote('service_account');
+  assert.match(html, /flows_config\.service_account_new_group_warning/);
+  assert.match(html, /data-saved-account="uid-1"[^>]* hidden>/);
+});
+
+test('the service account field carries the warning, other fields and nodes carry nothing', () => {
+  const panel = busPanel({});
+  assert.match(panel._renderBusConsumeNote('service_account'), /flows_config\.service_account_new_group_warning/);
+  assert.equal(panel._renderBusConsumeNote('topic'), '');
+  panel.node = { type: 'bus_publish', config: {} };
+  assert.equal(panel._renderBusConsumeNote('group'), '');
+});

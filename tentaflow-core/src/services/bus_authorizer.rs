@@ -325,6 +325,33 @@ pub fn api_key_topic_allows(
     }
 }
 
+/// Why a general API key cannot act as a flow's service account, read from its
+/// key row alone (rights on topics are the authorizer's separate question).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAccountProblem {
+    NotFound,
+    /// A user- or group-bound key acts as its subject, which would bring that
+    /// subject's rights into the flow.
+    NotServiceKey,
+    Disabled,
+    LookupFailed,
+}
+
+/// `None` when `key_uid` is an existing, active, general key — the only kind
+/// a flow may run as (`api_key_topic_allows` demands the same).
+pub fn service_account_problem(db: &DbPool, key_uid: &str) -> Option<ServiceAccountProblem> {
+    match repository::get_api_key_by_uid(db, key_uid) {
+        Ok(None) => Some(ServiceAccountProblem::NotFound),
+        Ok(Some(key)) if key.key_type != "general" => Some(ServiceAccountProblem::NotServiceKey),
+        Ok(Some(key)) if !key.is_active => Some(ServiceAccountProblem::Disabled),
+        Ok(Some(_)) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "bus ACL: service account lookup failed");
+            Some(ServiceAccountProblem::LookupFailed)
+        }
+    }
+}
+
 /// Production `bus::BusAuthorizer` wired at `bus::init_instance` time —
 /// plan-app-platform §4.5. Named for what it now is: ONE TentaBus instance's
 /// authorizer, backed by the addon permission matrix rather than org-RBAC

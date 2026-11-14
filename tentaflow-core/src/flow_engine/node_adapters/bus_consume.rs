@@ -20,6 +20,8 @@ use async_trait::async_trait;
 
 use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
+use crate::bus::topics;
+use crate::bus::API_KEY_GROUP_PREFIX;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -113,7 +115,16 @@ pub struct ConsumeConfig {
     pub instance_id: BusInstanceId,
     pub org_id: String,
     pub topic: String,
+    /// Plain consumer-group name as the flow author typed it. What the broker
+    /// sees is `effective_group()`: the service account's own `k:` namespace
+    /// plus this name.
     pub group: String,
+    /// Uid of the general API key this subscription reads (and, downstream,
+    /// publishes) as. `None` only for a legacy node saved before the field
+    /// existed: the reactor reports such a flow as refused instead of
+    /// consuming. No default exists on purpose — a uid has no safe fallback,
+    /// and falling back to any identity would hand the flow someone's rights.
+    pub service_account: Option<String>,
     pub batch_size: u32,
     pub max_wait_ms: u32,
     pub commit_mode: CommitMode,
@@ -121,6 +132,15 @@ pub struct ConsumeConfig {
 }
 
 impl ConsumeConfig {
+    /// The consumer group the broker sees: `k:<service account uid>.<group>`,
+    /// the only namespace a general API key may consume under. `None` while no
+    /// service account is set.
+    pub fn effective_group(&self) -> Option<String> {
+        self.service_account
+            .as_deref()
+            .map(|uid| format!("{API_KEY_GROUP_PREFIX}{uid}.{}", self.group))
+    }
+
     /// Parses a `bus_consume` node's `config`. `topic` and `group` are
     /// required (a subscription addressing nothing, or committing offsets
     /// under no group, is a configuration mistake, not a wildcard) — every
@@ -153,6 +173,25 @@ impl ConsumeConfig {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("bus_consume requires a non-empty 'group'"))?
             .to_string();
+        // The group becomes the `.name` part of the key's consumer group, so
+        // it must satisfy the broker's group-name charset.
+        topics::validate_user_topic_name(&group)
+            .map_err(|e| anyhow!("bus_consume: invalid 'group' '{group}': {e}"))?;
+        let service_account = match config
+            .get("service_account")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(uid) if is_canonical_uuid(uid) => Some(uid.to_string()),
+            Some(_) => {
+                return Err(anyhow!(
+                    "bus_consume: 'service_account' must be the lowercase uid of a general \
+                     API key"
+                ));
+            }
+        };
         let org_id = config
             .get("org_id")
             .and_then(|v| v.as_str())
@@ -202,12 +241,18 @@ impl ConsumeConfig {
             org_id,
             topic,
             group,
+            service_account,
             batch_size,
             max_wait_ms,
             commit_mode,
             on_error,
         })
     }
+}
+
+/// The shape `bus::validate_group_name` requires of a key uid in a `k:` group.
+fn is_canonical_uuid(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok_and(|u| u.hyphenated().to_string() == s)
 }
 
 #[async_trait]
@@ -319,11 +364,11 @@ mod tests {
         )
         .is_err());
         assert!(ConsumeConfig::from_config(
-            &json!({"instance_id": TEST_INSTANCE_ID, "group": "g"})
+            &json!({"instance_id": TEST_INSTANCE_ID, "group": "gg"})
         )
         .is_err());
         assert!(ConsumeConfig::from_config(
-            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"})
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg"})
         )
         .is_ok());
     }
@@ -333,31 +378,86 @@ mod tests {
     /// malformed and foreign-package ids must all be rejected.
     #[test]
     fn config_requires_instance_id() {
-        let err = ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).unwrap_err();
+        let err = ConsumeConfig::from_config(&json!({"topic": "t", "group": "gg"})).unwrap_err();
         assert!(err.to_string().contains("instance_id"));
 
         let err =
-            ConsumeConfig::from_config(&json!({"instance_id": "", "topic": "t", "group": "g"}))
+            ConsumeConfig::from_config(&json!({"instance_id": "", "topic": "t", "group": "gg"}))
                 .unwrap_err();
         assert!(err.to_string().contains("instance_id"));
 
         let err = ConsumeConfig::from_config(
-            &json!({"instance_id": "not-a-valid-id", "topic": "t", "group": "g"}),
+            &json!({"instance_id": "not-a-valid-id", "topic": "t", "group": "gg"}),
         )
         .unwrap_err();
         assert!(err.to_string().contains("bus instance id"));
 
         let ok = ConsumeConfig::from_config(
-            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"}),
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg"}),
         )
         .unwrap();
         assert_eq!(ok.instance_id.as_str(), TEST_INSTANCE_ID);
     }
 
+    const TEST_KEY_UID: &str = "0b9e6a6e-7f0c-4a53-9d1a-3a1f2f6c8b11";
+
+    fn config_with(extra: serde_json::Value) -> anyhow::Result<ConsumeConfig> {
+        let mut config = json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        ConsumeConfig::from_config(&config)
+    }
+
+    #[test]
+    fn service_account_is_optional_when_parsing() {
+        assert_eq!(config_with(json!({})).unwrap().service_account, None);
+        assert_eq!(
+            config_with(json!({"service_account": "  "}))
+                .unwrap()
+                .service_account,
+            None
+        );
+        assert_eq!(config_with(json!({})).unwrap().effective_group(), None);
+    }
+
+    #[test]
+    fn service_account_must_be_a_canonical_lowercase_uuid() {
+        let ok = config_with(json!({"service_account": TEST_KEY_UID})).unwrap();
+        assert_eq!(ok.service_account.as_deref(), Some(TEST_KEY_UID));
+        for bad in [
+            "not-a-uuid",
+            "0B9E6A6E-7F0C-4A53-9D1A-3A1F2F6C8B11",
+            "0b9e6a6e7f0c4a539d1a3a1f2f6c8b11",
+        ] {
+            let err = config_with(json!({"service_account": bad})).unwrap_err();
+            assert!(err.to_string().contains("service_account"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn effective_group_is_the_key_namespace_plus_the_plain_group() {
+        let c = config_with(json!({"service_account": TEST_KEY_UID, "group": "billing"})).unwrap();
+        assert_eq!(c.group, "billing");
+        assert_eq!(
+            c.effective_group().unwrap(),
+            format!("k:{TEST_KEY_UID}.billing")
+        );
+    }
+
+    #[test]
+    fn config_rejects_a_group_outside_the_broker_charset() {
+        for bad in ["bad group", "a:b", "k:x", "../x"] {
+            let err = config_with(json!({"group": bad})).unwrap_err();
+            assert!(err.to_string().contains("group"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn config_defaults() {
         let c = ConsumeConfig::from_config(
-            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"}),
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg"}),
         )
         .unwrap();
         assert_eq!(c.org_id, DEFAULT_ORG_ID);
@@ -370,7 +470,7 @@ mod tests {
     #[test]
     fn config_clamps_batch_size_and_overrides() {
         let c = ConsumeConfig::from_config(&json!({
-            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g", "batch_size": 5000,
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg", "batch_size": 5000,
             "org_id": "org-2", "commit_mode": "at_most_once", "on_error": "halt",
         }))
         .unwrap();
@@ -387,7 +487,7 @@ mod tests {
     #[test]
     fn config_rejects_explicit_commit_mode() {
         let err = ConsumeConfig::from_config(&json!({
-            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g",
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg",
             "commit_mode": "explicit"
         }))
         .unwrap_err()
@@ -406,7 +506,7 @@ mod tests {
             ("at_most_once", CommitMode::AtMostOnce),
         ] {
             let c = ConsumeConfig::from_config(&json!({
-                "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g",
+                "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg",
                 "commit_mode": mode
             }))
             .unwrap();
@@ -417,7 +517,7 @@ mod tests {
     #[test]
     fn config_rejects_unknown_on_error() {
         let err = ConsumeConfig::from_config(&json!({
-            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g", "on_error": "bogus"
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "gg", "on_error": "bogus"
         }))
         .unwrap_err();
         assert!(err.to_string().contains("on_error"));

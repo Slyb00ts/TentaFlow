@@ -708,6 +708,13 @@
   text-overflow: ellipsis;
 }
 .fb-node-row .fb-val.missing { color: var(--tf-danger, #ef4444); }
+/* Consumer state of a bus_consume flow: only a state that needs attention is coloured. */
+.fb-node-consumer .fb-key { font-weight: 600; }
+.fb-node-consumer[data-state="refused"] .fb-key,
+.fb-consumer-banner[data-state="refused"] { color: var(--tf-warning, #d9a300); }
+.fb-node-consumer[data-state="halted"] .fb-key,
+.fb-consumer-banner[data-state="halted"] { color: var(--tf-danger, #ef4444); }
+.fb-consumer-banner { font-size: 12px; font-weight: 600; }
 
 /* Porty */
 .fb-port {

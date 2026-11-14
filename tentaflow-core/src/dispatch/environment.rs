@@ -729,13 +729,19 @@ pub fn environment_import_apply(
         .router
         .flow_dispatcher()
         .map(|d| d.registry().as_ref());
+    // A flow that reads the bus as a service account is checked the way a
+    // save checks it; one that fails is imported as a draft.
+    let mut bundle = pending.bundle.clone();
+    let imported_bindings =
+        super::handlers::screen_imported_flows(ctx, &mut bundle, &payload.selected_resource_keys);
     let result = config_bundle::apply_bundle(
         &ctx.state.db,
-        &pending.bundle,
+        &bundle,
         &payload.selected_resource_keys,
         registry,
     )
     .map_err(|e| ProtocolError::bad_request(format!("apply failed: {e}")))?;
+    super::handlers::audit_imported_bindings(ctx, &imported_bindings);
 
     let donor_node_id = pending.donor_node_id.clone();
     let from_file = pending.from_file;

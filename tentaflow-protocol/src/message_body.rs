@@ -959,6 +959,37 @@ pub struct FlowSummary {
     /// `FlowFactoryRestoreRequest`.
     #[serde(default)]
     pub is_factory: bool,
+    /// State of the flow's TentaBus consumer on the answering node; `None`
+    /// for a flow with no `bus_consume` entry that node's reactor knows of.
+    #[serde(default)]
+    pub bus_consumer: Option<BusConsumerStatus>,
+}
+
+/// Where a `bus_consume` flow's consumer stands on one node (`bus::reactor`).
+/// Per node: refusals come from replicated data and read the same everywhere,
+/// only "not leader" differs, which is why the node is named.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusConsumerStatus {
+    /// "running" | "waiting" | "refused" | "halted".
+    pub state: String,
+    /// Stable machine reason, e.g. "service_account_missing", "read_denied",
+    /// "not_leader"; absent while running or halted.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Unix seconds when `state`/`reason` last changed.
+    pub since_epoch: u64,
+    /// Node the status was read on.
+    pub node_id: String,
+}
+
+/// One entry of the Flow Builder's service-account picker: an active general
+/// API key, by uid and name only — never a token, verifier or rights.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAccountOption {
+    pub key_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -980,6 +1011,9 @@ pub struct FlowDetail {
     /// `FlowFactoryRestoreRequest`.
     #[serde(default)]
     pub is_factory: bool,
+    /// See `FlowSummary::bus_consumer`.
+    #[serde(default)]
+    pub bus_consumer: Option<BusConsumerStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -8741,6 +8775,14 @@ pub enum MessageBody {
     AddonRequirementInstallRequestBody(AddonRequirementInstallRequest),
     AddonRequirementInstallResponseBody(AddonRequirementInstallResponse),
     ProcessBody(crate::processes::ProcessPayload),
+    // ----- Service-account picker (Flow Builder, PowerUser) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). The
+    // full key list is Admin-only; a PowerUser binding a `bus_consume` node
+    // needs only which general keys exist.
+    ServiceAccountListRequest,
+    ServiceAccountListResponse {
+        accounts: Vec<ServiceAccountOption>,
+    },
 }
 
 // =============================================================================
@@ -10391,6 +10433,65 @@ mod tests {
         value["is_factory"] = serde_json::Value::Bool(true);
         let summary: FlowSummary = serde_json::from_value(value).expect("decode");
         assert!(summary.is_factory);
+    }
+
+    /// `bus_consumer` was appended with `#[serde(default)]`: a peer that omits
+    /// it (an older node) decodes to `None`, and a present status survives a
+    /// CBOR round trip on both the list and the detail record.
+    #[test]
+    fn flow_records_carry_an_optional_bus_consumer_status() {
+        let summary_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+            "updated_at_epoch": 2, "enabled": true,
+        });
+        let summary: FlowSummary = serde_json::from_value(summary_json).expect("decode");
+        assert_eq!(summary.bus_consumer, None);
+        let detail_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "graph_json": "{}",
+            "enabled": true, "status": "active",
+        });
+        let detail: FlowDetail = serde_json::from_value(detail_json).expect("decode");
+        assert_eq!(detail.bus_consumer, None);
+
+        let status = BusConsumerStatus {
+            state: "refused".to_string(),
+            reason: Some("service_account_missing".to_string()),
+            detail: None,
+            since_epoch: 1_700_000_000,
+            node_id: "node-1".to_string(),
+        };
+        let body = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                bus_consumer: Some(status.clone()),
+                ..summary
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+        let detail = MessageBody::FlowDetailResponse(FlowDetail {
+            bus_consumer: Some(status),
+            ..detail
+        });
+        let bytes = crate::cbor::encode(&detail).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, detail);
+    }
+
+    #[test]
+    fn service_account_picker_round_trips() {
+        let body = MessageBody::ServiceAccountListResponse {
+            accounts: vec![ServiceAccountOption {
+                key_id: "k-1".to_string(),
+                name: "Laboratorium LIS".to_string(),
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+        let request = crate::cbor::encode(&MessageBody::ServiceAccountListRequest).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&request).expect("decode");
+        assert_eq!(decoded, MessageBody::ServiceAccountListRequest);
     }
 
     #[test]

@@ -229,9 +229,10 @@ pub enum FlowOrigin {
     System,
     /// TentaBus reactor (`bus::reactor`) — a flow whose entry is `bus_consume`,
     /// dispatched in the background when new records land on its subscribed
-    /// topic/group. The message carries no human/service identity, so the run
-    /// acts under `FlowActor::system()`; this origin is what distinguishes it
-    /// in the event log from `System`'s other internal-work callers.
+    /// topic/group. The message carries no identity, so the run acts as the
+    /// flow's bound service account (`FlowActor::api_key`, no user); this
+    /// origin is what distinguishes it in the event log from `System`'s other
+    /// internal-work callers.
     Bus,
     /// BPMN process engine — a Service task running an addon tool (and later
     /// other implementations) as the instance initiator. The actor names the

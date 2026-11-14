@@ -212,6 +212,7 @@ const FlowBuilderScreen = {
         if (!this._current(state)) return;
         state.flow = { id: detail.id, name: detail.name, description: detail.description ?? null,
           flow_json: detail.graphJson ?? '{"nodes":[],"edges":[]}', status: detail.status ?? (detail.enabled ? 'active' : 'draft') };
+        state.busConsumer = detail.busConsumer ?? null;
         state.readOnly = !!detail.isSystem;
       }
     } catch (err) {
@@ -304,6 +305,7 @@ const FlowBuilderScreen = {
     state.canvas.setTemplates(state.palette.getTemplates());
     if (state.mode === 'bpmn') state.canvas.setData(parsed);
     else state.canvas.setData(parsed.nodes || [], parsed.edges || []);
+    if (state.mode !== 'bpmn') state.canvas.setBusConsumer(state.busConsumer ?? null);
     if (state.mode === 'bpmn') {
       this._syncProcessBodySelect();
       this._syncStartCatalog();
@@ -334,6 +336,7 @@ const FlowBuilderScreen = {
       // Lets the config panel ask the live graph for a node's loop-region role
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
+      getBusConsumer: () => state.busConsumer ?? null,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : [])
         .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: processDiagnosticDetail(diagnostic) })),

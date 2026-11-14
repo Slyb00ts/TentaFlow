@@ -10,6 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
+import { busConsumerText } from '/js/modules/flows-builder/bus-consumer.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
@@ -258,9 +259,23 @@ async function loadDynamicEnumOptions(source, category) {
         }))
         .filter((o) => o.value);
     }
+    if (source === 'bus_service_accounts') {
+      // Service-account picker of a `bus_consume` node: the active general API
+      // keys, by uid and name (`ServiceAccountListRequest`, PowerUser — the full
+      // key list is Admin-only and carries far more than a picker needs). A
+      // failed call is NOT turned into an empty list: the field then says the
+      // accounts could not be loaded instead of "no keys". A saved uid that is
+      // no longer offered falls into the "stale value" branch above.
+      const accounts = await ApiBinary.list('serviceAccountListRequest', { arrayKey: 'accounts' });
+      return (Array.isArray(accounts) ? accounts : [])
+        .map((a) => ({ value: String(a.keyId ?? ''), label: String(a.name || a.keyId || '') }))
+        .filter((o) => o.value);
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);
+  // A failed load must not stay cached for the whole session.
+  promise.catch(() => _dynamicEnumCache.delete(key));
   return promise;
 }
 
@@ -1969,7 +1984,8 @@ export class FlowConfig {
     const keys = schema.order && schema.order.length ? schema.order : Object.keys(props);
 
     const labelVal = isAutoNodeLabel(n.label, n.type, this.template?.label) ? '' : (n.label || '');
-    let html = `
+    let html = this._renderBusConsumerBanner();
+    html += `
       <div class="fb-field">
         <tf-input data-bind="label" data-type="string" label="${escapeAttr(I18n.t('flows_config.name'))}" value="${escapeAttr(labelVal)}" placeholder="${escapeAttr(getNodeName(n.type, this.template?.label))}"></tf-input>
       </div>
@@ -1987,6 +2003,7 @@ export class FlowConfig {
       if (!def) continue;
       const value = n.config?.[key];
       html += this._renderField(key, def, value, required.includes(key));
+      html += this._renderBusConsumeNote(key);
     }
 
     for (const f of harness) {
@@ -2028,6 +2045,39 @@ export class FlowConfig {
       </div>
     `;
     return html;
+  }
+
+  // `bus_consume` runs as a service account: its consumer group is that key's
+  // own `k:<uid>.<group>`, and the group a flow reads from is new whenever the
+  // account is. The author types the plain group; both facts are shown here
+  // instead of left to be discovered in TentaBus.
+  _busEffectiveGroupText() {
+    const cfg = this.node?.config || {};
+    const uid = String(cfg.service_account || '').trim();
+    const group = String(cfg.group || '').trim();
+    if (!uid || !group) return I18n.t('flows_config.effective_group_pending');
+    return I18n.t('flows_config.effective_group', { group: `k:${uid}.${group}` });
+  }
+
+  _renderBusConsumeNote(key) {
+    if (this.node?.type !== 'bus_consume') return '';
+    if (key === 'group') {
+      return `<div class="fb-field-hint" data-role="bus-effective-group">${escapeHtml(this._busEffectiveGroupText())}</div>`;
+    }
+    if (key === 'service_account') {
+      // Hidden until the account differs from the one the node opened with: a
+      // flow reading under an unchanged account keeps its group and position.
+      const saved = String(this.node?.config?.service_account || '').trim();
+      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" data-saved-account="${escapeAttr(saved)}" hidden>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
+    }
+    return '';
+  }
+
+  _renderBusConsumerBanner() {
+    if (this.node?.type !== 'bus_consume') return '';
+    const info = busConsumerText(this.opts.getBusConsumer?.());
+    if (!info) return '';
+    return `<div class="fb-field fb-consumer-banner" data-state="${escapeAttr(info.state)}" role="status">${escapeHtml(info.detail)}</div>`;
   }
 
   _renderField(key, def, value, isRequired) {
@@ -2214,6 +2264,14 @@ export class FlowConfig {
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
         this.opts.onConfigChange?.(node.id, { [key]: v });
         this._refreshPreview();
+        if (node.type === 'bus_consume' && (key === 'group' || key === 'service_account')) {
+          const line = body.querySelector('[data-role="bus-effective-group"]');
+          if (line) line.textContent = this._busEffectiveGroupText();
+          const warning = body.querySelector('[data-role="bus-new-group-warning"]');
+          if (warning && key === 'service_account') {
+            warning.hidden = String(v || '').trim() === warning.dataset.savedAccount;
+          }
+        }
       });
     });
 
@@ -2228,7 +2286,14 @@ export class FlowConfig {
       try {
         const opts = await loadDynamicEnumOptions(source, category);
         if (!opts.length) {
-          sel.setOptions([{ value: '', label: I18n.t('flows_config.dynamic_empty', { source, category }), disabled: true }], '');
+          const label = source === 'bus_service_accounts'
+            ? I18n.t('flows_config.service_account_none')
+            : I18n.t('flows_config.dynamic_empty', { source, category });
+          const rows = [{ value: '', label, disabled: true }];
+          // The bound key stays visible and selected even when the list is
+          // empty, so a hidden picker never reads as "no account".
+          if (currentValue) rows.push({ value: currentValue, label: I18n.t('flows_config.dynamic_stale', { value: currentValue }) });
+          sel.setOptions(rows, currentValue || '');
           return;
         }
         const list = [{ value: '', label: I18n.t('flows_config.select_placeholder') }, ...opts];
@@ -2241,6 +2306,11 @@ export class FlowConfig {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(`[fb-config] dynamic_enum load failed for ${source}:${category}:`, err);
+        if (source === 'bus_service_accounts') {
+          const rows = [{ value: '', label: I18n.t('flows_config.service_account_load_failed'), disabled: true }];
+          if (currentValue) rows.push({ value: currentValue, label: I18n.t('flows_config.dynamic_stale', { value: currentValue }) });
+          sel.setOptions(rows, currentValue || '');
+        }
       }
     });
   }

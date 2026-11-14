@@ -6,6 +6,13 @@
 //! stamped with the run's organisation. The Events browser org pin itself is
 //! tested in `dispatch/events_browser.rs`.
 //!
+//! The engine runs behind the PRODUCTION `InstanceBusAuthorizer`, and each flow
+//! runs as its own service account (a general API key): K1 reads A and writes B,
+//! K2 reads B and writes C, each holding exactly those rights. Behind an
+//! allow-all authorizer this chain passed while no `bus_consume` flow could read
+//! at all in the running app. A second test takes K1's right to write B away and
+//! expects F1's run to fail at `bus_publish`, with nothing reaching B.
+//!
 //! The entry record is published the way `api::bus_rest` does it: the request's
 //! id becomes `BusCallContext::correlation_id` and `bus::correlation::
 //! settle_records` settles the records. The REST handler itself is driven by
@@ -28,6 +35,7 @@ use bytes::Bytes;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::agents::{
     bus_source_of, reactive_run_meta, AgentPrincipal, ReactorFlowDispatch,
 };
@@ -46,6 +54,7 @@ use tentaflow_core::flow_engine::node_adapter::test_support::stub_ctx;
 use tentaflow_core::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext};
 use tentaflow_core::flow_engine::node_adapters::{BusConsumeNodeAdapter, BusPublishNodeAdapter};
 use tentaflow_core::flow_engine::progress_broker::{begin_run, RunDescriptor};
+use tentaflow_core::services::bus_authorizer::{topic_acl_resource_id, InstanceBusAuthorizer};
 
 const ORG_ID: &str = "org-default";
 const OTHER_ORG_ID: &str = "org-other";
@@ -53,61 +62,51 @@ const CORRELATION_ID: &str = "req-tb02-chain-1";
 const TOPIC_A: &str = "tb02.a";
 const TOPIC_B: &str = "tb02.b";
 const TOPIC_C: &str = "tb02.c";
-
-struct AllowAllAuthorizer;
-
-impl bus::BusAuthorizer for AllowAllAuthorizer {
-    fn authorize(
-        &self,
-        _ctx: &BusCallContext,
-        _action: BusAction,
-        _topic: &str,
-    ) -> Result<(), BusServiceError> {
-        Ok(())
-    }
-    fn authorize_group(
-        &self,
-        _ctx: &BusCallContext,
-        _action: BusAction,
-        _topic: &str,
-        _group: &str,
-    ) -> Result<(), BusServiceError> {
-        Ok(())
-    }
-    fn generation(&self) -> u64 {
-        0
-    }
-}
+const GATE_USER: &str = "tb02-gate";
 
 fn instance_id() -> bus::instance::BusInstanceId {
     bus::instance::BusInstanceId::parse("tentabus-00000001").expect("valid instance id")
 }
 
-fn bus_service() -> Arc<BusService> {
-    bus::instance(&instance_id()).expect("bus initialized")
+/// The negative test's own engine: the process registry holds both.
+fn denied_instance_id() -> bus::instance::BusInstanceId {
+    bus::instance::BusInstanceId::parse("tentabus-00000002").expect("valid instance id")
 }
 
-fn call_ctx(correlation_id: Option<&str>) -> BusCallContext {
+fn bus_service(inst: &bus::instance::BusInstanceId) -> Arc<BusService> {
+    bus::instance(inst).expect("bus initialized")
+}
+
+fn call_ctx(inst: &bus::instance::BusInstanceId, correlation_id: Option<&str>) -> BusCallContext {
     BusCallContext {
-        instance_id: instance_id(),
+        instance_id: inst.clone(),
         org_id: ORG_ID.to_string(),
-        actor: Some("tb02-gate".to_string()),
+        actor: Some(GATE_USER.to_string()),
         actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: correlation_id.map(str::to_string),
         origin: "v1.bus.rest".to_string(),
     }
 }
 
-fn init_bus(bus_dir: std::path::PathBuf, db: DbPool) {
+/// Starts an engine behind the production authorizer. `GATE_USER` holds every
+/// bus matrix permission (it creates the topics and reads them back); the flows'
+/// service accounts hold only what `grant_key` gives them.
+fn init_bus(inst: &bus::instance::BusInstanceId, bus_dir: std::path::PathBuf, db: DbPool) {
     let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
     bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
+    let checker = Arc::new(PermissionChecker::new(db.clone()));
+    for perm in ["bus.read", "bus.write", "bus.admin"] {
+        repository::upsert_permission(&db, inst.as_str(), "user", GATE_USER, perm, "allow", None)
+            .expect("grant matrix permission");
+    }
+    checker.refresh_addon(inst.as_str());
     bus::init(BusInitConfig {
-        instance_id: instance_id(),
+        instance_id: inst.clone(),
         local_db,
         bus_dir,
+        authorizer: Arc::new(InstanceBusAuthorizer::new(db.clone(), inst.clone(), checker)),
         db,
-        authorizer: Arc::new(AllowAllAuthorizer),
         retention_interval: None,
         dedup_expected_rate_per_sec: 10_000,
         partition_handle_lru: None,
@@ -121,14 +120,47 @@ fn init_bus(bus_dir: std::path::PathBuf, db: DbPool) {
 
 /// The reactor skips a subscription whose instance has no enabled `addons`
 /// row (see `bus_flow_chain_p11_gate.rs`).
-fn enable_bus_instance(db: &DbPool) {
+fn enable_bus_instance(inst: &bus::instance::BusInstanceId, db: &DbPool) {
     let conn = db.write().expect("db lock");
     conn.execute(
         "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
          VALUES (?1, ?1, '1.0.0', 'tentabus', 1)",
-        rusqlite::params![instance_id().as_str()],
+        rusqlite::params![inst.as_str()],
     )
     .expect("seed bus instance row");
+}
+
+/// A general API key holding `read`/`write` on the given topics (and nothing
+/// else); returns its uid.
+fn service_account(
+    db: &DbPool,
+    inst: &bus::instance::BusInstanceId,
+    name: &str,
+    rights: &[(&str, &str)],
+) -> String {
+    let (_, uid) = repository::create_api_key(
+        db,
+        &format!("verifier-{name}"),
+        "sk-...tb02",
+        name,
+        "general",
+        None,
+        60,
+    )
+    .expect("create key");
+    for (topic, action) in rights {
+        repository::resource_permissions::set_with_action(
+            db,
+            "topic",
+            &topic_acl_resource_id(inst.as_str(), ORG_ID, topic),
+            "api_key",
+            &uid,
+            action,
+            "allow",
+        )
+        .expect("grant key right");
+    }
+    uid
 }
 
 fn create_topic(svc: &BusService, ctx: &BusCallContext, name: &str) {
@@ -144,11 +176,19 @@ fn create_topic(svc: &BusService, ctx: &BusCallContext, name: &str) {
 }
 
 /// `bus_consume(from) -> bus_publish(to)`, one record per run.
-fn seed_relay_flow(db: &DbPool, name: &str, from: &str, to: &str, group: &str) -> (String, String) {
+fn seed_relay_flow(
+    inst: &bus::instance::BusInstanceId,
+    db: &DbPool,
+    name: &str,
+    (from, to): (&str, &str),
+    group: &str,
+    account: &str,
+) -> (String, String) {
     let flow_json = json!({
         "nodes": [
             {"id": "c", "type": "bus_consume", "config": {
-                "instance_id": instance_id().as_str(),
+                "instance_id": inst.as_str(),
+                "service_account": account,
                 "topic": from,
                 "group": group,
                 "batch_size": 1,
@@ -157,7 +197,7 @@ fn seed_relay_flow(db: &DbPool, name: &str, from: &str, to: &str, group: &str) -
                 "org_id": ORG_ID,
             }},
             {"id": "p", "type": "bus_publish", "config": {
-                "instance_id": instance_id().as_str(),
+                "instance_id": inst.as_str(),
                 "topic": to,
             }}
         ],
@@ -246,10 +286,15 @@ impl ReactorFlowDispatch for RelayDispatch {
 }
 
 /// Every record currently on `topic` as `(payload, tf.correlation_id)`.
-fn read_topic(svc: &BusService, topic: &str, group: &str) -> Vec<(Bytes, Option<String>)> {
+fn read_topic(
+    svc: &BusService,
+    inst: &bus::instance::BusInstanceId,
+    topic: &str,
+    group: &str,
+) -> Vec<(Bytes, Option<String>)> {
     let handle = svc
         .open_consumer(
-            &call_ctx(None),
+            &call_ctx(inst, None),
             group,
             &[topic.to_string()],
             ConsumerConfig {
@@ -276,19 +321,36 @@ fn read_topic(svc: &BusService, topic: &str, group: &str) -> Vec<(Bytes, Option<
 async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("init db");
-    enable_bus_instance(&db);
+    let inst = instance_id();
+    enable_bus_instance(&inst, &db);
     let events_pool = events::db::init(&tmp.path().join("events.db")).expect("events db");
     events::progress_log::start(events_pool.clone(), db.clone());
 
     {
-        let (db, bus_dir) = (db.clone(), tmp.path().join("bus"));
-        tokio::task::spawn_blocking(move || init_bus(bus_dir, db))
+        let (db, bus_dir, inst) = (db.clone(), tmp.path().join("bus"), inst.clone());
+        tokio::task::spawn_blocking(move || init_bus(&inst, bus_dir, db))
             .await
             .expect("init_bus task");
     }
 
-    let (f1, f1_json) = seed_relay_flow(&db, "tb02-f1", TOPIC_A, TOPIC_B, "tb02-g1");
-    let (f2, f2_json) = seed_relay_flow(&db, "tb02-f2", TOPIC_B, TOPIC_C, "tb02-g2");
+    // Topics first: creating one clears the access entries keyed by its name,
+    // so the keys' rights are granted after.
+    {
+        let inst = inst.clone();
+        tokio::task::spawn_blocking(move || {
+            let svc = bus_service(&inst);
+            for topic in [TOPIC_A, TOPIC_B, TOPIC_C] {
+                create_topic(&svc, &call_ctx(&inst, None), topic);
+            }
+        })
+        .await
+        .expect("create topics task");
+    }
+    // Each flow runs as its own key, holding exactly what its flow needs.
+    let k1 = service_account(&db, &inst, "tb02-k1", &[(TOPIC_A, "read"), (TOPIC_B, "write")]);
+    let k2 = service_account(&db, &inst, "tb02-k2", &[(TOPIC_B, "read"), (TOPIC_C, "write")]);
+    let (f1, f1_json) = seed_relay_flow(&inst, &db, "tb02-f1", (TOPIC_A, TOPIC_B), "tb02-g1", &k1);
+    let (f2, f2_json) = seed_relay_flow(&inst, &db, "tb02-f2", (TOPIC_B, TOPIC_C), "tb02-g2", &k2);
     let mut compiled = HashMap::new();
     for (id, json) in [(&f1, &f1_json), (&f2, &f2_json)] {
         compiled.insert(
@@ -299,12 +361,10 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
 
     // The entry record, published the way the REST handler does.
     {
-        let rest_ctx = call_ctx(Some(CORRELATION_ID));
+        let inst = inst.clone();
+        let rest_ctx = call_ctx(&inst, Some(CORRELATION_ID));
         tokio::task::spawn_blocking(move || {
-            let svc = bus_service();
-            for topic in [TOPIC_A, TOPIC_B, TOPIC_C] {
-                create_topic(&svc, &call_ctx(None), topic);
-            }
+            let svc = bus_service(&inst);
             let mut records = vec![PublishRecord {
                 key: None,
                 headers: vec![],
@@ -345,10 +405,14 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     // runs every 5 s).
     let deadline = Instant::now() + Duration::from_secs(90);
     let on_c = loop {
-        let on_c =
-            tokio::task::spawn_blocking(|| read_topic(&bus_service(), TOPIC_C, "tb02-verify-c"))
-                .await
-                .expect("read C");
+        let on_c = {
+            let inst = inst.clone();
+            tokio::task::spawn_blocking(move || {
+                read_topic(&bus_service(&inst), &inst, TOPIC_C, "tb02-verify-c")
+            })
+            .await
+            .expect("read C")
+        };
         if !on_c.is_empty() {
             break on_c;
         }
@@ -360,15 +424,30 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     };
     cancel.cancel();
 
-    let (on_a, on_b) = tokio::task::spawn_blocking(|| {
-        let svc = bus_service();
-        (
-            read_topic(&svc, TOPIC_A, "tb02-verify-a"),
-            read_topic(&svc, TOPIC_B, "tb02-verify-b"),
-        )
-    })
+    let (on_a, on_b) = {
+        let inst = inst.clone();
+        tokio::task::spawn_blocking(move || {
+            let svc = bus_service(&inst);
+            (
+                read_topic(&svc, &inst, TOPIC_A, "tb02-verify-a"),
+                read_topic(&svc, &inst, TOPIC_B, "tb02-verify-b"),
+            )
+        })
+    }
     .await
     .expect("read A and B");
+
+    // The run carried the service account, not the system or a user: the rows
+    // name `api_key:<uid>`-style actors.
+    for (flow_id, key) in [(&f1, &k1), (&f2, &k2)] {
+        let rows = repository::list_flow_executions_for_flow(&db, flow_id, 10).expect("rows");
+        assert!(
+            rows.iter().all(|r| {
+                r.actor_kind.as_deref() == Some("api_key") && r.actor_id.as_deref() == Some(key)
+            }),
+            "flow {flow_id} ran as its service account: {rows:?}"
+        );
+    }
     for (name, records) in [("A", &on_a), ("B", &on_b), ("C", &on_c)] {
         assert_eq!(records.len(), 1, "topic {name}");
         assert_eq!(
@@ -457,7 +536,7 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     for event in browse(ORG_ID).events {
         if let EventPayload::RequestStarted { bus_source, .. } = event.payload {
             let source = bus_source.expect("a reactor run records its trigger");
-            assert_eq!(source.instance_id.as_deref(), Some(instance_id().as_str()));
+            assert_eq!(source.instance_id.as_deref(), Some(inst.as_str()));
             sources.push((source.topic, source.partition, source.offset));
         }
     }
@@ -474,4 +553,101 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
         .map(|e| e.run_id)
         .collect();
     assert_eq!(foreign, vec!["run-foreign".to_string()]);
+}
+
+/// The service account's rights, not the flow's wiring, decide what a run may
+/// publish: K1 may read A but holds no write right on B, so F1's run fails at
+/// `bus_publish` and nothing reaches B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flow_cannot_publish_where_its_service_account_may_not_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("init db");
+    let inst = denied_instance_id();
+    enable_bus_instance(&inst, &db);
+    {
+        let (db, bus_dir, inst) = (db.clone(), tmp.path().join("bus"), inst.clone());
+        tokio::task::spawn_blocking(move || init_bus(&inst, bus_dir, db))
+            .await
+            .expect("init_bus task");
+    }
+    // Topics first: creating one clears the access entries keyed by its name,
+    // so the keys' rights are granted after.
+    {
+        let inst = inst.clone();
+        tokio::task::spawn_blocking(move || {
+            let svc = bus_service(&inst);
+            for topic in [TOPIC_A, TOPIC_B] {
+                create_topic(&svc, &call_ctx(&inst, None), topic);
+            }
+        })
+        .await
+        .expect("create topics task");
+    }
+    let k1 = service_account(&db, &inst, "tb02-k1-readonly", &[(TOPIC_A, "read")]);
+    let (f1, f1_json) = seed_relay_flow(&inst, &db, "tb02-f1-denied", (TOPIC_A, TOPIC_B), "tb02-g1", &k1);
+    let mut compiled = HashMap::new();
+    compiled.insert(
+        f1.clone(),
+        Arc::new(CompiledFlow::from_json(&f1, &f1_json, &registry()).expect("compile flow")),
+    );
+    {
+        let inst = inst.clone();
+        tokio::task::spawn_blocking(move || {
+            let svc = bus_service(&inst);
+            svc.publish(
+                &call_ctx(&inst, Some("req-tb02-denied")),
+                TOPIC_A,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(json!({"order": 8}).to_string()),
+                        timestamp_ms: 1,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish A");
+        })
+        .await
+        .expect("setup task");
+    }
+
+    let mut base_ctx = stub_ctx();
+    base_ctx.org_id = Some(ORG_ID.to_string());
+    let dispatch: Arc<dyn ReactorFlowDispatch> = Arc::new(RelayDispatch {
+        db: db.clone(),
+        flows: compiled,
+        registry: registry(),
+        base_ctx,
+    });
+    let cancel = CancellationToken::new();
+    let _reactor = bus::reactor::start(db.clone(), dispatch, cancel.clone());
+
+    // F1 ran (so the read worked) and its run did not complete.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let rows = repository::list_flow_executions_for_flow(&db, &f1, 10).expect("rows");
+        if rows
+            .iter()
+            .any(|r| r.status.as_deref().is_some_and(|s| s != "completed" && s != "running"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "F1's run never failed: {rows:?}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    cancel.cancel();
+
+    let on_b = {
+        let inst = inst.clone();
+        tokio::task::spawn_blocking(move || {
+            read_topic(&bus_service(&inst), &inst, TOPIC_B, "tb02-verify-b")
+        })
+        .await
+        .expect("read B")
+    };
+    assert!(on_b.is_empty(), "nothing reached B: {on_b:?}");
 }

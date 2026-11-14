@@ -741,6 +741,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Naprawa: flow z węzłem `bus_consume` nigdy niczego nie czytał, bo reaktor
+  konsumował bez tożsamości, a autoryzator odmawia wołającemu bez aktora. Teraz
+  węzeł wskazuje konto usługowe (`service_account`: uid aktywnego klucza ogólnego,
+  nigdy klucza użytkownika ani grupy) i flow czyta, publikuje (`bus_publish`) i
+  zapisuje do DLQ jako ten klucz, z jego prawami do tematów i regułami ukrywania
+  pól; w audycie występuje jako `api_key:<uid>`. Konsumuje w grupie klucza
+  `k:<uid>.<grupa>` (autor wpisuje samą grupę). Nowo przypisane konto czyta temat
+  od najstarszego zachowanego rekordu. Zapis flow z takim węzłem (tworzenie,
+  edycja aktywnego flow, przywracanie wersji i fabryczne) sprawdza przy każdym
+  zapisie, że zapisujący (PowerUser lub Admin) sam ma odczyt tematu i zapis na
+  każdy temat `bus_publish`, w swojej organizacji, że klucz istnieje, jest aktywny i
+  ogólny, ma te same prawa, i odmawia `create_if_missing` (klucz nie tworzy
+  tematów); powiązanie trafia do audytu jako `flow.service_account.bind`. Flow bez
+  konta usługowego (zapisane przed zmianą) pozostaje bez odbioru z widocznym
+  powodem; nic nie jest uzupełniane automatycznie. Broker zapisuje list martwy
+  (`on_error = dlq`) dla klucza własnym kontekstem wewnętrznym, tak jak kwarantannę
+  schematu, dopiero po sprawdzeniu odczytu klucza na temacie źródłowym; klucz nadal
+  nie ma dostępu do tematów `__`. Stan odbioru per węzeł (działa, oczekuje,
+  wstrzymany z powodem, zatrzymany) jest w `FlowSummary`/`FlowDetail`
+  (`bus_consumer`, dopisane na końcu z `#[serde(default)]`, `SCHEMA_VERSION`
+  bez zmian), na liście flow, na węźle i w inspektorze; wstrzymany odbiór wznawia
+  się sam w ciągu 5 s po naprawie przyczyny, a zatrzymany (`halt`) po ponownym
+  zapisie flow. Nowe żądanie `ServiceAccountListRequest` (PowerUser) zwraca do
+  listy wyboru tylko uid i nazwę aktywnych kluczy ogólnych. Flow działający jako
+  konto usługowe nie może mieć `bus_publish` w podflow, pętli ani mapie (ani
+  węzła `agent`): klucz działa jedną tożsamością w całym przebiegu, więc zapis
+  odmawia, a `SubflowRunner` odmawia w czasie wykonania ciała edytowanego po
+  powiązaniu. Import środowiska sprawdza flow tak jak zapis; flow, który nie
+  przejdzie, trafia jako szkic (audyt `flow.service_account.import_demoted`).
+  Audyt zna też `flow.service_account.unbind`. Znane ograniczenia: lista kluczy
+  nie jest zawężona do organizacji (klucze nie mają organizacji), a stan
+  „wstrzymany” jest tylko w pamięci procesu (po restarcie reaktor ustala go od
+  nowa). Bez migracji.
 - Korelacja end to end (TB-02, backend): jeden `correlation_id` przechodzi przez
   łańcuch temat → przepływ → temat. Nagłówek rekordu `correlation-id` (ASCII
   `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) broker waliduje i zapisuje jako

@@ -14,6 +14,7 @@ import { I18n } from '/js/i18n.js';
 import { executionsTableHtml } from '/js/lib/flow-executions.js';
 import { emptyProcessModel, processCommand } from './flows-builder/bpmn.js';
 import { openProcessInstances } from './flows-builder/process-monitor.js';
+import { busConsumerText, busConsumerChipStatus } from './flows-builder/bus-consumer.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
@@ -148,7 +149,12 @@ function renderRow(f) {
   const factoryChip = isFactory
     ? ` <tf-chip status="neutral" data-flow-factory="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.factory_chip'))}</tf-chip>`
     : '';
-  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
+  // A flow that reads the bus says so when it does not: the chip names the state, the title adds the reason and the node.
+  const consumer = busConsumerText(f.busConsumer);
+  const consumerChip = consumer && consumer.state !== 'running'
+    ? ` <tf-chip status="${busConsumerChipStatus(consumer.state)}" title="${escapeAttr(consumer.detail)}" data-flow-consumer="${escapeAttr(f.id)}">${escapeHtml(consumer.text)}</tf-chip>`
+    : '';
+  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
 }
 
 function bindRowActions() {
