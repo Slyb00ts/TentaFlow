@@ -179,10 +179,30 @@ impl RunEventLog {
                 debug!(scope = %scope, "progress events with no bound run; not stored");
                 continue;
             };
-            state.retarget(&provenance);
-
             let mut rows: Vec<RunEvent> = Vec::with_capacity(batch.len());
+            // The end of the run this subscriber was last writing, read after
+            // the scope was rebound to the next run: written under the run it
+            // names, not under the one bound now.
+            let mut current = Vec::with_capacity(batch.len());
             for stamped in batch {
+                let previous = match &stamped.event {
+                    ProgressEvent::RunFinished { run_id, .. }
+                        if *run_id != provenance.run_id
+                            && state.run_id.as_deref() == Some(run_id.as_str()) =>
+                    {
+                        state.bound.clone()
+                    }
+                    _ => None,
+                };
+                match previous {
+                    Some(previous) => {
+                        state.translate(&previous, stamped.at_ms, stamped.event, &mut rows)
+                    }
+                    None => current.push(stamped),
+                }
+            }
+            state.retarget(&provenance);
+            for stamped in current {
                 state.translate(&provenance, stamped.at_ms, stamped.event, &mut rows);
             }
             if rows.is_empty() {
@@ -240,6 +260,17 @@ struct ScopeState {
     /// announces no "run began" event, so the opening of a run is read off the
     /// first node it starts — see [`ScopeState::translate`].
     request_opened: bool,
+    /// Emission instant of this run's `request_started` row; the far end of the
+    /// duration `request_finished` reports. `None` when the run closed without
+    /// a node ever starting.
+    opened_at_ms: Option<i64>,
+    /// Whether the run's `request_finished` row was produced. A run has exactly
+    /// one end, so a second `RunFinished` for the same run is dropped.
+    request_closed: bool,
+    /// The provenance the current run was bound with, kept so that an end event
+    /// of this run that is read after the scope moved on to the next run is
+    /// still written under its own run.
+    bound: Option<RunProvenance>,
     /// `node_id -> node_type`, learnt from `NodeStarted`. `NodeFinished` does
     /// not repeat the type and the log will not guess one: a node whose start
     /// was never seen closes with an EMPTY step label, which reads as the gap it
@@ -295,7 +326,10 @@ impl ScopeState {
     fn retarget(&mut self, provenance: &RunProvenance) {
         if self.run_id.as_deref() != Some(provenance.run_id.as_str()) {
             self.run_id = Some(provenance.run_id.clone());
+            self.bound = Some(provenance.clone());
             self.request_opened = false;
+            self.opened_at_ms = None;
+            self.request_closed = false;
             self.node_types.clear();
             self.streaming_nodes.clear();
             self.pending_io.clear();
@@ -372,6 +406,11 @@ impl ScopeState {
     /// failed closes as `error` and gets no message row at all, because a
     /// message that never completed has no completion instant.
     ///
+    /// **`request_finished` is `RunFinished`.** The executor announces the end
+    /// of a top-level run; the duration is this instant minus the
+    /// `request_started` instant seen by this subscriber (invariant 5), and the
+    /// row has no payload beyond the status, so it is safe for every origin.
+    ///
     /// The variants deliberately dropped are `MapElement`, `Compaction`,
     /// `ChildSpawned`, `ChildFinished`, `RouterDecision`, `UserQuestion`,
     /// `PermissionRequest` and `InteractionResolved` — recording them would mean
@@ -388,6 +427,7 @@ impl ScopeState {
             ProgressEvent::NodeStarted { node_id, node_type } => {
                 if !self.request_opened {
                     self.request_opened = true;
+                    self.opened_at_ms = Some(at_ms);
                     out.push(row(
                         provenance,
                         at_ms,
@@ -543,6 +583,27 @@ impl ScopeState {
                     },
                     None,
                     Some(call_id),
+                ));
+            }
+            ProgressEvent::RunFinished { run_id, status } => {
+                // An end for a run that is not the one being written would
+                // close the wrong request.
+                if run_id != provenance.run_id || self.request_closed {
+                    return;
+                }
+                self.request_closed = true;
+                let duration_ms = self
+                    .opened_at_ms
+                    .map(|opened| u64::try_from(at_ms.saturating_sub(opened)).unwrap_or(0));
+                out.push(row(
+                    provenance,
+                    at_ms,
+                    EventPayload::RequestFinished {
+                        status,
+                        duration_ms,
+                    },
+                    None,
+                    None,
                 ));
             }
             ProgressEvent::MapElement { .. }
@@ -1360,5 +1421,240 @@ mod tests {
                 "the per-run ACL answer must hold for EVERY row of the run"
             );
         }
+    }
+    async fn count_outbox(h: &Harness, run_id: &str) -> i64 {
+        h.pool
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT COUNT(*) FROM audit_outbox WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )
+            .expect("count outbox")
+    }
+
+    /// A bus-origin run is closed by exactly one `request_finished` that states
+    /// the outcome and the span between two emission instants and nothing else:
+    /// no step content, no audit mirror, the run's own organisation.
+    #[tokio::test]
+    async fn a_bus_run_ends_with_one_request_finished_that_carries_no_content() {
+        let h = Harness::start_with(bus_provenance("run-bus-end"));
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "bus_consume".into(),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "n1".into(),
+            status: "ok".into(),
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-bus-end".into(),
+            status: "completed".into(),
+        });
+        // A second end for the same run must not become a second row.
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-bus-end".into(),
+            status: "failed".into(),
+        });
+        h.rows("run-bus-end", 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = read_run(&h.pool, "run-bus-end", 0, 1000).expect("read run");
+
+        let ends: Vec<&StoredEvent> = rows
+            .iter()
+            .filter(|r| r.kind == crate::events::EventKind::RequestFinished)
+            .collect();
+        assert_eq!(ends.len(), 1, "exactly one end event: {rows:?}");
+        let end = ends[0];
+        let opened = rows
+            .iter()
+            .find(|r| r.kind == crate::events::EventKind::RequestStarted)
+            .expect("opening row");
+        let EventPayload::RequestFinished {
+            status,
+            duration_ms,
+        } = &end.payload
+        else {
+            panic!("expected request_finished, got {:?}", end.payload);
+        };
+        assert_eq!(status, "completed", "the first end wins");
+        assert_eq!(
+            *duration_ms,
+            Some((end.at_ms - opened.at_ms) as u64),
+            "duration is the difference between two events"
+        );
+        let json = serde_json::to_value(&end.payload).expect("payload json");
+        let keys: std::collections::BTreeSet<_> =
+            json.as_object().expect("object").keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["duration_ms", "kind", "status"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "only status and timing: {json}"
+        );
+        assert_eq!(
+            end.org_id.as_deref(),
+            Some("org-3"),
+            "pinned to the run's org"
+        );
+        assert_eq!(end.correlation_id, opened.correlation_id);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.payload, EventPayload::StepIo { .. })),
+            "a bus run stores no step content"
+        );
+        assert_eq!(count_outbox(&h, "run-bus-end").await, 0, "no audit mirror");
+    }
+
+    /// The same for a run of another origin; its end is a timeline row only,
+    /// so the audit outbox keeps holding just the opening.
+    #[tokio::test]
+    async fn a_run_with_no_llm_call_ends_with_one_request_finished() {
+        let h = Harness::start("run-plain-end");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "trigger".into(),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "n1".into(),
+            status: "ok".into(),
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-plain-end".into(),
+            status: "failed".into(),
+        });
+        let rows = h.rows("run-plain-end", 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = read_run(&h.pool, "run-plain-end", 0, 1000).unwrap_or(rows);
+        let ends: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r.payload, EventPayload::RequestFinished { .. }))
+            .collect();
+        assert_eq!(ends.len(), 1, "{rows:?}");
+        assert!(matches!(
+            &ends[0].payload,
+            EventPayload::RequestFinished { status, .. } if status == "failed"
+        ));
+        assert_eq!(count_outbox(&h, "run-plain-end").await, 1);
+    }
+
+    /// A run that ended before any node started has no opening row to measure
+    /// from: the end states no duration instead of inventing one.
+    #[tokio::test]
+    async fn an_end_with_no_opening_row_states_no_duration() {
+        let h = Harness::start("run-early-end");
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-early-end".into(),
+            status: "failed".into(),
+        });
+        let rows = h.rows("run-early-end", 1).await;
+        assert!(matches!(
+            &rows[0].payload,
+            EventPayload::RequestFinished { status, duration_ms: None } if status == "failed"
+        ));
+    }
+
+    /// Rebinding the scope to the next run (a session scope carries one run
+    /// after another) gives that run its own end.
+    #[tokio::test]
+    async fn each_run_of_a_scope_gets_its_own_end() {
+        let h = Harness::start("run-first");
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-first".into(),
+            status: "completed".into(),
+        });
+        h.rows("run-first", 1).await;
+        h.broker.release_run_provenance(SCOPE);
+        h.broker
+            .bind_run_provenance(SCOPE, provenance("run-second"));
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-second".into(),
+            status: "completed".into(),
+        });
+        h.rows("run-second", 1).await;
+    }
+    fn ends_of(rows: &[StoredEvent]) -> Vec<&StoredEvent> {
+        rows.iter()
+            .filter(|r| r.kind == crate::events::EventKind::RequestFinished)
+            .collect()
+    }
+
+    /// Two back-to-back runs on ONE session scope, with the log stalled
+    /// between them: run A's end is still queued when run B rebinds the scope
+    /// and publishes its own. A current-thread runtime keeps the subscriber
+    /// from running until the test awaits, which forces that order. Each run
+    /// must get exactly its own end, A's before B's opening.
+    #[tokio::test]
+    async fn back_to_back_runs_on_one_scope_each_get_their_own_end() {
+        let h = Harness::start("run-a");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "trigger".into(),
+        });
+        h.rows("run-a", 2).await;
+
+        // Stalled from here: nothing below is read until the next await.
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-a".into(),
+            status: "completed".into(),
+        });
+        h.broker.bind_run_provenance(SCOPE, provenance("run-b"));
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "trigger".into(),
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-b".into(),
+            status: "failed".into(),
+        });
+
+        let a = h.rows("run-a", 3).await;
+        let b = h.rows("run-b", 3).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let a = read_run(&h.pool, "run-a", 0, 1000).unwrap_or(a);
+        let b = read_run(&h.pool, "run-b", 0, 1000).unwrap_or(b);
+
+        let (a_ends, b_ends) = (ends_of(&a), ends_of(&b));
+        assert_eq!(a_ends.len(), 1, "run A keeps its own end: {a:?}");
+        assert_eq!(b_ends.len(), 1, "run B gets exactly one end: {b:?}");
+        assert!(matches!(
+            &a_ends[0].payload,
+            EventPayload::RequestFinished { status, duration_ms: Some(_) } if status == "completed"
+        ));
+        assert!(matches!(
+            &b_ends[0].payload,
+            EventPayload::RequestFinished { status, duration_ms: Some(_) } if status == "failed"
+        ));
+        assert_eq!(
+            b[0].kind,
+            crate::events::EventKind::RequestStarted,
+            "B's end comes after B's own opening: {b:?}"
+        );
+    }
+
+    /// An end naming a run the scope is not bound to, and that this subscriber
+    /// never wrote, closes nothing.
+    #[tokio::test]
+    async fn an_end_for_a_run_that_is_not_bound_is_dropped() {
+        let h = Harness::start("run-here");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n1".into(),
+            node_type: "trigger".into(),
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-elsewhere".into(),
+            status: "completed".into(),
+        });
+        h.rows("run-here", 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = read_run(&h.pool, "run-here", 0, 1000).expect("read run");
+        assert!(ends_of(&rows).is_empty(), "{rows:?}");
+        assert!(read_run(&h.pool, "run-elsewhere", 0, 1000)
+            .expect("read run")
+            .is_empty());
     }
 }

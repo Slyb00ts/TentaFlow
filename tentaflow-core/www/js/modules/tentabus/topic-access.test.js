@@ -528,6 +528,35 @@ test('"Prawa klucza": one change described, its scope set or cleared; "Unieważn
   assert.deepEqual(revoked, [{ keyId: 'k-lis' }]);
 });
 
+test('"Unieważnij" names the flows that read as this key, and says so when the check failed', () => {
+  closeAll();
+  const lis = keyRows({ aclEntries: ACL, keys: KEYS, instanceId: INSTANCE, orgId: ORG }).find((r) => r.keyId === 'k-lis');
+  const base = { revoke: async () => {}, describeError: String, onSaved: () => {} };
+  const impactOf = (win) => norm(win.querySelector('[data-role="impact"]').textContent);
+
+  const withFlows = openKeyRevoke(lis, { ...base, serviceFlows: [{ flowId: 'f1', name: 'Przyjmij zamówienia' }, { flowId: 'f2', name: 'Wyniki LIS' }] });
+  assert.match(impactOf(withFlows), /Klucz jest kontem usługi dla 2 przepływów: Przyjmij zamówienia, Wyniki LIS; po odwołaniu przestaną czytać\./);
+  closeAll();
+
+  const unknown = openKeyRevoke(lis, { ...base, serviceFlows: [], serviceFlowsUnknown: true });
+  assert.match(impactOf(unknown), /Nie udało się sprawdzić, czy ten klucz jest kontem usługi przepływów\./);
+  closeAll();
+
+  const none = openKeyRevoke(lis, { ...base, serviceFlows: [] });
+  assert.doesNotMatch(impactOf(none), /kontem usługi|Nie udało się sprawdzić/);
+});
+
+test('"Unieważnij" shows a flow name as text, never as markup', () => {
+  closeAll();
+  const lis = keyRows({ aclEntries: ACL, keys: KEYS, instanceId: INSTANCE, orgId: ORG }).find((r) => r.keyId === 'k-lis');
+  const hostile = '<img src=x onerror=alert(1)>Flow';
+  const win = openKeyRevoke(lis, { revoke: async () => {}, describeError: String, onSaved: () => {}, serviceFlows: [{ flowId: 'f1', name: hostile }] });
+  const impact = win.querySelector('[data-role="impact"]');
+  assert.equal(impact.querySelector('img'), null, 'no element may be created from a flow name');
+  assert.ok(norm(impact.textContent).includes(hostile), 'the name is shown literally');
+  closeAll();
+});
+
 // ---------------------------------------------------------------------------
 // Review fixes: gone keys, the one-time window, the Zmień sentence
 // ---------------------------------------------------------------------------

@@ -95,6 +95,7 @@ export const requests = {
   encodeMetaSchemaVersionCheck: (clientVersion) => encode('', 'MetaSchemaVersionCheck', { client_version: clientVersion }),
   encodeApiKeyListRequest: () => encode('', 'ApiKeyListRequest', {}),
   encodeServiceAccountListRequest: () => encode('', 'ServiceAccountListRequest', {}),
+  encodeServiceAccountUsageRequest: (keyUid) => encode('', 'ServiceAccountUsageRequest', { key_uid: keyUid }),
   encodeApiKeyScopeListRequest: (keyUid) => encode('', 'ApiKeyScopeListRequest', { key_uid: keyUid }),
   encodeApiKeyScopeSetRequest: (keyUid, resourceType, resourceId, accessLevel, action) => encode('', 'ApiKeyScopeSetRequest', { key_uid: keyUid, resource_type: resourceType, resource_id: resourceId, access_level: accessLevel, action }),
   encodeApiKeyScopeClearRequest: (keyUid, resourceType, resourceId, action) => encode('', 'ApiKeyScopeClearRequest', { key_uid: keyUid, resource_type: resourceType, resource_id: resourceId, action }),

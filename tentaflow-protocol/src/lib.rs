@@ -278,6 +278,7 @@ pub use message_body::{
     ApiKeySummary,
     AppEntryWire,
     BusConsumerStatus,
+    ServiceAccountFlowUsage,
     ServiceAccountOption,
     AuditEvent,
     AuditLogCleanupRequest,

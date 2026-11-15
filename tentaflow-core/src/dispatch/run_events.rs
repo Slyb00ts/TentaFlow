@@ -173,6 +173,10 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
             e.interaction_id = interaction_id;
             e.outcome = outcome;
         }
+        // Never reaches the wire: the subscribe loop drops it. It is a
+        // bookkeeping event for the durable event log, and the agent activity
+        // view would render it as a nameless step.
+        ProgressEvent::RunFinished { .. } => {}
     }
     e
 }
@@ -276,6 +280,9 @@ fn run_events_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
         loop {
             match rx.recv().await {
                 Ok(stamped) => {
+                    if matches!(stamped.event, ProgressEvent::RunFinished { .. }) {
+                        continue;
+                    }
                     let body = MessageBody::AgentsBody(AgentsPayload::RunEvent(to_wire(
                         &scope_key,
                         stamped.event,

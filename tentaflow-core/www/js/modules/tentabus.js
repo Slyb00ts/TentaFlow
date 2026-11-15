@@ -1359,7 +1359,9 @@ const detailContext = {
     else if (action.kind === 'retry') { state.detailError = null; renderPanel(); loadTopicDetail(name); }
     else if (action.kind === 'access-reload') loadTopicAccess(name);
     else if (action.kind === 'hiding-reload') loadTopicHiding(name);
-    else if (action.kind.startsWith('access-') || action.kind.startsWith('key-')) openAccessWindow(name, action);
+    else if (action.kind.startsWith('access-') || action.kind.startsWith('key-')) {
+      openAccessWindow(name, action).catch((err) => toast(describeBusError(err), 'error'));
+    }
     else if (action.kind.startsWith('hiding-')) openHidingWindow(name, action);
   },
 };
@@ -1429,7 +1431,11 @@ async function loadTopicAccess(name) {
   renderPanel();
 }
 
-function openAccessWindow(name, action) {
+// A key-revoke click looks up the flows reading as the key before the window
+// opens; a second click while that is in flight must not open a second window.
+let revokeLookupBusy = false;
+
+async function openAccessWindow(name, action) {
   const detail = state.detail;
   if (!detail?.access?.canAdmin || !state.access.acl) return;
   const instanceId = state.instanceId;
@@ -1496,7 +1502,25 @@ function openAccessWindow(name, action) {
   if (action.kind === 'key-rights') {
     openKeyRights(key, { ...keyCtx, scope: reloadAfter(({ kind, payload }) => ApiBinary.action(kind, payload)) });
   } else if (action.kind === 'key-revoke') {
-    openKeyRevoke(key, { ...keyCtx, revoke: reloadAfter((request) => ApiBinary.action('apiKeyRevokeRequest', request)) });
+    if (revokeLookupBusy) return;
+    revokeLookupBusy = true;
+    let serviceFlows = [];
+    let serviceFlowsUnknown = false;
+    try {
+      serviceFlows = await ApiBinary.list('serviceAccountUsageRequest', { payload: { keyUid: key.keyId }, arrayKey: 'flows' });
+    } catch (_) {
+      serviceFlowsUnknown = true;
+    } finally {
+      revokeLookupBusy = false;
+    }
+    // The user may have left this topic or instance while the lookup ran.
+    if (!still()) return;
+    openKeyRevoke(key, {
+      ...keyCtx,
+      serviceFlows,
+      serviceFlowsUnknown,
+      revoke: reloadAfter((request) => ApiBinary.action('apiKeyRevokeRequest', request)),
+    });
   }
 }
 

@@ -1313,6 +1313,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::ServiceAccountUsageRequest { keyUid } (Admin): active flows that read under the key. */
+  serviceAccountUsageRequest(correlationId, { keyUid }, sequence = 1) {
+    assertReady();
+    const body = requests.encodeServiceAccountUsageRequest(keyUid);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::ApiKeyScopeListRequest { keyUid } */
   apiKeyScopeListRequest(correlationId, { keyUid }, sequence = 1) {
     assertReady();

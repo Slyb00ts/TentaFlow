@@ -1725,6 +1725,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::Error(_) => "Error",
         MessageBody::ServiceAccountListRequest => "ServiceAccountListRequest",
         MessageBody::ServiceAccountListResponse { .. } => "ServiceAccountListResponse",
+        MessageBody::ServiceAccountUsageRequest { .. } => "ServiceAccountUsageRequest",
+        MessageBody::ServiceAccountUsageResponse { .. } => "ServiceAccountUsageResponse",
         MessageBody::ApiKeyScopeListRequest { .. } => "ApiKeyScopeListRequest",
         MessageBody::ApiKeyScopeListResponse { .. } => "ApiKeyScopeListResponse",
         MessageBody::ApiKeyScopeSetRequest { .. } => "ApiKeyScopeSetRequest",

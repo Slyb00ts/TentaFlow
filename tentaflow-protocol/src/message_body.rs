@@ -992,6 +992,19 @@ pub struct ServiceAccountOption {
     pub name: String,
 }
 
+/// One active flow whose `bus_consume` node reads under a given API key: what
+/// the revoke warning names. No topic, instance or node detail, and never a
+/// token.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAccountFlowUsage {
+    #[serde(default)]
+    pub flow_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct FlowDetail {
     pub id: String,
@@ -8783,6 +8796,17 @@ pub enum MessageBody {
     ServiceAccountListResponse {
         accounts: Vec<ServiceAccountOption>,
     },
+    // ----- Service-account usage (API key revoke warning, Admin) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). Which
+    // active flows of the caller's organisation read under `key_uid`.
+    ServiceAccountUsageRequest {
+        #[serde(default)]
+        key_uid: String,
+    },
+    ServiceAccountUsageResponse {
+        #[serde(default)]
+        flows: Vec<ServiceAccountFlowUsage>,
+    },
 }
 
 // =============================================================================
@@ -10492,6 +10516,41 @@ mod tests {
         let request = crate::cbor::encode(&MessageBody::ServiceAccountListRequest).expect("encode");
         let decoded: MessageBody = crate::cbor::decode(&request).expect("decode");
         assert_eq!(decoded, MessageBody::ServiceAccountListRequest);
+    }
+
+    #[test]
+    fn service_account_usage_round_trips_and_decodes_without_fields() {
+        let request = MessageBody::ServiceAccountUsageRequest {
+            key_uid: "k-1".to_string(),
+        };
+        assert_eq!(round_trip(request.clone()), request);
+        let response = MessageBody::ServiceAccountUsageResponse {
+            flows: vec![ServiceAccountFlowUsage {
+                flow_id: "f-1".to_string(),
+                name: "Przyjmij zamowienia".to_string(),
+                status: "active".to_string(),
+            }],
+        };
+        assert_eq!(round_trip(response.clone()), response);
+
+        // A peer that sends the bare variant (no fields) still decodes.
+        #[derive(SerdeSerialize)]
+        enum Bare {
+            ServiceAccountUsageRequest {},
+            ServiceAccountUsageResponse {},
+        }
+        let bytes = crate::cbor::encode(&Bare::ServiceAccountUsageRequest {}).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            MessageBody::ServiceAccountUsageRequest {
+                key_uid: String::new()
+            }
+        );
+        let bytes = crate::cbor::encode(&Bare::ServiceAccountUsageResponse {}).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            MessageBody::ServiceAccountUsageResponse { flows: Vec::new() }
+        );
     }
 
     #[test]

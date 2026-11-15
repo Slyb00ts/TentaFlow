@@ -6,6 +6,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Zdarzenia i konta usługowe (TB-02)
+
+- Każdy przebieg przepływu kończy się teraz jednym wierszem `request_finished`
+  w dzienniku zdarzeń (status `completed`/`failed`/`cancelled` i czas, bez
+  treści), także przebiegi z magistrali i przepływy bez wywołania LLM; widok
+  Zdarzeń zamyka żądanie tym wierszem, a dla starszych przebiegów zostaje
+  dotychczasowa reguła (odpowiedź albo błąd). Wiersz nie wymaga migracji, ale
+  starsza wersja programu po obniżeniu wersji odrzuca strony zdarzeń zawierające
+  `request_finished` (nieznany rodzaj zdarzenia).
+- Odwołanie klucza API, który jest kontem usługi aktywnych przepływów
+  `bus_consume`, ostrzega przed potwierdzeniem i wymienia te przepływy
+  (`ServiceAccountUsageRequest`, tylko Admin, w obrębie organizacji wywołującego).
+
 ### Struktura organizacyjna
 
 - Nieobecność nie ma już powodu: pole zniknęło z formularza, bazy (migracja 200

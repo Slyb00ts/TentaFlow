@@ -1255,6 +1255,67 @@ pub fn service_account_list(
     Ok(MessageBody::ServiceAccountListResponse { accounts })
 }
 
+/// The active flows of the caller's organisation whose `bus_consume` node reads
+/// under `key_uid`, for the warning an Admin sees before revoking, disabling or
+/// deleting that key. Admin-only, like the key list itself. A binding counts
+/// when its node reads the caller's organisation (the same rule the bind-time
+/// check applies), so another tenant's flows are neither named nor counted.
+#[handler(variant = "ServiceAccountUsageRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_account_usage(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ServiceAccountUsageRequest { key_uid } => key_uid.trim(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceAccountUsageRequest",
+            ))
+        }
+    };
+    if key_uid.is_empty() {
+        return Err(ProtocolError::bad_request("key_uid is required"));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    const PAGE: i64 = 200;
+    let mut flows = Vec::new();
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page = repository::list_active_flows_after(
+            &ctx.state.db,
+            after
+                .as_ref()
+                .map(|(name, id)| (name.as_str(), id.as_str())),
+            PAGE,
+        )
+        .map_err(db_err)?;
+        let Some(last) = page.last() else { break };
+        after = Some((last.name.clone(), last.id.clone()));
+        let full = page.len() as i64 == PAGE;
+        flows.extend(
+            page.into_iter()
+                .filter(|f| {
+                    bus_service_account_bindings(&f.flow_json)
+                        .iter()
+                        .any(|b| b.key_uid == key_uid && b.org_id == org.org_id)
+                })
+                .map(|f| tentaflow_protocol::ServiceAccountFlowUsage {
+                    flow_id: f.id,
+                    name: f.name,
+                    status: f.status,
+                }),
+        );
+        if !full {
+            break;
+        }
+    }
+    Ok(MessageBody::ServiceAccountUsageResponse { flows })
+}
+
 /// Shared validation for a general key's scope resource. `resource_type` must be
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
@@ -14550,6 +14611,99 @@ mod bus_service_account_save_tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].key_id, live);
         assert_eq!(accounts[0].name, "Flow SA");
+    }
+
+    fn bound_flow(fx: &Fx, name: &str, json: &str, status: &str) -> String {
+        repository::create_flow(
+            &fx.ctx.state.db,
+            &db::models::FlowParams {
+                name,
+                description: None,
+                is_default: false,
+                service_type: None,
+                flow_json: json,
+                status,
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("flow")
+    }
+
+    fn usage_of(fx: &Fx, key_uid: &str) -> Vec<(String, String, String)> {
+        let MessageBody::ServiceAccountUsageResponse { flows } = service_account_usage(
+            &MessageBody::ServiceAccountUsageRequest {
+                key_uid: key_uid.to_string(),
+            },
+            &fx.ctx,
+        )
+        .expect("usage") else {
+            panic!("unexpected response");
+        };
+        flows
+            .into_iter()
+            .map(|f| (f.flow_id, f.name, f.status))
+            .collect()
+    }
+
+    #[test]
+    fn usage_names_only_active_flows_of_the_callers_org_bound_to_that_key() {
+        let fx = fixture("admin", &[], ORG);
+        let k = key(&fx, "general", &[]);
+        let other = key(&fx, "general", &[]);
+        let mine = bound_flow(&fx, "Orders in", &flow(&k, None, None), "active");
+        bound_flow(&fx, "Draft reader", &flow(&k, None, None), "draft");
+        bound_flow(&fx, "Other key", &flow(&other, None, None), "active");
+        bound_flow(
+            &fx,
+            "Foreign tenant",
+            &flow(&k, Some("org-foreign"), None),
+            "active",
+        );
+        bound_flow(&fx, "No consumer", VALID_FLOW, "active");
+
+        assert_eq!(
+            usage_of(&fx, &k),
+            vec![(mine, "Orders in".to_string(), "active".to_string())]
+        );
+        assert!(usage_of(&fx, "unknown-uid").is_empty());
+    }
+
+    #[test]
+    fn usage_is_read_per_organisation_of_the_caller() {
+        let fx = fixture("admin", &[], "org-foreign");
+        let k = key(&fx, "general", &[]);
+        bound_flow(&fx, "Default tenant", &flow(&k, None, None), "active");
+        let theirs = bound_flow(
+            &fx,
+            "Foreign tenant",
+            &flow(&k, Some("org-foreign"), None),
+            "active",
+        );
+        let found = usage_of(&fx, &k);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, theirs);
+    }
+
+    #[tokio::test]
+    async fn usage_is_admin_only() {
+        let key_uid = {
+            let fx = fixture("admin", &[], ORG);
+            key(&fx, "general", &[])
+        };
+        let request = MessageBody::ServiceAccountUsageRequest { key_uid };
+        for role in ["power_user", "user"] {
+            let fx = fixture(role, &[], ORG);
+            let (body, is_err) = run(&fx, request.clone()).await;
+            assert!(is_err, "{role} must be refused: {body:?}");
+        }
+        let fx = fixture("admin", &[], ORG);
+        let (body, is_err) = run(&fx, request).await;
+        assert!(!is_err, "admin refused: {body:?}");
+        assert!(matches!(
+            body,
+            MessageBody::ServiceAccountUsageResponse { .. }
+        ));
     }
 }
 

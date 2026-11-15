@@ -59,6 +59,100 @@ fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatu
     );
 }
 
+/// Announces the end of one top-level run on its progress scope, exactly once.
+///
+/// Nested runs (subflow, loop and map bodies, capability hops) share the
+/// parent's scope and must not close it, so [`RunEnd::of`] hands back an inert
+/// value for them. Clones share one state: the entry point that owns the run
+/// and the task that settles a stream may both try to close it, and only the
+/// first does. If every clone is dropped without anyone closing the run — the
+/// run future was dropped by a timeout or an abort, or the task settling the
+/// stream panicked — the last drop closes it as `cancelled`, so a run never
+/// stays open in the log. Carries no content, only the outcome label.
+///
+/// `run_id` is stamped here, at publish time: a session scope carries one run
+/// after another and the log may read this event after the scope moved on.
+#[derive(Clone)]
+struct RunEnd(Option<Arc<RunEndState>>);
+
+struct RunEndState {
+    progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
+    scope: String,
+    run_id: String,
+    cancel: CancellationToken,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl RunEndState {
+    fn emit_once(&self, status: &str) {
+        if self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        self.progress.emit(
+            &self.scope,
+            crate::flow_engine::dispatchers::ProgressEvent::RunFinished {
+                run_id: self.run_id.clone(),
+                status: status.to_string(),
+            },
+        );
+    }
+}
+
+impl Drop for RunEndState {
+    fn drop(&mut self) {
+        self.emit_once("cancelled");
+    }
+}
+
+impl RunEnd {
+    fn of(ctx: &ExecutionContext) -> Self {
+        if ctx.subflow_depth > 0 || ctx.light {
+            return Self(None);
+        }
+        Self(Some(Arc::new(RunEndState {
+            progress: ctx.progress.clone(),
+            scope: ctx.progress_scope.clone(),
+            run_id: ctx.request_id.clone(),
+            cancel: ctx.cancel_token.clone(),
+            done: std::sync::atomic::AtomicBool::new(false),
+        })))
+    }
+
+    fn finish(&self, status: &str) {
+        if let Some(state) = &self.0 {
+            state.emit_once(status);
+        }
+    }
+
+    fn finish_with(&self, outcome: &FlowExecutionOutcome) {
+        self.finish(run_status(outcome.finish_reason, outcome.error.is_some()));
+    }
+
+    /// The run ended with an error before an outcome existed. A run whose
+    /// cancel token fired is `cancelled`, however the cancellation surfaced.
+    fn finish_err(&self) {
+        if let Some(state) = &self.0 {
+            let status = if state.cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            state.emit_once(status);
+        }
+    }
+}
+
+/// The run-end label: cancellation first, then any failure.
+fn run_status(finish_reason: FinishReason, has_error: bool) -> &'static str {
+    if finish_reason == FinishReason::Cancelled {
+        "cancelled"
+    } else if has_error || finish_reason == FinishReason::Error {
+        "failed"
+    } else {
+        "completed"
+    }
+}
+
 /// What one envelope contributes to the step content kept by the event log:
 /// its payload (binary payloads only by kind and size) and, when a retrieval put
 /// them there, the passages it cites. `unchanged_from` is the envelope the step
@@ -155,9 +249,15 @@ pub async fn execute_blocking(
     adapters: Arc<AdapterRegistry>,
 ) -> Result<FlowExecutionOutcome> {
     let span = flow_run_span(&compiled.flow_id, &ctx);
-    execute_blocking_inner(db, compiled, initial, ctx, adapters)
+    let run_end = RunEnd::of(&ctx);
+    let result = execute_blocking_inner(db, compiled, initial, ctx, adapters)
         .instrument(span)
-        .await
+        .await;
+    match &result {
+        Ok(outcome) => run_end.finish_with(outcome),
+        Err(_) => run_end.finish_err(),
+    }
+    result
 }
 
 /// The span every flow run executes under, so a log line from any node
@@ -421,6 +521,21 @@ async fn execute_blocking_inner(
 pub async fn execute_direct_blocking(
     node: FlowNode,
     initial: FlowEnvelope,
+    ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<FlowExecutionOutcome> {
+    let run_end = RunEnd::of(&ctx);
+    let result = execute_direct_blocking_inner(node, initial, ctx, adapters).await;
+    match &result {
+        Ok(outcome) => run_end.finish_with(outcome),
+        Err(_) => run_end.finish_err(),
+    }
+    result
+}
+
+async fn execute_direct_blocking_inner(
+    node: FlowNode,
+    initial: FlowEnvelope,
     mut ctx: ExecutionContext,
     adapters: Arc<AdapterRegistry>,
 ) -> Result<FlowExecutionOutcome> {
@@ -499,8 +614,25 @@ pub async fn execute_direct_streaming(
     db: DbPool,
     node: FlowNode,
     initial: FlowEnvelope,
+    ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<StreamingExecution> {
+    let run_end = RunEnd::of(&ctx);
+    let result =
+        execute_direct_streaming_inner(db, node, initial, ctx, adapters, run_end.clone()).await;
+    if result.is_err() {
+        run_end.finish_err();
+    }
+    result
+}
+
+async fn execute_direct_streaming_inner(
+    db: DbPool,
+    node: FlowNode,
+    initial: FlowEnvelope,
     mut ctx: ExecutionContext,
     adapters: Arc<AdapterRegistry>,
+    run_end: RunEnd,
 ) -> Result<StreamingExecution> {
     let started = Instant::now();
     let initial_arc = Arc::new(initial);
@@ -559,6 +691,7 @@ pub async fn execute_direct_streaming(
             db,
             progress,
             progress_scope,
+            run_end,
         },
     ));
 
@@ -1676,9 +1809,14 @@ pub async fn execute_streaming(
     adapters: Arc<AdapterRegistry>,
 ) -> Result<StreamingExecution> {
     let span = flow_run_span(&compiled.flow_id, &ctx);
-    execute_streaming_inner(db, compiled, initial, ctx, adapters)
+    let run_end = RunEnd::of(&ctx);
+    let result = execute_streaming_inner(db, compiled, initial, ctx, adapters, run_end.clone())
         .instrument(span)
-        .await
+        .await;
+    if result.is_err() {
+        run_end.finish_err();
+    }
+    result
 }
 
 async fn execute_streaming_inner(
@@ -1687,6 +1825,7 @@ async fn execute_streaming_inner(
     initial: FlowEnvelope,
     mut ctx: ExecutionContext,
     adapters: Arc<AdapterRegistry>,
+    run_end: RunEnd,
 ) -> Result<StreamingExecution> {
     let started = Instant::now();
     let initial_arc = Arc::new(initial);
@@ -1698,7 +1837,16 @@ async fn execute_streaming_inner(
     // inline and the post-producer blocking nodes (`persist_turn`, `output`) run
     // over the fully accumulated turn once the stream settles.
     if compiled.stream_producer_region(adapters.as_ref()).is_some() {
-        return execute_streaming_region(db, compiled, initial_arc, ctx, adapters, started).await;
+        return execute_streaming_region(
+            db,
+            compiled,
+            initial_arc,
+            ctx,
+            adapters,
+            started,
+            run_end,
+        )
+        .await;
     }
 
     let execution_id = create_execution_record(&db, &compiled.flow_id, &ctx).await?;
@@ -1897,6 +2045,7 @@ async fn execute_streaming_inner(
             db: db_for_task,
             progress,
             progress_scope,
+            run_end,
         },
     ));
 
@@ -1925,6 +2074,7 @@ async fn execute_streaming_region(
     mut ctx: ExecutionContext,
     adapters: Arc<AdapterRegistry>,
     started: Instant,
+    run_end: RunEnd,
 ) -> Result<StreamingExecution> {
     let execution_id = create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
@@ -2045,6 +2195,7 @@ async fn execute_streaming_region(
         producer_node_id,
         producer_node_type,
         producer_step_started,
+        run_end,
     }));
 
     let stream = futures::stream::unfold(outbound_rx, |mut rx| async move {
@@ -2076,6 +2227,7 @@ struct RegionFinalizerInputs {
     producer_node_id: String,
     producer_node_type: String,
     producer_step_started: u64,
+    run_end: RunEnd,
 }
 
 /// Drives the region stream, runs post-producer blocking nodes over the
@@ -2102,6 +2254,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         producer_node_id,
         producer_node_type,
         producer_step_started,
+        run_end,
     } = inputs;
 
     let producer_attempt = Instant::now();
@@ -2182,6 +2335,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                 total_latency_ms: started.elapsed().as_millis() as i64,
                 error: Some(msg),
             };
+            run_end.finish_with(&outcome);
             persist_execution(&db, execution_id, &outcome).await;
             let _ = outcome_tx.send(outcome);
             return;
@@ -2279,6 +2433,10 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
     } else {
         last_finish.unwrap_or(FinishReason::Stop)
     };
+    // Announced before the trailer reaches the client and before the outcome
+    // is persisted, so the client's next request on this scope cannot overtake
+    // the end of this run.
+    run_end.finish(run_status(finish_reason, post_error.is_some()));
     let usage = last_usage.unwrap_or_default();
     let trailer = EnvelopeDelta::Llm(crate::flow_engine::envelope::LlmStreamChunk {
         choice_index: 0,
@@ -2330,6 +2488,7 @@ struct FinalizerInputs {
     /// the stream settles (the producer's start was emitted by the executor).
     progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
     progress_scope: String,
+    run_end: RunEnd,
 }
 
 async fn finalize_streaming_flow(
@@ -2466,7 +2625,6 @@ async fn finalize_streaming_flow(
             }
         }
     }
-    drop(outbound_tx);
 
     // Stage 3d Krok 2c-2 fix: outcome shape zależny od końcowego kind'u
     // strumienia. Audio path (chain skończony przez tts_stream_bridge)
@@ -2576,6 +2734,15 @@ async fn finalize_streaming_flow(
     } else {
         last_finish.unwrap_or(FinishReason::Stop)
     };
+
+    // The end of the run is announced BEFORE the client's stream closes and
+    // before the outcome is persisted: the client's next request on this
+    // session scope rebinds it, and persisting is a database write the next
+    // run must not be able to overtake.
+    inputs
+        .run_end
+        .finish(run_status(finish_reason, error.is_some() || cancelled));
+    drop(outbound_tx);
 
     let outcome = FlowExecutionOutcome {
         final_envelope,
@@ -3406,6 +3573,72 @@ mod chain_integration_tests {
             e,
             ProgressEvent::NodeFinished { node_id, status } if node_id == "p1" && status == "ok"
         )));
+        // The streaming run ends with exactly one run-finished event, after
+        // the producer's own NodeFinished.
+        let finished: Vec<usize> = evs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, ProgressEvent::RunFinished { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(finished.len(), 1, "one end event per run: {evs:?}");
+        assert!(matches!(
+            &evs[finished[0]],
+            ProgressEvent::RunFinished { status, .. } if status == "completed"
+        ));
+        assert_eq!(finished[0], evs.len() - 1, "the end event is last: {evs:?}");
+    }
+
+    /// A streaming run cancelled before its producer starts is `cancelled`,
+    /// not `failed`, however the cancellation surfaced.
+    #[tokio::test]
+    async fn a_streaming_run_cancelled_before_its_producer_is_labelled_cancelled() {
+        use crate::flow_engine::node_adapter::test_support::{
+            CapturingProgress, TestStreamProducer,
+        };
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(TestStreamProducer::new("test_producer")));
+        let registry = Arc::new(r);
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"p1","type":"test_producer","config":{}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"p1","from_port":"text","to_port":"in"},
+                {"from":"p1","to":"o1","from_port":"stream","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        ctx.cancel_token.cancel();
+        match execute_streaming(fresh_db(), compiled, FlowEnvelope::empty(), ctx, registry).await {
+            Err(_) => {}
+            Ok(exec) => {
+                let mut stream = exec.stream;
+                while stream.next().await.is_some() {}
+                let _ = exec.outcome.await;
+            }
+        }
+        let statuses: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                crate::flow_engine::dispatchers::ProgressEvent::RunFinished { status, .. } => {
+                    Some(status)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec!["cancelled"]);
     }
 
     /// §3.11 A — a stream producer cancelled MID-FLIGHT (after it already
@@ -4322,6 +4555,114 @@ mod concurrent_executor_tests {
             )),
             "true branch must be reported skipped: {evs:?}"
         );
+    }
+
+    fn run_finished_statuses(
+        capture: &crate::flow_engine::node_adapter::test_support::CapturingProgress,
+    ) -> Vec<String> {
+        capture
+            .events()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                crate::flow_engine::dispatchers::ProgressEvent::RunFinished { status, .. } => {
+                    Some(status)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn run_capturing(
+        json: &str,
+        configure: impl FnOnce(&mut ExecutionContext),
+    ) -> Vec<String> {
+        use crate::flow_engine::node_adapter::test_support::CapturingProgress;
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        configure(&mut ctx);
+        let _ = execute_blocking(db(), compiled, FlowEnvelope::empty(), ctx, reg).await;
+        run_finished_statuses(&capture)
+    }
+
+    const OK_FLOW: &str = r#"{"nodes":[
+        {"id":"t","type":"trigger","config":{}},
+        {"id":"s","type":"sleep","config":{}}
+    ],"edges":[{"from":"t","to":"s","from_port":"text","to_port":"in"}]}"#;
+
+    #[tokio::test]
+    async fn a_completed_run_announces_its_end_exactly_once() {
+        assert_eq!(run_capturing(OK_FLOW, |_| {}).await, vec!["completed"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_announces_its_end_exactly_once() {
+        let json = r#"{"nodes":[
+            {"id":"t","type":"trigger","config":{}},
+            {"id":"s","type":"sleep","config":{"fail":true}}
+        ],"edges":[{"from":"t","to":"s","from_port":"text","to_port":"in"}]}"#;
+        assert_eq!(run_capturing(json, |_| {}).await, vec!["failed"]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_announces_its_end_exactly_once() {
+        let statuses = run_capturing(OK_FLOW, |ctx| ctx.cancel_token.cancel()).await;
+        assert_eq!(statuses, vec!["cancelled"]);
+    }
+
+    /// The run future being dropped — the dispatcher's one-hour timeout, an
+    /// aborted task — still closes the run, as cancelled, exactly once.
+    #[tokio::test]
+    async fn a_dropped_run_future_closes_the_run_as_cancelled() {
+        use crate::flow_engine::node_adapter::test_support::CapturingProgress;
+        let json = r#"{"nodes":[
+            {"id":"t","type":"trigger","config":{}},
+            {"id":"s","type":"sleep","config":{"sleep_ms":60000}}
+        ],"edges":[{"from":"t","to":"s","from_port":"text","to_port":"in"}]}"#;
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", json, &reg).expect("compile"));
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        let run = execute_blocking(db(), compiled, FlowEnvelope::empty(), ctx, reg);
+        let timed_out = tokio::time::timeout(Duration::from_millis(300), run).await;
+        assert!(timed_out.is_err(), "the run must still be going");
+        assert_eq!(run_finished_statuses(&capture), vec!["cancelled"]);
+    }
+
+    /// The end names the run it closes, so a log that reads it after the
+    /// session scope moved on can still attribute it.
+    #[tokio::test]
+    async fn the_end_event_names_its_run() {
+        use crate::flow_engine::node_adapter::test_support::CapturingProgress;
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", OK_FLOW, &reg).expect("compile"));
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        ctx.request_id = "req-named".into();
+        execute_blocking(db(), compiled, FlowEnvelope::empty(), ctx, reg)
+            .await
+            .expect("exec");
+        assert!(capture.events().iter().any(|(_, e)| matches!(
+            e,
+            crate::flow_engine::dispatchers::ProgressEvent::RunFinished { run_id, .. }
+                if run_id == "req-named"
+        )));
+    }
+
+    /// A subflow, loop or map body runs on its parent's scope; closing it
+    /// would end the parent's timeline early.
+    #[tokio::test]
+    async fn a_nested_run_does_not_announce_an_end() {
+        assert!(run_capturing(OK_FLOW, |ctx| ctx.subflow_depth = 1)
+            .await
+            .is_empty());
+        assert!(run_capturing(OK_FLOW, |ctx| ctx.light = true)
+            .await
+            .is_empty());
     }
 }
 

@@ -81,6 +81,7 @@ pub enum EventKind {
     TurnEnd,
     Error,
     StepIo,
+    RequestFinished,
 }
 
 impl EventKind {
@@ -99,6 +100,7 @@ impl EventKind {
             EventKind::TurnEnd => "turn_end",
             EventKind::Error => "error",
             EventKind::StepIo => "step_io",
+            EventKind::RequestFinished => "request_finished",
         }
     }
 
@@ -115,6 +117,7 @@ impl EventKind {
             "turn_end" => EventKind::TurnEnd,
             "error" => EventKind::Error,
             "step_io" => EventKind::StepIo,
+            "request_finished" => EventKind::RequestFinished,
             _ => return None,
         };
         Some(kind)
@@ -215,6 +218,21 @@ pub enum EventPayload {
         prompt_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_tokens: Option<u64>,
+    },
+    /// Closes a run: the one row that says the request is over, for every
+    /// origin and whether or not an LLM was called. It carries no content, only
+    /// the outcome and timing; ids (run, correlation, org) are the row's own
+    /// columns. Written once per top-level run, so a bus-origin run needs no
+    /// special case: there is nothing in it to withhold.
+    ///
+    /// `status` is `completed`, `failed` or `cancelled` and is minted by the
+    /// engine, never taken from a node's own text. `duration_ms` is the
+    /// difference between this row's `at_ms` and the run's `request_started`
+    /// row (invariant 5); absent when that opening row was never written.
+    RequestFinished {
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -327,6 +345,7 @@ impl EventPayload {
             EventPayload::TurnEnd { .. } => EventKind::TurnEnd,
             EventPayload::Error { .. } => EventKind::Error,
             EventPayload::StepIo { .. } => EventKind::StepIo,
+            EventPayload::RequestFinished { .. } => EventKind::RequestFinished,
         }
     }
 
@@ -397,6 +416,7 @@ impl EventPayload {
             | EventPayload::FirstToken {}
             | EventPayload::StepStart { .. }
             | EventPayload::StepIo { .. }
+            | EventPayload::RequestFinished { .. }
             | EventPayload::TurnStart { .. }) => payload,
         }
     }

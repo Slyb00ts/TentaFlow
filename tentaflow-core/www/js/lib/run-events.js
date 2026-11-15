@@ -8,8 +8,13 @@
 //
 //   The server returns STORED ROWS, not bars. Every span is a DIFFERENCE
 //   BETWEEN TWO EVENTS derived here:
-//     model band  request_started → assistant_message | error, split at
-//                 first_token into TTFT and decoding,
+//     model band  request_started → request_finished, split at first_token
+//                 into TTFT and decoding. ONE closing rule: when the run has
+//                 a request_finished row it is the only closer (an `error`
+//                 row can be one failed step of a run that went on, and a
+//                 flow with no LLM has no assistant_message). A run with no
+//                 request_finished — written before that row existed, or its
+//                 tail lost — falls back to assistant_message | error,
 //     tool band   tool_call → tool_result paired by call_id (never by tool
 //                 name — two concurrent calls to one tool must not cross),
 //     step band   step_start → step_end,
@@ -106,6 +111,36 @@ export function rowName(row) {
   }
 }
 
+const FINISH_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+/** The label of a `request_finished` status; an unknown status stays visible as text. */
+export function finishStatusLabel(status) {
+  return FINISH_STATUSES.has(status) ? t(`status_${status}`) : String(status ?? '');
+}
+
+/**
+ * How a run ended, read from its `request_finished` row: `{ status,
+ * durationMs }`, or `null` when the run has none (older run, lost tail, or
+ * simply not loaded yet — never guessed from other rows). The duration is the
+ * difference between the closing row and the run's `request_started` when both
+ * are loaded, otherwise what the closing row itself stated.
+ */
+export function runOutcome(rows, runId) {
+  let start = null;
+  let finish = null;
+  for (const row of rows) {
+    if (row.runId !== runId) continue;
+    if (row.kind === 'request_started' && (start === null || row.seq < start.seq)) start = row;
+    if (row.kind === 'request_finished' && (finish === null || row.seq > finish.seq)) finish = row;
+  }
+  if (!finish) return null;
+  const stated = finish.payload?.duration_ms;
+  const durationMs = start
+    ? Math.max(0, finish.atMs - start.atMs)
+    : (typeof stated === 'number' ? stated : null);
+  return { status: String(finish.payload?.status ?? ''), durationMs };
+}
+
 function assistantBody(p) {
   const body = p.body;
   if (!body || typeof body !== 'object') return '';
@@ -152,6 +187,8 @@ export function rowDetail(row) {
       return [t('detail_turn', { turn: p.turn ?? '?' }), p.status].filter(Boolean).join(' · ');
     case 'error':
       return [p.stage, truncate(p.message ?? '')].filter(Boolean).join(' · ');
+    case 'request_finished':
+      return finishStatusLabel(p.status);
     default:
       return '';
   }
@@ -177,6 +214,7 @@ function newBand(row, lane, name) {
     turn: row.turn,
     ttft: null,
     error: false,
+    status: null,
   };
 }
 
@@ -204,6 +242,9 @@ export function deriveTimeline(rows) {
     let request = null;
     const openTools = new Map();
     const openSteps = new Map();
+    // The closing rule is decided per run, before the walk: a run that has a
+    // request_finished row is closed by it alone.
+    const finishClosesRequest = runRows.some((r) => r.kind === 'request_finished');
 
     for (const row of runRows) {
       const p = row.payload ?? {};
@@ -233,14 +274,15 @@ export function deriveTimeline(rows) {
         }
         case 'assistant_message': {
           if (request) {
-            request.duration = row.atMs - request.start;
+            const span = row.atMs - request.start;
             row.bandId = request.id;
             // The decode leg when a first_token was recorded, otherwise the
             // whole request — never a difference from an event that is absent.
-            row.durationMs = request.ttft === null
-              ? request.duration
-              : request.duration - request.ttft;
-            request = null;
+            row.durationMs = request.ttft === null ? span : span - request.ttft;
+            if (!finishClosesRequest) {
+              request.duration = span;
+              request = null;
+            }
           }
           break;
         }
@@ -288,10 +330,28 @@ export function deriveTimeline(rows) {
           }
           break;
         }
-        case 'error': {
-          // An error closes the open request when there is one; otherwise it is
-          // an instant of its own and gets no band.
+        case 'request_finished': {
+          const status = String(p.status ?? '');
           if (request) {
+            request.duration = row.atMs - request.start;
+            request.status = status;
+            request.error = status === 'failed';
+            row.bandId = request.id;
+            row.durationMs = request.duration;
+            request = null;
+          } else if (typeof p.duration_ms === 'number') {
+            // The opening row is not among the loaded rows: state only what
+            // the closing row itself recorded.
+            row.durationMs = p.duration_ms;
+          }
+          break;
+        }
+        case 'error': {
+          // Without a request_finished in the run, an error closes the open
+          // request; with one it is just an event (a step failed, the run may
+          // have gone on) and the run's own end decides. With no open request
+          // it is an instant of its own and gets no band.
+          if (request && !finishClosesRequest) {
             request.duration = row.atMs - request.start;
             request.error = true;
             row.bandId = request.id;

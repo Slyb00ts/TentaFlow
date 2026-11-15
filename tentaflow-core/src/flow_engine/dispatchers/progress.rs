@@ -116,6 +116,14 @@ pub enum ProgressEvent {
         interaction_id: String,
         outcome: String,
     },
+    /// A top-level flow run ended, whichever way: `completed`, `failed` or
+    /// `cancelled`. Emitted once per run by the executor (nested subflow, loop
+    /// and map runs share the scope and do not emit it), so the event log can
+    /// close a run that made no LLM call. Carries no content. `run_id` is
+    /// stamped at publish time: a session scope carries one run after another,
+    /// and by the time the log reads the event the scope may be bound to the
+    /// next run, which must not inherit this run's end.
+    RunFinished { run_id: String, status: String },
 }
 
 /// Narrow sink the executor publishes progress to. Mirrors `MetricsSink`:

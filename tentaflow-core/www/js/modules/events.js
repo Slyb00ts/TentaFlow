@@ -24,7 +24,7 @@ import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
 import {
-  normalizeRow, plotFrom, actorLabel, rowName, rowDetail,
+  normalizeRow, plotFrom, actorLabel, rowName, rowDetail, runOutcome, finishStatusLabel,
 } from '/js/lib/run-events.js';
 import {
   busRecordHref, busSourceOf, normalizeCorrelation,
@@ -263,6 +263,17 @@ function runTotal(runId) {
   return fmtMs(Math.max(0, last - first), lang());
 }
 
+// How the run ended when the log says so (`request_finished`); otherwise the
+// wall-clock span of what is loaded, which claims nothing about an end.
+function runSpanText(runId) {
+  const outcome = runOutcome(state.rows, runId);
+  if (!outcome) return t('run_total', { time: runTotal(runId) });
+  const status = finishStatusLabel(outcome.status);
+  return outcome.durationMs === null
+    ? status
+    : t('run_outcome', { status, time: fmtMs(outcome.durationMs, lang()) });
+}
+
 function renderHead(item) {
   const g = item.group;
   const row = g.first;
@@ -275,7 +286,7 @@ function renderHead(item) {
     actorLabel(row),
   ].filter(Boolean).map(escapeHtml).join(' · ');
   return `<div class="ev-turnhead">${escapeHtml(title)}
-    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(t('run_total', { time: runTotal(g.runId) }))}</span>
+    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(runSpanText(g.runId))}</span>
   </div>`;
 }
 
@@ -454,6 +465,10 @@ function renderInspector() {
     }
   } else if (row.durationMs !== null) {
     timing.push(kv(t('duration'), escapeHtml(fmtMs(row.durationMs, lang()))));
+  }
+
+  if (row.kind === 'request_finished') {
+    timing.unshift(kv(t('status'), escapeHtml(finishStatusLabel(row.payload?.status))));
   }
 
   insp.innerHTML = `
