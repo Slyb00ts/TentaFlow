@@ -113,7 +113,7 @@ async fn a_bus_run_and_a_dashboard_run_without_llm_each_end_with_one_event() {
         )
         .expect("seed flow");
     let pool = events::db::init(&tmp.path().join("events.db")).expect("events db");
-    events::progress_log::start(pool.clone(), db.clone());
+    events::progress_log::start(pool.clone());
 
     run_flow(
         &db,

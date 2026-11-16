@@ -63,6 +63,7 @@ pub fn service_request(
             instance_id: Some(state.instance_id.clone()),
             is_system_call: state.is_system_call,
             org_id: state.org_id.clone(),
+            provenance: Some(state.call_provenance.clone()),
         },
         service_name: service_name.clone(),
         payload_json: request_json,

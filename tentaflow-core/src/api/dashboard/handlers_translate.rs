@@ -249,7 +249,12 @@ text, with no explanations, quotes, preface or meta-commentary.",
             None,
             crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
             actor,
-            None,
+            // The organisation the session is acting in; without it the run
+            // would be filed under whichever the user joined first.
+            Some(crate::compliance::ai_gateway::AiGatewayContext {
+                org_id: ctx.org_context.as_ref().map(|org| org.org_id.clone()),
+                ..Default::default()
+            }),
         )
         .await
         .map_err(|e| {

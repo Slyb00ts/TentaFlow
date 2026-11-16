@@ -492,7 +492,8 @@ pub struct FlowRequestMeta {
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
     /// AppState's `ProgressBroker`) injects the production sink; `None` →
-    /// no-op (headless / tests). Scope = session_id, falling back to
+    /// no-op (headless / tests). Scope = `progress_scope()`: a server-minted
+    /// scope when the entry point set one, else session_id, falling back to
     /// request_id so a broadcast key always exists.
     pub progress_sink: Option<Arc<dyn ProgressSink>>,
     /// RAG C2 (recursion guard) — głębokość zagnieżdżenia flow odziedziczona
@@ -507,6 +508,12 @@ pub struct FlowRequestMeta {
     /// reactor dispatch for `FlowOrigin::Bus` runs and written on the run-start
     /// event. A separate field for the same reason as `origin`.
     pub bus_source: Option<crate::events::store::BusRecordRef>,
+    /// Server-minted broadcast scope that replaces the session id for this run.
+    /// A client-chosen session id is low-entropy and shared by every run of a
+    /// conversation, so using it as the scope would let another user's run
+    /// collide with it (and its events and audit rows be suppressed) and would
+    /// file one run's trailing rows under the next.
+    pub(crate) progress_scope_override: Option<String>,
 }
 
 /// Maps a refused block access to the dispatch error a caller already handles:
@@ -548,15 +555,33 @@ impl FlowRequestMeta {
             progress_sink: None,
             flow_depth: 0,
             bus_source: None,
+            progress_scope_override: None,
         }
     }
 
-    /// Effective broadcast scope for progress events — session id when present,
-    /// else the request id.
-    pub(crate) fn progress_scope(&self) -> String {
-        self.session_id
+    /// Effective broadcast scope for progress events — the server-minted scope
+    /// when one was set, else the session id when present, else the request id.
+    pub fn progress_scope(&self) -> String {
+        self.progress_scope_override
             .clone()
+            .or_else(|| self.session_id.clone())
             .unwrap_or_else(|| self.request_id.clone())
+    }
+
+    /// Puts this run on the Events log under a scope of its own. Called by the
+    /// AI entry points only: a run without a sink publishes nothing, and a
+    /// nested flow (reached through a model alias) must not call it, or the
+    /// inner run would be recorded as a second top-level run. The scope is the
+    /// request id, minted by the server per run, so no other principal can
+    /// observe or contest it and the conversation's `session_id` stays what it
+    /// is for memory.
+    pub fn record_to_event_log(&mut self) {
+        self.progress_scope_override = Some(self.request_id.clone());
+        self.progress_sink = Some(Arc::new(
+            crate::flow_engine::progress_broker::BrokerProgressSink::new(
+                crate::flow_engine::progress_broker::global_broker(),
+            ),
+        ));
     }
 }
 
@@ -1210,6 +1235,9 @@ impl FlowDispatcher {
         meta.user_id = Some(account.id);
         meta.user_role = Some(account.role);
         meta.org_id = Some(org_id.to_owned());
+        // A process step is an AI run like any other: it goes on the Events log
+        // under its own run id and the process's organisation.
+        crate::routing::start_recording(&mut meta, Some(&self.db), Some(org_id));
         Ok(meta)
     }
 
@@ -1235,6 +1263,7 @@ impl FlowDispatcher {
         let user = crate::auth::acl::UserContext {
             user_id: user_id.to_owned(),
             role: String::new(),
+            org_id: None,
         };
         let context = crate::compliance::ai_gateway::AiGatewayContext {
             org_id: Some(org_id.to_owned()),
@@ -1571,6 +1600,9 @@ impl FlowDispatcher {
         meta.user_id = Some(account.id);
         meta.user_role = Some(account.role);
         meta.org_id = Some(org_id.to_owned());
+        // A process step is an AI run like any other: it goes on the Events log
+        // under its own run id and the process's organisation.
+        crate::routing::start_recording(&mut meta, Some(&self.db), Some(org_id));
         Ok(meta)
     }
 
@@ -2720,7 +2752,7 @@ mod tests {
         // `begin_run` keeps the provenance binding only while something is
         // watching the scope; without the process-wide log there is no
         // subscriber, no timeline row and therefore no audit mirror to compare.
-        crate::events::progress_log::start(events_pool.clone(), main_db.clone());
+        crate::events::progress_log::start(events_pool.clone());
 
         let run_id = format!("req-{}", uuid::Uuid::new_v4());
         let mut meta = FlowRequestMeta::new(

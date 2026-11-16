@@ -1939,6 +1939,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             progress_sink: Some(progress),
             flow_depth: 0,
             bus_source: None,
+            progress_scope_override: None,
         };
 
         let outcome = dispatcher

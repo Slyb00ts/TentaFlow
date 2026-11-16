@@ -421,14 +421,19 @@ pub async fn run_ask_user(
     progress_scope: &str,
     run_id: &str,
     parent_run_id: Option<&str>,
+    owner_user_id: Option<&str>,
     question: &str,
     choices: &[String],
     timeout: Duration,
 ) -> (String, Duration) {
     let interaction_id = uuid::Uuid::new_v4().to_string();
+    // A flow with no managed agent run still raises a card. It is filed under
+    // the run's own scope, which is what the live view names the run by, so the
+    // card can be answered; the manager is told nothing of it.
+    let card_run_id = if run_id.is_empty() { progress_scope } else { run_id };
     let info = PendingInteraction {
         id: interaction_id.clone(),
-        run_id: run_id.to_string(),
+        run_id: card_run_id.to_string(),
         parent_run_id: parent_run_id.map(|s| s.to_string()),
         kind: InteractionKind::Question,
         prompt: question.to_string(),
@@ -437,10 +442,11 @@ pub async fn run_ask_user(
         tool_name: None,
         permission: None,
         raised_at_ms: now_ms(),
-        // A question is answered by the model's caller, not by a sign-in.
+        // A question is answered by the model's caller, not by a sign-in; the
+        // principal is the run's owner, who alone (besides an admin) may answer.
         engine_id: None,
         account_id: None,
-        user_id: None,
+        user_id: owner_user_id.map(str::to_string),
     };
     let rx = registry.register(info);
 
@@ -453,7 +459,7 @@ pub async fn run_ask_user(
     progress.emit(
         progress_scope,
         ProgressEvent::UserQuestion {
-            run_id: run_id.to_string(),
+            run_id: card_run_id.to_string(),
             interaction_id: interaction_id.clone(),
             question: question.to_string(),
             choices: choices.to_vec(),
@@ -483,7 +489,7 @@ pub async fn run_ask_user(
     progress.emit(
         progress_scope,
         ProgressEvent::InteractionResolved {
-            run_id: run_id.to_string(),
+            run_id: card_run_id.to_string(),
             interaction_id,
             outcome: outcome_label.to_string(),
         },
@@ -505,6 +511,7 @@ pub async fn run_permission_request(
     progress_scope: &str,
     run_id: &str,
     parent_run_id: Option<&str>,
+    owner_user_id: Option<&str>,
     addon_id: &str,
     tool_name: &str,
     permission: &str,
@@ -513,9 +520,10 @@ pub async fn run_permission_request(
     let interaction_id = uuid::Uuid::new_v4().to_string();
     let prompt =
         format!("Allow tool '{tool_name}' (addon '{addon_id}', permission '{permission}')?");
+    let card_run_id = if run_id.is_empty() { progress_scope } else { run_id };
     let info = PendingInteraction {
         id: interaction_id.clone(),
-        run_id: run_id.to_string(),
+        run_id: card_run_id.to_string(),
         parent_run_id: parent_run_id.map(|s| s.to_string()),
         kind: InteractionKind::Permission,
         prompt,
@@ -524,10 +532,11 @@ pub async fn run_permission_request(
         tool_name: Some(tool_name.to_string()),
         permission: Some(permission.to_string()),
         raised_at_ms: now_ms(),
-        // A permission grant is a decision, not a missing account.
+        // A permission grant is a decision, not a missing account; the principal
+        // is the run's owner, who alone (besides an admin) may decide.
         engine_id: None,
         account_id: None,
-        user_id: None,
+        user_id: owner_user_id.map(str::to_string),
     };
     let rx = registry.register(info);
 
@@ -538,7 +547,7 @@ pub async fn run_permission_request(
     progress.emit(
         progress_scope,
         ProgressEvent::PermissionRequest {
-            run_id: run_id.to_string(),
+            run_id: card_run_id.to_string(),
             interaction_id: interaction_id.clone(),
             addon_id: addon_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -564,7 +573,7 @@ pub async fn run_permission_request(
     progress.emit(
         progress_scope,
         ProgressEvent::InteractionResolved {
-            run_id: run_id.to_string(),
+            run_id: card_run_id.to_string(),
             interaction_id,
             outcome: outcome_label.to_string(),
         },
@@ -771,6 +780,7 @@ mod tests {
                 "scope",
                 "run-1",
                 None,
+                None,
                 "delete file X?",
                 &["yes".into(), "no".into()],
                 Duration::from_secs(10),
@@ -808,6 +818,7 @@ mod tests {
             "scope",
             "run-1",
             None,
+            None,
             "anyone?",
             &[],
             Duration::from_millis(20),
@@ -830,6 +841,7 @@ mod tests {
                 &progress,
                 "scope",
                 "run-7",
+                None,
                 None,
                 "contacts",
                 "contacts.lookup",
@@ -877,6 +889,7 @@ mod tests {
             &progress,
             "scope",
             "run-1",
+            None,
             None,
             "contacts",
             "contacts.lookup",

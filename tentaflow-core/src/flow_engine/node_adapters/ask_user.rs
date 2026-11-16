@@ -155,6 +155,7 @@ impl NodeAdapter for AskUserNodeAdapter {
             &ctx.progress_scope,
             &run_id,
             None,
+            ctx.user_id.as_deref(),
             &question,
             &choices,
             timeout,

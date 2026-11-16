@@ -33,6 +33,7 @@ use bytes::Bytes;
 use crate::auth::actor::ActorKind;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::{self, BusCallContext, PublishBatch, PublishRecord};
+use crate::flow_engine::dispatchers::SafeFailure;
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
 use crate::flow_engine::expr::{evaluate, flow_value_to_json, ExprScope};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
@@ -261,13 +262,33 @@ impl NodeAdapter for BusPublishNodeAdapter {
         })
         .await
         .map_err(|e| anyhow!("bus_publish: publish task panicked: {e}"))?
-        .map_err(|e| anyhow!("bus_publish: {e}"))?;
+        .map_err(|e| {
+            anyhow::Error::new(SafeFailure::new(
+                format!("bus_publish: {e}"),
+                publish_failure_reason(&e, &topic),
+            ))
+        })?;
 
         let mut out = (*input.envelope).clone();
         out.meta
             .insert("bus_publish_topic".into(), serde_json::json!(topic));
         record_publish_outcome(&mut out, &result);
         Ok(out)
+    }
+}
+
+/// Why a publish was refused, in words that are safe for the event log: the
+/// topic and the missing right, never a record or an engine message (those can
+/// quote the content that was being written).
+fn publish_failure_reason(error: &bus::BusServiceError, target: &str) -> String {
+    match error {
+        bus::BusServiceError::PermissionDenied { action, topic } => {
+            format!("no {action} permission on topic {topic}")
+        }
+        bus::BusServiceError::TopicNotFound { name } => format!("topic {name} not found"),
+        bus::BusServiceError::QuotaExceeded { .. }
+        | bus::BusServiceError::QuotaRequestTooLarge { .. } => "org quota exceeded".to_string(),
+        _ => format!("publish to topic {target} failed"),
     }
 }
 
@@ -315,6 +336,40 @@ mod tests {
             label: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn a_refused_publish_names_the_topic_and_right_and_nothing_else() {
+        let denied = bus::BusServiceError::PermissionDenied {
+            action: "write",
+            topic: "cel".into(),
+        };
+        assert_eq!(
+            publish_failure_reason(&denied, "cel"),
+            "no write permission on topic cel"
+        );
+        let missing = bus::BusServiceError::TopicNotFound { name: "cel".into() };
+        assert_eq!(
+            publish_failure_reason(&missing, "cel"),
+            "topic cel not found"
+        );
+        let engine = bus::BusServiceError::Codec("payload SEKRET".into());
+        assert_eq!(
+            publish_failure_reason(&engine, "cel"),
+            "publish to topic cel failed"
+        );
+    }
+
+    #[test]
+    fn a_safe_failure_keeps_the_full_message_and_stays_downcastable() {
+        let err = anyhow::Error::new(SafeFailure::new(
+            "bus_publish: permission denied: write on topic 'B'",
+            "no write permission on topic B",
+        ));
+        assert!(err.to_string().contains("permission denied"));
+        let wrapped = err.context("pre-producer node 'p' failed");
+        let failure = wrapped.downcast_ref::<SafeFailure>().expect("downcast");
+        assert_eq!(failure.reason(), "no write permission on topic B");
     }
 
     /// A run that an addon started for a user publishes as that user — its

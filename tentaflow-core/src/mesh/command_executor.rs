@@ -1207,6 +1207,8 @@ impl MeshCommandExecutor {
             &model_name,
             &message,
             max_tokens,
+            // A peer's request: no local person to attribute it to.
+            None,
         )
         .await
         {

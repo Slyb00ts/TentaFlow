@@ -504,6 +504,14 @@ impl LlmNodeAdapter {
         // and it is shared by the blocking and the streaming path.
         ctx.usage_sink.record_model(&model);
         let messages = Self::build_messages(node, envelope);
+        let (tools, tool_choice) = Self::pick_tools(envelope);
+        let temperature = Self::pick_optional_f32(node, envelope, "temperature");
+        let reasoning_effort = Self::pick_optional_string(node, envelope, "reasoning_effort");
+        let max_tokens = Self::pick_optional_u32(node, envelope, "max_tokens");
+        let top_p = Self::pick_optional_f32(node, envelope, "top_p");
+        let frequency_penalty = Self::pick_optional_f32(node, envelope, "frequency_penalty");
+        let presence_penalty = Self::pick_optional_f32(node, envelope, "presence_penalty");
+        let stop = Self::pick_stop(node);
         if ctx.progress.wants_io() {
             ctx.progress.emit(
                 &ctx.progress_scope,
@@ -515,8 +523,9 @@ impl LlmNodeAdapter {
                     completion_tokens: None,
                 },
             );
-            // The exact prompt, not the envelope it was assembled from: this is
-            // what the model was actually given.
+            // The exact request, not the envelope it was assembled from: the
+            // messages (system prompt included), the tools offered and every
+            // sampling parameter the model was given.
             ctx.progress.emit(
                 &ctx.progress_scope,
                 crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
@@ -524,25 +533,41 @@ impl LlmNodeAdapter {
                     input: serde_json::to_string_pretty(&serde_json::json!({
                         "model": model,
                         "messages": messages,
+                        "tools": tools
+                            .iter()
+                            .map(|tool| serde_json::json!({
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.parameters,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "tool_choice": tool_choice,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "top_p": top_p,
+                        "frequency_penalty": frequency_penalty,
+                        "presence_penalty": presence_penalty,
+                        "stop": stop,
+                        "reasoning_effort": reasoning_effort,
                     }))
-                    .ok(),
+                    .ok()
+                    .map(crate::events::step_io::limit_side),
                     output: None,
                 },
             );
         }
-        let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {
             // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
             provenance: ctx.provenance(),
             model,
             messages,
-            temperature: Self::pick_optional_f32(node, envelope, "temperature"),
-            reasoning_effort: Self::pick_optional_string(node, envelope, "reasoning_effort"),
-            max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
-            top_p: Self::pick_optional_f32(node, envelope, "top_p"),
-            frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
-            presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
-            stop: Self::pick_stop(node),
+            temperature,
+            reasoning_effort,
+            max_tokens,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
+            stop,
             // Audio out is per-block config, not a model guess: the operator
             // decides that THIS step should speak. A model without the
             // capability is rejected by the resolver, not silently muted.
@@ -1338,6 +1363,57 @@ mod tests {
         assert_eq!(req.tools[0].name, "core.skill_view");
         assert_eq!(req.tools[1].name, "memory.memory_store");
         assert_eq!(req.tool_choice.as_deref(), Some("auto"));
+    }
+
+    /// The recorded request names the tools the model was offered, with their
+    /// descriptions and parameter schemas, not just the messages.
+    #[test]
+    fn the_recorded_request_lists_the_tools_offered() {
+        use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Capture(Mutex<Vec<ProgressEvent>>);
+        impl ProgressSink for Capture {
+            fn emit(&self, _scope: &str, event: ProgressEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn wants_io(&self) -> bool {
+                true
+            }
+        }
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("m"));
+        env.meta.insert(
+            "harness_tools".into(),
+            json!([
+                {"name": "core.skill_view", "description": "load a skill", "parameters": {"type": "object"}},
+                {"name": "memory.memory_store", "description": "store", "parameters": {"type": "object"}}
+            ]),
+        );
+        env.meta.insert("tool_choice".into(), json!("auto"));
+        let capture = Arc::new(Capture::default());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        LlmNodeAdapter::build_llm_request(&node(json!({})), &env, &ctx).unwrap();
+
+        let events = capture.0.lock().unwrap();
+        let input = events
+            .iter()
+            .find_map(|event| match event {
+                ProgressEvent::NodeIo { input: Some(input), .. } => Some(input.clone()),
+                _ => None,
+            })
+            .expect("the request was recorded");
+        let recorded: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let tools = recorded["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "core.skill_view");
+        assert_eq!(tools[0]["description"], "load a skill");
+        assert_eq!(tools[0]["parameters"], json!({"type": "object"}));
+        assert_eq!(tools[1]["name"], "memory.memory_store");
+        assert_eq!(recorded["tool_choice"], "auto");
     }
 
     #[test]

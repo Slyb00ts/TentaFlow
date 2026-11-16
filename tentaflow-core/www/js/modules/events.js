@@ -552,12 +552,14 @@ async function loadStepIo(row) {
     const cut = body.truncated
       ? `<div class="ev-io-note">${escapeHtml(t('io_cut'))}</div>`
       : '';
-    const section = (label, bytes, text) => `
+    // The bytes the reply could not carry arrive as a number; the words are ours.
+    const section = (label, bytes, text, omitted) => `
       <h4>${escapeHtml(label)} <span class="ev-io-size">${escapeHtml(fmtBytes(bytes))}</span></h4>
-      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>`;
+      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>
+      ${omitted > 0 ? `<div class="ev-io-note">${escapeHtml(t('io_preview_cut', { size: fmtBytes(omitted) }))}</div>` : ''}`;
     byId('events-io').innerHTML = `${cut}
-      ${section(t('io_input'), body.inputBytes, body.input)}
-      ${section(t('io_output'), body.outputBytes, body.output)}`;
+      ${section(t('io_input'), body.inputBytes, body.input, body.inputOmittedBytes ?? 0)}
+      ${section(t('io_output'), body.outputBytes, body.output, body.outputOmittedBytes ?? 0)}`;
   } catch (err) {
     if (state.selectedKey !== key) return;
     const host2 = byId('events-io');
@@ -565,11 +567,13 @@ async function loadStepIo(row) {
   }
 }
 
+// One decimal in the viewer's own separator, like every other number here.
 function fmtBytes(n) {
   if (typeof n !== 'number') return '';
   if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  const one = new Intl.NumberFormat(lang(), { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  if (n < 1024 * 1024) return `${one.format(n / 1024)} KB`;
+  return `${one.format(n / (1024 * 1024))} MB`;
 }
 
 function prettyPayload(row) {
@@ -741,7 +745,13 @@ function renderLedger() {
 
 function renderStatus() {
   const count = byId('events-count');
-  if (count) count.setAttribute('label', t('loaded_count', { count: state.rows.length }));
+  // A full window is not the whole log: older events exist until the server
+  // stops handing out a cursor, so the label says so instead of looking final.
+  if (count) {
+    count.setAttribute('label', state.hasMore
+      ? t('loaded_count_more', { count: state.rows.length })
+      : t('loaded_count', { count: state.rows.length }));
+  }
   const scope = byId('events-scope');
   if (scope) {
     scope.hidden = !state.scopedToSelf;

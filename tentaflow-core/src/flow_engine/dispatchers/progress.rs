@@ -23,6 +23,11 @@ pub enum ProgressEvent {
     /// A node settled. `status` is the trace status label (`ok` / `error` /
     /// `skipped`) so the UI mirrors the trace without carrying the full step.
     NodeFinished { node_id: String, status: String },
+    /// Why a node is about to settle as `error`, in words that are safe to
+    /// store: the executor emits it only for a failure the adapter raised as a
+    /// [`SafeFailure`], right before the node's `NodeFinished(error)`.
+    /// Never carries record content or the raw error text of a node.
+    NodeFailed { node_id: String, reason: String },
     /// The streaming producer delivered its first visible token for the current
     /// step. TTFT is `request_started -> first_token` and decoding is
     /// `first_token -> assistant_message`, so this event exists to keep both as
@@ -69,6 +74,15 @@ pub enum ProgressEvent {
     /// obok siebie, parowanie po nazwie potrafi zlaczyc start jednego z koncem
     /// drugiego i wyliczyc z tego bzdurny czas.
     ToolCallStarted { call_id: String, name: String },
+    /// The content of one tool call, for a sink that keeps content: the
+    /// arguments the model sent (reported just before the call starts) and the
+    /// text the tool returned (just before the call settles). Never reaches a
+    /// live view.
+    ToolIo {
+        call_id: String,
+        arguments: Option<String>,
+        result: Option<String>,
+    },
     /// A tool call settled (phase 3/5 harness emits).
     ToolCallFinished {
         call_id: String,
@@ -126,6 +140,39 @@ pub enum ProgressEvent {
     RunFinished { run_id: String, status: String },
 }
 
+/// A node error that also carries a reason safe to store. Its `Display` is the
+/// node's full error message, so every consumer of the error (execution log,
+/// client error, step text) sees exactly what it saw before; `reason` is what
+/// the event log may keep. The raw message of a node may quote the data it was
+/// handling, so the log never stores it; only a reason carried by this type
+/// reaches the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeFailure {
+    message: String,
+    reason: String,
+}
+
+impl SafeFailure {
+    pub fn new(message: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for SafeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SafeFailure {}
+
 /// Narrow sink the executor publishes progress to. Mirrors `MetricsSink`:
 /// `Send + Sync`, fire-and-forget, never blocks the execution path.
 ///
@@ -142,6 +189,75 @@ pub trait ProgressSink: Send + Sync {
         false
     }
 }
+
+/// The run a model call is made on behalf of, when the call is not a top-level
+/// run itself (an `addon.*` block inside a flow calling `llm_generate`).
+///
+/// `origin` is the parent's, so a bus run stays a bus call. `sink` is the
+/// parent's progress sink with its scope: the call's content is recorded there
+/// as a child step of the parent run. It is `None` when nothing may be recorded
+/// for the call: a Bus or Mesh parent, or a sink that keeps no content.
+#[derive(Clone)]
+pub struct ParentRun {
+    pub origin: crate::flow_engine::dispatcher::FlowOrigin,
+    pub sink: Option<std::sync::Arc<dyn ProgressSink>>,
+    pub scope: String,
+}
+
+impl ParentRun {
+    /// A parent run. The sink is kept only for an origin whose content is
+    /// recorded (never Bus or Mesh) and only when the sink stores content.
+    pub fn new(
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        sink: std::sync::Arc<dyn ProgressSink>,
+        scope: String,
+    ) -> Self {
+        let records = !matches!(
+            origin,
+            crate::flow_engine::dispatcher::FlowOrigin::Bus
+                | crate::flow_engine::dispatcher::FlowOrigin::Mesh
+        ) && sink.wants_io();
+        Self {
+            origin,
+            sink: records.then_some(sink),
+            scope,
+        }
+    }
+
+    /// A parent whose calls are never recorded (a mesh forward, a bus run
+    /// seen without its sink).
+    pub fn unrecorded(origin: crate::flow_engine::dispatcher::FlowOrigin) -> Self {
+        Self {
+            origin,
+            sink: None,
+            scope: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ParentRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParentRun")
+            .field("origin", &self.origin)
+            .field("recorded", &self.sink.is_some())
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl PartialEq for ParentRun {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin == other.origin
+            && self.scope == other.scope
+            && match (&self.sink, &other.sink) {
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ParentRun {}
 
 /// Default no-op sink used by tests/test_support and whenever no broker is
 /// wired (headless deploys without the dashboard).

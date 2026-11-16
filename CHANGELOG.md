@@ -8,6 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### Zdarzenia i konta usługowe (TB-02)
 
+- Przebiegi AI w dzienniku zdarzeń zawsze zapisują pełne wejście i wyjście
+  (prompt, odpowiedź, argumenty i wyniki narzędzi, żądanie do modelu w każdej
+  iteracji agenta) — bez zgody organizacji. Ustawienie
+  `events.store_assistant_body:<org>` nie istnieje: wiersz `assistant_message`
+  niesie treść odpowiedzi dla każdego przebiegu, a starsze wiersze z
+  `not_enabled` i `no_organisation` nadal się odczytują. Przebiegi z magistrali
+  (TentaBus, dane medyczne) nie zapisują żadnej treści — tylko oś czasu — i tego
+  nie zmienia żadna ścieżka. Przebieg czatu bez modelu kończy się teraz jako
+  `failed` (błąd dociera do strumienia zamiast pustej odpowiedzi), a przycisk
+  „Anuluj” nie pojawia się przy przebiegach, których nie da się anulować.
 - Każdy przebieg przepływu kończy się teraz jednym wierszem `request_finished`
   w dzienniku zdarzeń (status `completed`/`failed`/`cancelled` i czas, bez
   treści), także przebiegi z magistrali i przepływy bez wywołania LLM; widok

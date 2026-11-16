@@ -28,6 +28,24 @@ impl Router {
         origin: crate::flow_engine::dispatcher::FlowOrigin,
         actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
+        self.route_embeddings_in_context(request, user, origin, actor, None)
+            .await
+    }
+
+    /// [`Self::route_embeddings_for_user`] with the gateway context of the
+    /// caller (the organisation an addon acts in, the run it is nested in).
+    ///
+    /// The call is recorded like a chat call: a run of its own when standalone
+    /// (the text sent and a summary of what came back), a child step of the
+    /// parent run when nested, nothing for a bus run.
+    pub async fn route_embeddings_in_context(
+        &self,
+        request: EmbeddingRequest,
+        user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
+        context: Option<crate::compliance::ai_gateway::AiGatewayContext>,
+    ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::auth::acl::check_access_safe(
@@ -45,10 +63,27 @@ impl Router {
                 }
             }
         }
+        let run = crate::routing::direct_run::DirectRun::begin_embeddings(
+            &request,
+            origin,
+            &actor,
+            user.as_ref(),
+            self.db.as_ref(),
+            context.as_ref(),
+            None,
+        );
         // Usage is booked by the embeddings dispatcher through the AI gateway,
         // once per backend call; booking it here as well would count it twice.
-        self.route_embeddings_inner(request, user, origin, actor)
-            .await
+        let routed = self
+            .route_embeddings_inner(request, user, origin, actor)
+            .await;
+        if let Some(run) = run {
+            match &routed {
+                Ok(result) => run.finish_embeddings(&result.response),
+                Err(_) => run.finish_failed(),
+            }
+        }
+        routed
     }
 
     /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.

@@ -41,6 +41,10 @@ pub fn token_quota_enabled() -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub struct AiGatewayContext {
+    /// The flow run this call is made on behalf of (an addon block running inside
+    /// a flow). Its content belongs to that run: the router opens no top-level
+    /// run for it and records it as a child step of the parent, or not at all.
+    pub parent_run: Option<crate::flow_engine::dispatchers::ParentRun>,
     pub org_id: Option<String>,
     pub addon_id: Option<String>,
     pub instance_id: Option<String>,

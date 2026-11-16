@@ -134,10 +134,16 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         // Realny zalogowany użytkownik z sesji → atrybucja zużycia tokenów i kwot
         // per-user (bez tego AiGateway zapisywałby zużycie na sentinel __system__).
         let user = match &ctx.session {
-            SessionAuth::UserSession { user_id, role } => Some(crate::auth::acl::UserContext::new(
-                super::handlers::user_id_to_uuid(user_id),
-                role.clone().unwrap_or_else(|| "user".to_string()),
-            )),
+            SessionAuth::UserSession { user_id, role } => {
+                let user = crate::auth::acl::UserContext::new(
+                    super::handlers::user_id_to_uuid(user_id),
+                    role.clone().unwrap_or_else(|| "user".to_string()),
+                );
+                Some(match ctx.org_context.as_ref() {
+                    Some(org) => user.with_org(org.org_id.clone()),
+                    None => user,
+                })
+            }
             _ => None,
         };
         // §2.5 — dashboard chat surface; the actor is the session user.
@@ -340,10 +346,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
     };
 
     let router = ctx.state.router.clone();
-    let progress_broker = ctx.state.progress_broker.clone();
-    // Authenticated principal of this foreground flow. Bound to the session
-    // scope below so run-events ACL (§3.3) can reject a foreign subscriber — the
-    // client-minted session id is not an authorization token on its own.
+    // Authenticated principal of this foreground flow.
     let actor_id = match &ctx.session {
         SessionAuth::UserSession { user_id, .. } => {
             Some(uuid::Uuid::from_bytes(*user_id).hyphenated().to_string())
@@ -444,15 +447,10 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             serde_json::Value::String(correlation_key),
         );
         meta.cancel_token = cancel.clone();
-
-        // Bind the session scope to this principal so run-events ACL (§3.3) can
-        // authorize a `Session` subscription — the progress scope is this
-        // session id (engine plumbing), and without the binding any user could
-        // subscribe by guessing it.
-        if let (Some(session_id), Some(actor)) = (invoke.session_id.as_deref(), actor_id.as_deref())
-        {
-            progress_broker.bind_session_owner(session_id, actor);
-        }
+        meta.org_id = ctx.org_context.as_ref().map(|org| org.org_id.clone());
+        // Without a sink the run publishes nothing and never reaches the event
+        // log; the run gets a scope of its own, not the client's session id.
+        crate::routing::start_recording(&mut meta, Some(&ctx.state.db), None);
 
         // flow_id ma priorytet — odpala dokładnie ten flow który user wybrał
         // (np. w trybie audio). Bez niego rozwiązanie przez model/service_type.
@@ -2197,12 +2195,9 @@ fn project_studio_chat_stream_handler(
         // byc wiazaniem serwera, a nie parametrem, ktory da sie przekierowac.
         meta.addon_id = Some(crate::project_studio::ingest::vector_scope(&project_id));
         meta.cancel_token = cancel.clone();
-        // Without a sink the run publishes nothing and never reaches the event log.
-        meta.progress_sink = Some(Arc::new(
-            crate::flow_engine::progress_broker::BrokerProgressSink::new(
-                ctx.state.progress_broker.clone(),
-            ),
-        ));
+        // Without a sink the run publishes nothing and never reaches the event
+        // log; it records under a scope of its own, not the chat's session id.
+        meta.record_to_event_log();
 
         let dispatch = fd
             .dispatch_by_flow_id_streaming(
@@ -3209,11 +3204,7 @@ fn project_studio_code_assist_stream_handler(
         meta.user_role = user_role;
         meta.org_id = Some(org_id);
         meta.cancel_token = cancel.clone();
-        meta.progress_sink = Some(Arc::new(
-            crate::flow_engine::progress_broker::BrokerProgressSink::new(
-                ctx.state.progress_broker.clone(),
-            ),
-        ));
+        meta.record_to_event_log();
 
         let exec = match fd
             .try_dispatch_streaming(&agent.model, "chat", envelope, meta)

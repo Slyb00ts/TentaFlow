@@ -487,7 +487,7 @@ function rowButtons(pairs) {
     b.setAttribute('size', 'sm');
     b.dataset.act = act;
     b.textContent = label;
-    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(b); });
     wrap.appendChild(b);
   }
   return wrap;
@@ -572,7 +572,7 @@ export function paintAccessSection(host, view, ctx) {
       if (!row._known) return null;
       return rowButtons([
         ['key-rights', T('access.change.button'), () => ctx.go({ kind: 'key-rights', keyId: live()._key })],
-        ['key-revoke', T('access.keys.revoke.button'), () => ctx.go({ kind: 'key-revoke', keyId: live()._key })],
+        ['key-revoke', T('access.keys.revoke.button'), (button) => ctx.go({ kind: 'key-revoke', keyId: live()._key }, button)],
       ]);
     } : null;
   }

@@ -82,6 +82,9 @@ pub trait SummaryModel: Send + Sync {
 /// The platform model behind [`SUMMARY_ALIAS`].
 pub struct RouterModel {
     pub router: Arc<Router>,
+    /// The person the summaries are written for (whoever added the source), so
+    /// the runs are theirs to see. `None` when nobody is known.
+    pub attribution: Option<crate::auth::acl::UserContext>,
 }
 
 #[async_trait]
@@ -124,9 +127,14 @@ impl SummaryModel for RouterModel {
             crate::flow_engine::dispatcher::FlowOrigin::Project,
             crate::flow_engine::dispatcher::FlowActor::system_component("project_studio"),
         );
-        let response = executor
-            .execute_chat(request, &mut rctx)
-            .await
+        let response = crate::routing::direct_run::execute_chat_recorded(
+            &executor,
+            request,
+            &mut rctx,
+            self.router.db.as_ref(),
+            self.attribution.as_ref(),
+        )
+        .await
             .map_err(|e| anyhow!("summary model ({SUMMARY_ALIAS}): {e}"))?;
         let truncated = response
             .choices

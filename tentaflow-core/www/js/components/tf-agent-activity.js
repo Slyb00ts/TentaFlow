@@ -63,6 +63,12 @@ const STATUS_TONE = {
   timed_out: 'warn',
 };
 
+// A run with no agent name is named by when it started: an id prefix means
+// nothing to the person looking at the list.
+function runLabel(run) {
+  return run.agent || new Date(run.startedAt).toLocaleTimeString();
+}
+
 // child_finished status → run status (the run row updates from lifecycle events).
 // A timed-out run has ENDED: it must not be counted as activity, kept in a badge
 // or offered a Cancel button. `cancelling` is deliberately absent — a requested
@@ -344,6 +350,18 @@ class TfAgentActivity extends HTMLElement {
       run = this._newRun(runId, ev.agent || '');
       this._runs.set(runId, run);
     }
+    // A flow run that is not a managed agent run cannot be cancelled from here.
+    if (ev.unmanaged) run.unmanaged = true;
+
+    // The end of the run settles it; it is bookkeeping, not a step.
+    if (ev.kind === 'run_finished') {
+      run.status = TERMINAL_STATUSES.has(ev.status) ? ev.status : 'completed';
+      run.toolInFlight = '';
+      run.finishedAt = Date.now();
+      run.lastEventAt = run.finishedAt;
+      if (this._built) this._render();
+      return;
+    }
 
     if (ev.kind === 'child_spawned') {
       // The child row is created above by the generic path (it is keyed by
@@ -400,6 +418,12 @@ class TfAgentActivity extends HTMLElement {
     run.steps.push(step);
     run.currentStep = step.detail ? `${step.kind} · ${step.detail}` : step.kind;
 
+    if (this._built) this._render();
+  }
+
+  // Forgets every run: the widget follows one conversation at a time.
+  clearRuns() {
+    this._runs.clear();
     if (this._built) this._render();
   }
 
@@ -601,7 +625,7 @@ class TfAgentActivity extends HTMLElement {
   _waitingLine() {
     for (const run of this._runs.values()) {
       if (run.status === 'waiting_user') {
-        const who = run.agent || run.runId.slice(0, 8);
+        const who = runLabel(run);
         return `${who} ${this._labels.asks}`;
       }
     }
@@ -631,7 +655,7 @@ class TfAgentActivity extends HTMLElement {
         </div>`
       : '';
     return `<div class="tf-aa-card tf-aa-card-question" data-run="${esc(run.runId)}" data-interaction="${esc(q.interactionId)}">
-      <div class="tf-aa-card-head">${esc(run.agent || run.runId.slice(0, 8))} ${esc(this._labels.asks)}</div>
+      <div class="tf-aa-card-head">${esc(runLabel(run))} ${esc(this._labels.asks)}</div>
       <div class="tf-aa-card-body">${esc(q.question)}</div>
       ${choices ? `<div class="tf-aa-choices">${choices}</div>` : ''}
       ${freeText}
@@ -641,7 +665,7 @@ class TfAgentActivity extends HTMLElement {
   _renderPermissionCard(run) {
     const p = run.permission;
     return `<div class="tf-aa-card tf-aa-card-perm" data-run="${esc(run.runId)}" data-interaction="${esc(p.interactionId)}">
-      <div class="tf-aa-card-head">${esc(run.agent || run.runId.slice(0, 8))}</div>
+      <div class="tf-aa-card-head">${esc(runLabel(run))}</div>
       <div class="tf-aa-card-body">${esc(this._labels.perm_wants)} <strong>${esc(p.toolName)}</strong> ${esc(this._labels.perm_of)} <strong>${esc(p.addonId)}</strong></div>
       <div class="tf-aa-perm-actions">
         <tf-button variant="ghost" data-perm="deny">${esc(this._labels.perm_deny)}</tf-button>
@@ -669,13 +693,13 @@ class TfAgentActivity extends HTMLElement {
       // still going is measured against the clock.
       const elapsed = formatElapsed((run.finishedAt || Date.now()) - run.startedAt);
       const tokens = run.promptTokens + run.completionTokens;
-      const cancellable = !TERMINAL_STATUSES.has(run.status);
+      const cancellable = !run.unmanaged && !TERMINAL_STATUSES.has(run.status);
       const row = `<div class="tf-aa-run" data-run="${esc(run.runId)}" style="--depth:${depth}">
         <button class="tf-aa-run-main" data-action="open-run" data-run-id="${esc(run.runId)}"${run.model ? ` title="${esc(run.model)}"` : ''}>
           <tf-chip status="${tone}" dot>${esc(runStatusText(run.status, this._labels))}</tf-chip>
-          <span class="tf-aa-run-agent">${esc(run.agent || run.runId.slice(0, 8))}</span>
+          <span class="tf-aa-run-agent">${esc(runLabel(run))}</span>
           ${this._accountChip(run)}
-          <span class="tf-aa-run-meta">${esc(elapsed)} · ${esc(String(tokens))} ${esc(this._labels.tokens)}</span>
+          <span class="tf-aa-run-meta">${esc(elapsed)}${tokens > 0 || !run.unmanaged ? ` · ${esc(String(tokens))} ${esc(this._labels.tokens)}` : ''}</span>
         </button>
         ${cancellable ? `<tf-button variant="ghost" size="sm" data-action="cancel-run" data-run-id="${esc(run.runId)}">${esc(this._labels.cancel)}</tf-button>` : ''}
       </div>`;
@@ -693,7 +717,7 @@ class TfAgentActivity extends HTMLElement {
     const tone = STATUS_TONE[run.status] || 'info';
     const head = `<div class="tf-aa-panel-head">
       <tf-button variant="ghost" size="sm" data-action="to-tree">‹ ${esc(this._labels.back)}</tf-button>
-      <span class="tf-aa-panel-title">${esc(run.agent || run.runId.slice(0, 8))}</span>
+      <span class="tf-aa-panel-title">${esc(runLabel(run))}</span>
       ${this._accountChip(run)}
       <tf-chip status="${tone}" dot>${esc(runStatusText(run.status, this._labels))}</tf-chip>
     </div>`;

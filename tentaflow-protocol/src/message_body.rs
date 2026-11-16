@@ -3740,6 +3740,11 @@ pub struct AgentRunEventsSubscribeRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AgentRunEvent {
     pub scope: String,
+    /// Set on an event mirrored from a conversation's flow run that is not a
+    /// managed agent run: `scope` then names that run, and the run cannot be
+    /// cancelled through the agent run manager.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmanaged: bool,
     /// One of: node_started | node_finished | first_token | iteration_started |
     /// iteration_finished | map_element | tool_call_started | tool_call_finished
     /// | compaction | child_spawned | child_finished | router_decision |

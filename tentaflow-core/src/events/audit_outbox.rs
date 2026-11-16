@@ -316,7 +316,6 @@ mod tests {
     #[test]
     fn a_failed_outbox_insert_takes_the_event_with_it() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         {
             let conn = pool.write().unwrap();
             conn.execute_batch(
@@ -327,7 +326,7 @@ mod tests {
         }
 
         let error =
-            append(&pool, &main, request_started("r-1")).expect_err("the append must fail loudly");
+            append(&pool, request_started("r-1")).expect_err("the append must fail loudly");
         assert!(
             error.to_string().contains("outbox unavailable"),
             "the failure was reported as something else: {error:#}"
@@ -353,7 +352,7 @@ mod tests {
     fn the_audit_row_is_written_before_the_outbox_row_is_marked_delivered() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        append(&pool, &main, request_started("r-1")).unwrap();
+        append(&pool, request_started("r-1")).unwrap();
         {
             let conn = pool.write().unwrap();
             conn.execute_batch(
@@ -399,7 +398,7 @@ mod tests {
     fn a_security_event_reaches_the_main_audit_log_exactly_once() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        append(&pool, &main, request_started("r-1")).unwrap();
+        append(&pool, request_started("r-1")).unwrap();
 
         let report = deliver_pending(&main, &pool, 10).unwrap();
         assert_eq!(report.delivered, 1);
@@ -418,7 +417,7 @@ mod tests {
     fn the_delivered_row_carries_the_correlation_link_and_the_chain() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        append(&pool, &main, request_started("r-1")).unwrap();
+        append(&pool, request_started("r-1")).unwrap();
         deliver_pending(&main, &pool, 10).unwrap();
 
         let conn = main.read().unwrap();
@@ -456,7 +455,6 @@ mod tests {
 
         append(
             &pool,
-            &main,
             request_started("r-tenant").with_org("org-acme"),
         )
         .unwrap();
@@ -475,7 +473,7 @@ mod tests {
             },
         );
         assert!(system.org_id.is_none());
-        append(&pool, &main, system).unwrap();
+        append(&pool, system).unwrap();
 
         assert_eq!(deliver_pending(&main, &pool, 10).unwrap().delivered, 2);
 
@@ -542,7 +540,6 @@ mod tests {
         ] {
             append(
                 &pool,
-                &main,
                 RunEvent::new(
                     "r-1",
                     now_ms(),
@@ -571,7 +568,7 @@ mod tests {
     fn a_failing_delivery_backs_off_instead_of_spinning() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        append(&pool, &main, request_started("r-1")).unwrap();
+        append(&pool, request_started("r-1")).unwrap();
         {
             let conn = main.write().unwrap();
             conn.execute_batch(

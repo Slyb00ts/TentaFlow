@@ -40,6 +40,7 @@ pub(crate) fn build_user_context(
     user_id.map(|uid| crate::auth::acl::UserContext {
         user_id: uid,
         role: user_role.unwrap_or("user").to_string(),
+        org_id: None,
     })
 }
 

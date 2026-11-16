@@ -1332,7 +1332,7 @@ const detailContext = {
       nowMs: Date.now(),
     };
   },
-  go(action) {
+  go(action, button) {
     const name = state.view?.name;
     if (!name) return;
     if (action.kind === 'back') { setTab('topics'); return; }
@@ -1360,7 +1360,7 @@ const detailContext = {
     else if (action.kind === 'access-reload') loadTopicAccess(name);
     else if (action.kind === 'hiding-reload') loadTopicHiding(name);
     else if (action.kind.startsWith('access-') || action.kind.startsWith('key-')) {
-      openAccessWindow(name, action).catch((err) => toast(describeBusError(err), 'error'));
+      openAccessWindow(name, action, button).catch((err) => toast(describeBusError(err), 'error'));
     }
     else if (action.kind.startsWith('hiding-')) openHidingWindow(name, action);
   },
@@ -1435,7 +1435,7 @@ async function loadTopicAccess(name) {
 // opens; a second click while that is in flight must not open a second window.
 let revokeLookupBusy = false;
 
-async function openAccessWindow(name, action) {
+async function openAccessWindow(name, action, button) {
   const detail = state.detail;
   if (!detail?.access?.canAdmin || !state.access.acl) return;
   const instanceId = state.instanceId;
@@ -1504,6 +1504,11 @@ async function openAccessWindow(name, action) {
   } else if (action.kind === 'key-revoke') {
     if (revokeLookupBusy) return;
     revokeLookupBusy = true;
+    const disabledHere = button != null && !button.hasAttribute('disabled');
+    if (disabledHere) {
+      button.setAttribute('disabled', '');
+      button.setAttribute('aria-busy', 'true');
+    }
     let serviceFlows = [];
     let serviceFlowsUnknown = false;
     try {
@@ -1512,6 +1517,10 @@ async function openAccessWindow(name, action) {
       serviceFlowsUnknown = true;
     } finally {
       revokeLookupBusy = false;
+      if (disabledHere) {
+        button.removeAttribute('disabled');
+        button.removeAttribute('aria-busy');
+      }
     }
     // The user may have left this topic or instance while the lookup ran.
     if (!still()) return;

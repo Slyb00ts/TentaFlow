@@ -72,6 +72,7 @@ impl EmbeddingsDispatcherImpl {
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
+            org_id: None,
         });
         let context = AiGatewayContext {
             org_id: req.provenance.org_id.clone(),

@@ -212,7 +212,7 @@ pub fn dispatch_invoke(
     // callers (is_system_call=true with no user_id) record NULL.
     let actor_user_id = state.user_id.clone();
     let org_id = state.org_id.clone();
-    match run_invoke(
+    match run_invoke_in_run(
         scheduler,
         &state.addon_id,
         &input.flow_id,
@@ -220,6 +220,7 @@ pub fn dispatch_invoke(
         input.wait_ms,
         actor_user_id,
         org_id,
+        Some(state.call_provenance.clone()),
     ) {
         Ok(out) => {
             audit(
@@ -256,14 +257,40 @@ pub fn run_invoke(
     actor_user_id: Option<String>,
     org_id: Option<String>,
 ) -> Result<FlowInvocationOutput, (AbiError, &'static str)> {
-    let wait_ms = wait_ms.min(MAX_SYNC_WAIT_MS);
-    let res = block_on_runtime(scheduler.invoke(
+    run_invoke_in_run(
+        scheduler,
         addon_id,
         flow_id,
         input,
         wait_ms,
         actor_user_id,
         org_id,
+        None,
+    )
+}
+
+/// [`run_invoke`] for a caller whose provenance is known: the flow's operators
+/// stamp their model calls with it.
+#[allow(clippy::too_many_arguments)]
+pub fn run_invoke_in_run(
+    scheduler: &std::sync::Arc<FlowScheduler>,
+    addon_id: &str,
+    flow_id: &str,
+    input: toml::Value,
+    wait_ms: u32,
+    actor_user_id: Option<String>,
+    org_id: Option<String>,
+    provenance: Option<crate::addon::AddonCallProvenance>,
+) -> Result<FlowInvocationOutput, (AbiError, &'static str)> {
+    let wait_ms = wait_ms.min(MAX_SYNC_WAIT_MS);
+    let res = block_on_runtime(scheduler.invoke_in_run(
+        addon_id,
+        flow_id,
+        input,
+        wait_ms,
+        actor_user_id,
+        org_id,
+        provenance,
     ));
     match res {
         Ok(status) => Ok(invocation_output_from_status(status)),

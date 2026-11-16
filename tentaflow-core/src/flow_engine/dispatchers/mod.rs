@@ -34,7 +34,7 @@ pub use memory::{
 };
 pub use metrics::{MetricsSink, NoopMetrics};
 pub use pii_rules::{PiiRule, PiiRulesStore};
-pub use progress::{NoopProgress, ProgressEvent, ProgressSink};
+pub use progress::{NoopProgress, ParentRun, ProgressEvent, ProgressSink, SafeFailure};
 pub use prompts::PromptStore;
 pub use rerank::{RerankDispatcher, RerankRequest, RerankResponse, RerankResult};
 pub use stt::{SttDispatcher, SttRequest, SttResponse};

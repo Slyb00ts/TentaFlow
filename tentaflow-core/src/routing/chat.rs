@@ -153,6 +153,17 @@ impl Router {
                     .into());
                 }
             };
+            let direct_run = crate::routing::direct_run::DirectRun::begin(
+                &request,
+                origin,
+                &actor,
+                user.as_ref(),
+                self.db.as_ref(),
+                compliance_context.as_ref(),
+                compliance_event
+                    .as_ref()
+                    .map(|handle| handle.request_id().to_string()),
+            );
             let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
                 user,
                 origin,
@@ -160,6 +171,9 @@ impl Router {
             );
             match executor.execute_chat(request.clone(), &mut exec_ctx).await {
                 Ok(response) => {
+                    if let Some(run) = direct_run {
+                        run.finish_response(&response);
+                    }
                     let usage = response.usage.as_ref().map(|u| {
                         crate::routing::middleware::TokenUsageMetadata {
                             prompt_tokens: u.prompt_tokens as u64,
@@ -196,6 +210,9 @@ impl Router {
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
                 Err(e) => {
+                    if let Some(run) = direct_run {
+                        run.finish_failed();
+                    }
                     if let Some(event) = compliance_event.as_ref() {
                         let _ = event.finish_failed(&e.to_string());
                     }
@@ -215,6 +232,17 @@ impl Router {
                 &blobs,
             )
             .await?;
+            // This is a true entry point: a nested flow reaches the engine
+            // through the runtime executor, which records nothing.
+            if crate::routing::records_call(origin, compliance_context.as_ref()) {
+                crate::routing::start_recording(
+                    &mut meta,
+                    self.db.as_ref(),
+                    compliance_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.org_id.as_deref()),
+                );
+            }
             // RAG E2.0 (enabler) — przeprowadź tożsamość addona-callera do
             // FlowRequestMeta. Gdy chat jest wyzwolony przez addon (host-fn
             // llm_generate ustawia compliance_context.addon_id/org_id), executor

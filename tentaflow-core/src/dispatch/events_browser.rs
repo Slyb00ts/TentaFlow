@@ -399,7 +399,7 @@ fn run_timeline(
         req.limit as usize
     };
     let limit = limit.clamp(1, MAX_READ_LIMIT);
-    let events = events::read_run(&pool, &req.run_id, req.after_seq, limit)
+    let events = events::read_run_headers(&pool, &req.run_id, req.after_seq, limit)
         .map_err(|e| db_error("read_run", e))?;
     // A short page is the only evidence the run's log ended here; a full page
     // yields a resume point even when nothing follows it.
@@ -457,15 +457,43 @@ fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBod
         return Err(not_found());
     };
     let body = events::step_io::unpack(&z).map_err(|e| db_error("step_io_unpack", e))?;
+    // The log keeps up to `MAX_SIDE_BYTES` per side; one frame cannot carry two
+    // of them. The reply is a preview, cut with the same flag a stored cut sets.
+    let (input, input_omitted) = fit_to_frame(body.input);
+    let (output, output_omitted) = fit_to_frame(body.output);
     Ok(MessageBody::EventsBody(EventsPayload::StepIoResponse(
         EventsStepIoResponse {
-            input: body.input,
-            output: body.output,
+            input,
+            output,
             input_bytes,
             output_bytes,
-            truncated,
+            truncated: truncated || input_omitted > 0 || output_omitted > 0,
+            input_omitted_bytes: input_omitted as u64,
+            output_omitted_bytes: output_omitted as u64,
         },
     )))
+}
+
+/// Largest side one `StepIoResponse` carries: two sides plus the envelope stay
+/// well inside a transport frame.
+const RESPONSE_SIDE_BYTES: usize = tentaflow_transport::MAX_FRAME_SIZE / 8 * 3;
+const _: () = assert!(2 * RESPONSE_SIDE_BYTES < tentaflow_transport::MAX_FRAME_SIZE);
+
+/// Cuts a side to [`RESPONSE_SIDE_BYTES`] on a character boundary and returns
+/// how many bytes were left out; the bytes themselves stay whole in the log.
+/// The count travels as data, not as words in the text, so the screen can say it
+/// in the viewer's language.
+fn fit_to_frame(mut text: String) -> (String, usize) {
+    if text.len() <= RESPONSE_SIDE_BYTES {
+        return (text, 0);
+    }
+    let mut end = RESPONSE_SIDE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    text.truncate(end);
+    (text, dropped)
 }
 
 #[handler(variant = "EventsBody", since = (1, 0))]
@@ -529,6 +557,22 @@ mod tests {
     use crate::flow_engine::dispatcher::FlowActor;
     use crate::services::rbac::OrgContext;
 
+    /// A side the log kept whole (up to 16 MiB) must still leave the node in one
+    /// frame: the reply is cut on a character boundary and says so.
+    #[test]
+    fn a_side_larger_than_the_frame_share_is_previewed_not_dropped() {
+        let (kept, omitted) = fit_to_frame("short".to_string());
+        assert_eq!((kept.as_str(), omitted), ("short", 0));
+
+        let huge = "ż".repeat(RESPONSE_SIDE_BYTES);
+        let total = huge.len();
+        let (preview, omitted) = fit_to_frame(huge);
+        assert!(omitted > 0);
+        assert!(preview.len() <= RESPONSE_SIDE_BYTES);
+        assert_eq!(preview.len() + omitted, total, "every byte is kept or counted");
+        assert!(2 * preview.len() < tentaflow_transport::MAX_FRAME_SIZE);
+    }
+
     /// The event log is reached through a process-global pool, so the tests
     /// share ONE temporary database — kept alive here for the length of the
     /// process. Every test therefore scopes its assertions to a session id of
@@ -590,11 +634,10 @@ mod tests {
 
     /// Seeds one run owned by `who`, inside `session_id` so the test can find
     /// its own rows in the shared log.
-    fn seed_run(ctx: &HandlerContext, run_id: &str, session_id: &str, who: &str, at_ms: i64) {
+    fn seed_run(run_id: &str, session_id: &str, who: &str, at_ms: i64) {
         let pool = events_pool();
         append(
             &pool,
-            &ctx.state.db,
             RunEvent::new(
                 run_id,
                 at_ms,
@@ -609,10 +652,9 @@ mod tests {
     }
 
     /// Like `seed_run`, in another organisation.
-    fn seed_run_in_org(ctx: &HandlerContext, run_id: &str, session_id: &str, org_id: &str) {
+    fn seed_run_in_org(run_id: &str, session_id: &str, org_id: &str) {
         append(
             &events_pool(),
-            &ctx.state.db,
             RunEvent::new(
                 run_id,
                 300,
@@ -649,11 +691,10 @@ mod tests {
         let anna = principal();
         let marek = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&marek_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &marek_ctx).await;
         assert!(!is_err, "unexpected error body: {body:?}");
@@ -676,11 +717,10 @@ mod tests {
         let marek = principal();
         let admin = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let admin_ctx = ctx_with(&admin, &[PERM_READ, PERM_READ_ALL]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&anna_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &admin_ctx).await;
         assert!(!is_err, "unexpected error body: {body:?}");
@@ -704,11 +744,10 @@ mod tests {
         let marek = principal();
         let auditor = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&anna_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &auditor_ctx).await;
         assert!(!is_err, "read_all alone must not be a denial: {body:?}");
@@ -751,8 +790,8 @@ mod tests {
         let auditor = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
         let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
-        seed_run(&auditor_ctx, "run-own-org", &session, "anna", 100);
-        seed_run_in_org(&auditor_ctx, "run-other-org", &session, "org-other");
+        seed_run("run-own-org", &session, "anna", 100);
+        seed_run_in_org("run-other-org", &session, "org-other");
 
         let unnamed = expect_browse(
             browse(
@@ -797,8 +836,8 @@ mod tests {
             user_id: admin.bytes,
             role: Some("admin".to_string()),
         };
-        seed_run(&admin_ctx, "run-own-org", &session, "anna", 100);
-        seed_run_in_org(&admin_ctx, "run-other-org", &session, "org-other");
+        seed_run("run-own-org", &session, "anna", 100);
+        seed_run_in_org("run-other-org", &session, "org-other");
 
         let all = expect_browse(
             browse(
@@ -840,8 +879,8 @@ mod tests {
         let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
         let own = format!("run-own-{}", uuid::Uuid::new_v4());
         let foreign = format!("run-foreign-{}", uuid::Uuid::new_v4());
-        seed_run(&auditor_ctx, &own, &session, "anna", 100);
-        seed_run_in_org(&auditor_ctx, &foreign, &session, "org-other");
+        seed_run(&own, &session, "anna", 100);
+        seed_run_in_org(&foreign, &session, "org-other");
 
         let timeline = |ctx: &HandlerContext, run: &str| {
             run_timeline(
@@ -893,7 +932,6 @@ mod tests {
         let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         append(
             &events_pool(),
-            &anna_ctx.state.db,
             RunEvent::new(
                 "run-null-org",
                 100,
@@ -933,13 +971,12 @@ mod tests {
         let anna = principal();
         let marek = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let anna_run = format!("run-anna-{}", uuid::Uuid::new_v4());
         let marek_run = format!("run-marek-{}", uuid::Uuid::new_v4());
 
-        seed_run(&anna_ctx, &anna_run, &session, &anna.uuid, 100);
-        seed_run(&marek_ctx, &marek_run, &session, &marek.uuid, 200);
+        seed_run(&anna_run, &session, &anna.uuid, 100);
+        seed_run(&marek_run, &session, &marek.uuid, 200);
 
         // The payload names anna as the actor. `actor_user_id` is derived from
         // marek's session and the two are ANDed, so the page is empty — the
@@ -1009,7 +1046,7 @@ mod tests {
     /// asserts on that field rather than on the decoded value behind it.
     #[tokio::test]
     async fn an_omitted_assistant_body_never_reaches_the_wire() {
-        const SECRET: &str = "the answer nobody opted in to keep";
+        const SECRET: &str = "the answer a Bus run never keeps";
         let anna = principal();
         let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let session = format!("sess-{}", uuid::Uuid::new_v4());
@@ -1017,11 +1054,10 @@ mod tests {
         let pool = events_pool();
         append(
             &pool,
-            &anna_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 100,
-                FlowOrigin::Chat,
+                FlowOrigin::Bus,
                 &FlowActor::user(&anna.uuid),
                 EventPayload::AssistantMessage {
                     body: crate::events::ResponseBody::Text(SECRET.to_string()),
@@ -1029,8 +1065,8 @@ mod tests {
                 },
             )
             .with_session(&session)
-            // An organisation that never opted in, which is every organisation
-            // by default — so the writer stores the omission marker.
+            // A Bus run keeps no content — so the writer stores the omission
+            // marker.
             .with_org("org-test"),
         )
         .expect("append");
@@ -1090,7 +1126,7 @@ mod tests {
         let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
-        seed_run(&anna_ctx, &run_id, &session, &anna.uuid, 100);
+        seed_run(&run_id, &session, &anna.uuid, 100);
 
         let existing = MessageBody::EventsBody(EventsPayload::RunRequest(EventsRunRequest {
             run_id: run_id.clone(),
@@ -1148,7 +1184,6 @@ mod tests {
         let pool = events_pool();
         append(
             &pool,
-            &service_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 100,
@@ -1180,11 +1215,10 @@ mod tests {
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let session = format!("sess-{}", uuid::Uuid::new_v4());
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
-        seed_run(&anna_ctx, &run_id, &session, &anna.uuid, 100);
+        seed_run(&run_id, &session, &anna.uuid, 100);
         let packed = crate::events::step_io::pack("prompt do modelu", "odpowiedź").unwrap();
         let appended = append(
             &events_pool(),
-            &anna_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 101,

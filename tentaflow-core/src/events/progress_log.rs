@@ -75,10 +75,6 @@ pub struct RunEventLog {
 
 struct Inner {
     pool: DbPool,
-    /// The MAIN database. Carried only so the writer can resolve the
-    /// per-organisation response-body setting (`store::write_event`); nothing
-    /// on this path reads or writes it for any other reason.
-    core_db: DbPool,
     broker: Arc<ProgressBroker>,
     /// Scopes with a live subscriber. An entry is claimed before the task is
     /// spawned and removed by the task on its way out, so `attach` is
@@ -88,11 +84,10 @@ struct Inner {
 }
 
 impl RunEventLog {
-    pub fn new(pool: DbPool, core_db: DbPool, broker: Arc<ProgressBroker>) -> Self {
+    pub fn new(pool: DbPool, broker: Arc<ProgressBroker>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 pool,
-                core_db,
                 broker,
                 scopes: DashMap::new(),
                 cancel: CancellationToken::new(),
@@ -179,44 +174,29 @@ impl RunEventLog {
                 debug!(scope = %scope, "progress events with no bound run; not stored");
                 continue;
             };
-            let mut rows: Vec<RunEvent> = Vec::with_capacity(batch.len());
-            // The end of the run this subscriber was last writing, read after
-            // the scope was rebound to the next run: written under the run it
-            // names, not under the one bound now.
-            let mut current = Vec::with_capacity(batch.len());
-            for stamped in batch {
-                let previous = match &stamped.event {
-                    ProgressEvent::RunFinished { run_id, .. }
-                        if *run_id != provenance.run_id
-                            && state.run_id.as_deref() == Some(run_id.as_str()) =>
-                    {
-                        state.bound.clone()
-                    }
-                    _ => None,
-                };
-                match previous {
-                    Some(previous) => {
-                        state.translate(&previous, stamped.at_ms, stamped.event, &mut rows)
-                    }
-                    None => current.push(stamped),
-                }
-            }
-            state.retarget(&provenance);
-            for stamped in current {
-                state.translate(&provenance, stamped.at_ms, stamped.event, &mut rows);
-            }
-            if rows.is_empty() {
-                continue;
-            }
-
+            // Translating a batch packs step content (redaction, JSON, zstd,
+            // base64 of up to 16 MiB a side), which must not run on the async
+            // worker: it moves, with the scope's state, to the blocking pool
+            // together with the write and comes back afterwards.
             let pool = self.inner.pool.clone();
-            let core_db = self.inner.core_db.clone();
-            let write =
-                tokio::task::spawn_blocking(move || write_batch(&pool, &core_db, rows)).await;
-            match write {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!(scope = %scope, %error, "event log write failed; timeline rows lost")
+            let moved = std::mem::take(&mut state);
+            let work = tokio::task::spawn_blocking(move || {
+                let mut state = moved;
+                let rows = translate_batch(&mut state, &provenance, batch);
+                let written = if rows.is_empty() {
+                    Ok(())
+                } else {
+                    write_batch(&pool, rows)
+                };
+                (state, written)
+            })
+            .await;
+            match work {
+                Ok((returned, written)) => {
+                    state = returned;
+                    if let Err(error) = written {
+                        warn!(scope = %scope, %error, "event log write failed; timeline rows lost")
+                    }
                 }
                 Err(error) => {
                     warn!(scope = %scope, %error, "event log writer panicked")
@@ -229,16 +209,52 @@ impl RunEventLog {
     }
 }
 
+/// Turns one batch of events into rows. The provenance is read once per batch:
+/// a rebinding mid-batch would mean a new run started while these events were
+/// queued, and the events in hand belong to the run that was current when they
+/// were emitted.
+fn translate_batch(
+    state: &mut ScopeState,
+    provenance: &RunProvenance,
+    batch: Vec<StampedProgressEvent>,
+) -> Vec<RunEvent> {
+    let mut rows: Vec<RunEvent> = Vec::with_capacity(batch.len());
+    // The end of the run this subscriber was last writing, read after the scope
+    // was rebound to the next run: written under the run it names, not under the
+    // one bound now.
+    let mut current = Vec::with_capacity(batch.len());
+    for stamped in batch {
+        let previous = match &stamped.event {
+            ProgressEvent::RunFinished { run_id, .. }
+                if *run_id != provenance.run_id
+                    && state.run_id.as_deref() == Some(run_id.as_str()) =>
+            {
+                state.bound.clone()
+            }
+            _ => None,
+        };
+        match previous {
+            Some(previous) => state.translate(&previous, stamped.at_ms, stamped.event, &mut rows),
+            None => current.push(stamped),
+        }
+    }
+    state.retarget(provenance);
+    for stamped in current {
+        state.translate(provenance, stamped.at_ms, stamped.event, &mut rows);
+    }
+    rows
+}
+
 /// Writes a batch in ONE immediate transaction. `store::append_in_tx` still
 /// allocates each `seq` inside it, so the batch does not weaken invariant 2 —
 /// it only saves the per-event commit.
-fn write_batch(pool: &DbPool, core_db: &DbPool, rows: Vec<RunEvent>) -> anyhow::Result<()> {
+fn write_batch(pool: &DbPool, rows: Vec<RunEvent>) -> anyhow::Result<()> {
     let mut conn = pool
         .write()
         .map_err(|e| anyhow::anyhow!("events db write: {e}"))?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for row in rows {
-        store::append_in_tx(&tx, core_db, row)?;
+        store::append_in_tx(&tx, row)?;
     }
     tx.commit()?;
     Ok(())
@@ -286,6 +302,45 @@ struct ScopeState {
     /// Model facts per node, merged from `NodeModel` events and attached to the
     /// node's `step_io` row.
     pending_model: HashMap<String, ModelFacts>,
+    /// Why a node failed, from `NodeFailed`, until its `NodeFinished(error)`
+    /// closes it. Only reasons the adapter vouched for arrive here.
+    failure_reasons: HashMap<String, String>,
+    /// Whether a first token has been recorded since the last step or turn
+    /// began. The streaming finalizer reports the first token of the same
+    /// generation the region's llm member already reported; one generation has
+    /// one first token.
+    first_token_seen: bool,
+    /// Tool-call content waiting for its call's row: the arguments by call id
+    /// until `ToolCallStarted`, the result until `ToolCallFinished`.
+    tool_arguments: HashMap<String, String>,
+    tool_results: HashMap<String, String>,
+}
+
+/// The arguments of a tool call as the log's key/value form. A JSON object keeps
+/// one entry per key (strings as they are, everything else as its JSON text);
+/// anything else is kept whole under `arguments`, so nothing the model sent is
+/// lost to a shape the map cannot hold.
+fn argument_map(raw: &str) -> std::collections::BTreeMap<String, String> {
+    use serde_json::Value;
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(object)) => object
+            .into_iter()
+            .map(|(key, value)| match value {
+                Value::String(text) => (key, text),
+                other => (key, other.to_string()),
+            })
+            .collect(),
+        _ => std::collections::BTreeMap::from([("arguments".to_string(), raw.to_string())]),
+    }
+}
+
+/// The answer text of a streamed step: the `content` of a message-shaped output,
+/// otherwise the output as it is.
+fn answer_text(output: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .and_then(|value| value.get("content").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_else(|| output.to_string())
 }
 
 /// Builds one timeline row from the run's provenance. The provenance is COPIED
@@ -334,6 +389,10 @@ impl ScopeState {
             self.streaming_nodes.clear();
             self.pending_io.clear();
             self.pending_model.clear();
+            self.failure_reasons.clear();
+            self.first_token_seen = false;
+            self.tool_arguments.clear();
+            self.tool_results.clear();
         }
     }
 
@@ -442,6 +501,8 @@ impl ScopeState {
                         None,
                     ));
                 }
+                self.failure_reasons.remove(&node_id);
+                self.first_token_seen = false;
                 self.node_types.insert(node_id.clone(), node_type.clone());
                 out.push(row(
                     provenance,
@@ -460,12 +521,13 @@ impl ScopeState {
                 // duration that was never completed produces no number at all
                 // rather than one measured to a failure.
                 if status == "error" {
+                    let message = self.failure_reasons.remove(&node_id).unwrap_or(status);
                     out.push(row(
                         provenance,
                         at_ms,
                         EventPayload::Error {
                             stage: step,
-                            message: status,
+                            message,
                         },
                         Some(node_id.clone()),
                         None,
@@ -474,15 +536,25 @@ impl ScopeState {
                     return;
                 }
                 if streamed {
+                    // The answer is the step's reported output; a Bus run keeps
+                    // no content, and a step that reported none has none to show.
+                    let body = match self.pending_io.get(&node_id).and_then(|io| io.1.as_ref()) {
+                        Some(output)
+                            if provenance.origin != crate::flow_engine::dispatcher::FlowOrigin::Bus =>
+                        {
+                            ResponseBody::Text(answer_text(output))
+                        }
+                        _ => ResponseBody::Omitted(BodyOmission::NotCarried),
+                    };
+                    // A count only when the engine reported one.
+                    let tokens = self
+                        .pending_model
+                        .get(&node_id)
+                        .and_then(|facts| facts.completion_tokens);
                     out.push(row(
                         provenance,
                         at_ms,
-                        EventPayload::AssistantMessage {
-                            body: ResponseBody::Omitted(BodyOmission::NotCarried),
-                            // The engine reports no token count on this path;
-                            // a zero would be a fabricated one.
-                            tokens: None,
-                        },
+                        EventPayload::AssistantMessage { body, tokens },
                         Some(node_id.clone()),
                         None,
                     ));
@@ -523,6 +595,10 @@ impl ScopeState {
                 slot.completion_tokens = completion_tokens.or(slot.completion_tokens);
             }
             ProgressEvent::FirstToken { node_id } => {
+                if self.first_token_seen {
+                    return;
+                }
+                self.first_token_seen = true;
                 self.streaming_nodes.insert(node_id.clone());
                 out.push(row(
                     provenance,
@@ -535,6 +611,7 @@ impl ScopeState {
             ProgressEvent::IterationStarted { node_id, n, .. } => {
                 // `max` is the configured iteration budget, not a fact about
                 // this turn, and the schema has nowhere to put it.
+                self.first_token_seen = false;
                 out.push(row(
                     provenance,
                     at_ms,
@@ -547,26 +624,47 @@ impl ScopeState {
                 out.push(row(
                     provenance,
                     at_ms,
-                    // The engine reports no outcome for a finished iteration, so
-                    // the status is empty rather than a cheerful `ok`.
+                    // The engine announces an iteration only when its body ran to
+                    // the end; one that failed or was cut short ends the run
+                    // instead, and the run's own end row says how.
                     EventPayload::TurnEnd {
                         turn: n,
-                        status: String::new(),
+                        status: "completed".to_string(),
                     },
                     Some(node_id),
                     None,
                 ));
             }
+            ProgressEvent::ToolIo {
+                call_id,
+                arguments,
+                result,
+            } => {
+                // A Bus run keeps no content: its tool arguments and results can
+                // carry the records the publisher's policies hide.
+                if provenance.origin == crate::flow_engine::dispatcher::FlowOrigin::Bus {
+                    return;
+                }
+                if let Some(arguments) = arguments {
+                    self.tool_arguments.insert(call_id.clone(), arguments);
+                }
+                if let Some(result) = result {
+                    self.tool_results.insert(call_id, result);
+                }
+            }
             ProgressEvent::ToolCallStarted { call_id, name } => {
+                // No reported arguments (a sink that keeps no content, or a Bus
+                // run) leaves the map empty: the absence of them, not a call
+                // that took none.
+                let arguments = self
+                    .tool_arguments
+                    .remove(&call_id)
+                    .map(|raw| argument_map(&raw))
+                    .unwrap_or_default();
                 out.push(row(
                     provenance,
                     at_ms,
-                    // The progress event carries no arguments; an empty map is
-                    // the absence of them, not a call that took none.
-                    EventPayload::ToolCall {
-                        name,
-                        arguments: Default::default(),
-                    },
+                    EventPayload::ToolCall { name, arguments },
                     None,
                     Some(call_id),
                 ));
@@ -574,12 +672,15 @@ impl ScopeState {
             ProgressEvent::ToolCallFinished {
                 call_id, status, ..
             } => {
+                // The tool's own answer when it was reported; the bare outcome
+                // otherwise.
+                let summary = self.tool_results.remove(&call_id).unwrap_or_else(|| status.clone());
                 out.push(row(
                     provenance,
                     at_ms,
                     EventPayload::ToolResult {
                         ok: status == "ok",
-                        summary: status,
+                        summary,
                     },
                     None,
                     Some(call_id),
@@ -592,6 +693,15 @@ impl ScopeState {
                     return;
                 }
                 self.request_closed = true;
+                // A run that ends with a node still open (cancelled, timed out,
+                // client gone) keeps what that node had already reported: the
+                // prompt it was given is the part worth having. Written before
+                // the end row, so the run still closes on its last row.
+                let mut open: Vec<String> = self.pending_io.keys().cloned().collect();
+                open.sort();
+                for node_id in open {
+                    self.push_step_io(provenance, at_ms, &node_id, out);
+                }
                 let duration_ms = self
                     .opened_at_ms
                     .map(|opened| u64::try_from(at_ms.saturating_sub(opened)).unwrap_or(0));
@@ -605,6 +715,9 @@ impl ScopeState {
                     None,
                     None,
                 ));
+            }
+            ProgressEvent::NodeFailed { node_id, reason } => {
+                self.failure_reasons.insert(node_id, reason);
             }
             ProgressEvent::MapElement { .. }
             | ProgressEvent::Compaction { .. }
@@ -621,8 +734,8 @@ impl ScopeState {
 /// Publishes the process-wide log. Called by `events::init`, alongside the
 /// audit-outbox loop and the retention sweep, so the store and the thing that
 /// fills it start from the same place.
-pub fn start(pool: DbPool, core_db: DbPool) {
-    let _ = LOG.set(RunEventLog::new(pool, core_db, global_broker()));
+pub fn start(pool: DbPool) {
+    let _ = LOG.set(RunEventLog::new(pool, global_broker()));
 }
 
 /// Starts watching a broadcast scope, reporting whether anything is watching it
@@ -715,7 +828,6 @@ mod tests {
             broker.bind_run_provenance(SCOPE, provenance);
             let log = RunEventLog::new(
                 pool.clone(),
-                crate::events::test_support::main_db(),
                 broker.clone(),
             );
             log.attach(SCOPE);
@@ -874,7 +986,6 @@ mod tests {
         let broker = Arc::new(ProgressBroker::new());
         let log = RunEventLog::new(
             pool.clone(),
-            crate::events::test_support::main_db(),
             broker.clone(),
         );
         log.attach("unbound");
@@ -995,6 +1106,61 @@ mod tests {
         }
     }
 
+    /// A failure reason the adapter vouched for becomes the error row's
+    /// message; without one the row keeps the bare status.
+    #[tokio::test]
+    async fn a_vouched_failure_reason_is_the_error_message() {
+        let h = Harness::start("run-reason");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "p".into(),
+            node_type: "bus_publish".into(),
+        });
+        h.emit(ProgressEvent::NodeFailed {
+            node_id: "p".into(),
+            reason: "no write permission on topic cel".into(),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "p".into(),
+            status: "error".into(),
+        });
+        let rows = h.rows("run-reason", 3).await;
+        match &rows[2].payload {
+            EventPayload::Error { stage, message } => {
+                assert_eq!(stage, "bus_publish");
+                assert_eq!(message, "no write permission on topic cel");
+            }
+            other => panic!("expected an error payload, got {other:?}"),
+        }
+    }
+
+    /// A reason belongs to the start it followed: a node id that starts again
+    /// does not inherit it.
+    #[tokio::test]
+    async fn a_stale_failure_reason_is_not_picked_up_by_a_later_start() {
+        let h = Harness::start("run-stale");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "p".into(),
+            node_type: "bus_publish".into(),
+        });
+        h.emit(ProgressEvent::NodeFailed {
+            node_id: "p".into(),
+            reason: "no write permission on topic cel".into(),
+        });
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "p".into(),
+            node_type: "bus_publish".into(),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "p".into(),
+            status: "error".into(),
+        });
+        let rows = h.rows("run-stale", 4).await;
+        match &rows[3].payload {
+            EventPayload::Error { message, .. } => assert_eq!(message, "error"),
+            other => panic!("expected an error payload, got {other:?}"),
+        }
+    }
+
     /// The content a node reported is written as ONE `step_io` row right after
     /// the row that closes the step, and a later report for the same node
     /// replaces an earlier one (the `llm` node's exact prompt beats the generic
@@ -1040,6 +1206,199 @@ mod tests {
             }
             other => panic!("expected a step_io payload, got {other:?}"),
         }
+    }
+
+    /// The content of an agent's loop is on the log: the arguments of a tool
+    /// call and what it returned, the answer of a streamed model step with its
+    /// token count, one first token per generation and a completed turn. A bus run
+    /// keeps none of the content.
+    #[tokio::test]
+    async fn an_agent_loop_is_recorded_with_its_arguments_answers_and_outcome() {
+        let h = Harness::start("run-loop");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: None,
+            output: Some(r#"{"role":"assistant","content":"the answer"}"#.into()),
+        });
+        h.emit(ProgressEvent::NodeModel {
+            node_id: "llm-1".into(),
+            requested: None,
+            served: None,
+            prompt_tokens: None,
+            completion_tokens: Some(7),
+        });
+        // The region's member and the streaming finalizer both report the same
+        // first token.
+        h.emit(ProgressEvent::FirstToken {
+            node_id: "llm-1".into(),
+        });
+        h.emit(ProgressEvent::FirstToken {
+            node_id: "entry".into(),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "llm-1".into(),
+            status: "ok".into(),
+        });
+        h.emit(ProgressEvent::ToolIo {
+            call_id: "call-1".into(),
+            arguments: Some(r#"{"city":"Warszawa","days":3}"#.into()),
+            result: None,
+        });
+        h.emit(ProgressEvent::ToolCallStarted {
+            call_id: "call-1".into(),
+            name: "get_weather".into(),
+        });
+        h.emit(ProgressEvent::ToolIo {
+            call_id: "call-1".into(),
+            arguments: None,
+            result: Some("sunny, 21 C".into()),
+        });
+        h.emit(ProgressEvent::ToolCallFinished {
+            call_id: "call-1".into(),
+            name: "get_weather".into(),
+            status: "ok".into(),
+        });
+        h.emit(ProgressEvent::IterationFinished {
+            node_id: "region".into(),
+            n: 1,
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-loop".into(),
+            status: "completed".into(),
+        });
+        let rows = h.rows("run-loop", 10).await;
+
+        let first_tokens = rows
+            .iter()
+            .filter(|r| r.kind == crate::events::EventKind::FirstToken)
+            .count();
+        assert_eq!(first_tokens, 1, "one generation, one first token");
+        let answer = rows
+            .iter()
+            .find_map(|r| match &r.payload {
+                EventPayload::AssistantMessage { body, tokens } => Some((body.clone(), *tokens)),
+                _ => None,
+            })
+            .expect("the answer row");
+        assert_eq!(
+            answer.0,
+            crate::events::ResponseBody::Text("the answer".into())
+        );
+        assert_eq!(answer.1, Some(7));
+        let args = rows
+            .iter()
+            .find_map(|r| match &r.payload {
+                EventPayload::ToolCall { arguments, .. } => Some(arguments.clone()),
+                _ => None,
+            })
+            .expect("the tool call row");
+        assert_eq!(args.get("city").map(String::as_str), Some("Warszawa"));
+        assert_eq!(args.get("days").map(String::as_str), Some("3"));
+        let result = rows
+            .iter()
+            .find_map(|r| match &r.payload {
+                EventPayload::ToolResult { ok, summary } => Some((*ok, summary.clone())),
+                _ => None,
+            })
+            .expect("the tool result row");
+        assert_eq!(result, (true, "sunny, 21 C".to_string()));
+        assert!(rows.iter().any(|r| matches!(
+            &r.payload,
+            EventPayload::TurnEnd { status, .. } if status == "completed"
+        )));
+
+        let bus = Harness::start_with(bus_provenance("run-loop-bus"));
+        bus.emit(ProgressEvent::NodeStarted {
+            node_id: "n".into(),
+            node_type: "bus_consume".into(),
+        });
+        bus.emit(ProgressEvent::ToolIo {
+            call_id: "c".into(),
+            arguments: Some(r#"{"record":"medical"}"#.into()),
+            result: Some("medical result".into()),
+        });
+        bus.emit(ProgressEvent::ToolCallStarted {
+            call_id: "c".into(),
+            name: "t".into(),
+        });
+        bus.emit(ProgressEvent::ToolCallFinished {
+            call_id: "c".into(),
+            name: "t".into(),
+            status: "ok".into(),
+        });
+        let rows = bus.rows("run-loop-bus", 4).await;
+        let stored = serde_json::to_string(&rows.iter().map(|r| &r.payload).collect::<Vec<_>>())
+            .expect("json");
+        assert!(!stored.contains("medical"), "{stored}");
+    }
+
+    /// A run cancelled while an `llm` step is still open keeps the prompt the step
+    /// had reported, as a `step_io` row before the run's end; a bus run keeps
+    /// nothing.
+    #[tokio::test]
+    async fn a_run_ended_mid_step_keeps_the_prompt_already_reported() {
+        let h = Harness::start("run-cut");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: Some("the prompt before the cancel".into()),
+            output: None,
+        });
+        h.emit(ProgressEvent::RunFinished {
+            run_id: "run-cut".into(),
+            status: "cancelled".into(),
+        });
+        let rows = h.rows("run-cut", 4).await;
+        assert_eq!(
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                crate::events::EventKind::RequestStarted,
+                crate::events::EventKind::StepStart,
+                crate::events::EventKind::StepIo,
+                crate::events::EventKind::RequestFinished,
+            ]
+        );
+        let EventPayload::StepIo { z, .. } = &rows[2].payload else {
+            panic!("not a step_io row");
+        };
+        let body = crate::events::step_io::unpack(z).unwrap();
+        assert_eq!(body.input, "the prompt before the cancel");
+        // A timeline page gets the sizes without the packed body.
+        let headers = crate::events::store::read_run_headers(&h.pool, "run-cut", 0, 100).unwrap();
+        let EventPayload::StepIo {
+            z, input_bytes, ..
+        } = &headers[2].payload
+        else {
+            panic!("not a step_io row");
+        };
+        assert!(z.is_empty());
+        assert_eq!(*input_bytes, "the prompt before the cancel".len() as u64);
+
+        let bus = Harness::start_with(bus_provenance("run-cut-bus"));
+        bus.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        bus.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: Some("record body".into()),
+            output: None,
+        });
+        bus.emit(ProgressEvent::RunFinished {
+            run_id: "run-cut-bus".into(),
+            status: "cancelled".into(),
+        });
+        let rows = bus.rows("run-cut-bus", 3).await;
+        assert!(!rows
+            .iter()
+            .any(|r| r.kind == crate::events::EventKind::StepIo));
     }
 
     /// The model facts of an `llm` step arrive in separate events (the request

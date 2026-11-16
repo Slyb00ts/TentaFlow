@@ -279,6 +279,25 @@ impl FlowScheduler {
         actor_user_id: Option<String>,
         org_id: Option<String>,
     ) -> Result<InvocationStatus, InvokeError> {
+        self.invoke_in_run(addon_id, flow_id, input, wait_ms, actor_user_id, org_id, None)
+            .await
+    }
+
+    /// [`Self::invoke`] for a caller whose provenance is known. The operators'
+    /// model calls carry it: a call made inside a flow run belongs to that run
+    /// (a bus run keeps no bodies, so nothing is recorded for it), and one made
+    /// by a scheduler job or a process step is stamped with that origin.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_in_run(
+        self: &Arc<Self>,
+        addon_id: &str,
+        flow_id: &str,
+        input: toml::Value,
+        wait_ms: u32,
+        actor_user_id: Option<String>,
+        org_id: Option<String>,
+        provenance: Option<crate::addon::AddonCallProvenance>,
+    ) -> Result<InvocationStatus, InvokeError> {
         let flow =
             registry::global()
                 .get(addon_id, flow_id)
@@ -374,6 +393,7 @@ impl FlowScheduler {
             operators_total,
             guard,
             org_id.clone(),
+            provenance,
         );
 
         if wait_ms == 0 {
@@ -736,6 +756,7 @@ impl FlowScheduler {
         operators_total: i64,
         guard: CapGuard,
         org_id: Option<String>,
+        provenance: Option<crate::addon::AddonCallProvenance>,
     ) -> InvocationStatus {
         // Build the per-invocation PermissionChecker once and share by Arc.
         // The operators that need it (Predict, Sink event/ui_notify) clone
@@ -777,6 +798,7 @@ impl FlowScheduler {
                 event_bus: self.event_bus(),
                 sink_outputs: sink_outputs.clone(),
                 org_id: org_id.clone(),
+                provenance: provenance.clone(),
             };
             let op_type = op.op_type;
             let token = cancel.clone();

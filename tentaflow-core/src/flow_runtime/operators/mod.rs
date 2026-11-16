@@ -76,6 +76,10 @@ pub struct OperatorContext {
     /// resolved OrgContext (legacy host-fn callers, boot recovery sweeps);
     /// SQL sink falls back to `org-default` with a warn in that case.
     pub org_id: Option<String>,
+    /// What started the invocation (`flow_invoke_v1`): the calling addon's
+    /// provenance, which says whether it ran inside a flow run. `None` for an
+    /// invocation with no addon call behind it.
+    pub provenance: Option<crate::addon::AddonCallProvenance>,
 }
 
 impl OperatorContext {
@@ -86,6 +90,7 @@ impl OperatorContext {
             instance_id: None,
             is_system_call: true,
             org_id: self.org_id.clone(),
+            provenance: self.provenance.clone(),
         }
     }
 }

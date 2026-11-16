@@ -2261,9 +2261,20 @@ async fn run_job(
     // Summaries trail the ingest: the source is searchable the moment it is
     // `ready`, and a slow model must not hold the job (or its worker slot) open.
     if !summary_targets.is_empty() {
+        // The summaries are written for whoever added the source.
+        let attribution = repository::get_source(&project_pool, &source_id)
+            .ok()
+            .flatten()
+            .map(|source| {
+                crate::auth::acl::UserContext::new(source.created_by, "user")
+                    .with_org(org_id.clone())
+            });
         tokio::spawn(super::summary::summarize_targets(
             core_db,
-            Arc::new(super::summary::RouterModel { router }),
+            Arc::new(super::summary::RouterModel {
+                router,
+                attribution,
+            }),
             project_pool,
             org_id,
             project_id,

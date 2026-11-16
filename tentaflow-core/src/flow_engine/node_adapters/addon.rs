@@ -151,6 +151,12 @@ impl NodeAdapter for AddonNodeAdapter {
         let block_type = self.block_type.clone();
         let user_id = ctx.user_id.clone();
         let correlation_id = ctx.correlation_id.clone();
+        let org_id = ctx.org_id.clone();
+        let parent = crate::flow_engine::dispatchers::ParentRun::new(
+            ctx.origin,
+            ctx.progress.clone(),
+            ctx.progress_scope.clone(),
+        );
         let node_type = self.node_type.clone();
 
         let response_bytes = tokio::task::spawn_blocking(move || {
@@ -159,10 +165,11 @@ impl NodeAdapter for AddonNodeAdapter {
                 &block_type,
                 &envelope_json,
                 user_id,
-                None,
+                org_id,
                 fuel,
                 deadline,
                 correlation_id,
+                Some(parent),
             )
         })
         .await

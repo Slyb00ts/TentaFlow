@@ -9,15 +9,13 @@
 // `RunDetail` after a reconnect, never from here.
 //
 // ACL (§3.3): a `Run` scope must resolve to the caller's principal or an admin;
-// a `Session` scope must be owned by the caller. A session-scope key is the
-// client-minted conversation id — low entropy, time-correlated — so it is NOT
-// an authorization token: the dispatch layer binds `session_id -> user_id` on
-// the broker when a foreground flow starts, and this handler rejects a `Session`
-// subscription whose key is unbound or owned by a different principal (admin
-// bypass). Without that check any authenticated user could guess/observe
-// another user's session id and read their harness activity (question text,
-// permission/tool names, router reasons) — a cross-principal info leak. A
-// non-admin subscribing to another principal's run/session gets an immediate
+// a `Session` scope is keyed by the caller's own authenticated id plus the
+// client-minted conversation id (low entropy, time-correlated, so never an
+// authorization token on its own). The events of a run the caller started are
+// mirrored to that key by the server, so another user on the same conversation
+// id holds a different key and sees nothing: no binding to hijack and no
+// existence to leak. A
+// non-admin subscribing to another principal's run gets an immediate
 // stream end with an error frame rather than a silent empty stream.
 
 use std::sync::Arc;
@@ -70,6 +68,10 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
         ProgressEvent::NodeIo { node_id, .. } => {
             e.kind = "node_io".into();
             e.node_id = node_id;
+        }
+        ProgressEvent::ToolIo { call_id, .. } => {
+            e.kind = "tool_io".into();
+            e.call_id = call_id;
         }
         ProgressEvent::NodeModel { node_id, .. } => {
             e.kind = "node_model".into();
@@ -173,10 +175,17 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
             e.interaction_id = interaction_id;
             e.outcome = outcome;
         }
+        // The end of the run: a live view needs it to stop showing the run as
+        // going. The widget settles the run from it and adds no step.
+        ProgressEvent::RunFinished { run_id, status } => {
+            e.kind = "run_finished".into();
+            e.run_id = run_id;
+            e.status = status;
+        }
         // Never reaches the wire: the subscribe loop drops it. It is a
         // bookkeeping event for the durable event log, and the agent activity
         // view would render it as a nameless step.
-        ProgressEvent::RunFinished { .. } => {}
+        ProgressEvent::NodeFailed { .. } => {}
     }
     e
 }
@@ -210,27 +219,19 @@ fn authorize_scope(
     scope: &AgentRunEventScope,
 ) -> Result<String, ProtocolError> {
     match scope {
-        // A session scope must be owned by the caller. The session id is a
-        // client-minted, low-entropy conversation id, so it cannot be trusted as
-        // an authorization token — the broker carries the server-side
-        // `session_id -> user_id` binding recorded when the foreground flow
-        // started. Unbound or foreign-owned scopes are rejected (admin bypass).
+        // The conversation id is client-minted and low-entropy, so it never
+        // addresses a scope by itself: the key is derived from the caller's own
+        // authenticated id, and a runs' events reach it through the mirror the
+        // server set up when the caller started that run. Another user's view of
+        // the same conversation id is a different key and receives nothing.
         AgentRunEventScope::Session { session_id } => {
             if session_id.is_empty() {
                 return Err(ProtocolError::bad_request("empty session scope"));
             }
             let actor = actor_id(ctx)?;
-            if session_is_admin(ctx) {
-                return Ok(session_id.clone());
-            }
-            let owner = ctx.state.progress_broker.session_owner(session_id);
-            if owner.as_deref() != Some(actor.as_str()) {
-                // Do not leak existence — report as not-found like the run views.
-                return Err(ProtocolError::not_found(format!(
-                    "session scope not found: {session_id}"
-                )));
-            }
-            Ok(session_id.clone())
+            Ok(crate::flow_engine::progress_broker::session_scope_key(
+                &actor, session_id,
+            ))
         }
         AgentRunEventScope::Run { run_id } => {
             if run_id.is_empty() {
@@ -280,13 +281,16 @@ fn run_events_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
         loop {
             match rx.recv().await {
                 Ok(stamped) => {
-                    if matches!(stamped.event, ProgressEvent::RunFinished { .. }) {
+                    if matches!(stamped.event, ProgressEvent::NodeFailed { .. }) {
                         continue;
                     }
-                    let body = MessageBody::AgentsBody(AgentsPayload::RunEvent(to_wire(
-                        &scope_key,
-                        stamped.event,
-                    )));
+                    // An event mirrored onto the conversation's key says which run
+                    // it belongs to; the key itself names no run.
+                    let wire_scope = stamped.run_scope.as_deref().unwrap_or(&scope_key);
+                    let mut wire = to_wire(wire_scope, stamped.event);
+                    // Such a run has no `agent_runs` row, so cancel cannot reach it.
+                    wire.unmanaged = stamped.run_scope.is_some();
+                    let body = MessageBody::AgentsBody(AgentsPayload::RunEvent(wire));
                     // Receiver closed (client disconnected) → stop draining the
                     // broker so the scope can be pruned on its next publish.
                     if push_chunk_async(&sub, body).await.is_err() {
@@ -394,6 +398,20 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_a_run_reaches_the_wire_with_its_status() {
+        let e = to_wire(
+            "run-1",
+            ProgressEvent::RunFinished {
+                run_id: "run-1".into(),
+                status: "failed".into(),
+            },
+        );
+        assert_eq!(e.kind, "run_finished");
+        assert_eq!(e.run_id, "run-1");
+        assert_eq!(e.status, "failed");
+    }
+
+    #[test]
     fn to_wire_maps_kind_and_fields() {
         let e = to_wire(
             "sess-1",
@@ -436,58 +454,51 @@ mod tests {
         assert_eq!(q.choices, vec!["A".to_string(), "B".to_string()]);
     }
 
-    #[test]
-    fn session_scope_requires_server_side_ownership() {
+    /// A non-admin on its own session scope receives the permission request
+    /// and the question of a run it started; another user on the same
+    /// conversation id receives nothing.
+    #[tokio::test]
+    async fn session_scope_is_keyed_by_the_caller_and_receives_its_runs() {
         let state = AppState::for_test();
-        let owner = uuid::Uuid::from_bytes([3u8; 16]).hyphenated().to_string();
-        // Foreground dispatch binds the session scope to its principal.
-        state.progress_broker.bind_session_owner("sess-abc", &owner);
-
-        // Owner resolves to the bound key.
+        let owner_id = uuid::Uuid::from_bytes([3u8; 16]).hyphenated().to_string();
         let owner_ctx = ctx("user", [3u8; 16], state.clone());
-        let key = authorize_scope(
-            &owner_ctx,
-            &AgentRunEventScope::Session {
-                session_id: "sess-abc".into(),
-            },
-        )
-        .expect("owner allowed");
-        assert_eq!(key, "sess-abc");
-
-        // A different principal who guessed/observed the session id is rejected
-        // as not-found (no existence leak), even though the scope exists.
         let other_ctx = ctx("user", [7u8; 16], state.clone());
-        let err = authorize_scope(
-            &other_ctx,
-            &AgentRunEventScope::Session {
-                session_id: "sess-abc".into(),
-            },
-        )
-        .expect_err("foreign principal denied");
-        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+        let scope = AgentRunEventScope::Session {
+            session_id: "sess-abc".into(),
+        };
+        let owner_key = authorize_scope(&owner_ctx, &scope).expect("own scope");
+        let other_key = authorize_scope(&other_ctx, &scope).expect("a key of its own");
+        assert_ne!(owner_key, other_key);
 
-        // An unbound session id is also not-found (a client cannot subscribe to
-        // a scope no flow ever registered).
-        let unbound_ctx = ctx("user", [3u8; 16], state.clone());
-        let err = authorize_scope(
-            &unbound_ctx,
-            &AgentRunEventScope::Session {
-                session_id: "never-started".into(),
+        let broker = state.progress_broker.clone();
+        let mut owner_rx = broker.subscribe(&owner_key);
+        let mut other_rx = broker.subscribe(&other_key);
+        broker.mirror_run_to_session(
+            "run-1",
+            &crate::flow_engine::progress_broker::session_scope_key(&owner_id, "sess-abc"),
+        );
+        for event in [
+            ProgressEvent::PermissionRequest {
+                run_id: "run-1".into(),
+                interaction_id: "i1".into(),
+                addon_id: "a".into(),
+                tool_name: "t".into(),
+                permission: "p".into(),
             },
-        )
-        .expect_err("unbound session denied");
-        assert_eq!(err.code, ProtocolErrorCode::NotFound);
-
-        // Admin bypasses ownership and may watch any session scope.
-        let admin_ctx = ctx("admin", [9u8; 16], state);
-        let key = authorize_scope(
-            &admin_ctx,
-            &AgentRunEventScope::Session {
-                session_id: "sess-abc".into(),
+            ProgressEvent::UserQuestion {
+                run_id: "run-1".into(),
+                interaction_id: "i2".into(),
+                question: "q".into(),
+                choices: vec![],
             },
-        )
-        .expect("admin allowed");
-        assert_eq!(key, "sess-abc");
+        ] {
+            broker.publish("run-1", event);
+        }
+        let first = owner_rx.recv().await.expect("permission request");
+        let second = owner_rx.recv().await.expect("question");
+        assert!(matches!(first.event, ProgressEvent::PermissionRequest { .. }));
+        assert!(matches!(second.event, ProgressEvent::UserQuestion { .. }));
+        assert!(other_rx.try_recv().is_err());
     }
 
     #[test]

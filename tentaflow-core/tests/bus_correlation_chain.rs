@@ -328,7 +328,7 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     let inst = instance_id();
     enable_bus_instance(&inst, &db);
     let events_pool = events::db::init(&tmp.path().join("events.db")).expect("events db");
-    events::progress_log::start(events_pool.clone(), db.clone());
+    events::progress_log::start(events_pool.clone());
 
     {
         let (db, bus_dir, inst) = (db.clone(), tmp.path().join("bus"), inst.clone());
@@ -485,7 +485,6 @@ async fn one_correlation_id_follows_a_chain_of_reactive_flows() {
     // reusing a guessed id would produce.
     events::append(
         &events_pool,
-        &db,
         RunEvent::new(
             "run-foreign",
             1,

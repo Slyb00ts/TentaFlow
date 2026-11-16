@@ -59,6 +59,21 @@ fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatu
     );
 }
 
+/// Passes on why a node failed when its adapter raised a
+/// [`SafeFailure`]. Any other error text stays out of the event log: it
+/// may quote the content the node was handling.
+fn emit_node_failure_reason(ctx: &ExecutionContext, node_id: &str, error: &anyhow::Error) {
+    if let Some(failure) = error.downcast_ref::<crate::flow_engine::dispatchers::SafeFailure>() {
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::NodeFailed {
+                node_id: node_id.to_string(),
+                reason: failure.reason().to_string(),
+            },
+        );
+    }
+}
+
 /// Announces the end of one top-level run on its progress scope, exactly once.
 ///
 /// Nested runs (subflow, loop and map bodies, capability hops) share the
@@ -184,6 +199,22 @@ fn envelope_snapshot(
     }
 }
 
+/// What an `llm` step produced, whole: the assistant turn it appended (text,
+/// reasoning, tool calls) rather than the text payload alone. A step that
+/// appended no assistant turn falls back to its payload.
+fn llm_turn_snapshot(envelope: &FlowEnvelope) -> String {
+    use crate::flow_engine::envelope::ChatRole;
+    match envelope
+        .context
+        .messages
+        .last()
+        .filter(|message| message.role == ChatRole::Assistant)
+    {
+        Some(turn) => serde_json::to_string_pretty(turn).unwrap_or_default(),
+        None => snapshot_text(&envelope_snapshot(envelope, None)),
+    }
+}
+
 fn snapshot_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
@@ -202,8 +233,8 @@ fn emit_node_io(
         &ctx.progress_scope,
         crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
             node_id: node_id.to_string(),
-            input,
-            output,
+            input: input.map(crate::events::step_io::limit_side),
+            output: output.map(crate::events::step_io::limit_side),
         },
     );
 }
@@ -568,6 +599,7 @@ async fn execute_direct_blocking_inner(
         }
         Err(e) => {
             let msg = e.to_string();
+            emit_node_failure_reason(&ctx, &node.id, &e);
             emit_node_finished(
                 &ctx,
                 &node.id,
@@ -869,6 +901,9 @@ fn spawn_node(
             io_mapping_inbound(&inputs).unwrap_or_else(|| initial.as_ref());
         let result = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx).await;
         let duration_ms = attempt.elapsed().as_millis() as u64;
+        if let Err(e) = &result {
+            emit_node_failure_reason(&ctx, &node.id, e);
+        }
         NodeRun {
             pos,
             node_id: node.id.clone(),
@@ -1428,6 +1463,43 @@ async fn stream_llm_member(
     last_usage: &mut Option<TokenUsage>,
     last_perf: &mut Option<GenPerf>,
 ) -> Result<FlowEnvelope> {
+    // Each model call of the loop is a step of its own: the request the model was
+    // given (reported by the adapter as it builds it) and the turn it produced.
+    emit_node_started(ctx, &node.id, &node.node_type);
+    let result =
+        stream_llm_member_turn(adapters, node, inputs, ctx, outbound, last_usage, last_perf).await;
+    match &result {
+        Ok(envelope) => {
+            if ctx.progress.wants_io() {
+                let turn = envelope
+                    .context
+                    .messages
+                    .last()
+                    .and_then(|message| serde_json::to_string_pretty(message).ok());
+                emit_node_io(ctx, &node.id, None, turn);
+            }
+            emit_node_finished(ctx, &node.id, &TraceStatus::Ok);
+        }
+        Err(error) => emit_node_finished(
+            ctx,
+            &node.id,
+            &TraceStatus::Error {
+                message: error.to_string(),
+            },
+        ),
+    }
+    result
+}
+
+async fn stream_llm_member_turn(
+    adapters: &Arc<AdapterRegistry>,
+    node: &FlowNode,
+    inputs: &[NodeInput],
+    ctx: &Arc<ExecutionContext>,
+    outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
+    last_usage: &mut Option<TokenUsage>,
+    last_perf: &mut Option<GenPerf>,
+) -> Result<FlowEnvelope> {
     let producer = adapters.stream_producer(&node.node_type).ok_or_else(|| {
         anyhow!(
             "no StreamProducerAdapter for region member '{}' (type '{}')",
@@ -1732,6 +1804,7 @@ async fn run_node_with_io_mapping(
             ))),
         };
         let output = match &result {
+            Ok(envelope) if node.node_type == "llm" => llm_turn_snapshot(envelope),
             Ok(envelope) => snapshot_text(&envelope_snapshot(
                 envelope,
                 inputs.first().map(|i| i.envelope.as_ref()),
@@ -1917,6 +1990,7 @@ async fn execute_streaming_inner(
         let envelope = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx)
             .await
             .map_err(|e| {
+                emit_node_failure_reason(&ctx, &node.id, &e);
                 emit_node_finished(
                     &ctx,
                     &node.id,
@@ -2133,6 +2207,7 @@ async fn execute_streaming_region(
         let envelope = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx)
             .await
             .map_err(|e| {
+                emit_node_failure_reason(&ctx, &node.id, &e);
                 emit_node_finished(
                     &ctx,
                     &node.id,
@@ -2317,9 +2392,16 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                 },
                 usage: last_usage.filter(|u| *u != TokenUsage::default()),
             });
-            // The region already forwarded any backend error to the client; the
-            // outcome carries it for the audit row. No post-producer nodes run.
+            // A backend error was already forwarded by the member that met it, but
+            // a failure before any stream existed (no model, a step ahead of the
+            // model refusing) was not: without this the consumer reads a clean end
+            // of stream, which is an empty answer reported as a success. A nested
+            // run's outcome is dropped by whoever forwards its stream, so the
+            // stream is the only place its parent can learn the run failed.
             let cancelled = ctx.cancel_token.is_cancelled();
+            if !cancelled {
+                let _ = outbound_tx.send(Err(anyhow!("{msg}"))).await;
+            }
             let finish = if cancelled {
                 FinishReason::Cancelled
             } else {
@@ -2403,6 +2485,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
             }
             Err(e) => {
                 let msg = e.to_string();
+                emit_node_failure_reason(&ctx, &node.id, &e);
                 emit_node_finished(
                     &ctx,
                     &node.id,
@@ -2690,7 +2773,7 @@ async fn finalize_streaming_flow(
             crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
                 node_id: inputs.producer_node_id.clone(),
                 input: None,
-                output: Some(answer),
+                output: Some(crate::events::step_io::limit_side(answer)),
             },
         );
     }
@@ -4606,6 +4689,17 @@ mod concurrent_executor_tests {
         assert_eq!(run_capturing(json, |_| {}).await, vec!["failed"]);
     }
 
+    /// An error the flow handles on purpose (`continue_on_error`: the failed step
+    /// is passed over and the run goes on) is a run that completed.
+    #[tokio::test]
+    async fn a_recovered_error_branch_still_completes() {
+        let json = r#"{"nodes":[
+            {"id":"t","type":"trigger","config":{"continue_on_error":true}},
+            {"id":"s","type":"sleep","config":{"fail":true}}
+        ],"edges":[{"from":"t","to":"s","from_port":"text","to_port":"in"}]}"#;
+        assert_eq!(run_capturing(json, |_| {}).await, vec!["completed"]);
+    }
+
     #[tokio::test]
     async fn a_cancelled_run_announces_its_end_exactly_once() {
         let statuses = run_capturing(OK_FLOW, |ctx| ctx.cancel_token.cancel()).await;
@@ -6119,6 +6213,188 @@ mod first_token_tests {
                 "iteration_finished",
             ]
         );
+    }
+
+    /// The model step of a region cannot start (no model configured): it refuses
+    /// before any stream exists, so nothing was forwarded to the client.
+    struct NoModelRegionBody;
+
+    #[async_trait]
+    impl NodeAdapter for NoModelRegionBody {
+        fn node_type(&self) -> &str {
+            "no_model_region_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Any),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok((*ctx.initial_envelope).clone())
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for NoModelRegionBody {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            Err(anyhow::anyhow!("no model is configured"))
+        }
+    }
+
+    fn no_model_region_flow() -> serde_json::Value {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "no_model_region_body", "region": "loop1",
+                 "config": {"loop_max_iterations": 5}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "b", "from_port": "text", "to_port": "in"},
+                {"from": "b", "to": "b", "from_port": "full", "to_port": "in", "kind": "loop_back"},
+                {"from": "b", "to": "o", "from_port": "stream", "to_port": "text"}
+            ]
+        })
+    }
+
+    /// The outer flow's stream producer: it runs the inner flow as a nested run
+    /// (like the `agent` block) and forwards ITS stream, dropping the inner
+    /// outcome.
+    struct NestedForwarder {
+        inner: Arc<CompiledFlow>,
+        inner_registry: Arc<AdapterRegistry>,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for NestedForwarder {
+        fn node_type(&self) -> &str {
+            "nested_forwarder"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok((*ctx.initial_envelope).clone())
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for NestedForwarder {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            let mut child = ctx.clone();
+            child.subflow_depth += 1;
+            let mut initial = FlowEnvelope::empty();
+            initial.payload = FlowValue::Text("go".into());
+            let exec = execute_streaming(
+                db(),
+                self.inner.clone(),
+                initial,
+                child,
+                self.inner_registry.clone(),
+            )
+            .await?;
+            Ok(exec.stream)
+        }
+    }
+
+    /// The chat run with no model: the model step refuses inside a nested run,
+    /// the user gets no answer, and the run reports `failed` — not `completed`
+    /// with an empty answer.
+    #[tokio::test]
+    async fn a_chat_run_with_no_model_ends_as_failed() {
+        let inner_registry = {
+            let mut r = AdapterRegistry::new();
+            r.register(Arc::new(TriggerNodeAdapter::new()));
+            r.register(Arc::new(OutputNodeAdapter::new()));
+            r.register_stream_producer(Arc::new(NoModelRegionBody));
+            Arc::new(r)
+        };
+        let inner = Arc::new(
+            CompiledFlow::from_json("0", &no_model_region_flow().to_string(), &inner_registry)
+                .expect("compile inner"),
+        );
+        let registry = {
+            let mut r = AdapterRegistry::new();
+            r.register(Arc::new(TriggerNodeAdapter::new()));
+            r.register(Arc::new(OutputNodeAdapter::new()));
+            r.register_stream_producer(Arc::new(NestedForwarder {
+                inner,
+                inner_registry,
+            }));
+            Arc::new(r)
+        };
+        let outer = json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "a", "type": "nested_forwarder", "config": {}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "a", "from_port": "text", "to_port": "in"},
+                {"from": "a", "to": "o", "from_port": "stream", "to_port": "text"}
+            ]
+        });
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &outer.to_string(), &registry).expect("compile outer"),
+        );
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hello".into());
+
+        let exec = execute_streaming(db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+        let mut stream = exec.stream;
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            saw_error |= item.is_err();
+        }
+        let outcome = exec.outcome.await.expect("outcome");
+
+        assert!(saw_error, "the client is told, not given an empty answer");
+        assert_eq!(outcome.finish_reason, FinishReason::Error);
+        assert!(outcome.error.is_some());
+        let statuses: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                ProgressEvent::RunFinished { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec!["failed"]);
     }
 }
 

@@ -804,6 +804,10 @@ fn run_go2_call(
                 ROBOT_BLOCK_FUEL,
                 None,
                 None,
+                // Driven from a mesh peer: nothing is recorded here.
+                Some(crate::flow_engine::dispatchers::ParentRun::unrecorded(
+                    crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                )),
             )?;
             serde_json::from_slice::<serde_json::Value>(&raw)
                 .map_err(|e| anyhow::anyhow!("decode block result: {e}"))

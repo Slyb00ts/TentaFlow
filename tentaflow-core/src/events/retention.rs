@@ -226,7 +226,7 @@ mod tests {
 
     /// Writes one event of `org` (`None` = a run started by no tenant) at
     /// `at_ms`.
-    fn at(pool: &DbPool, main: &DbPool, run_id: &str, at_ms: i64, org: Option<&str>) {
+    fn at(pool: &DbPool, run_id: &str, at_ms: i64, org: Option<&str>) {
         let mut event = RunEvent::new(
             run_id,
             at_ms,
@@ -237,7 +237,7 @@ mod tests {
             },
         );
         event.org_id = org.map(str::to_string);
-        append(pool, main, event).unwrap();
+        append(pool, event).unwrap();
     }
 
     fn ms_ago(pool: &DbPool, days: i64) -> i64 {
@@ -341,17 +341,15 @@ mod tests {
             "the seeded default is not what the sweeper resolves"
         );
 
-        at(&pool, &main, "old", ms_ago(&pool, 40), Some(DEFAULT_ORG_ID));
+        at(&pool, "old", ms_ago(&pool, 40), Some(DEFAULT_ORG_ID));
         at(
             &pool,
-            &main,
             "recent",
             ms_ago(&pool, 10),
             Some(DEFAULT_ORG_ID),
         );
         at(
             &pool,
-            &main,
             "fresh",
             ms_ago(&pool, 1),
             Some(DEFAULT_ORG_ID),
@@ -392,35 +390,30 @@ mod tests {
 
         at(
             &pool,
-            &main,
             "strict-stale",
             ms_ago(&pool, 10),
             Some("org-strict"),
         );
         at(
             &pool,
-            &main,
             "strict-fresh",
             ms_ago(&pool, 1),
             Some("org-strict"),
         );
         at(
             &pool,
-            &main,
             "lax-stale",
             ms_ago(&pool, 10),
             Some("org-lax"),
         );
         at(
             &pool,
-            &main,
             "lax-ancient",
             ms_ago(&pool, 90),
             Some("org-lax"),
         );
         at(
             &pool,
-            &main,
             "default-mid",
             ms_ago(&pool, 10),
             Some(DEFAULT_ORG_ID),
@@ -446,13 +439,12 @@ mod tests {
         let main = main_db();
         add_org(&main, "org-strict", 3);
 
-        at(&pool, &main, "system-stale", ms_ago(&pool, 10), None);
-        at(&pool, &main, "system-fresh", ms_ago(&pool, 1), None);
+        at(&pool, "system-stale", ms_ago(&pool, 10), None);
+        at(&pool, "system-fresh", ms_ago(&pool, 1), None);
         // An organisation that has since been deleted from the node: the row
         // still names a tenant, but no policy can be resolved for it.
         at(
             &pool,
-            &main,
             "ghost-stale",
             ms_ago(&pool, 10),
             Some("org-gone"),
@@ -461,7 +453,6 @@ mod tests {
         // the unattributed cutoff is not simply applied to everything.
         at(
             &pool,
-            &main,
             "default-mid",
             ms_ago(&pool, 10),
             Some(DEFAULT_ORG_ID),
@@ -485,12 +476,11 @@ mod tests {
         set_policy_days(&main, DEFAULT_ORG_ID, 0);
         at(
             &pool,
-            &main,
             "fresh",
             ms_ago(&pool, 0),
             Some(DEFAULT_ORG_ID),
         );
-        at(&pool, &main, "fresh-system", ms_ago(&pool, 0), None);
+        at(&pool, "fresh-system", ms_ago(&pool, 0), None);
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.unattributed_retention_days, 1);
@@ -508,7 +498,6 @@ mod tests {
         let old = ms_ago(&pool, 90);
         append(
             &pool,
-            &main,
             RunEvent::new(
                 "r-old",
                 old,
@@ -549,7 +538,7 @@ mod tests {
     fn a_delivered_audit_copy_is_swept_on_its_own_cutoff() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        at(&pool, &main, "r-1", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
+        at(&pool, "r-1", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
         {
             let conn = pool.write().unwrap();
             conn.execute(

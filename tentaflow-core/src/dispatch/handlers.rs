@@ -9761,15 +9761,32 @@ pub fn agent_run_detail(
 /// ACL for answering a run's interaction (§3.13): a non-admin may reply only to
 /// a run whose principal is themselves; an unattended (no-principal) run is
 /// admin-only. A missing run is reported as not-found (not leaking existence).
-fn assert_run_reply_access(ctx: &HandlerContext, run_id: &str) -> Result<(), ProtocolError> {
+///
+/// A card raised by a flow that has no managed agent run (a chat flow's
+/// `ask_user` block, an agent node outside the run manager) names the flow's own
+/// run id, which has no `agent_runs` row. Such a card carries the authenticated
+/// owner of the flow run, and that owner (or an admin) may answer it.
+/// `interaction_id` is the card being answered; actions on a run itself
+/// (cancel) pass `None` and need the row.
+fn assert_run_reply_access(
+    ctx: &HandlerContext,
+    run_id: &str,
+    interaction_id: Option<&str>,
+) -> Result<(), ProtocolError> {
     let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
-    let run = repository::get_agent_run(&ctx.state.db, run_id)
-        .map_err(db_err)?
-        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {run_id}")))?;
+    let not_found = || ProtocolError::not_found(format!("agent run not found: {run_id}"));
+    let run = repository::get_agent_run(&ctx.state.db, run_id).map_err(db_err)?;
+    let Some(run) = run else {
+        let owned_card = interaction_id
+            .and_then(|id| crate::agents::interaction_registry_global().info(id))
+            .is_some_and(|card| {
+                card.run_id == run_id
+                    && (session_is_admin(ctx) || card.user_id.as_deref() == Some(actor_id.as_str()))
+            });
+        return if owned_card { Ok(()) } else { Err(not_found()) };
+    };
     if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
-        return Err(ProtocolError::not_found(format!(
-            "agent run not found: {run_id}"
-        )));
+        return Err(not_found());
     }
     Ok(())
 }
@@ -9786,7 +9803,7 @@ pub fn agent_run_reply(
         _ => return Err(ProtocolError::bad_request("expected AgentRunReplyRequest")),
     };
     // ACL: the run's principal or an admin may answer its questions (§3.13 A).
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, Some(&payload.question_id))?;
 
     let registry = crate::agents::interaction_registry_global();
     // The interaction must belong to the named run (an answer cannot be routed
@@ -9824,7 +9841,7 @@ pub fn agent_permission_reply(
             ))
         }
     };
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, Some(&payload.request_id))?;
 
     let decision = crate::agents::PermissionDecision::parse(&payload.decision)
         .ok_or_else(|| ProtocolError::bad_request("unknown permission decision"))?;
@@ -9862,7 +9879,7 @@ pub fn agent_run_cancel(
         _ => return Err(ProtocolError::bad_request("expected AgentRunCancelRequest")),
     };
     // ACL: the run's principal or an admin may cancel it (§3.3).
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, None)?;
 
     let user_id = require_user_id(ctx)?;
     let cancelled = crate::agents::agent_run_manager_global()
@@ -10147,7 +10164,12 @@ pub async fn agent_builder_assist(
             // §2.5 — Agent Builder assist is a dashboard builder surface.
             crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
             handler_actor(ctx),
-            None,
+            // The organisation the session is acting in; without it the run
+            // would be filed under whichever the user joined first.
+            Some(crate::compliance::ai_gateway::AiGatewayContext {
+                org_id: ctx.org_context.as_ref().map(|org| org.org_id.clone()),
+                ..Default::default()
+            }),
         )
         .await
         .map_err(|e| ProtocolError::internal(format!("builder assist LLM call failed: {e}")))?;

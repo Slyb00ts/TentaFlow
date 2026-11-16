@@ -4775,6 +4775,58 @@ mod tests {
         }
     }
 
+    /// A card raised by a flow that has no managed agent run (a chat flow's
+    /// `ask_user`) names the flow's own run id, which has no `agent_runs` row. It
+    /// carries the authenticated owner, who can answer it; a stranger cannot, and
+    /// a card with no owner stays unanswerable.
+    #[tokio::test]
+    async fn a_card_of_a_flow_run_without_an_agent_row_is_answered_by_its_owner() {
+        use tentaflow_protocol::{AgentRunReplyRequest, AgentsPayload};
+        let state = state::AppState::for_test();
+        let owner_bytes = [43u8; 16];
+        let owner = uuid::Uuid::from_bytes(owner_bytes).to_string();
+        let reg = crate::agents::interaction_registry_global();
+        let card = |id: &str, user: Option<&str>| crate::agents::PendingInteraction {
+            id: id.into(),
+            run_id: "flow-run-without-row".into(),
+            parent_run_id: None,
+            kind: crate::agents::InteractionKind::Question,
+            prompt: "which?".into(),
+            choices: vec![],
+            addon_id: None,
+            tool_name: None,
+            permission: None,
+            raised_at_ms: crate::agents::interaction_now_ms(),
+            engine_id: None,
+            account_id: None,
+            user_id: user.map(str::to_string),
+        };
+        let _owned = reg.register(card("q-flow-owned", Some(&owner)));
+        let _orphan = reg.register(card("q-flow-orphan", None));
+        let reply = |id: &str| {
+            MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(AgentRunReplyRequest {
+                run_id: "flow-run-without-row".into(),
+                question_id: id.into(),
+                answer: "a".into(),
+            }))
+        };
+
+        let stranger = agents_ctx("user", [8u8; 16], state.clone());
+        let (_resp, is_err) = dispatch(&reply("q-flow-owned"), &stranger).await;
+        assert!(is_err, "a stranger must be denied");
+
+        let owner_ctx = agents_ctx("user", owner_bytes, state.clone());
+        let (resp, is_err) = dispatch(&reply("q-flow-owned"), &owner_ctx).await;
+        assert!(!is_err, "dispatch refused: {resp:?}");
+        match resp {
+            MessageBody::AgentsBody(AgentsPayload::RunReplyResponse(r)) => assert!(r.delivered),
+            other => panic!("expected RunReplyResponse, got {other:?}"),
+        }
+
+        let (_resp, is_err) = dispatch(&reply("q-flow-orphan"), &owner_ctx).await;
+        assert!(is_err, "a card with no owner is not answerable by a user");
+    }
+
     #[tokio::test]
     async fn tools_catalog_includes_core_builtins() {
         use tentaflow_protocol::{AgentsPayload, ToolsCatalogRequest};
