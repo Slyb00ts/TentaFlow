@@ -7188,6 +7188,9 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
             | K::OrgAbsence => {
                 emitted += crate::services::org_structure::replication::reseed(&tx, descriptor.kind)?;
             }
+            K::SlaPolicy | K::SlaAssignment => {
+                emitted += crate::sla::repository::reseed(&tx, descriptor.kind)?;
+            }
         }
     }
 

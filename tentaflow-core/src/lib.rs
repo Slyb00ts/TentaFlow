@@ -35,6 +35,7 @@ pub mod routing;
 pub mod scheduler;
 pub mod services;
 pub mod services_repo;
+pub mod sla;
 pub mod skills;
 pub mod skills_hub;
 pub mod stt;

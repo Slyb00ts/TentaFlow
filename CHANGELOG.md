@@ -6,6 +6,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Limity i SLA usług (TB-03, etap 1–2)
+
+- Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,
+  replikowane przez Sync Ledger w zakresie organizacji: polityka jest wspólna
+  dla całego klastra, a limity /v1 liczy każdy węzeł osobno. 212 dodaje lokalne
+  tabele węzła `sla_breaches` i `sla_samples`.
+- Nowy moduł `sla` z rejestrem polityk i bramką usługi. Bramka pilnuje limitu
+  równoczesnych wywołań, krótkiej kolejki z limitem czasu oraz limitu wywołań
+  w oknie zegarowym, a także zbiera p95 opóźnień. Zmiana polityki działa
+  w miejscu i nie ucina trwających wywołań. Bramek nic jeszcze nie wywołuje,
+  więc zachowanie aplikacji się nie zmienia.
+- Jeśli dwa węzły nadadzą polityce tę samą nazwę, na każdym węźle wygrywa ta
+  sama, starsza polityka, a druga dostaje przyrostek z identyfikatora.
+
 ### Zdarzenia i konta usługowe (TB-02)
 
 - Przebiegi AI w dzienniku zdarzeń zawsze zapisują pełne wejście i wyjście

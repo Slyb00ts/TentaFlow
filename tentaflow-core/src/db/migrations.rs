@@ -1337,8 +1337,119 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_incident_retry_attempts",
             MigrationStep::Sql(BPMN_INCIDENT_RETRY_ATTEMPTS),
         ),
+        (
+            211,
+            "service_sla_policies",
+            MigrationStep::Sql(SERVICE_SLA_POLICIES),
+        ),
+        (
+            212,
+            "sla_breaches_and_samples",
+            MigrationStep::Sql(SLA_BREACHES_AND_SAMPLES),
+        ),
     ]
 }
+
+/// v211 — TB-03 service SLA policies (ML 90, ML 91). A policy is a named set of
+/// limits and thresholds of one organization; an assignment binds one policy to
+/// one service (today only a flow). Both tables replicate through the Sync
+/// Ledger as `Organization`-scoped resources, so the foreign key from an
+/// assignment to its policy stays INSIDE the feature: the replication applier
+/// defers an assignment that arrives before its policy.
+///
+/// `call_limit` and `call_window_secs` are set together or both NULL: a limit
+/// without a window (or the reverse) has no meaning. `ON DELETE RESTRICT` is
+/// the backstop of the repository's `policy_in_use` refusal. The target is not
+/// a foreign key: a flow row may not have materialized on this node yet.
+const SERVICE_SLA_POLICIES: &str = r#"
+CREATE TABLE IF NOT EXISTS service_sla_policies (
+    id                TEXT PRIMARY KEY,
+    org_id            TEXT NOT NULL,
+    name              TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 200),
+    description       TEXT NOT NULL DEFAULT '' CHECK(length(description) <= 2000),
+    max_concurrency   INTEGER CHECK(max_concurrency IS NULL
+                          OR (typeof(max_concurrency)='integer' AND max_concurrency BETWEEN 1 AND 1024)),
+    max_queue         INTEGER CHECK(max_queue IS NULL
+                          OR (typeof(max_queue)='integer' AND max_queue BETWEEN 0 AND 10000)),
+    queue_timeout_ms  INTEGER CHECK(queue_timeout_ms IS NULL
+                          OR (typeof(queue_timeout_ms)='integer' AND queue_timeout_ms BETWEEN 1 AND 300000)),
+    call_limit        INTEGER CHECK(call_limit IS NULL
+                          OR (typeof(call_limit)='integer' AND call_limit >= 1)),
+    call_window_secs  INTEGER CHECK(call_window_secs IS NULL
+                          OR (typeof(call_window_secs)='integer' AND call_window_secs IN (1, 60, 3600, 86400))),
+    timeout_ms        INTEGER CHECK(timeout_ms IS NULL
+                          OR (typeof(timeout_ms)='integer' AND timeout_ms BETWEEN 100 AND 86400000)),
+    latency_p95_ms    INTEGER CHECK(latency_p95_ms IS NULL
+                          OR (typeof(latency_p95_ms)='integer' AND latency_p95_ms >= 1)),
+    error_rate_pct    INTEGER CHECK(error_rate_pct IS NULL
+                          OR (typeof(error_rate_pct)='integer' AND error_rate_pct BETWEEN 1 AND 100)),
+    warn_at_pct       INTEGER CHECK(warn_at_pct IS NULL
+                          OR (typeof(warn_at_pct)='integer' AND warn_at_pct BETWEEN 1 AND 99)),
+    ordering          TEXT NOT NULL DEFAULT 'partition' CHECK(ordering IN ('partition', 'none')),
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    updated_by        TEXT NOT NULL DEFAULT '',
+    UNIQUE(org_id, name),
+    CHECK((call_limit IS NULL) = (call_window_secs IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS service_sla_assignments (
+    target_kind    TEXT NOT NULL CHECK(target_kind IN ('flow')),
+    target_id      TEXT NOT NULL CHECK(length(target_id) > 0),
+    policy_id      TEXT NOT NULL REFERENCES service_sla_policies(id) ON DELETE RESTRICT,
+    org_id         TEXT NOT NULL,
+    assigned_at_ms INTEGER NOT NULL,
+    assigned_by    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(target_kind, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_service_sla_assignments_policy ON service_sla_assignments(policy_id);
+CREATE INDEX IF NOT EXISTS idx_service_sla_assignments_org ON service_sla_assignments(org_id);
+"#;
+
+/// v212 — TB-03 node-local SLA evidence. Neither table has a Sync Ledger
+/// descriptor: what a node measured about a service is that node's own fact
+/// (the limits are counted per node), like `bus_lag_samples` in `tentabus.db`.
+///
+/// `sla_breaches` holds one row per breach for as long as it lasts; the partial
+/// unique index on `dedupe_key` is what keeps a breach that is still open from
+/// being raised a second time, while a resolved one frees its key. `sla_samples`
+/// is one row per minute and service, kept 7 days. `threshold` and `peak_value`
+/// are REAL because they carry milliseconds, percentages and call counts alike.
+const SLA_BREACHES_AND_SAMPLES: &str = r#"
+CREATE TABLE IF NOT EXISTS sla_breaches (
+    id             TEXT PRIMARY KEY,
+    org_id         TEXT NOT NULL,
+    target_id      TEXT NOT NULL,
+    policy_id      TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK(kind IN
+                       ('calls_warn', 'calls_limit', 'concurrency_saturated', 'latency', 'errors', 'timeouts')),
+    node_id        TEXT NOT NULL,
+    threshold      REAL NOT NULL,
+    peak_value     REAL NOT NULL,
+    raised_at_ms   INTEGER NOT NULL,
+    resolved_at_ms INTEGER,
+    dedupe_key     TEXT NOT NULL CHECK(length(dedupe_key) > 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sla_breaches_open
+    ON sla_breaches(dedupe_key) WHERE resolved_at_ms IS NULL;
+CREATE INDEX IF NOT EXISTS idx_sla_breaches_org_raised ON sla_breaches(org_id, raised_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_sla_breaches_target ON sla_breaches(target_id, raised_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS sla_samples (
+    org_id               TEXT NOT NULL,
+    target_id            TEXT NOT NULL,
+    sampled_at_ms        INTEGER NOT NULL,
+    accepted             INTEGER NOT NULL DEFAULT 0,
+    rejected_concurrency INTEGER NOT NULL DEFAULT 0,
+    rejected_calls       INTEGER NOT NULL DEFAULT 0,
+    timeouts             INTEGER NOT NULL DEFAULT 0,
+    errors               INTEGER NOT NULL DEFAULT 0,
+    in_flight_peak       INTEGER NOT NULL DEFAULT 0,
+    p95_ms               INTEGER,
+    PRIMARY KEY(target_id, sampled_at_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_sla_samples_at ON sla_samples(sampled_at_ms);
+"#;
 
 /// v210 — BPMN B4.6 retry policy per activity. One failure of a step is one
 /// incident row for as long as it lasts, however many times it is repeated, so
@@ -7932,6 +8043,12 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         reason,
     };
     vec![
+        t(
+            "service_sla_policies",
+            "updated_by",
+            "created by v211, long after the v56 identity flip: free-text audit attribution \
+             of the editing user, no FK, never an integer id",
+        ),
         t(
             "flow_invocations",
             "actor_user_id",
@@ -17197,7 +17314,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 210);
+        assert_eq!(head, 212);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -17216,7 +17333,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 31);
+        assert_eq!(applied_after_179.len(), 33);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -17236,6 +17353,8 @@ mod tests {
         assert_eq!(applied_after_179[28], "bpmn_incident_notices");
         assert_eq!(applied_after_179[29], "bpmn_activity_io_generations");
         assert_eq!(applied_after_179[30], "bpmn_incident_retry_attempts");
+        assert_eq!(applied_after_179[31], "service_sla_policies");
+        assert_eq!(applied_after_179[32], "sla_breaches_and_samples");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17704,6 +17823,295 @@ mod tests {
         conn.execute("UPDATE bpmn_instances SET initiator_user_id='owner'", []).unwrap();
         conn.execute_batch(&incident("same-person", "NULL")).unwrap();
         assert_eq!(notices(&conn), 3, "an initiator who owns the definition is one recipient");
+    }
+
+    /// v211 and v212 create the SLA tables on a fresh database and on one that
+    /// was at v210, and a second run changes nothing.
+    #[test]
+    fn migrations_211_and_212_create_the_sla_tables_fresh_and_upgraded() {
+        const TABLES: [&str; 4] = [
+            "service_sla_policies",
+            "service_sla_assignments",
+            "sla_breaches",
+            "sla_samples",
+        ];
+        let fresh = Connection::open_in_memory().unwrap();
+        run(&fresh).unwrap();
+
+        let upgraded = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&upgraded, 210);
+        for table in TABLES {
+            assert!(
+                !table_exists(&upgraded, table).unwrap(),
+                "{table} before the rungs"
+            );
+        }
+        run(&upgraded).unwrap();
+        run(&upgraded).unwrap();
+
+        for conn in [&fresh, &upgraded] {
+            for table in TABLES {
+                assert!(table_exists(conn, table).unwrap(), "{table}");
+            }
+            let rungs: Vec<(i64, String)> = conn
+                .prepare(
+                    "SELECT version, name FROM _migrations WHERE version > 210 ORDER BY version",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                rungs,
+                vec![
+                    (211, "service_sla_policies".to_string()),
+                    (212, "sla_breaches_and_samples".to_string()),
+                ]
+            );
+        }
+    }
+
+    fn sla_policy_insert(
+        conn: &Connection,
+        id: &str,
+        org: &str,
+        name: &str,
+        extra_columns: &str,
+        extra_values: &str,
+    ) -> rusqlite::Result<usize> {
+        let sql =
+            format!(
+            "INSERT INTO service_sla_policies (id, org_id, name, created_at_ms, updated_at_ms{}) \
+             VALUES (?1, ?2, ?3, 1, 1{})",
+            if extra_columns.is_empty() { String::new() } else { format!(", {extra_columns}") },
+            if extra_values.is_empty() { String::new() } else { format!(", {extra_values}") },
+        );
+        conn.execute(&sql, rusqlite::params![id, org, name])
+    }
+
+    /// Every bound of the policy table is enforced by the schema itself, so a
+    /// row that arrives from a peer through the ledger cannot break it either.
+    #[test]
+    fn sla_policy_checks_and_unique_name_are_enforced_by_the_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        sla_policy_insert(&conn, "p-null", "o", "all unset", "", "").unwrap();
+        let ordering: String = conn
+            .query_row(
+                "SELECT ordering FROM service_sla_policies WHERE id='p-null'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordering, "partition");
+
+        let accepted: [(&str, &str); 9] = [
+            ("max_concurrency", "1"),
+            ("max_concurrency", "1024"),
+            ("max_queue", "0"),
+            ("max_queue", "10000"),
+            ("queue_timeout_ms", "300000"),
+            ("timeout_ms", "100"),
+            ("error_rate_pct", "100"),
+            ("warn_at_pct", "99"),
+            ("ordering", "'none'"),
+        ];
+        for (index, (column, value)) in accepted.iter().enumerate() {
+            sla_policy_insert(
+                &conn,
+                &format!("ok-{index}"),
+                "o",
+                &format!("ok {index}"),
+                column,
+                value,
+            )
+            .unwrap_or_else(|e| panic!("{column}={value} must be accepted: {e}"));
+        }
+
+        let rejected: [(&str, &str); 17] = [
+            ("max_concurrency", "0"),
+            ("max_concurrency", "1025"),
+            ("max_queue", "-1"),
+            ("max_queue", "10001"),
+            ("queue_timeout_ms", "0"),
+            ("queue_timeout_ms", "300001"),
+            ("timeout_ms", "99"),
+            ("timeout_ms", "86400001"),
+            ("latency_p95_ms", "0"),
+            ("error_rate_pct", "0"),
+            ("error_rate_pct", "101"),
+            ("warn_at_pct", "0"),
+            ("warn_at_pct", "100"),
+            ("ordering", "'sorted'"),
+            ("max_concurrency", "'many'"),
+            ("call_limit", "5"),
+            ("call_window_secs", "60"),
+        ];
+        for (index, (column, value)) in rejected.iter().enumerate() {
+            assert!(
+                sla_policy_insert(
+                    &conn,
+                    &format!("bad-{index}"),
+                    "o",
+                    &format!("bad {index}"),
+                    column,
+                    value
+                )
+                .is_err(),
+                "{column}={value} must be rejected"
+            );
+        }
+        assert!(sla_policy_insert(&conn, "bad-name", "o", "", "", "").is_err());
+        let long = format!("'{}'", "d".repeat(2000));
+        sla_policy_insert(&conn, "d-ok", "o", "long description", "description", &long)
+            .expect("2000 characters are allowed");
+        let too_long = format!("'{}'", "d".repeat(2001));
+        assert!(
+            sla_policy_insert(&conn, "d-bad", "o", "too long", "description", &too_long).is_err(),
+            "a description above 2000 characters is rejected"
+        );
+
+        sla_policy_insert(
+            &conn,
+            "w-1",
+            "o",
+            "per second",
+            "call_limit, call_window_secs",
+            "10, 1",
+        )
+        .unwrap();
+        sla_policy_insert(
+            &conn,
+            "w-day",
+            "o",
+            "per day",
+            "call_limit, call_window_secs",
+            "1000, 86400",
+        )
+        .unwrap();
+        for (index, values) in ["0, 60", "10, 30", "10, 0", "-1, 60"].iter().enumerate() {
+            assert!(
+                sla_policy_insert(
+                    &conn,
+                    &format!("bad-w-{index}"),
+                    "o",
+                    &format!("bad window {index}"),
+                    "call_limit, call_window_secs",
+                    values
+                )
+                .is_err(),
+                "call_limit, call_window_secs = {values} must be rejected"
+            );
+        }
+
+        assert!(
+            sla_policy_insert(&conn, "dup", "o", "all unset", "", "").is_err(),
+            "a name is unique inside an organization"
+        );
+        sla_policy_insert(&conn, "other-org", "o2", "all unset", "", "")
+            .expect("the same name in another organization");
+    }
+
+    #[test]
+    fn sla_assignment_checks_foreign_key_and_restrict_are_enforced_by_the_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        sla_policy_insert(&conn, "p1", "o", "policy", "", "").unwrap();
+        let assign = |kind: &str, target: &str, policy: &str| {
+            conn.execute(
+                "INSERT INTO service_sla_assignments (target_kind, target_id, policy_id, org_id, assigned_at_ms) \
+                 VALUES (?1, ?2, ?3, 'o', 1)",
+                rusqlite::params![kind, target, policy],
+            )
+        };
+        assign("flow", "f1", "p1").unwrap();
+        assert!(
+            assign("flow", "f1", "p1").is_err(),
+            "one policy per service"
+        );
+        assert!(
+            assign("topic", "t1", "p1").is_err(),
+            "only flows can be assigned for now"
+        );
+        assert!(assign("flow", "", "p1").is_err());
+        assert!(
+            assign("flow", "f2", "missing").is_err(),
+            "the policy must exist"
+        );
+        assert!(
+            conn.execute("DELETE FROM service_sla_policies WHERE id='p1'", [])
+                .is_err(),
+            "a policy that is assigned cannot be deleted"
+        );
+        conn.execute(
+            "DELETE FROM service_sla_assignments WHERE target_id='f1'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM service_sla_policies WHERE id='p1'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn sla_breach_dedupe_key_is_unique_only_while_the_breach_is_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let raise = |id: &str, kind: &str, key: &str| {
+            conn.execute(
+                "INSERT INTO sla_breaches (id, org_id, target_id, policy_id, kind, node_id, threshold, \
+                                           peak_value, raised_at_ms, dedupe_key) \
+                 VALUES (?1, 'o', 'f1', 'p1', ?2, 'n1', 2000.0, 2500.0, 1, ?3)",
+                rusqlite::params![id, kind, key],
+            )
+        };
+        raise("b1", "latency", "o:f1:latency").unwrap();
+        assert!(
+            raise("b2", "latency", "o:f1:latency").is_err(),
+            "already open"
+        );
+        raise("b3", "errors", "o:f1:errors").unwrap();
+        assert!(raise("b4", "slow", "o:f1:slow").is_err(), "unknown kind");
+        assert!(raise("b5", "latency", "").is_err(), "empty key");
+
+        conn.execute(
+            "UPDATE sla_breaches SET resolved_at_ms = 5 WHERE id='b1'",
+            [],
+        )
+        .unwrap();
+        raise("b6", "latency", "o:f1:latency").expect("a resolved breach frees its key");
+        conn.execute(
+            "UPDATE sla_breaches SET resolved_at_ms = 6 WHERE id='b6'",
+            [],
+        )
+        .unwrap();
+        raise("b7", "latency", "o:f1:latency").unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sla_breaches WHERE dedupe_key='o:f1:latency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn sla_sample_is_one_row_per_service_and_minute() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let sample = |target: &str, at: i64| {
+            conn.execute(
+                "INSERT INTO sla_samples (org_id, target_id, sampled_at_ms) VALUES ('o', ?1, ?2)",
+                rusqlite::params![target, at],
+            )
+        };
+        sample("f1", 60_000).unwrap();
+        assert!(sample("f1", 60_000).is_err());
+        sample("f1", 120_000).unwrap();
+        sample("f2", 60_000).unwrap();
     }
 
     /// v210: the retry columns are there, an incident waiting for its automatic
