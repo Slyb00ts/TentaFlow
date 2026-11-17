@@ -10061,6 +10061,25 @@ impl ConsumerHandle {
         Ok(())
     }
 
+    /// The group's durable committed offset on one subscribed partition. For a
+    /// caller that commits a position it computed itself and must not ask for
+    /// one behind what is stored (a dead letter advances the store on its own).
+    pub fn committed_offset(&self, topic: &str, partition: u32) -> Result<u64, BusServiceError> {
+        self.offsets
+            .committed_offset(&self.org_id, &self.group, topic, partition)
+    }
+
+    /// Whether this node still leads every subscribed partition (consumption
+    /// and commits are leader-only). For a caller that paused after a fetch and
+    /// must not hand the records out when the leadership moved meanwhile.
+    pub fn check_leadership(&self) -> Result<(), BusServiceError> {
+        let coordinator = self.replication.read().clone();
+        for cp in &self.partitions {
+            check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
+        }
+        Ok(())
+    }
+
     /// Deliberate recovery from `OffsetOutOfRange`: jumps the fetch
     /// cursor AND the durable commit forward to `earliest_offset()` for
     /// `(topic, partition)`. This is always a FORWARD move (skipping a gap

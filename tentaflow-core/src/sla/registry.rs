@@ -233,6 +233,7 @@ mod tests {
                 queue_timeout: Duration::from_millis(queue_timeout_ms),
                 call_limit: None,
                 timeout: None,
+                ordering: crate::sla::BusOrdering::default(),
             },
         }
     }

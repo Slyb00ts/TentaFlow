@@ -1441,7 +1441,7 @@ async fn a_flow_without_a_policy_runs_as_before() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_bus_run_is_never_refused_while_the_same_limit_refuses_others() {
+async fn a_run_whose_caller_holds_the_slot_takes_no_second_one_while_the_limit_refuses_others() {
     let rig = rig();
     rig.insert_flow("held", &held_flow());
     let gate = rig.govern("held", limit(1, 0, 1_000));
@@ -1471,39 +1471,54 @@ async fn a_bus_run_is_never_refused_while_the_same_limit_refuses_others() {
         Err(DispatchError::Overloaded { .. })
     ));
 
-    let bus = {
+    // A bus-origin run is a run like any other until its caller says it holds
+    // the permit.
+    let refused_bus = rig
+        .dispatcher
+        .dispatch_by_flow_id_background(
+            FlowRef::live("held"),
+            input(),
+            FlowRequestMeta::new("bus", FlowOrigin::Bus, FlowActor::system()),
+        )
+        .await;
+    assert!(matches!(refused_bus, Err(DispatchError::Overloaded { .. })));
+
+    let reactor_run = {
         let dispatcher = rig.dispatcher.clone();
         tokio::spawn(async move {
+            let mut meta = FlowRequestMeta::new("bus", FlowOrigin::Bus, FlowActor::system());
+            meta.slot_held_by_caller = true;
             dispatcher
-                .dispatch_by_flow_id_background(
-                    FlowRef::live("held"),
-                    input(),
-                    FlowRequestMeta::new("bus", FlowOrigin::Bus, FlowActor::system()),
-                )
+                .dispatch_by_flow_id_background(FlowRef::live("held"), input(), meta)
                 .await
         })
     };
-    wait_for("the bus run to run beside the holder", || {
+    wait_for("the run to run beside the holder", || {
         rig.probe.current.load(Ordering::SeqCst) == 2
     })
     .await;
-    assert_eq!(stats(&gate).in_flight, 1, "the bus run holds no slot");
+    assert_eq!(
+        stats(&gate).in_flight,
+        1,
+        "the run holds no slot of its own"
+    );
     rig.probe.open_hold();
 
-    bus.await
+    reactor_run
+        .await
         .unwrap()
-        .expect("a bus run is admitted while the slot is taken");
+        .expect("a run whose caller holds the slot is admitted while the slot is taken");
     holder.await.unwrap().expect("the holder finishes");
     let stats = stats(&gate);
     assert_eq!(
         (stats.accepted, stats.rejected_concurrency),
-        (1, 2),
-        "the bus run took no slot and was never counted as a refusal"
+        (1, 3),
+        "the run took no slot and was never counted as a refusal"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_bus_run_gets_the_policy_timeout_as_a_backstop_and_is_not_counted_yet() {
+async fn a_run_whose_caller_holds_the_slot_gets_the_policy_timeout_and_is_not_counted_twice() {
     let rig = rig();
     rig.insert_flow(
         "hangs",
@@ -1520,6 +1535,20 @@ async fn a_bus_run_gets_the_policy_timeout_as_a_backstop_and_is_not_counted_yet(
         },
     );
 
+    let mut held = FlowRequestMeta::new("bus", FlowOrigin::Bus, FlowActor::system());
+    held.slot_held_by_caller = true;
+    let result = rig
+        .dispatcher
+        .dispatch_by_flow_id_background(FlowRef::live("hangs"), input(), held)
+        .await;
+
+    assert!(matches!(result, Err(DispatchError::TimedOut { .. })));
+    let stats = stats(&gate);
+    // The permit is the caller's (the bus reactor's), which records the
+    // timeout on it: the dispatcher bounds the run and counts nothing.
+    assert_eq!((stats.accepted, stats.timeouts, stats.in_flight), (0, 0, 0));
+
+    // Without that, a bus-origin run is admitted and counted like any other.
     let result = rig
         .dispatcher
         .dispatch_by_flow_id_background(
@@ -1528,12 +1557,111 @@ async fn a_bus_run_gets_the_policy_timeout_as_a_backstop_and_is_not_counted_yet(
             FlowRequestMeta::new("bus", FlowOrigin::Bus, FlowActor::system()),
         )
         .await;
-
     assert!(matches!(result, Err(DispatchError::TimedOut { .. })));
+    let stats = self::stats(&gate);
+    assert_eq!((stats.accepted, stats.timeouts, stats.in_flight), (1, 1, 0));
+}
+
+fn bus_principal(origin: FlowOrigin) -> crate::agents::AgentPrincipal {
+    crate::agents::AgentPrincipal::new(None, None, origin, FlowActor::system())
+}
+
+/// The bus reactor's dispatch maps what the dispatcher answers to a typed error,
+/// which is how the reactor tells a timeout from a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reactive_dispatch_reports_a_policy_timeout_as_a_typed_error() {
+    use crate::agents::{
+        FlowDispatcherReactorDispatch, ReactiveDispatchError, ReactorFlowDispatch,
+    };
+
+    let rig = rig();
+    rig.insert_flow(
+        "hangs",
+        &node_flow(serde_json::json!({
+            "delay_ms": 60_000, "stop_on_cancel": true
+        })),
+    );
+    let gate = rig.govern(
+        "hangs",
+        SlaPolicySpec {
+            max_concurrency: Some(1),
+            timeout_ms: Some(100),
+            ..Default::default()
+        },
+    );
+    let dispatch = FlowDispatcherReactorDispatch::new(&rig.dispatcher);
+
+    let error = dispatch
+        .dispatch("hangs".into(), input(), bus_principal(FlowOrigin::Bus))
+        .await
+        .expect_err("the run is stopped by its timeout");
+
+    let typed = error
+        .downcast_ref::<ReactiveDispatchError>()
+        .expect("a typed dispatch error");
+    assert!(matches!(typed.0, DispatchError::TimedOut { .. }));
+    assert!(error
+        .to_string()
+        .starts_with("reactive flow dispatch failed: "));
+    assert_eq!(
+        stats(&gate).accepted,
+        0,
+        "the permit is the reactor's: the dispatcher counted nothing"
+    );
+}
+
+/// A policy that appears while a bus run is on its way must not make the
+/// dispatcher refuse that run (and the reactor dead-letter it): bus-origin runs,
+/// reactor and reactions alike, never take a slot here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bus_origin_reactive_run_is_not_refused_by_a_gate_it_met_late() {
+    use crate::agents::{
+        FlowDispatcherReactorDispatch, ReactiveDispatchError, ReactorFlowDispatch,
+    };
+
+    let rig = rig();
+    rig.insert_flow("held", &held_flow());
+    let gate = rig.govern("held", limit(1, 0, 1_000));
+    rig.probe.close_hold();
+    let holder = spawn_requests(&rig, "held", 1).pop().unwrap();
+    wait_for("the holder to take the slot", || {
+        stats(&gate).in_flight == 1
+    })
+    .await;
+    let dispatch = Arc::new(FlowDispatcherReactorDispatch::new(&rig.dispatcher));
+
+    // The same dispatch for another origin is refused, and the refusal is typed.
+    let refused = dispatch
+        .dispatch("held".into(), input(), bus_principal(FlowOrigin::Agent))
+        .await
+        .expect_err("an agent run meets the full gate");
+    assert!(matches!(
+        refused
+            .downcast_ref::<ReactiveDispatchError>()
+            .map(|e| &e.0),
+        Some(DispatchError::Overloaded { .. })
+    ));
+
+    let bus_run = {
+        let dispatch = dispatch.clone();
+        tokio::spawn(async move {
+            dispatch
+                .dispatch("held".into(), input(), bus_principal(FlowOrigin::Bus))
+                .await
+        })
+    };
+    wait_for("the bus run to run beside the holder", || {
+        rig.probe.current.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    rig.probe.open_hold();
+    bus_run
+        .await
+        .unwrap()
+        .expect("a bus-origin run is not refused");
+    holder.await.unwrap().expect("the holder finishes");
     let stats = stats(&gate);
-    // The gate's permit is the reactor's to take, in S4. Until then a bus
-    // run is bounded by the timeout but is not counted in the gate.
-    assert_eq!((stats.accepted, stats.timeouts, stats.in_flight), (0, 0, 0));
+    assert_eq!((stats.accepted, stats.rejected_concurrency), (1, 1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

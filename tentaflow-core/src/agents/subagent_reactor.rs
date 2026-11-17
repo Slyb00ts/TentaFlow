@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::db::{repository, DbPool};
+use crate::flow_engine::dispatcher::DispatchError;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::CompletionFilter;
 use crate::flow_engine::types::FlowDefinition;
@@ -61,6 +62,14 @@ pub trait ReactorFlowDispatch: Send + Sync {
         principal: AgentPrincipal,
     ) -> anyhow::Result<()>;
 }
+
+/// A reactive run the dispatcher refused or stopped. Typed (not flattened to
+/// text) so a caller that holds the run's permit (the bus reactor) can tell a
+/// timeout, a run that never started and a refusal from a plain failure; it
+/// reads like every other reactive dispatch failure.
+#[derive(Debug, thiserror::Error)]
+#[error("reactive flow dispatch failed: {0}")]
+pub struct ReactiveDispatchError(pub DispatchError);
 
 /// Production dispatch: drives an event-driven flow through the FlowDispatcher's
 /// background path (no foreground deadline; governed by its own flow). Holds a
@@ -99,7 +108,7 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
                 meta,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("reactive flow dispatch failed: {e}"))?;
+            .map_err(|e| anyhow::Error::new(ReactiveDispatchError(e)))?;
         if let Some(err) = outcome.error {
             return Err(anyhow::anyhow!("reactive flow failed: {err}"));
         }
@@ -149,6 +158,11 @@ pub fn reactive_run_meta(
     meta.user_id = principal.user_id.clone();
     meta.org_id = principal.org_id.clone();
     meta.correlation_id = principal.correlation_id.clone();
+    // A bus-origin run needs no slot of its own: the bus reactor holds the permit
+    // of the run it starts, and whatever else runs under that provenance (a
+    // sub-agent completion reaction, an agent run the flow started) continues
+    // work that was admitted already. Refusing it would drop that work.
+    meta.slot_held_by_caller = principal.origin == crate::flow_engine::dispatcher::FlowOrigin::Bus;
     meta.progress_sink = Some(Arc::new(
         crate::flow_engine::progress_broker::BrokerProgressSink::new(
             crate::flow_engine::progress_broker::global_broker(),

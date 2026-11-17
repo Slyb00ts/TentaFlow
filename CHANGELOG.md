@@ -31,8 +31,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wykonania kończy się wtedy jako `error`. `/v1` zwraca 504, a WebSocket
   błąd `sla.timeout`. Klienci SDK OpenAI ponawiają 504 dwa razy, więc
   kosztowny przepływ może się wykonać do trzech razy.
-- Przebiegi z magistrali na razie dostają tylko timeout jako zabezpieczenie.
-  Limit dla magistrali przejmie reaktor w kolejnym kroku.
+- Reaktor TentaBus konsumuje flow zgodnie z jego polityką SLA. Przy
+  `max_concurrency` = N przetwarza naraz do N paczek: przy `ordering =
+  partition` partycja idzie po kolei, a różne partycje równolegle; przy
+  `ordering = none` wszystkie paczki idą równolegle. Bez polityki albo przy
+  N = 1 reaktor działa jak dotąd.
+- Commit obejmuje tylko ciągły prefiks obsłużonych paczek w każdej partycji.
+  Rekordy po porażce zostaną dostarczone ponownie; `on_error` (dlq, skip,
+  halt) działa dla każdej paczki osobno.
+- Wyczerpany limit tylko opóźnia przetwarzanie: nic nie trafia do DLQ i nic
+  nie ginie, rośnie lag. Spowalnianie widać w lagu i jego alertach oraz w
+  polu `throttled_until`, a nie w licznikach odmów.
+- W trybie `at_most_once` reaktor najpierw rezerwuje sloty i pobiera najwyżej
+  tyle paczek, ile zarezerwował. Czekanie na nowe rekordy jest wtedy skracane
+  do połowy `queue_timeout` polityki.
+- Status konsumenta pokazuje `in_flight`, `max_concurrency` i
+  `throttled_until`. Starsze węzły odczytują go bez tych pól.
 - `max_concurrent` usługi AI jest teraz prawdziwym limitem równoczesnych
   wywołań na węźle. Obejmuje usługi HTTP, QUIC i silniki wbudowane
   (llama.cpp, MLX, sherpa) oraz endpointy `/v1/infer`, `/v1/rerank`,

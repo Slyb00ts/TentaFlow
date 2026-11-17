@@ -1939,6 +1939,10 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             progress_sink: Some(progress),
             flow_depth: 0,
             nested_in_run: false,
+            // An agent run started under a bus run continues work that was
+            // admitted already, as before the SLA gate existed.
+            slot_held_by_caller: principal.origin
+                == crate::flow_engine::dispatcher::FlowOrigin::Bus,
             settle: Default::default(),
             bus_source: None,
             progress_scope_override: None,

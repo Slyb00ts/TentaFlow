@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Semaphore;
 
-use super::policy::SlaPolicySpec;
+use super::policy::{BusOrdering, SlaPolicySpec};
 
 /// How long a call waits for a free slot when the policy does not say.
 pub const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,6 +55,9 @@ pub struct GateLimits {
     pub call_limit: Option<(u32, u32)>,
     /// Execution timeout the dispatcher applies to an admitted call.
     pub timeout: Option<Duration>,
+    /// How a parallel bus consumer orders what it hands to the flow. Read by
+    /// the bus reactor only; the gate itself does not look at it.
+    pub ordering: BusOrdering,
 }
 
 impl GateLimits {
@@ -69,6 +72,7 @@ impl GateLimits {
             timeout: spec
                 .timeout_ms
                 .map(|ms| Duration::from_millis(u64::from(ms))),
+            ordering: spec.ordering,
         }
         .normalized()
     }
@@ -439,7 +443,17 @@ impl ServiceGate {
     /// Admits one call or says why not. Cancel-safe: dropping the future while
     /// it waits gives the queue place and the reserved call back.
     pub async fn admit(self: &Arc<Self>, origin: AdmitOrigin) -> Result<SlaPermit, SlaRefusal> {
-        self.admit_with(origin, true).await
+        self.admit_with(origin, true, true).await
+    }
+
+    /// [`Self::admit`] for a caller that was refused already and asks again for
+    /// the same piece of work: a refusal is not counted a second time, so
+    /// `rejected_*` counts the work held back, not the polls it took.
+    pub async fn admit_again(
+        self: &Arc<Self>,
+        origin: AdmitOrigin,
+    ) -> Result<SlaPermit, SlaRefusal> {
+        self.admit_with(origin, true, false).await
     }
 
     /// [`Self::admit`] that never waits: a call that finds no free slot is
@@ -447,13 +461,25 @@ impl ServiceGate {
     /// caller that has somewhere better to put a call off than a queue held open
     /// by its own lease, such as a BPMN job that can be deferred.
     pub async fn try_admit(self: &Arc<Self>, origin: AdmitOrigin) -> Result<SlaPermit, SlaRefusal> {
-        self.admit_with(origin, false).await
+        self.admit_with(origin, false, true).await
+    }
+
+    /// [`Self::try_admit`] for a caller that holds a permit already and takes
+    /// more only if they are free right now, such as the bus reactor reserving
+    /// the slots of one cycle: running into a full gate is the normal end of
+    /// that, not a refusal, so nothing is counted.
+    pub async fn try_admit_more(
+        self: &Arc<Self>,
+        origin: AdmitOrigin,
+    ) -> Result<SlaPermit, SlaRefusal> {
+        self.admit_with(origin, false, false).await
     }
 
     async fn admit_with(
         self: &Arc<Self>,
         origin: AdmitOrigin,
         may_wait: bool,
+        count_refusals: bool,
     ) -> Result<SlaPermit, SlaRefusal> {
         let config = self.config();
         let limits = config.limits;
@@ -467,7 +493,9 @@ impl ServiceGate {
         let reservation = match self.reserve_call(limits.call_limit) {
             Ok(reservation) => reservation,
             Err(retry_after_ms) => {
-                self.counters.rejected_calls.fetch_add(1, Ordering::Relaxed);
+                if count_refusals {
+                    self.counters.rejected_calls.fetch_add(1, Ordering::Relaxed);
+                }
                 return Err(refuse(RefusalReason::CallLimit, retry_after_ms));
             }
         };
@@ -477,9 +505,11 @@ impl ServiceGate {
             self.try_acquire_slot()
         };
         if let Err(reason) = acquired {
-            self.counters
-                .rejected_concurrency
-                .fetch_add(1, Ordering::Relaxed);
+            if count_refusals {
+                self.counters
+                    .rejected_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Err(refuse(reason, CONCURRENCY_RETRY_AFTER_MS));
         }
         let window_epoch = reservation.epoch;
@@ -674,6 +704,13 @@ impl SlaPermit {
         self.outcome = Some(outcome);
     }
 
+    /// Restarts the permit's clock: the call is timed from here, not from
+    /// admission. For a caller that takes its permit ahead of the work (the bus
+    /// reactor reserves before its fetch), so the wait is not latency.
+    pub fn begin(&mut self) {
+        self.started = Instant::now();
+    }
+
     /// Gives the admission back because the call never started: records
     /// nothing, frees the slot and returns the call to its window.
     pub fn forgo(mut self) {
@@ -708,6 +745,7 @@ mod tests {
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             call_limit: None,
             timeout: None,
+            ordering: BusOrdering::default(),
         }
     }
 
@@ -1215,5 +1253,89 @@ mod tests {
         gate.try_admit(AdmitOrigin::Request)
             .await
             .expect("free again once the holder is done");
+    }
+
+    #[tokio::test]
+    async fn a_reservation_that_is_given_back_leaves_no_trace() {
+        let gate = ServiceGate::new(
+            "flow",
+            config(GateLimits {
+                call_limit: Some((10, 60)),
+                ..limits(Some(3), 0, 100)
+            }),
+            system_clock(),
+        );
+        let _outsider = gate.try_admit(AdmitOrigin::Request).await.unwrap();
+        let before = gate.stats();
+
+        let first = gate.admit(AdmitOrigin::Bus).await.expect("a slot is free");
+        let second = gate
+            .try_admit_more(AdmitOrigin::Bus)
+            .await
+            .expect("a slot is free");
+        let refused = gate.try_admit_more(AdmitOrigin::Bus).await;
+        assert_eq!(
+            refused.unwrap_err().reason,
+            RefusalReason::QueueFull,
+            "the gate is full"
+        );
+        first.forgo();
+        second.forgo();
+
+        let after = gate.stats();
+        assert_eq!(
+            (
+                after.in_flight,
+                after.accepted,
+                after.window_calls,
+                after.rejected_concurrency,
+                after.rejected_calls,
+                after.ok + after.errors + after.timeouts + after.cancelled,
+            ),
+            (
+                before.in_flight,
+                before.accepted,
+                before.window_calls,
+                before.rejected_concurrency,
+                before.rejected_calls,
+                0,
+            ),
+            "reserving and giving back the slots costs the window and the counters nothing"
+        );
+        let _free = gate
+            .try_admit(AdmitOrigin::Request)
+            .await
+            .expect("the slots are free again");
+    }
+
+    #[tokio::test]
+    async fn a_permit_that_begins_late_records_only_its_run_time() {
+        let gate = ServiceGate::new("flow", config(limits(Some(1), 0, 100)), system_clock());
+        let mut permit = gate.admit(AdmitOrigin::Bus).await.expect("admitted");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        permit.begin();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        permit.finish(Outcome::Ok);
+
+        let p95 = gate.stats().latency.p95_ms().expect("one sample");
+        assert!(p95 < 500, "the 600 ms before begin() is not latency: {p95}");
+    }
+
+    #[tokio::test]
+    async fn asking_again_does_not_count_the_refusal_a_second_time() {
+        let gate = ServiceGate::new(
+            "flow",
+            config(GateLimits {
+                call_limit: Some((1, 60)),
+                ..limits(None, 0, 100)
+            }),
+            system_clock(),
+        );
+        let _first = gate.admit(AdmitOrigin::Bus).await.expect("admitted");
+        assert!(gate.admit(AdmitOrigin::Bus).await.is_err());
+        for _ in 0..3 {
+            assert!(gate.admit_again(AdmitOrigin::Bus).await.is_err());
+        }
+        assert_eq!(gate.stats().rejected_calls, 1);
     }
 }

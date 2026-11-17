@@ -2341,6 +2341,9 @@ fn bus_consumer_status(
         detail: s.detail,
         since_epoch: s.since_epoch,
         node_id: node_id.to_string(),
+        in_flight: s.in_flight,
+        max_concurrency: s.max_concurrency,
+        throttled_until: s.throttled_until,
     })
 }
 

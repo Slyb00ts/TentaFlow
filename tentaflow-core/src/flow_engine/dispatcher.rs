@@ -556,6 +556,14 @@ pub struct FlowRequestMeta {
     /// nested call takes no SLA slot: it would wait for the one its caller
     /// holds.
     pub nested_in_run: bool,
+    /// The run needs no slot of its own: its caller holds the permit for the
+    /// run's whole duration (the bus reactor counts the call, owns the window
+    /// and pauses a refused unit itself), or it continues work of a bus run
+    /// that was admitted already (a sub-agent completion reaction, an agent run
+    /// the flow started). The dispatcher takes no second slot, so a call is
+    /// counted once and never refused here, but still applies the policy's
+    /// timeout to the run as a backstop.
+    pub slot_held_by_caller: bool,
     /// Shared with the SLA admission of this run: the audit row the executor
     /// creates is published here.
     pub settle: Arc<crate::flow_engine::node_adapter::RunSettle>,
@@ -610,6 +618,7 @@ impl FlowRequestMeta {
             progress_sink: None,
             flow_depth: 0,
             nested_in_run: false,
+            slot_held_by_caller: false,
             settle: Arc::default(),
             bus_source: None,
             progress_scope_override: None,
@@ -1835,8 +1844,8 @@ impl FlowDispatcher {
     /// resolver-unreachable system flows (no per-user ACL rows).
     ///
     /// A flow under an SLA policy is admitted like any top-level run, and the
-    /// policy's timeout bounds it; a bus-origin run takes no slot (see
-    /// [`Self::admit_run`]).
+    /// policy's timeout bounds it; a run whose caller holds the permit takes no
+    /// slot of its own (see [`Self::admit_run`]).
     pub async fn dispatch_by_flow_id_background(
         &self,
         target: FlowRef,
@@ -2144,11 +2153,12 @@ impl FlowDispatcher {
     /// already one deep, a nested chat call is zero deep). A flow without a
     /// policy gets an untracked admission and runs exactly as before.
     ///
-    /// A bus run takes no slot here: today the bus reactor does not hold the
-    /// gate's permit, so a bus run gets only the policy's timeout, as a backstop
-    /// the bus path did not have. In S4 the reactor takes the permit around its
-    /// dispatch and owns the call window, the concurrency count and the retry
-    /// pause; this skip then avoids counting the same call twice.
+    /// A run whose caller already holds the permit (`meta.slot_held_by_caller`)
+    /// takes no second slot, so the call is counted once, and still gets the
+    /// policy's timeout as a backstop. The bus reactor is that caller: it takes
+    /// the permit around each unit of records it dispatches, owns the call
+    /// window, the concurrency count and the pause after a refusal, and records
+    /// the unit's outcome (including a timeout) on its own permit.
     pub async fn admit_run(
         &self,
         flow_id: &str,
@@ -2186,7 +2196,7 @@ impl FlowDispatcher {
         let Some(gate) = sla.gate(flow_id) else {
             return Ok(SlaAdmission::untracked(flow_id));
         };
-        let permit = if meta.origin == FlowOrigin::Bus {
+        let permit = if meta.slot_held_by_caller {
             crate::sla::SlaPermit::untracked()
         } else if may_wait {
             gate.admit(origin).await?

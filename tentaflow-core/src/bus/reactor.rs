@@ -86,6 +86,51 @@
 // otherwise address an org-scoped topic; see `bus_consume.rs::ConsumeConfig::
 // from_config`'s doc).
 //
+// SLA policy (TB-03, `sla::ServiceGate`): a flow with a policy is consumed under
+// its gate. Without one, or with a `max_concurrency` of 1 or none, a cycle is
+// what it always was: one fetch, one unit of everything fetched, one dispatch,
+// one commit. With `max_concurrency = N` a cycle fetches up to N units of
+// `batch_size` records (N fetches, so a backlog spreads over partitions), cuts
+// the records into units of one partition each and runs them with at most N in
+// flight. `ordering = partition` runs the units of one partition one after
+// another and different partitions side by side; `ordering = none` runs every
+// unit side by side. Each unit takes a gate permit (`AdmitOrigin::Bus`) around
+// its dispatch; the dispatcher is told (`slot_held_by_caller`) not to take a
+// second one, so the call is counted once, and still bounds the run by the
+// policy's timeout, which the reactor records as the permit's outcome. A gate
+// refusal (call window used up, no slot in time) is never a failure of the
+// records: the unit sleeps the gate's `retry_after_ms` and asks again, nothing
+// is dead-lettered or lost, and the lag grows.
+//
+// Where the permit is taken depends on the commit mode, because a record that
+// is fetched and not run must not be lost. `AutoAfterSuccess`: fetch first,
+// then every unit joins the gate's queue like any other caller (fair, so
+// /v1 or chat traffic on the same flow cannot starve the bus); the records are
+// uncommitted, so a consumer that is held back or lost only has them delivered
+// again, and after any wait the unit checks the consumer is still usable
+// (engine, rights, leadership) before it dispatches. `AtMostOnce`: the fetch
+// commits, so the cycle reserves first (the first permit queued, up to N - 1
+// more only if free right now), fetches no more than the permits cover, merges
+// the records into at most that many units, and gives the unused permits back
+// (`forgo`: no call, no acceptance, no cancellation), so an idle poll leaves
+// no trace in the gate. The reserved slots are held through the fetch's long
+// poll, which is capped at half the policy's queue timeout (or `max_wait_ms`,
+// if shorter) so an idle consumer does not make other callers of the flow time
+// out in the queue. A refused reservation ends the cycle after one pause
+// (the next cycle asks again, so one throttle episode is counted once), with the cached consumer dropped first, so the subscription loop checks its
+// instance again instead of a stopped engine's consumer waiting out the pause.
+//
+// The commit follows from at-least-once: per partition only the contiguous
+// prefix of handled units is committed (`commit_prefix`). A unit is handled when
+// the flow succeeded on it, `on_error = skip` gave it up, or every record of it
+// is in the dead-letter topic. After a unit that is not (a failure, a dead
+// letter still under its delivery attempts, a halt) the rest of its partition
+// is delivered again, even units that succeeded in `ordering = none`; in
+// `ordering = partition` they are not even started. A halt starts no further
+// unit, lets those in flight finish, and commits what precedes the halted one.
+// The kept handle follows the same rule as before: it stays only when everything
+// it fetched is committed.
+//
 // Status: every flow's consumer state (`Running`/`Waiting`/`Refused`/`Halted`,
 // with a reason) is kept in memory per node (`StatusStore`) and exposed via
 // `consumer_status`, so the UI can say why a flow reads nothing. A refusal is
@@ -110,29 +155,36 @@
 // config changed. =====
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
-use crate::agents::{AgentPrincipal, FlowDispatcherReactorDispatch, ReactorFlowDispatch};
+use crate::agents::{
+    AgentPrincipal, FlowDispatcherReactorDispatch, ReactiveDispatchError, ReactorFlowDispatch,
+};
 use crate::auth::actor::ActorKind;
 use crate::bus::correlation;
-use crate::bus::dlq::DlqReason;
+use crate::bus::dlq::{DlqOutcome, DlqReason};
 use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::{
-    BusCallContext, BusService, BusServiceError, ConsumerConfig, ConsumerHandle, FetchedRecordMeta,
-    TopicPartition,
+    BusCallContext, BusService, BusServiceError, ConsumerConfig, ConsumerHandle, FetchedBatch,
+    FetchedRecordMeta, TopicPartition,
 };
 use crate::db::{repository, DbPool};
 use crate::dispatch::app_gate;
-use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
+use crate::flow_engine::dispatcher::{DispatchError, FlowActor, FlowOrigin};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::bus_consume::{self, ConsumeConfig, OnError};
 use crate::flow_engine::types::FlowDefinition;
+use crate::sla::{
+    AdmitOrigin, BusOrdering, Outcome, ServiceGate, SlaPermit, SlaRefusal, SlaRegistry,
+};
 
 /// Byte ceiling passed to `ConsumerHandle::fetch_up_to` on every poll cycle;
 /// `config.batch_size` is the record bound that normally ends the read first.
@@ -148,6 +200,12 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// itself errors (bus not initialized yet, transient auth/DB hiccup) — avoids
 /// a tight error loop hammering the same failure.
 const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The longest a unit refused by its SLA gate sleeps before it asks again. The
+/// gate's own hint can be as long as a whole call window (a day); asking again
+/// sooner lets a raised limit or a changed policy take effect without waiting
+/// that out.
+const MAX_THROTTLE_PAUSE: Duration = Duration::from_secs(30);
 
 /// Why a flow's consumer is not reading right now. Stable strings: the UI
 /// maps them to localized text.
@@ -207,6 +265,15 @@ pub struct ConsumerStatus {
     pub detail: Option<String>,
     /// Unix seconds when `state`/`reason` last changed.
     pub since_epoch: u64,
+    /// Units of records the consumer has in flight right now. Counted only for
+    /// a flow under an SLA policy; `0` otherwise.
+    pub in_flight: u32,
+    /// The `max_concurrency` of the flow's SLA policy, as of the last cycle;
+    /// `None` without a policy or without a concurrency limit.
+    pub max_concurrency: Option<u32>,
+    /// Unix milliseconds until which the policy holds the consumer back (its
+    /// call limit is used up, or no slot is free); `None` when it is not.
+    pub throttled_until: Option<u64>,
 }
 
 /// What `StatusStore::set` found.
@@ -221,6 +288,9 @@ struct Transition {
 #[derive(Default)]
 pub struct StatusStore {
     inner: Mutex<HashMap<String, ConsumerStatus>>,
+    /// Flows whose last `AtMostOnce` reservation was refused: the next one asks
+    /// again for the same work, so the gate counts one refusal per episode.
+    reservation_refused: Mutex<HashSet<String>>,
 }
 
 impl StatusStore {
@@ -229,7 +299,63 @@ impl StatusStore {
     }
 
     fn get(&self, flow_id: &str) -> Option<ConsumerStatus> {
-        self.map().get(flow_id).cloned()
+        let mut status = self.map().get(flow_id).cloned()?;
+        let now = now_epoch_ms();
+        status.throttled_until = status.throttled_until.filter(|until| *until > now);
+        Some(status)
+    }
+
+    fn reservation_refused(&self, flow_id: &str) -> bool {
+        let refused = self
+            .reservation_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        refused.contains(flow_id)
+    }
+
+    fn set_reservation_refused(&self, flow_id: &str, refused: bool) {
+        let mut set = self
+            .reservation_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if refused {
+            set.insert(flow_id.to_string());
+        } else {
+            set.remove(flow_id);
+        }
+    }
+
+    /// Records the concurrency limit the flow's consumer runs under.
+    fn set_limit(&self, flow_id: &str, max_concurrency: Option<u32>) {
+        if let Some(status) = self.map().get_mut(flow_id) {
+            status.max_concurrency = max_concurrency;
+        }
+    }
+
+    fn add_in_flight(&self, flow_id: &str, delta: i32) {
+        if let Some(status) = self.map().get_mut(flow_id) {
+            status.in_flight = status.in_flight.saturating_add_signed(delta);
+        }
+    }
+
+    /// Notes that the policy holds the consumer back until `until_ms`. Read
+    /// back only while it lies in the future, so nothing has to clear it. A
+    /// consumer held back on its very first cycle has no status yet: it is
+    /// created as `Running`, which is what the consumer is once it is let in.
+    fn throttle_until(&self, flow_id: &str, until_ms: u64) {
+        let mut map = self.map();
+        let status = map
+            .entry(flow_id.to_string())
+            .or_insert_with(|| ConsumerStatus {
+                state: ConsumerState::Running,
+                reason: None,
+                detail: None,
+                since_epoch: now_epoch_secs(),
+                in_flight: 0,
+                max_concurrency: None,
+                throttled_until: None,
+            });
+        status.throttled_until = Some(status.throttled_until.map_or(until_ms, |t| t.max(until_ms)));
     }
 
     /// Stores the status; `since_epoch` moves only when state or reason
@@ -249,6 +375,10 @@ impl StatusStore {
             Some(p) if !changed => p.since_epoch,
             _ => now_epoch_secs(),
         };
+        // What the cycle reports about its units outlives a change of state.
+        let (in_flight, max_concurrency, throttled_until) = previous.map_or((0, None, None), |p| {
+            (p.in_flight, p.max_concurrency, p.throttled_until)
+        });
         map.insert(
             flow_id.to_string(),
             ConsumerStatus {
@@ -256,6 +386,9 @@ impl StatusStore {
                 reason,
                 detail,
                 since_epoch,
+                in_flight,
+                max_concurrency,
+                throttled_until,
             },
         );
         Transition {
@@ -302,6 +435,13 @@ fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -816,6 +956,15 @@ fn build_envelope(
     env
 }
 
+/// Holds a unit or a cycle back for `retry_after_ms`, the gate's own estimate,
+/// and says so in the consumer status. Only the sleep is capped: the status
+/// shows the real time, and a raised limit is noticed within the cap.
+async fn pause_throttled(status: &StatusStore, flow_id: &str, retry_after_ms: u64) {
+    let ms = retry_after_ms.max(1);
+    status.throttle_until(flow_id, now_epoch_ms() + ms);
+    tokio::time::sleep(Duration::from_millis(ms).min(MAX_THROTTLE_PAUSE)).await;
+}
+
 /// Runs `handle.commit` off the async runtime (BLOCKING, see `ConsumerHandle::
 /// fetch`'s own doc). The caller decides whether the handle survives into the
 /// next cycle (see the module doc).
@@ -823,10 +972,21 @@ async fn commit_offsets(
     handle: Arc<ConsumerHandle>,
     offsets: Vec<(TopicPartition, u64)>,
 ) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || handle.commit(&offsets))
-        .await
-        .map_err(|e| anyhow::anyhow!("commit task panicked: {e}"))?
-        .map_err(|e| anyhow::anyhow!("commit failed: {e}"))
+    tokio::task::spawn_blocking(move || {
+        // A dead letter advances the store on its own, possibly past what a
+        // prefix says, and `commit` refuses the whole call when one entry lies
+        // behind the store. Such an entry is raised to the store: it is
+        // covered already, and the handle's cursor follows the store.
+        let mut pending = Vec::with_capacity(offsets.len());
+        for (tp, offset) in offsets {
+            let stored = handle.committed_offset(&tp.topic, tp.partition)?;
+            pending.push((tp, offset.max(stored)));
+        }
+        handle.commit(&pending)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("commit task panicked: {e}"))?
+    .map_err(|e| anyhow::anyhow!("commit failed: {e}"))
 }
 
 /// Runs `BusService::note_delivery_failure` off the async runtime for one
@@ -838,7 +998,7 @@ async fn note_failure(
     record: FetchedRecordMeta,
     reason: DlqReason,
     message: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DlqOutcome> {
     tokio::task::spawn_blocking(move || {
         svc.note_delivery_failure(
             &bctx,
@@ -853,8 +1013,7 @@ async fn note_failure(
     })
     .await
     .map_err(|e| anyhow::anyhow!("note_delivery_failure task panicked: {e}"))?
-    .map_err(|e| anyhow::anyhow!("note_delivery_failure failed: {e}"))?;
-    Ok(())
+    .map_err(|e| anyhow::anyhow!("note_delivery_failure failed: {e}"))
 }
 
 /// Whether a poll cycle should keep going after `on_error` handling.
@@ -900,101 +1059,594 @@ fn still_usable(
         && svc.check_consume_access(bctx, topic, group).is_ok()
 }
 
-/// Routes a failed batch (JSON decode failure OR a failed flow dispatch)
-/// through `config.on_error` (`bus_consume::OnError`'s own doc). Consumes
-/// `handle` — every branch drops it except a committed skip, which hands it
-/// back through `keep` (the cursor equals the committed offset again).
-async fn handle_batch_failure(
-    svc: &Arc<BusService>,
-    bctx: &BusCallContext,
-    handle: Arc<ConsumerHandle>,
-    keep: &mut Option<Arc<ConsumerHandle>>,
-    flow_id: &str,
-    config: &ConsumeConfig,
-    group: &str,
-    records: &[FetchedRecordMeta],
-    reason: DlqReason,
-    message: &str,
-    run_correlation_id: Option<&str>,
-) -> AfterFailure {
-    match config.on_error {
-        OnError::Halt => {
-            tracing::warn!(
-                "bus reactor: flow '{flow_id}' halted ({reason:?}): {message} — an operator \
-                 must fix and republish the flow to resume"
-            );
-            drop(handle);
-            AfterFailure::Halt(message.to_string())
+/// What became of one unit of records.
+#[derive(Debug)]
+enum UnitFate {
+    /// The flow ran on it and succeeded.
+    Done,
+    /// It failed and `on_error = skip` gave it up.
+    Skipped,
+    /// It failed and every record of it is in the dead-letter topic.
+    DeadLettered,
+    /// It failed and stays uncommitted, so it is delivered again: a dead letter
+    /// still under its delivery attempts, or one that could not be written
+    /// (`dlq_unavailable`, which makes the loop pause).
+    Failed { dlq_unavailable: bool },
+    /// It failed under `on_error = halt`.
+    Halt(String),
+    /// It never ran: an earlier unit of its partition did not succeed, or the
+    /// cycle was halted first. Delivered again.
+    NotRun,
+}
+
+impl UnitFate {
+    /// Whether the unit's offsets may be committed once everything before it in
+    /// its partition is: it succeeded or `on_error` gave it up.
+    fn is_handled(&self) -> bool {
+        matches!(
+            self,
+            UnitFate::Done | UnitFate::Skipped | UnitFate::DeadLettered
+        )
+    }
+}
+
+/// Records handed to one flow run. Without a policy (or with a concurrency of
+/// one) a cycle has a single unit holding everything the fetch returned, as
+/// before; with a concurrency of N it has up to N, each of one partition and at
+/// most `batch_size` records.
+struct Unit {
+    records: Vec<FetchedRecordMeta>,
+}
+
+/// The SLA gate a cycle runs under and what the reactor reads off its policy.
+struct Governed {
+    gate: Arc<ServiceGate>,
+    max_concurrency: Option<u32>,
+    /// Units in flight at once; `1` when the policy sets no concurrency limit,
+    /// which keeps the consumer serial exactly as without a policy.
+    parallelism: usize,
+    ordering: BusOrdering,
+}
+
+impl Governed {
+    fn new(gate: Arc<ServiceGate>) -> Self {
+        let limits = gate.config().limits;
+        Self {
+            max_concurrency: limits.max_concurrency,
+            parallelism: limits.max_concurrency.map_or(1, |n| (n as usize).max(1)),
+            ordering: limits.ordering,
+            gate,
         }
-        OnError::Skip => {
-            tracing::warn!(
-                "bus reactor: flow '{flow_id}' skipping {} record(s) ({reason:?}): {message}",
-                records.len()
-            );
-            if config.commit_mode == CommitMode::AutoAfterSuccess {
-                let offsets = end_offsets(records);
-                match commit_offsets(handle.clone(), offsets).await {
-                    Ok(()) => *keep = Some(handle),
-                    Err(e) => {
-                        tracing::warn!("bus reactor: flow '{flow_id}' skip-commit failed: {e}")
+    }
+}
+
+/// Splits what a cycle fetched into lanes of units. A lane runs its units one
+/// after another; lanes run side by side.
+///
+/// Serial (`parallel` is `None`): one lane with one unit of everything fetched.
+/// Otherwise records are grouped by partition in fetch order and cut into units
+/// of `batch_size`. With `BusOrdering::Partition` a partition is a lane, so its
+/// units keep their order; with `BusOrdering::None` every unit is a lane. Units
+/// are listed partition by partition, each partition in offset order, which is
+/// the order the commit prefix reads them in.
+fn plan_lanes(
+    records: Vec<FetchedRecordMeta>,
+    parallel: Option<(usize, BusOrdering)>,
+) -> Vec<Vec<Unit>> {
+    let Some((batch_size, ordering)) = parallel else {
+        return vec![vec![Unit { records }]];
+    };
+    let mut partitions: Vec<Vec<FetchedRecordMeta>> = Vec::new();
+    let mut index: HashMap<(String, u32), usize> = HashMap::new();
+    for record in records {
+        let slot = *index
+            .entry((record.topic.clone(), record.partition))
+            .or_insert_with(|| {
+                partitions.push(Vec::new());
+                partitions.len() - 1
+            });
+        partitions[slot].push(record);
+    }
+    let mut lanes = Vec::new();
+    for records in partitions {
+        let mut units = Vec::new();
+        let mut remaining = records.into_iter();
+        loop {
+            let chunk: Vec<_> = remaining.by_ref().take(batch_size.max(1)).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            units.push(Unit { records: chunk });
+        }
+        match ordering {
+            BusOrdering::Partition => lanes.push(units),
+            BusOrdering::None => lanes.extend(units.into_iter().map(|unit| vec![unit])),
+        }
+    }
+    lanes
+}
+
+/// Like [`plan_lanes`], for a cycle that holds `permits` permits and so cannot
+/// run more units than that. When the plan has more units (a fetch that spans
+/// partitions cuts them short), the records are merged into units of
+/// `batch_size` again, which is at most `permits` of them: a cycle reads no
+/// more than `permits * batch_size` records. Under `BusOrdering::Partition`
+/// the merged units are one lane, so no partition is ever read out of order.
+fn plan_fitting(
+    records: Vec<FetchedRecordMeta>,
+    parallel: Option<(usize, BusOrdering)>,
+    permits: usize,
+) -> Vec<Vec<Unit>> {
+    let lanes = plan_lanes(records, parallel);
+    let Some((batch_size, ordering)) = parallel else {
+        return lanes;
+    };
+    if lanes.iter().map(Vec::len).sum::<usize>() <= permits {
+        return lanes;
+    }
+    let mut records = lanes.into_iter().flatten().flat_map(|unit| unit.records);
+    let mut units = Vec::new();
+    loop {
+        let chunk: Vec<_> = records.by_ref().take(batch_size.max(1)).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        units.push(Unit { records: chunk });
+    }
+    match ordering {
+        BusOrdering::Partition => vec![units],
+        BusOrdering::None => units.into_iter().map(|unit| vec![unit]).collect(),
+    }
+}
+
+/// The gate permits an `AtMostOnce` cycle took before it fetched. What is left
+/// when it is dropped is given back with `forgo`, so a permit that never ran a
+/// unit is neither a call, nor an acceptance, nor a cancellation.
+struct Reservation {
+    permits: Vec<SlaPermit>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        for permit in self.permits.drain(..) {
+            permit.forgo();
+        }
+    }
+}
+
+/// Takes up to `wanted` permits of `gate`: the first one the way every caller
+/// does, queued, and the others only if they are free right now. A refusal of
+/// the first one is the gate's answer to the whole cycle. `again`: the previous
+/// cycle was refused, so a refusal now is not counted a second time.
+async fn reserve(
+    gate: &Arc<ServiceGate>,
+    wanted: usize,
+    again: bool,
+) -> Result<Reservation, SlaRefusal> {
+    let first = if again {
+        gate.admit_again(AdmitOrigin::Bus).await?
+    } else {
+        gate.admit(AdmitOrigin::Bus).await?
+    };
+    let mut held = Reservation {
+        permits: vec![first],
+    };
+    while held.permits.len() < wanted {
+        match gate.try_admit_more(AdmitOrigin::Bus).await {
+            Ok(permit) => held.permits.push(permit),
+            Err(_) => break,
+        }
+    }
+    Ok(held)
+}
+
+/// The offsets a cycle may commit: per partition, the contiguous prefix of
+/// handled units. `units` lists each partition's units in offset order. A unit
+/// that was not handled blocks every partition it touches, so a later success
+/// of that partition is not committed and is delivered again (at-least-once).
+fn commit_prefix(units: &[(&[FetchedRecordMeta], bool)]) -> Vec<(TopicPartition, u64)> {
+    let mut blocked: HashSet<(String, u32)> = HashSet::new();
+    let mut next: HashMap<(String, u32), u64> = HashMap::new();
+    for (records, handled) in units {
+        let ends = end_offsets(records);
+        let key = |tp: &TopicPartition| (tp.topic.clone(), tp.partition);
+        if *handled && ends.iter().all(|(tp, _)| !blocked.contains(&key(tp))) {
+            for (tp, end) in &ends {
+                next.insert(key(tp), *end);
+            }
+        } else {
+            blocked.extend(ends.iter().map(|(tp, _)| key(tp)));
+        }
+    }
+    next.into_iter()
+        .map(|((topic, partition), offset)| (TopicPartition { topic, partition }, offset))
+        .collect()
+}
+
+/// Counts a unit as in flight in the consumer status while it runs.
+struct InFlight<'a> {
+    status: &'a StatusStore,
+    flow_id: &'a str,
+}
+
+impl<'a> InFlight<'a> {
+    fn enter(status: &'a StatusStore, flow_id: &'a str) -> Self {
+        status.add_in_flight(flow_id, 1);
+        Self { status, flow_id }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.status.add_in_flight(self.flow_id, -1);
+    }
+}
+
+/// Everything the units of one cycle share.
+///
+/// Lanes are polled together by one `join_all` on the cycle's task: they are
+/// concurrent, not parallel. That suits flows that wait on I/O (model calls,
+/// HTTP); a dispatch that computes or blocks its thread holds the other lanes
+/// back while it does.
+struct CycleCtx<'a> {
+    svc: &'a Arc<BusService>,
+    handle: &'a Arc<ConsumerHandle>,
+    bctx: &'a BusCallContext,
+    flow_id: &'a str,
+    config: &'a ConsumeConfig,
+    group: &'a str,
+    service_account: &'a str,
+    dispatch: &'a Arc<dyn ReactorFlowDispatch>,
+    status: &'a StatusStore,
+    span: &'a tracing::Span,
+    /// Where the flow's gate is looked up again whenever a unit asks for a
+    /// permit, so a policy that changed meanwhile is followed.
+    sla: Option<&'static SlaRegistry>,
+    /// The gate the cycle started under (`None`: no policy).
+    governed: Option<&'a Governed>,
+    /// Bounds the units in flight at once when there are several lanes: the
+    /// policy's concurrency limit.
+    slots: Option<Semaphore>,
+    /// The permits an `AtMostOnce` cycle took before it fetched, one per unit.
+    reserved: Option<Mutex<Reservation>>,
+    /// Set by a halt: no unit starts after it. Never set under `AtMostOnce`,
+    /// whose records are committed already: every fetched unit runs, and the
+    /// halt takes effect once they all have.
+    stop: AtomicBool,
+}
+
+/// How a unit's request for a permit ended.
+enum Admission {
+    Permit(SlaPermit),
+    /// The flow has no gate any more: the unit runs without a permit.
+    Untracked,
+    /// The cycle was halted or the consumer is no longer usable: the unit does
+    /// not run and is delivered again.
+    Stopped,
+}
+
+impl CycleCtx<'_> {
+    fn at_most_once(&self) -> bool {
+        self.config.commit_mode == CommitMode::AtMostOnce
+    }
+
+    /// Runs the units of one lane in order; a unit that is not handled ends the
+    /// lane (the rest of its partition would only be delivered again). Under
+    /// `AtMostOnce` nothing is delivered again, so a failure ends nothing.
+    /// Returns one fate per unit.
+    async fn run_lane(&self, units: &[Unit]) -> Vec<UnitFate> {
+        let mut fates = Vec::with_capacity(units.len());
+        for unit in units {
+            let fate = if self.stop.load(Ordering::Acquire) {
+                UnitFate::NotRun
+            } else {
+                self.run_unit(unit).await
+            };
+            let go_on = fate.is_handled() || self.at_most_once();
+            fates.push(fate);
+            if !go_on {
+                break;
+            }
+        }
+        fates.resize_with(units.len(), || UnitFate::NotRun);
+        fates
+    }
+
+    async fn run_unit(&self, unit: &Unit) -> UnitFate {
+        let records = &unit.records;
+        let decoded: Result<Vec<serde_json::Value>, serde_json::Error> = records
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.payload))
+            .collect();
+        let values = match decoded {
+            Ok(values) => values,
+            Err(e) => {
+                let msg = format!("payload is not valid JSON: {e}");
+                return self
+                    .fail(records, DlqReason::SchemaViolation, &msg, None)
+                    .await;
+            }
+        };
+
+        let batch_corr = resolve_batch_correlation(records);
+        // Units that run side by side must not overwrite each other's id on the
+        // cycle's span, so each gets a span of its own.
+        let span = if self.slots.is_some() {
+            tracing::info_span!(parent: self.span, "bus_reactor_unit", correlation_id = %batch_corr.id)
+        } else {
+            self.span.record("correlation_id", batch_corr.id.as_str());
+            self.span.clone()
+        };
+        self.run_decoded(records, &values, &batch_corr)
+            .instrument(span)
+            .await
+    }
+
+    async fn run_decoded(
+        &self,
+        records: &[FetchedRecordMeta],
+        values: &[serde_json::Value],
+        batch_corr: &BatchCorrelation,
+    ) -> UnitFate {
+        let _slot = match &self.slots {
+            Some(slots) => slots.acquire().await.ok(),
+            None => None,
+        };
+        if self.stop.load(Ordering::Acquire) {
+            return UnitFate::NotRun;
+        }
+        let mut envelope = build_envelope(self.config, records, values);
+        apply_correlation_meta(&mut envelope, batch_corr);
+        let principal = AgentPrincipal::new(
+            None,
+            Some(self.config.org_id.clone()),
+            FlowOrigin::Bus,
+            FlowActor::api_key(self.service_account, None),
+        )
+        .with_correlation_id(Some(batch_corr.id.clone()));
+
+        let permit = if self.governed.is_some() {
+            match self.admit().await {
+                Admission::Permit(permit) => Some(permit),
+                Admission::Untracked => None,
+                Admission::Stopped => return UnitFate::NotRun,
+            }
+        } else {
+            None
+        };
+        let in_flight = self
+            .governed
+            .map(|_| InFlight::enter(self.status, self.flow_id));
+        let result = self
+            .dispatch
+            .dispatch(self.flow_id.to_string(), envelope, principal)
+            .await;
+        drop(in_flight);
+        let error = match result {
+            Ok(()) => {
+                if let Some(permit) = permit {
+                    permit.finish(Outcome::Ok);
+                }
+                return UnitFate::Done;
+            }
+            Err(error) => error,
+        };
+        match error.downcast_ref::<ReactiveDispatchError>().map(|e| &e.0) {
+            Some(DispatchError::TimedOut { .. }) => {
+                if let Some(permit) = permit {
+                    permit.finish(Outcome::Timeout);
+                }
+            }
+            // The run never started: it costs the policy nothing.
+            Some(DispatchError::CompileFailed { .. }) => {
+                if let Some(permit) = permit {
+                    permit.forgo();
+                }
+            }
+            _ => {
+                if let Some(permit) = permit {
+                    permit.finish(Outcome::Error);
+                }
+            }
+        }
+        self.fail(
+            records,
+            DlqReason::ConsumerError,
+            &error.to_string(),
+            Some(batch_corr.id.as_str()),
+        )
+        .await
+    }
+
+    /// The flow's gate as it is now.
+    fn current_gate(&self) -> Option<Arc<ServiceGate>> {
+        self.sla.and_then(|registry| {
+            let _ = registry.refresh_if_stale(self.svc.db());
+            registry.gate(self.flow_id)
+        })
+    }
+
+    /// The permit for one unit. An `AtMostOnce` cycle took its permits before it
+    /// fetched, so a unit just takes one of them. Otherwise the unit joins the
+    /// gate's queue like any caller. A refusal (the call window is used up, or
+    /// no slot freed in time) is never a failure of the records: the unit waits
+    /// out the gate's `retry_after_ms` and asks again, so nothing is
+    /// dead-lettered or lost and the lag simply grows. The gate is looked up
+    /// again after every pause, and the refusal is counted once. After any wait
+    /// the consumer may have lost its engine, its rights or its leadership; if
+    /// so the permit goes back unused and the unit is delivered again.
+    async fn admit(&self) -> Admission {
+        if let Some(reserved) = &self.reserved {
+            let permit = reserved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .permits
+                .pop();
+            return permit.map_or(Admission::Untracked, |mut permit| {
+                // Held since before the fetch: the unit's run is what is timed.
+                permit.begin();
+                Admission::Permit(permit)
+            });
+        }
+        let mut refused = false;
+        let mut waited = false;
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Admission::Stopped;
+            }
+            let Some(gate) = self.current_gate() else {
+                return Admission::Untracked;
+            };
+            let admitted = if refused {
+                gate.admit_again(AdmitOrigin::Bus).await
+            } else {
+                // A free slot is taken at once, with nothing to recheck.
+                match gate.try_admit_more(AdmitOrigin::Bus).await {
+                    Ok(permit) => Ok(permit),
+                    Err(_) => {
+                        waited = true;
+                        gate.admit(AdmitOrigin::Bus).await
                     }
                 }
-            } else {
-                drop(handle);
-            }
-            AfterFailure::Continue
-        }
-        OnError::Dlq => {
-            drop(handle);
-            let mut dlq_failed = false;
-            for record in records {
-                // The record's own chain; a legacy record without one joins the
-                // run it failed in (when a run was resolved).
-                let mut record_ctx = bctx.clone();
-                record_ctx.correlation_id = correlation::from_fetched_headers(&record.headers)
-                    .or_else(|| run_correlation_id.map(str::to_string));
-                let outcome = note_failure(
-                    svc.clone(),
-                    record_ctx,
-                    group.to_string(),
-                    record.clone(),
-                    reason,
-                    message.to_string(),
-                )
-                .await;
-                if let Err(e) = outcome {
-                    dlq_failed = true;
-                    tracing::warn!(
-                        "bus reactor: flow '{flow_id}' note_delivery_failure failed for \
-                         offset {}: {e}",
-                        record.offset
+            };
+            match admitted {
+                Ok(permit) => {
+                    if !waited || self.still_usable_now().await {
+                        return Admission::Permit(permit);
+                    }
+                    permit.forgo();
+                    return Admission::Stopped;
+                }
+                Err(refusal) => {
+                    tracing::debug!(
+                        "bus reactor: flow '{}' is held back by its SLA policy ({}), \
+                         retrying in {} ms",
+                        self.flow_id,
+                        refusal.reason.code(),
+                        refusal.retry_after_ms
                     );
+                    refused = true;
+                    waited = true;
+                    pause_throttled(self.status, self.flow_id, refusal.retry_after_ms).await;
+                    if !self.still_usable_now().await {
+                        return Admission::Stopped;
+                    }
                 }
             }
-            if dlq_failed {
-                AfterFailure::Backoff
-            } else {
-                AfterFailure::Continue
+        }
+    }
+
+    /// Whether the cycle's consumer may still read: its engine, its rights and
+    /// its leadership. DB reads, off the async runtime.
+    async fn still_usable_now(&self) -> bool {
+        let svc = self.svc.clone();
+        let handle = self.handle.clone();
+        let bctx = self.bctx.clone();
+        let topic = self.config.topic.clone();
+        let group = self.group.to_string();
+        let account = self.service_account.to_string();
+        tokio::task::spawn_blocking(move || {
+            still_usable(&svc, &handle, &bctx, &topic, &group, &account)
+                && handle.check_leadership().is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Routes a failed unit (a JSON decode failure OR a failed flow dispatch)
+    /// through `config.on_error` (`bus_consume::OnError`'s own doc).
+    async fn fail(
+        &self,
+        records: &[FetchedRecordMeta],
+        reason: DlqReason,
+        message: &str,
+        run_correlation_id: Option<&str>,
+    ) -> UnitFate {
+        let flow_id = self.flow_id;
+        match self.config.on_error {
+            OnError::Halt => {
+                tracing::warn!(
+                    "bus reactor: flow '{flow_id}' halted ({reason:?}): {message} — an operator \
+                     must fix and republish the flow to resume"
+                );
+                if !self.at_most_once() {
+                    self.stop.store(true, Ordering::Release);
+                }
+                UnitFate::Halt(message.to_string())
+            }
+            OnError::Skip => {
+                tracing::warn!(
+                    "bus reactor: flow '{flow_id}' skipping {} record(s) ({reason:?}): {message}",
+                    records.len()
+                );
+                UnitFate::Skipped
+            }
+            OnError::Dlq => {
+                let mut all_dead_lettered = true;
+                let mut dlq_failed = false;
+                for record in records {
+                    // The record's own chain; a legacy record without one joins
+                    // the run it failed in (when a run was resolved).
+                    let mut record_ctx = self.bctx.clone();
+                    record_ctx.correlation_id = correlation::from_fetched_headers(&record.headers)
+                        .or_else(|| run_correlation_id.map(str::to_string));
+                    let outcome = note_failure(
+                        self.svc.clone(),
+                        record_ctx,
+                        self.group.to_string(),
+                        record.clone(),
+                        reason,
+                        message.to_string(),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(DlqOutcome::Retry { .. }) => all_dead_lettered = false,
+                        Ok(_) => {}
+                        Err(e) => {
+                            dlq_failed = true;
+                            tracing::warn!(
+                                "bus reactor: flow '{flow_id}' note_delivery_failure failed for \
+                                 offset {}: {e}",
+                                record.offset
+                            );
+                        }
+                    }
+                }
+                if dlq_failed {
+                    UnitFate::Failed {
+                        dlq_unavailable: true,
+                    }
+                } else if all_dead_lettered {
+                    UnitFate::DeadLettered
+                } else {
+                    UnitFate::Failed {
+                        dlq_unavailable: false,
+                    }
+                }
             }
         }
     }
 }
 
 /// One full poll cycle for a subscription: reuses the kept `ConsumerHandle`
-/// (or opens one), fetches, and either dispatches the decoded batch reactively or routes a
+/// (or opens one), fetches, and either dispatches the decoded records reactively or routes a
 /// failure through `on_error` — see this module's doc for the full design.
 /// Takes `svc` as a parameter (rather than resolving `config.instance_id`
 /// itself, which `subscription_loop` does before calling this) so it is
 /// directly testable against a locally-constructed `BusService`, without
 /// touching the process-wide instance registry every other test in this
 /// crate's binary also shares.
-async fn run_cycle(
+///
+/// `sla` is the registry the flow's gate is looked up in (`None`: no policy
+/// applies, whatever the registry says).
+async fn run_governed_cycle(
     svc: &Arc<BusService>,
     flow_id: &str,
     config: &ConsumeConfig,
     dispatch: &Arc<dyn ReactorFlowDispatch>,
     status: &StatusStore,
     slot: &mut ConsumerSlot,
+    sla: Option<&'static SlaRegistry>,
 ) -> AfterFailure {
     let span = tracing::info_span!(
         "bus_reactor_cycle",
@@ -1002,7 +1654,7 @@ async fn run_cycle(
         topic = %config.topic,
         correlation_id = tracing::field::Empty,
     );
-    let after = run_cycle_in(svc, flow_id, config, dispatch, status, slot, &span)
+    let after = run_cycle_in(svc, flow_id, config, dispatch, status, slot, sla, &span)
         .instrument(span.clone())
         .await;
     match after {
@@ -1021,6 +1673,19 @@ async fn run_cycle(
         _ => {}
     }
     after
+}
+
+/// [`run_governed_cycle`] for a flow no policy governs.
+#[cfg(test)]
+async fn run_cycle(
+    svc: &Arc<BusService>,
+    flow_id: &str,
+    config: &ConsumeConfig,
+    dispatch: &Arc<dyn ReactorFlowDispatch>,
+    status: &StatusStore,
+    slot: &mut ConsumerSlot,
+) -> AfterFailure {
+    run_governed_cycle(svc, flow_id, config, dispatch, status, slot, None).await
 }
 
 /// How a failed `open_consumer`/`fetch` shows up in the consumer status.
@@ -1059,6 +1724,71 @@ fn classify_open_error(
     }
 }
 
+/// What one cycle's fetches returned.
+struct CycleFetch {
+    records: Vec<FetchedRecordMeta>,
+    /// Every fetch the cycle wanted succeeded. When one failed after others had
+    /// advanced the handle's cursor, the handle is not kept: a reopen starts
+    /// from the committed offset.
+    clean: bool,
+}
+
+/// Fetches what one cycle works on: one fetch of up to `batch_size` records,
+/// and, for a consumer that runs up to `fetches` units at once, up to
+/// `fetches - 1` more while each returns a full unit. Every call returns the
+/// records of the partitions it starts at, so the extra calls are what spread
+/// a backlog across partitions; they never wait. `fetches == 1` is the single
+/// fetch of a consumer without a policy.
+fn fetch_cycle(
+    handle: &ConsumerHandle,
+    batch_size: usize,
+    fetches: usize,
+    max_wait_ms: u32,
+) -> Result<CycleFetch, BusServiceError> {
+    fetch_cycle_with(
+        &mut |max_bytes, max_wait_ms| handle.fetch_up_to(max_bytes, batch_size, max_wait_ms),
+        batch_size,
+        fetches,
+        max_wait_ms,
+    )
+}
+
+/// [`fetch_cycle`] over any fetch function `(max_bytes, max_wait_ms)`.
+fn fetch_cycle_with(
+    fetch: &mut dyn FnMut(usize, u32) -> Result<FetchedBatch, BusServiceError>,
+    batch_size: usize,
+    fetches: usize,
+    max_wait_ms: u32,
+) -> Result<CycleFetch, BusServiceError> {
+    let mut records = fetch(FETCH_MAX_BYTES, max_wait_ms)?.records;
+    let mut bytes: usize = records.iter().map(|r| r.payload.len()).sum();
+    let mut last = records.len();
+    for _ in 1..fetches {
+        if last < batch_size || bytes >= FETCH_MAX_BYTES {
+            break;
+        }
+        match fetch(FETCH_MAX_BYTES - bytes, 0) {
+            Ok(batch) => {
+                last = batch.records.len();
+                bytes += batch.records.iter().map(|r| r.payload.len()).sum::<usize>();
+                records.extend(batch.records);
+            }
+            Err(e) => {
+                tracing::warn!("bus reactor: a top-up fetch failed, working on what was read: {e}");
+                return Ok(CycleFetch {
+                    records,
+                    clean: false,
+                });
+            }
+        }
+    }
+    Ok(CycleFetch {
+        records,
+        clean: true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_cycle_in(
     svc: &Arc<BusService>,
     flow_id: &str,
@@ -1066,6 +1796,7 @@ async fn run_cycle_in(
     dispatch: &Arc<dyn ReactorFlowDispatch>,
     status: &StatusStore,
     slot: &mut ConsumerSlot,
+    sla: Option<&'static SlaRegistry>,
     span: &tracing::Span,
 ) -> AfterFailure {
     let (Some(service_account), Some(group)) =
@@ -1081,17 +1812,72 @@ async fn run_cycle_in(
     };
     let bctx = consumer_context(svc.typed_instance_id(), config, service_account);
 
+    // The gate is looked up afresh every cycle; a failed policy load is logged
+    // and rate limited by the registry, which keeps serving the last good gates.
+    let governed = sla
+        .and_then(|registry| {
+            let _ = registry.refresh_if_stale(svc.db());
+            registry.gate(flow_id)
+        })
+        .map(Governed::new);
     let kept = slot
         .take()
         .filter(|c| Arc::ptr_eq(&c.svc, svc))
         .map(|c| c.handle);
-    let (handle, records) = {
+
+    // `AtMostOnce` commits inside the fetch, so a record fetched and not run is
+    // lost: the cycle takes its permits first and fetches no more than they
+    // cover. The slots are held through the fetch's long poll; the permits the
+    // fetch leaves unused are given back, and an idle poll leaves no trace in
+    // the gate. `AutoAfterSuccess` fetches first: its records stay uncommitted,
+    // so a consumer that is held back or lost only has them delivered again,
+    // and every unit joins the gate's queue for its own permit.
+    let mut reservation = None;
+    let mut fetches = governed.as_ref().map_or(1, |g| g.parallelism);
+    let mut max_wait_ms = config.max_wait_ms;
+    if let Some(governed) = governed
+        .as_ref()
+        .filter(|_| config.commit_mode == CommitMode::AtMostOnce)
+    {
+        let again = status.reservation_refused(flow_id);
+        match reserve(&governed.gate, governed.parallelism, again).await {
+            Ok(held) => {
+                status.set_reservation_refused(flow_id, false);
+                fetches = held.permits.len();
+                reservation = Some(held);
+                // The held slots keep other callers of the flow queued for as
+                // long as the fetch polls, so it polls for at most half of what
+                // a queued caller waits before it is refused.
+                let queue_timeout = governed.gate.config().limits.queue_timeout;
+                if !queue_timeout.is_zero() {
+                    let half = u32::try_from(queue_timeout.as_millis() / 2).unwrap_or(u32::MAX);
+                    max_wait_ms = max_wait_ms.min(half.max(1));
+                }
+            }
+            Err(refusal) => {
+                status.set_reservation_refused(flow_id, true);
+                // The cached consumer goes before the pause, and the cycle ends
+                // after it: the subscription loop checks its instance again
+                // instead of this cycle sitting on a stopped engine's consumer.
+                drop(kept);
+                tracing::debug!(
+                    "bus reactor: flow '{flow_id}' is held back by its SLA policy ({}), \
+                     retrying in {} ms",
+                    refusal.reason.code(),
+                    refusal.retry_after_ms
+                );
+                pause_throttled(status, flow_id, refusal.retry_after_ms).await;
+                return AfterFailure::Continue;
+            }
+        }
+    }
+
+    let (handle, fetched) = {
         let task_svc = svc.clone();
         let open_bctx = bctx.clone();
         let group = group.clone();
         let topic = config.topic.clone();
         let commit_mode = config.commit_mode;
-        let max_wait_ms = config.max_wait_ms;
         let batch_size = config.batch_size as usize;
         let task_account = service_account.to_string();
         let joined = tokio::task::spawn_blocking(move || {
@@ -1107,14 +1893,14 @@ async fn run_cycle_in(
                     ConsumerConfig { commit_mode },
                 )?),
             };
-            let batch = handle.fetch_up_to(FETCH_MAX_BYTES, batch_size, max_wait_ms)?;
-            Ok::<_, BusServiceError>((handle, batch))
+            let fetched = fetch_cycle(&handle, batch_size, fetches, max_wait_ms)?;
+            Ok::<_, BusServiceError>((handle, fetched))
         })
         .await;
         match joined {
-            Ok(Ok((handle, batch))) => {
+            Ok(Ok((handle, fetched))) => {
                 status.record(flow_id, ConsumerState::Running, None, None);
-                (handle, batch.records)
+                (handle, fetched)
             }
             Ok(Err(e)) => {
                 let (state, why, detail) = classify_open_error(svc.db(), service_account, &e);
@@ -1132,6 +1918,8 @@ async fn run_cycle_in(
             }
         }
     };
+    let CycleFetch { records, clean } = fetched;
+    status.set_limit(flow_id, governed.as_ref().and_then(|g| g.max_concurrency));
 
     if records.is_empty() {
         // `fetch` already long-polled up to `max_wait_ms` internally.
@@ -1139,88 +1927,91 @@ async fn run_cycle_in(
         return AfterFailure::Continue;
     }
 
-    let decoded: Result<Vec<serde_json::Value>, serde_json::Error> = records
-        .iter()
-        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.payload))
-        .collect();
-    let mut keep = None;
-    let values = match decoded {
-        Ok(values) => values,
-        Err(e) => {
-            let msg = format!("payload is not valid JSON: {e}");
-            let after = handle_batch_failure(
-                svc,
-                &bctx,
-                handle,
-                &mut keep,
-                flow_id,
-                config,
-                &group,
-                &records,
-                DlqReason::SchemaViolation,
-                &msg,
-                None,
-            )
-            .await;
-            restore_slot(slot, svc, keep);
-            return after;
-        }
-    };
-
-    let batch_corr = resolve_batch_correlation(&records);
-    span.record("correlation_id", batch_corr.id.as_str());
-    let mut envelope = build_envelope(config, &records, &values);
-    apply_correlation_meta(&mut envelope, &batch_corr);
-    let principal = AgentPrincipal::new(
-        None,
-        Some(config.org_id.clone()),
-        FlowOrigin::Bus,
-        FlowActor::api_key(service_account, None),
-    )
-    .with_correlation_id(Some(batch_corr.id.clone()));
-
-    match dispatch
-        .dispatch(flow_id.to_string(), envelope, principal)
-        .await
-    {
-        Ok(()) => {
-            if config.commit_mode == CommitMode::AutoAfterSuccess {
-                let offsets = end_offsets(&records);
-                match commit_offsets(handle.clone(), offsets).await {
-                    Ok(()) => keep = Some(handle),
-                    Err(e) => tracing::warn!(
-                        "bus reactor: flow '{flow_id}' commit after successful dispatch failed: {e}"
-                    ),
-                }
-            } else {
-                keep = Some(handle);
+    let parallel = governed
+        .as_ref()
+        .filter(|g| g.parallelism > 1)
+        .map(|g| (config.batch_size as usize, g.ordering));
+    let lanes = match &mut reservation {
+        Some(held) => {
+            let lanes = plan_fitting(records, parallel, held.permits.len());
+            let needed: usize = lanes.iter().map(Vec::len).sum();
+            for spare in held.permits.split_off(needed.min(held.permits.len())) {
+                spare.forgo();
             }
-            // `AtMostOnce` already committed inside `fetch()`; `Explicit`
-            // cannot reach here — `ConsumeConfig::from_config` rejects it, so
-            // `build_subscriptions` never builds such a subscription. See
-            // this module's doc.
-            restore_slot(slot, svc, keep);
-            AfterFailure::Continue
+            lanes
         }
-        Err(e) => {
-            let msg = e.to_string();
-            let after = handle_batch_failure(
-                svc,
-                &bctx,
-                handle,
-                &mut keep,
-                flow_id,
-                config,
-                &group,
-                &records,
-                DlqReason::ConsumerError,
-                &msg,
-                Some(batch_corr.id.as_str()),
-            )
-            .await;
-            restore_slot(slot, svc, keep);
-            after
+        None => plan_lanes(records, parallel),
+    };
+    let ctx = CycleCtx {
+        svc,
+        handle: &handle,
+        bctx: &bctx,
+        flow_id,
+        config,
+        group: &group,
+        service_account,
+        dispatch,
+        status,
+        span,
+        sla,
+        governed: governed.as_ref(),
+        slots: parallel.map(|_| Semaphore::new(fetches)),
+        reserved: reservation.map(Mutex::new),
+        stop: AtomicBool::new(false),
+    };
+    let fates: Vec<Vec<UnitFate>> =
+        futures::future::join_all(lanes.iter().map(|units| ctx.run_lane(units))).await;
+    let units: Vec<(&Unit, &UnitFate)> =
+        lanes.iter().flatten().zip(fates.iter().flatten()).collect();
+
+    let auto_commit = config.commit_mode == CommitMode::AutoAfterSuccess;
+    let mut committed = true;
+    if auto_commit {
+        let handled: Vec<(&[FetchedRecordMeta], bool)> = units
+            .iter()
+            .map(|(unit, fate)| (unit.records.as_slice(), fate.is_handled()))
+            .collect();
+        let offsets = commit_prefix(&handled);
+        if !offsets.is_empty() {
+            if let Err(e) = commit_offsets(handle.clone(), offsets).await {
+                tracing::warn!("bus reactor: flow '{flow_id}' commit failed: {e}");
+                committed = false;
+            }
         }
+    }
+    // `AtMostOnce` already committed inside `fetch()`; `Explicit` cannot reach
+    // here — `ConsumeConfig::from_config` rejects it, so `build_subscriptions`
+    // never builds such a subscription. See this module's doc.
+    //
+    // The handle's cursor is past everything fetched. It may stay only when
+    // all of that is also committed (or, for `AtMostOnce`, was never to be).
+    let advanced = units.iter().all(|(_, fate)| {
+        matches!(fate, UnitFate::Done) || (auto_commit && matches!(fate, UnitFate::Skipped))
+    });
+    restore_slot(
+        slot,
+        svc,
+        (clean && committed && advanced).then_some(handle),
+    );
+
+    if let Some(failure) = units.iter().find_map(|(_, fate)| match fate {
+        UnitFate::Halt(message) => Some(message.clone()),
+        _ => None,
+    }) {
+        return AfterFailure::Halt(failure);
+    }
+    let dlq_unavailable = units.iter().any(|(_, fate)| {
+        matches!(
+            fate,
+            UnitFate::Failed {
+                dlq_unavailable: true
+            }
+        )
+    });
+    if dlq_unavailable {
+        AfterFailure::Backoff
+    } else {
+        AfterFailure::Continue
     }
 }
 
@@ -1273,7 +2064,16 @@ async fn subscription_loop(
             tokio::time::sleep(ERROR_BACKOFF).await;
             continue;
         };
-        let after = run_cycle(&svc, &flow_id, &config, &dispatch, &status, &mut slot).await;
+        let after = run_governed_cycle(
+            &svc,
+            &flow_id,
+            &config,
+            &dispatch,
+            &status,
+            &mut slot,
+            Some(crate::sla::global()),
+        )
+        .await;
         if !continue_after(after).await {
             break;
         }
@@ -3925,5 +4725,1684 @@ mod tests {
         assert!(!again.changed);
         let recovered = store.set("f", ConsumerState::Running, None, None);
         assert!(recovered.changed && recovered.was_blocked);
+    }
+
+    // ---- TB-03 S4: consumption under an SLA policy ----
+
+    use crate::sla::SlaPolicySpec;
+
+    fn unit_of(records: &[(u32, u64)]) -> Vec<FetchedRecordMeta> {
+        records
+            .iter()
+            .map(|(partition, offset)| record("t", *partition, *offset, "{}"))
+            .collect()
+    }
+
+    #[test]
+    fn commit_prefix_stops_a_partition_at_its_first_unhandled_unit() {
+        let (a, b, c) = (
+            unit_of(&[(0, 0), (0, 1)]),
+            unit_of(&[(0, 2)]),
+            unit_of(&[(0, 3)]),
+        );
+        let mut committed = commit_prefix(&[(&a, true), (&b, false), (&c, true)]);
+        committed.sort_by_key(|(tp, _)| tp.partition);
+        assert_eq!(
+            committed,
+            vec![(
+                TopicPartition {
+                    topic: "t".into(),
+                    partition: 0
+                },
+                2
+            )],
+            "only the units before the first unhandled one are committed"
+        );
+    }
+
+    #[test]
+    fn commit_prefix_keeps_partitions_independent() {
+        let (a, b, c) = (unit_of(&[(0, 0)]), unit_of(&[(1, 0)]), unit_of(&[(1, 1)]));
+        let mut committed = commit_prefix(&[(&a, false), (&b, true), (&c, true)]);
+        committed.sort_by_key(|(tp, _)| tp.partition);
+        assert_eq!(
+            committed,
+            vec![(
+                TopicPartition {
+                    topic: "t".into(),
+                    partition: 1
+                },
+                2
+            )]
+        );
+    }
+
+    #[test]
+    fn commit_prefix_of_a_serial_unit_spanning_partitions_is_all_or_nothing() {
+        let both = unit_of(&[(0, 4), (1, 7)]);
+        let mut committed = commit_prefix(&[(&both, true)]);
+        committed.sort_by_key(|(tp, _)| tp.partition);
+        assert_eq!(
+            committed.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            vec![5, 8]
+        );
+        assert!(commit_prefix(&[(&both, false)]).is_empty());
+    }
+
+    #[test]
+    fn plan_lanes_without_parallelism_is_one_unit_of_everything_fetched() {
+        let records = unit_of(&[(0, 0), (1, 0), (0, 1)]);
+        let lanes = plan_lanes(records, None);
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].len(), 1);
+        assert_eq!(lanes[0][0].records.len(), 3);
+    }
+
+    #[test]
+    fn plan_lanes_cuts_partitions_into_units_in_offset_order() {
+        let records = unit_of(&[(0, 0), (1, 0), (0, 1), (0, 2), (1, 1)]);
+        let lanes = plan_lanes(records.clone(), Some((2, BusOrdering::Partition)));
+        let shape: Vec<Vec<Vec<(u32, u64)>>> = lanes
+            .iter()
+            .map(|lane| {
+                lane.iter()
+                    .map(|unit| {
+                        unit.records
+                            .iter()
+                            .map(|r| (r.partition, r.offset))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                vec![vec![(0, 0), (0, 1)], vec![(0, 2)]],
+                vec![vec![(1, 0), (1, 1)]],
+            ]
+        );
+
+        let unordered = plan_lanes(records, Some((2, BusOrdering::None)));
+        assert_eq!(unordered.len(), 3, "every unit is a lane of its own");
+        assert!(unordered.iter().all(|lane| lane.len() == 1));
+    }
+
+    #[test]
+    fn a_throttle_shows_only_while_it_lies_ahead_and_status_changes_keep_the_live_fields() {
+        let store = StatusStore::default();
+        store.record("f", ConsumerState::Running, None, None);
+        store.set_limit("f", Some(4));
+        store.add_in_flight("f", 2);
+        store.throttle_until("f", now_epoch_ms() + 60_000);
+        store.record("f", ConsumerState::Waiting, Some(reason::BUS_ERROR), None);
+        let status = store.get("f").unwrap();
+        assert_eq!(
+            (status.in_flight, status.max_concurrency),
+            (2, Some(4)),
+            "a state change does not reset what the cycle reports"
+        );
+        assert!(status.throttled_until.is_some());
+
+        store.throttle_until("f", 1);
+        assert!(
+            store.get("f").unwrap().throttled_until.is_some(),
+            "the later time stands"
+        );
+        let past = StatusStore::default();
+        past.record("g", ConsumerState::Running, None, None);
+        past.throttle_until("g", 1);
+        assert_eq!(past.get("g").unwrap().throttled_until, None);
+        past.add_in_flight("g", -1);
+        assert_eq!(past.get("g").unwrap().in_flight, 0, "never below zero");
+    }
+
+    /// Dispatch spy for parallel cycles. Payloads are `{"id": n, "p": partition}`
+    /// (one object, or an array of them for a batch). Every dispatch waits at a
+    /// barrier of `peers` dispatches on the way in and on the way out, so a
+    /// test that expects N units in flight at once gets exactly that (and can
+    /// look at them all in flight) or fails on the timeout, with no sleeping.
+    struct ParallelSpy {
+        state: Mutex<SpyState>,
+        arrive: tokio::sync::Barrier,
+        depart: tokio::sync::Barrier,
+        failing: Mutex<HashSet<i64>>,
+        timing_out: Mutex<HashSet<i64>>,
+        /// Ids whose run never starts (`CompileFailed`).
+        never_starts: Mutex<HashSet<i64>>,
+        /// How long a dispatch stays in flight (between the two barriers).
+        hold: Duration,
+        status: Option<(Arc<StatusStore>, String)>,
+    }
+
+    #[derive(Default)]
+    struct SpyState {
+        current: usize,
+        peak: usize,
+        active: HashMap<i64, usize>,
+        peak_per_partition: HashMap<i64, usize>,
+        started: Vec<(i64, Vec<i64>)>,
+        slot_held: Vec<bool>,
+        seen_in_flight: Vec<(u32, Option<u32>)>,
+    }
+
+    impl ParallelSpy {
+        fn new(peers: usize) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::default(),
+                arrive: tokio::sync::Barrier::new(peers),
+                depart: tokio::sync::Barrier::new(peers),
+                failing: Mutex::default(),
+                timing_out: Mutex::default(),
+                never_starts: Mutex::default(),
+                hold: Duration::ZERO,
+                status: None,
+            })
+        }
+
+        /// A spy whose dispatches stay in flight for `hold`, long enough for
+        /// two that overlap to be seen overlapping.
+        fn holding(peers: usize, hold: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::default(),
+                arrive: tokio::sync::Barrier::new(peers),
+                depart: tokio::sync::Barrier::new(peers),
+                failing: Mutex::default(),
+                timing_out: Mutex::default(),
+                never_starts: Mutex::default(),
+                hold,
+                status: None,
+            })
+        }
+
+        fn observing(peers: usize, status: Arc<StatusStore>, flow: &str) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::default(),
+                arrive: tokio::sync::Barrier::new(peers),
+                depart: tokio::sync::Barrier::new(peers),
+                failing: Mutex::default(),
+                timing_out: Mutex::default(),
+                never_starts: Mutex::default(),
+                hold: Duration::ZERO,
+                status: Some((status, flow.to_string())),
+            })
+        }
+
+        fn fail(&self, ids: &[i64]) {
+            *self.failing.lock().unwrap() = ids.iter().copied().collect();
+        }
+
+        fn started(&self) -> Vec<(i64, Vec<i64>)> {
+            self.state.lock().unwrap().started.clone()
+        }
+
+        fn started_ids(&self, partition: i64) -> Vec<i64> {
+            self.started()
+                .into_iter()
+                .filter(|(p, _)| *p == partition)
+                .flat_map(|(_, ids)| ids)
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ReactorFlowDispatch for ParallelSpy {
+        async fn dispatch(
+            &self,
+            flow_id: String,
+            initial: FlowEnvelope,
+            principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
+            let FlowValue::Json(value) = initial.payload else {
+                anyhow::bail!("expected a JSON payload");
+            };
+            let items: Vec<(i64, i64)> = match value {
+                serde_json::Value::Array(items) => items.iter().map(id_and_partition).collect(),
+                single => vec![id_and_partition(&single)],
+            };
+            let partition = items[0].1;
+            let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+            {
+                let mut state = self.state.lock().unwrap();
+                state.current += 1;
+                state.peak = state.peak.max(state.current);
+                let active = state.active.entry(partition).or_default();
+                *active += 1;
+                let active = *active;
+                let peak = state.peak_per_partition.entry(partition).or_default();
+                *peak = (*peak).max(active);
+                state.started.push((partition, ids.clone()));
+                state.slot_held.push(
+                    crate::agents::reactive_run_meta("x".into(), &principal).slot_held_by_caller,
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(10), self.arrive.wait())
+                .await
+                .expect("the other units never ran beside this one");
+            if let Some((status, flow)) = &self.status {
+                let seen = status.get(flow).expect("status");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .seen_in_flight
+                    .push((seen.in_flight, seen.max_concurrency));
+            }
+            tokio::time::sleep(self.hold).await;
+            tokio::time::timeout(Duration::from_secs(10), self.depart.wait())
+                .await
+                .expect("the other units never left");
+            {
+                let mut state = self.state.lock().unwrap();
+                state.current -= 1;
+                *state.active.get_mut(&partition).unwrap() -= 1;
+            }
+            if ids
+                .iter()
+                .any(|id| self.timing_out.lock().unwrap().contains(id))
+            {
+                return Err(anyhow::Error::new(ReactiveDispatchError(
+                    crate::flow_engine::dispatcher::DispatchError::TimedOut {
+                        flow_id,
+                        timeout_ms: 100,
+                    },
+                )));
+            }
+            if ids
+                .iter()
+                .any(|id| self.never_starts.lock().unwrap().contains(id))
+            {
+                return Err(anyhow::Error::new(ReactiveDispatchError(
+                    crate::flow_engine::dispatcher::DispatchError::CompileFailed {
+                        flow_id,
+                        msg: "scripted".into(),
+                    },
+                )));
+            }
+            if ids
+                .iter()
+                .any(|id| self.failing.lock().unwrap().contains(id))
+            {
+                anyhow::bail!("scripted dispatch failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn id_and_partition(value: &serde_json::Value) -> (i64, i64) {
+        (
+            value["id"].as_i64().expect("id"),
+            value["p"].as_i64().expect("partition"),
+        )
+    }
+
+    const SLA_FIRST_CLOCK_MS: u64 = 10_000_000;
+
+    /// A registry of the test's own on a clock the test moves, with `flow_id`
+    /// governed by `spec` in `svc`'s database.
+    struct SlaRig {
+        registry: &'static SlaRegistry,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        gate: Arc<ServiceGate>,
+    }
+
+    fn govern(svc: &Arc<BusService>, flow_id: &str, spec: SlaPolicySpec, clock_ms: u64) -> SlaRig {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(clock_ms));
+        let handle = clock.clone();
+        let registry: &'static SlaRegistry =
+            Box::leak(Box::new(SlaRegistry::with_clock(Arc::new(move || {
+                handle.load(std::sync::atomic::Ordering::SeqCst)
+            }))));
+        {
+            let conn = svc.db().write().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES (?1, ?1, '{}', 'active')",
+                [flow_id],
+            )
+            .expect("insert flow");
+            // The change journal references the organization and the actor.
+            conn.execute(
+                "INSERT OR IGNORE INTO organizations (org_id, name, slug, created_at) \
+                 VALUES ('org-a', 'org-a', 'org-a', datetime('now'))",
+                [],
+            )
+            .expect("insert organization");
+            conn.execute(
+                "INSERT OR IGNORE INTO user_accounts (id, username, password_hash) \
+                 VALUES ('admin', 'sla-test-admin', 'x')",
+                [],
+            )
+            .expect("insert actor");
+        }
+        let policy = crate::sla::repository::create_policy(
+            svc.db(),
+            "org-a",
+            "admin",
+            &SlaPolicySpec {
+                name: format!("policy-{flow_id}"),
+                ..spec
+            },
+        )
+        .expect("create policy");
+        crate::sla::repository::assign(svc.db(), "org-a", "admin", "flow", flow_id, &policy.id)
+            .expect("assign policy");
+        registry.refresh_if_stale(svc.db()).expect("load policies");
+        let gate = registry.gate(flow_id).expect("gate exists");
+        SlaRig {
+            registry,
+            clock,
+            gate,
+        }
+    }
+
+    fn concurrent(max_concurrency: u32) -> SlaPolicySpec {
+        SlaPolicySpec {
+            max_concurrency: Some(max_concurrency),
+            ..Default::default()
+        }
+    }
+
+    /// The flow's consumer config under a general key that exists in `svc`'s
+    /// database, so that the per-cycle checks of the consumer pass and a kept
+    /// consumer is really reused.
+    fn keyed_config(svc: &Arc<BusService>, extra: serde_json::Value) -> ConsumeConfig {
+        let key = seed_general_key(svc.db());
+        let mut config = json!({
+            "instance_id": "tentabus-00000001", "service_account": key,
+            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        ConsumeConfig::from_config(&config).unwrap()
+    }
+
+    async fn publish_to(svc: &Arc<BusService>, ctx: &BusCallContext, partition: u32, id: i64) {
+        let svc = svc.clone();
+        let ctx = ctx.clone();
+        blocking(move || {
+            svc.publish(
+                &ctx,
+                "orders.raw",
+                PublishBatch {
+                    partition: Some(partition),
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(json!({"id": id, "p": partition}).to_string()),
+                        timestamp_ms: 0,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("publish");
+    }
+
+    /// A topic with `partitions` partitions and `ids_per_partition` records on
+    /// each, ids `p * 100 + k` in publish order.
+    async fn filled_topic(
+        partitions: u32,
+        ids_per_partition: i64,
+        opts: TopicOptions,
+    ) -> (tempfile::TempDir, Arc<BusService>, BusCallContext) {
+        let (dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &svc,
+            &ctx,
+            "orders.raw",
+            TopicOptions {
+                partitions: Some(partitions),
+                ..opts
+            },
+        )
+        .await;
+        for p in 0..partitions {
+            for k in 1..=ids_per_partition {
+                publish_to(&svc, &ctx, p, i64::from(p) * 100 + k).await;
+            }
+        }
+        (dir, svc, ctx)
+    }
+
+    /// The ids the flow's group would still be delivered, from a fresh consumer.
+    async fn remaining(
+        svc: &Arc<BusService>,
+        ctx: &BusCallContext,
+        config: &ConsumeConfig,
+    ) -> Vec<i64> {
+        let group = config.effective_group().unwrap();
+        let mut ids: Vec<i64> = fetch_once(svc, ctx, &group, "orders.raw")
+            .await
+            .iter()
+            .map(|r| id_and_partition(&serde_json::from_slice(&r.payload).unwrap()).0)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn cycle(
+        svc: &Arc<BusService>,
+        config: &ConsumeConfig,
+        dispatch: &Arc<dyn ReactorFlowDispatch>,
+        status: &StatusStore,
+        sla: &SlaRig,
+    ) -> AfterFailure {
+        cycle_in(svc, config, dispatch, status, sla, &mut ConsumerSlot::None).await
+    }
+
+    /// [`cycle`] that keeps its consumer in `slot` between calls, as the
+    /// subscription loop does.
+    async fn cycle_in(
+        svc: &Arc<BusService>,
+        config: &ConsumeConfig,
+        dispatch: &Arc<dyn ReactorFlowDispatch>,
+        status: &StatusStore,
+        sla: &SlaRig,
+        slot: &mut ConsumerSlot,
+    ) -> AfterFailure {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_governed_cycle(
+                svc,
+                "flow-sla",
+                config,
+                dispatch,
+                status,
+                slot,
+                Some(sla.registry),
+            ),
+        )
+        .await
+        .expect("the cycle did not finish")
+    }
+
+    #[tokio::test]
+    async fn units_beyond_the_concurrency_wait_and_never_run_more_than_n_at_once() {
+        let (_dir, svc, ctx) = filled_topic(4, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(2), SLA_FIRST_CLOCK_MS);
+        let status = Arc::new(StatusStore::default());
+        let spy = ParallelSpy::observing(2, status.clone(), "flow-sla");
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        // One fetch returns all four records, one per partition: four units,
+        // two slots.
+        let config = keyed_config(&svc, json!({"batch_size": 4}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        {
+            let state = spy.state.lock().unwrap();
+            assert_eq!(state.started.len(), 4);
+            assert_eq!(state.peak, 2, "two ran together, never three");
+            assert!(state.slot_held.iter().all(|held| *held));
+            assert!(
+                state
+                    .seen_in_flight
+                    .iter()
+                    .all(|seen| *seen == (2, Some(2))),
+                "the status reports what is in flight and the limit: {:?}",
+                state.seen_in_flight
+            );
+        }
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        let stats = sla.gate.stats();
+        assert_eq!((stats.accepted, stats.ok, stats.in_flight), (4, 4, 0));
+        assert_eq!(status.get("flow-sla").unwrap().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn partitions_run_side_by_side_and_each_keeps_its_order() {
+        let (_dir, svc, ctx) = filled_topic(3, 4, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(3);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+
+        // Each cycle fetches three units, one record from each partition.
+        for _ in 0..4 {
+            let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+            assert!(matches!(after, AfterFailure::Continue));
+        }
+
+        {
+            let state = spy.state.lock().unwrap();
+            assert_eq!(state.peak, 3, "the three partitions ran together");
+            assert!(
+                state.peak_per_partition.values().all(|peak| *peak == 1),
+                "a partition never runs two units at once"
+            );
+        }
+        for p in 0..3i64 {
+            assert_eq!(
+                spy.started_ids(p),
+                (1..=4).map(|k| p * 100 + k).collect::<Vec<_>>(),
+                "partition {p} in order"
+            );
+        }
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_the_middle_commits_only_the_prefix_and_redelivers_the_rest() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[2]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+        let mut slot = ConsumerSlot::None;
+
+        let after = cycle_in(&svc, &config, &dispatch, &status, &sla, &mut slot).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started_ids(0),
+            vec![1, 2],
+            "the unit after the failed one of its partition does not start"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, vec![2, 3]);
+        assert!(
+            slot.is_none(),
+            "the cursor is past what was committed: the consumer is not kept"
+        );
+
+        spy.fail(&[]);
+        let after = cycle_in(&svc, &config, &dispatch, &status, &sla, &mut slot).await;
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started_ids(0),
+            vec![1, 2, 2, 3],
+            "redelivered, in order"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        assert!(slot.is_some(), "everything committed: the consumer is kept");
+    }
+
+    #[tokio::test]
+    async fn without_ordering_a_later_success_after_a_failure_is_redelivered() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                ordering: BusOrdering::None,
+                ..concurrent(3)
+            },
+            SLA_FIRST_CLOCK_MS,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(3);
+        spy.fail(&[2]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.state.lock().unwrap().peak,
+            3,
+            "units of one partition ran together"
+        );
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            vec![2, 3],
+            "3 succeeded but sits behind the failed 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn halt_in_a_partition_commits_what_precedes_it_and_starts_nothing_after() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[2]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"on_error": "halt"}));
+        let mut slot = ConsumerSlot::None;
+
+        let after = cycle_in(&svc, &config, &dispatch, &status, &sla, &mut slot).await;
+
+        assert!(matches!(after, AfterFailure::Halt(_)));
+        assert_eq!(
+            status_of(&status, "flow-sla"),
+            (ConsumerState::Halted, None)
+        );
+        assert_eq!(spy.started_ids(0), vec![1, 2]);
+        assert_eq!(remaining(&svc, &ctx, &config).await, vec![2, 3]);
+        assert!(slot.is_none(), "a halted cycle does not keep its consumer");
+        // Fixed and resumed (the supervisor restarts a halted loop on a save):
+        // the redelivery starts at the halted record.
+        spy.fail(&[]);
+        let after = cycle_in(&svc, &config, &dispatch, &status, &sla, &mut slot).await;
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(spy.started_ids(0), vec![1, 2, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn halt_lets_the_other_partitions_in_flight_finish_and_commits_them() {
+        let (_dir, svc, ctx) = filled_topic(2, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(2), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(2);
+        spy.fail(&[101]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"on_error": "halt", "batch_size": 2}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Halt(_)));
+        assert_eq!(spy.started().len(), 2, "both partitions were in flight");
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            vec![101],
+            "partition 0 finished and is committed, the halted unit is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_letters_are_written_per_record_and_the_partition_goes_on() {
+        let (_dir, svc, ctx) = filled_topic(
+            1,
+            4,
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let sla = govern(&svc, "flow-sla", concurrent(2), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[1, 2]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        // Two units of two records each, one partition: they run in order.
+        let config = keyed_config(&svc, json!({"batch_size": 2}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(spy.started(), vec![(0, vec![1, 2]), (0, vec![3, 4])]);
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            Vec::<i64>::new(),
+            "the dead-lettered unit counts as handled and the one after it committed"
+        );
+        let dead = fetch_once(
+            &svc,
+            &ctx,
+            "dlq-reader",
+            &crate::bus::dlq::dlq_topic_name("orders.raw"),
+        )
+        .await;
+        assert_eq!(
+            dead.len(),
+            2,
+            "one dead letter per record of the failed unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_once_commits_in_fetch_and_the_reactor_commits_nothing_more() {
+        let (_dir, svc, ctx) = filled_topic(2, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(2), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(2);
+        spy.fail(&[101]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(
+            &svc,
+            json!({
+                "commit_mode": "at_most_once", "on_error": "skip", "batch_size": 2
+            }),
+        );
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(spy.started().len(), 2);
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            Vec::<i64>::new(),
+            "both were committed by the fetch, the failed one included"
+        );
+        cycle(&svc, &config, &dispatch, &status, &sla).await;
+        assert_eq!(spy.started().len(), 2, "nothing is delivered twice");
+    }
+
+    #[tokio::test]
+    async fn a_call_limit_delays_the_unit_without_a_dead_letter_and_without_loss() {
+        let (_dir, svc, ctx) = filled_topic(
+            1,
+            3,
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        // 50 ms before the next one-second window.
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(2),
+                call_window_secs: Some(1),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 950,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+
+        for _ in 0..2 {
+            cycle(&svc, &config, &dispatch, &status, &sla).await;
+        }
+        assert_eq!(spy.started_ids(0), vec![1, 2]);
+
+        let third = cycle(&svc, &config, &dispatch, &status, &sla);
+        let observe = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while status
+                    .get("flow-sla")
+                    .and_then(|s| s.throttled_until)
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("the consumer was never held back");
+            assert_eq!(
+                spy.started_ids(0),
+                vec![1, 2],
+                "the held back unit did not run"
+            );
+            assert_eq!(
+                remaining(&svc, &ctx, &config).await,
+                vec![3],
+                "the record is still there, not lost"
+            );
+            assert_eq!(
+                fetch_dead_letters(&svc, &ctx).await,
+                0,
+                "a refusal is not a failure of the record"
+            );
+            sla.clock.store(
+                SLA_FIRST_CLOCK_MS + 1_100,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        };
+        let (after, ()) = tokio::join!(third, observe);
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started_ids(0),
+            vec![1, 2, 3],
+            "delivered in the next window"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        let stats = sla.gate.stats();
+        assert_eq!((stats.accepted, stats.ok, stats.in_flight), (3, 3, 0));
+        assert_eq!(
+            stats.rejected_calls, 1,
+            "the refusal is counted once for the unit, not for every time it asked"
+        );
+        assert_eq!(fetch_dead_letters(&svc, &ctx).await, 0);
+    }
+
+    async fn fetch_dead_letters(svc: &Arc<BusService>, ctx: &BusCallContext) -> usize {
+        let svc = svc.clone();
+        let ctx = ctx.clone();
+        let topic = crate::bus::dlq::dlq_topic_name("orders.raw");
+        blocking(move || {
+            svc.open_consumer(
+                &ctx,
+                "dlq-reader",
+                &[topic],
+                ConsumerConfig {
+                    commit_mode: CommitMode::AutoAfterSuccess,
+                },
+            )
+            .ok()
+            .map_or(0, |handle| {
+                handle.fetch(1024, 10).expect("fetch").records.len()
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_concurrency_of_one_is_the_serial_consumer_with_its_calls_counted() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(1), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"batch_size": 3}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started(),
+            vec![(0, vec![1, 2, 3])],
+            "one fetch, one run of the whole batch"
+        );
+        assert_eq!(spy.state.lock().unwrap().slot_held, vec![true]);
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        let stats = sla.gate.stats();
+        assert_eq!((stats.accepted, stats.ok), (1, 1));
+        assert_eq!(status.get("flow-sla").unwrap().max_concurrency, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_policy_without_a_concurrency_limit_keeps_the_consumer_serial() {
+        let (_dir, svc, _ctx) = filled_topic(2, 1, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(100),
+                call_window_secs: Some(60),
+                ..Default::default()
+            },
+            SLA_FIRST_CLOCK_MS,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"batch_size": 5}));
+
+        cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        let started = spy.started();
+        assert_eq!(started.len(), 1, "everything fetched is one unit");
+        let mut ids = started[0].1.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 101]);
+        assert_eq!(sla.gate.stats().accepted, 1);
+        assert_eq!(status.get("flow-sla").unwrap().max_concurrency, None);
+    }
+
+    #[tokio::test]
+    async fn a_policy_timeout_is_recorded_on_the_permit_not_as_a_plain_error() {
+        let (_dir, svc, ctx) = filled_topic(1, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(1), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.timing_out.lock().unwrap().insert(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"on_error": "skip"}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        let stats = sla.gate.stats();
+        assert_eq!(
+            (
+                stats.accepted,
+                stats.timeouts,
+                stats.errors,
+                stats.in_flight
+            ),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+    }
+
+    // ---- S4 review: capacity before fetch, commit edge cases, refusals ----
+
+    #[tokio::test]
+    async fn at_most_once_runs_every_fetched_unit_even_after_a_failure() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[1]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started_ids(0),
+            vec![1, 2, 3],
+            "the fetch committed all three: none may be dropped unrun"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn at_most_once_halts_only_after_every_fetched_unit_ran() {
+        let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[2]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(
+            &svc,
+            json!({"commit_mode": "at_most_once", "on_error": "halt"}),
+        );
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Halt(_)));
+        assert_eq!(spy.started_ids(0), vec![1, 2, 3]);
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn idle_polls_spend_no_call_budget() {
+        let (_dir, svc, ctx) = filled_topic(1, 0, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(2),
+                call_window_secs: Some(60),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+
+        for _ in 0..5 {
+            cycle(&svc, &config, &dispatch, &status, &sla).await;
+        }
+        let stats = sla.gate.stats();
+        assert_eq!((stats.accepted, stats.window_calls), (0, 0));
+
+        publish_to(&svc, &ctx, 0, 1).await;
+        publish_to(&svc, &ctx, 0, 2).await;
+        for _ in 0..2 {
+            cycle(&svc, &config, &dispatch, &status, &sla).await;
+        }
+        assert_eq!(spy.started_ids(0), vec![1, 2], "the whole budget was there");
+        assert_eq!(sla.gate.stats().window_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_at_most_once_consumer_fetches_nothing_until_it_has_room() {
+        let (_dir, svc, ctx) = filled_topic(1, 2, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(1),
+                call_window_secs: Some(60),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+        cycle(&svc, &config, &dispatch, &status, &sla).await;
+        assert_eq!(spy.started_ids(0), vec![1]);
+
+        // The window is used up: the next cycle waits and, being dropped here,
+        // never ran anything.
+        let held = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_governed_cycle(
+                &svc,
+                "flow-sla",
+                &config,
+                &dispatch,
+                &status,
+                &mut ConsumerSlot::None,
+                Some(sla.registry),
+            ),
+        )
+        .await;
+
+        assert!(held.is_err(), "the cycle is waiting for room");
+        assert!(status.get("flow-sla").unwrap().throttled_until.is_some());
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            vec![2],
+            "record 2 was not fetched, so the fetch did not commit it away"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_after_a_done_unit_is_committed_by_the_prefix() {
+        let (_dir, svc, ctx) = filled_topic(
+            1,
+            4,
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let sla = govern(&svc, "flow-sla", concurrent(2), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[3, 4]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"batch_size": 2}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        // The dead letters could not advance the store (the first unit was not
+        // committed yet), so the prefix commit is what moves it past them.
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        assert_eq!(fetch_dead_letters(&svc, &ctx).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_ahead_of_the_prefix_does_not_hold_back_another_partitions_commit() {
+        let (_dir, svc, ctx) = filled_topic(
+            2,
+            0,
+            TopicOptions {
+                max_delivery_attempts: Some(2),
+                ..Default::default()
+            },
+        )
+        .await;
+        for id in 1..=4 {
+            publish_to(&svc, &ctx, 0, id).await;
+        }
+        publish_to(&svc, &ctx, 1, 101).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let config = keyed_config(&svc, json!({"batch_size": 2}));
+        // Offsets 0 to 2 of p0 have failed once already: their next failure is
+        // dead-lettered, and each dead letter advances the store by itself.
+        for offset in 0..3 {
+            note_failure(
+                svc.clone(),
+                consumer_context(svc.typed_instance_id(), &config, TEST_KEY_UID),
+                config.effective_group().unwrap(),
+                record("orders.raw", 0, offset, "{}"),
+                DlqReason::ConsumerError,
+                "earlier".to_string(),
+            )
+            .await
+            .expect("noted");
+        }
+        // Three fetches of two records: [1, 2] of p0, [101, 3] and [4]. The units
+        // of p0 are [1, 2], which is dead-lettered whole (the store moves to
+        // 2), and [3, 4], with one dead letter (the store moves to 3) and one
+        // retry: the prefix ends at 2 while the store is at 3.
+        let spy = ParallelSpy::new(1);
+        spy.fail(&[1, 2, 3, 4]);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            vec![4],
+            "p1's success is committed, p0 resumes after its dead letters"
+        );
+        assert_eq!(fetch_dead_letters(&svc, &ctx).await, 3);
+    }
+
+    /// Two callers of the gate that are never idle (what /v1 or chat traffic on
+    /// the same flow looks like): one runs while the other is queued, so the
+    /// gate always has a waiter. `stop` ends them.
+    fn crowd_the_gate(
+        gate: &Arc<ServiceGate>,
+    ) -> (Arc<AtomicBool>, Vec<tokio::task::JoinHandle<()>>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let tasks = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Acquire) {
+                        if let Ok(permit) = gate.admit(AdmitOrigin::Request).await {
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            permit.finish(Outcome::Ok);
+                        }
+                    }
+                })
+            })
+            .collect();
+        (stop, tasks)
+    }
+
+    #[tokio::test]
+    async fn a_consumer_makes_progress_while_other_callers_keep_the_gate_queued() {
+        for commit_mode in ["auto_after_success", "at_most_once"] {
+            let (_dir, svc, ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+            let sla = govern(
+                &svc,
+                "flow-sla",
+                SlaPolicySpec {
+                    max_queue: Some(10),
+                    queue_timeout_ms: Some(10_000),
+                    ..concurrent(1)
+                },
+                SLA_FIRST_CLOCK_MS,
+            );
+            let status = StatusStore::default();
+            let spy = ParallelSpy::new(1);
+            let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+            let config = keyed_config(&svc, json!({"commit_mode": commit_mode, "batch_size": 1}));
+            let (stop, crowd) = crowd_the_gate(&sla.gate);
+
+            for _ in 0..3 {
+                let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+                assert!(matches!(after, AfterFailure::Continue), "{commit_mode}");
+            }
+            stop.store(true, Ordering::Release);
+            for task in crowd {
+                task.await.expect("the crowd ends");
+            }
+
+            assert_eq!(spy.started_ids(0), vec![1, 2, 3], "{commit_mode}");
+            assert_eq!(
+                remaining(&svc, &ctx, &config).await,
+                Vec::<i64>::new(),
+                "{commit_mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn at_most_once_idle_polls_leave_no_trace_in_the_gate() {
+        let (_dir, svc, _ctx) = filled_topic(2, 0, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(2),
+                call_window_secs: Some(60),
+                ..concurrent(2)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+
+        for _ in 0..5 {
+            cycle(&svc, &config, &dispatch, &status, &sla).await;
+        }
+
+        let stats = sla.gate.stats();
+        assert_eq!(
+            (
+                stats.accepted,
+                stats.window_calls,
+                stats.in_flight,
+                stats.cancelled,
+                stats.rejected_calls,
+                stats.rejected_concurrency
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "the permits taken for the fetch were given back"
+        );
+        assert!(spy.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn at_most_once_never_fetches_more_units_than_it_holds_permits() {
+        let (_dir, svc, ctx) = filled_topic(4, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(3), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(
+            &svc,
+            json!({"commit_mode": "at_most_once", "batch_size": 4}),
+        );
+        // Another caller holds one of the three slots: the cycle can reserve
+        // two, and one fetch returns all four records, one per partition.
+        let outsider = sla.gate.try_admit(AdmitOrigin::Request).await.unwrap();
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        let mut delivered: Vec<i64> = spy.started().into_iter().flat_map(|(_, ids)| ids).collect();
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered,
+            vec![1, 101, 201, 301],
+            "every record the fetch committed was handed to a unit that ran"
+        );
+        assert!(spy.started().len() <= 2, "no more units than permits");
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        let stats = sla.gate.stats();
+        assert_eq!(
+            (stats.in_flight, stats.cancelled),
+            (1, 0),
+            "only the outsider is left, the spare permit was given back"
+        );
+        drop(outsider);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_first_cycle_already_shows_in_the_consumer_status() {
+        let (_dir, svc, _ctx) = filled_topic(1, 2, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(1),
+                call_window_secs: Some(60),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        drop(sla.gate.try_admit(AdmitOrigin::Request).await.unwrap());
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+
+        let held = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_governed_cycle(
+                &svc,
+                "flow-sla",
+                &config,
+                &dispatch,
+                &status,
+                &mut ConsumerSlot::None,
+                Some(sla.registry),
+            ),
+        )
+        .await;
+
+        assert!(held.is_err(), "the cycle is waiting for room");
+        let shown = status.get("flow-sla").expect("a status exists");
+        assert_eq!(shown.state, ConsumerState::Running);
+        assert!(shown.throttled_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_throttle_episode_is_counted_once_however_many_cycles_it_spans() {
+        let (_dir, svc, _ctx) = filled_topic(1, 2, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(1),
+                call_window_secs: Some(60),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        sla.gate
+            .try_admit(AdmitOrigin::Request)
+            .await
+            .unwrap()
+            .finish(Outcome::Ok);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+
+        for _ in 0..3 {
+            let held = tokio::time::timeout(
+                Duration::from_millis(200),
+                run_governed_cycle(
+                    &svc,
+                    "flow-sla",
+                    &config,
+                    &dispatch,
+                    &status,
+                    &mut ConsumerSlot::None,
+                    Some(sla.registry),
+                ),
+            )
+            .await;
+            assert!(held.is_err(), "the cycle is paused");
+        }
+
+        assert_eq!(sla.gate.stats().rejected_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn an_idle_at_most_once_poll_is_capped_by_the_queue_timeout() {
+        let (_dir, svc, _ctx) = filled_topic(1, 0, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                queue_timeout_ms: Some(400),
+                max_queue: Some(5),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(
+            &svc,
+            json!({"commit_mode": "at_most_once", "max_wait_ms": 5000}),
+        );
+
+        let started = std::time::Instant::now();
+        cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "the long poll held the slot for {:?}, not for half the queue timeout",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_consumer_does_not_keep_its_cached_consumer_through_the_pause() {
+        let (_dir, svc, _ctx) = filled_topic(1, 2, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(2),
+                call_window_secs: Some(60),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 500,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"commit_mode": "at_most_once"}));
+        let mut slot = ConsumerSlot::None;
+        cycle_in(&svc, &config, &dispatch, &status, &sla, &mut slot).await;
+        let kept = Arc::downgrade(&slot.as_ref().expect("the consumer is kept").handle);
+        // One call of the window is left; take it so the next cycle is refused.
+        drop(sla.gate.try_admit(AdmitOrigin::Request).await.unwrap());
+
+        let mut paused = Box::pin(run_governed_cycle(
+            &svc,
+            "flow-sla",
+            &config,
+            &dispatch,
+            &status,
+            &mut slot,
+            Some(sla.registry),
+        ));
+        let observe = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while status
+                    .get("flow-sla")
+                    .and_then(|s| s.throttled_until)
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("the consumer was never held back");
+            assert!(
+                kept.upgrade().is_none(),
+                "the cycle sits in its pause without the consumer"
+            );
+        };
+        tokio::select! {
+            _ = &mut paused => panic!("the cycle should be paused"),
+            () = observe => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_policy_removed_while_a_unit_waits_lets_it_run_without_a_permit() {
+        let (_dir, svc, ctx) = filled_topic(1, 1, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                max_queue: Some(0),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS,
+        );
+        let held = sla.gate.try_admit(AdmitOrigin::Request).await.unwrap();
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+
+        let run = cycle(&svc, &config, &dispatch, &status, &sla);
+        let lift = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while status
+                    .get("flow-sla")
+                    .and_then(|s| s.throttled_until)
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("the unit was never refused");
+            assert!(spy.started().is_empty());
+            crate::sla::repository::unassign(svc.db(), "org-a", "admin", "flow", "flow-sla")
+                .expect("unassign");
+        };
+        let (after, ()) = tokio::join!(run, lift);
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            spy.started_ids(0),
+            vec![1],
+            "it ran once the policy was gone"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+        assert_eq!(
+            sla.gate.stats().accepted,
+            1,
+            "only the outsider was ever admitted"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_consumer_that_lost_its_rights_during_a_pause_dispatches_nothing() {
+        let (_dir, svc, ctx) = filled_topic(1, 1, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                call_limit: Some(1),
+                call_window_secs: Some(1),
+                ..concurrent(1)
+            },
+            SLA_FIRST_CLOCK_MS + 950,
+        );
+        sla.gate
+            .try_admit(AdmitOrigin::Request)
+            .await
+            .unwrap()
+            .finish(Outcome::Ok);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({}));
+        let key = config.service_account.clone().expect("a key");
+
+        let run = cycle(&svc, &config, &dispatch, &status, &sla);
+        let revoke = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while status
+                    .get("flow-sla")
+                    .and_then(|s| s.throttled_until)
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("the unit was never refused");
+            crate::db::repository::set_api_key_active(svc.db(), &key, false).expect("disable");
+            sla.clock.store(
+                SLA_FIRST_CLOCK_MS + 1_100,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        };
+        let (after, ()) = tokio::join!(run, revoke);
+
+        assert!(matches!(after, AfterFailure::Continue));
+        assert!(spy.started().is_empty(), "nothing was dispatched");
+        crate::db::repository::set_api_key_active(svc.db(), &key, true).expect("enable");
+        assert_eq!(
+            remaining(&svc, &ctx, &config).await,
+            vec![1],
+            "the record is delivered again"
+        );
+        let stats = sla.gate.stats();
+        assert_eq!(
+            (stats.accepted, stats.in_flight, stats.cancelled),
+            (1, 0, 0),
+            "the permit taken after the pause went back unused (only the outsider counts)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_raises_an_entry_behind_the_store_to_the_store() {
+        let (_dir, svc, ctx) = filled_topic(2, 1, TopicOptions::default()).await;
+        let config = keyed_config(&svc, json!({}));
+        let group = config.effective_group().unwrap();
+        let handle = {
+            let svc = svc.clone();
+            let ctx = ctx.clone();
+            blocking(move || {
+                svc.open_consumer(
+                    &ctx,
+                    &group,
+                    &["orders.raw".to_string()],
+                    ConsumerConfig {
+                        commit_mode: CommitMode::AutoAfterSuccess,
+                    },
+                )
+            })
+            .await
+            .map(Arc::new)
+            .expect("open")
+        };
+        let tp = |partition| TopicPartition {
+            topic: "orders.raw".into(),
+            partition,
+        };
+        commit_offsets(handle.clone(), vec![(tp(0), 1)])
+            .await
+            .expect("commit");
+        let behind_the_store = vec![(tp(0), 0), (tp(1), 1)];
+        assert!(
+            handle.commit(&behind_the_store).is_err(),
+            "the raw commit refuses the whole call"
+        );
+
+        commit_offsets(handle.clone(), behind_the_store)
+            .await
+            .expect("the covered entry is raised to the store, the other one is written");
+
+        assert_eq!(handle.committed_offset("orders.raw", 0).unwrap(), 1);
+        assert_eq!(handle.committed_offset("orders.raw", 1).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_started_costs_the_policy_nothing() {
+        let (_dir, svc, ctx) = filled_topic(1, 1, TopicOptions::default()).await;
+        let sla = govern(&svc, "flow-sla", concurrent(1), SLA_FIRST_CLOCK_MS);
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        spy.never_starts.lock().unwrap().insert(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"on_error": "skip"}));
+
+        let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+        assert!(matches!(after, AfterFailure::Continue));
+        let stats = sla.gate.stats();
+        assert_eq!(
+            (stats.accepted, stats.errors, stats.in_flight),
+            (0, 0, 0),
+            "not counted as a call nor as an error"
+        );
+        assert_eq!(remaining(&svc, &ctx, &config).await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn two_units_of_one_partition_never_overlap_but_do_without_ordering() {
+        for (ordering, expected_peak) in [(BusOrdering::Partition, 1), (BusOrdering::None, 2)] {
+            let (_dir, svc, _ctx) = filled_topic(1, 2, TopicOptions::default()).await;
+            let sla = govern(
+                &svc,
+                "flow-sla",
+                SlaPolicySpec {
+                    ordering,
+                    ..concurrent(2)
+                },
+                SLA_FIRST_CLOCK_MS,
+            );
+            let status = StatusStore::default();
+            // Units that overlap stay in flight together for 60 ms.
+            let spy = ParallelSpy::holding(1, Duration::from_millis(60));
+            let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+            let config = keyed_config(&svc, json!({}));
+
+            cycle(&svc, &config, &dispatch, &status, &sla).await;
+
+            let state = spy.state.lock().unwrap();
+            assert_eq!(state.started.len(), 2);
+            assert_eq!(state.peak, expected_peak, "{ordering:?}");
+            assert_eq!(state.peak_per_partition[&0], expected_peak, "{ordering:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_top_up_fetch_returns_what_was_read_and_is_not_clean() {
+        let one = |offset| FetchedBatch {
+            records: vec![record("t", 0, offset, "{}")],
+        };
+        let mut calls = 0;
+        let mut fetch = |_: usize, _: u32| {
+            calls += 1;
+            match calls {
+                1 => Ok(one(0)),
+                2 => Ok(one(1)),
+                _ => Err(BusServiceError::NotInitialized),
+            }
+        };
+        let fetched = fetch_cycle_with(&mut fetch, 1, 4, 10).expect("fetched");
+        assert_eq!(fetched.records.len(), 2);
+        assert!(
+            !fetched.clean,
+            "the handle's cursor may be ahead: do not keep it"
+        );
+        assert_eq!(calls, 3, "no fetch after the failed one");
+
+        let mut calls = 0;
+        let mut ends_short = |_: usize, _: u32| {
+            calls += 1;
+            Ok(if calls == 1 {
+                one(0)
+            } else {
+                FetchedBatch::default()
+            })
+        };
+        let fetched = fetch_cycle_with(&mut ends_short, 1, 4, 10).expect("fetched");
+        assert!(fetched.clean);
+        assert_eq!((fetched.records.len(), calls), (1, 2));
     }
 }

@@ -982,6 +982,18 @@ pub struct BusConsumerStatus {
     pub since_epoch: u64,
     /// Node the status was read on.
     pub node_id: String,
+    /// Units of work the consumer has in flight right now (an SLA policy's
+    /// parallel consumption); `0` for a flow without a policy.
+    #[serde(default)]
+    pub in_flight: u32,
+    /// The policy's `max_concurrency` the consumer runs under; `None` without
+    /// a policy or without a concurrency limit.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// Unix milliseconds until which the consumer is held back by the policy's
+    /// call limit or a full concurrency limit; `None` when it is not.
+    #[serde(default)]
+    pub throttled_until: Option<u64>,
 }
 
 /// One entry of the Flow Builder's service-account picker: an active general
@@ -10488,6 +10500,9 @@ mod tests {
             detail: None,
             since_epoch: 1_700_000_000,
             node_id: "node-1".to_string(),
+            in_flight: 3,
+            max_concurrency: Some(4),
+            throttled_until: Some(1_700_000_060_000),
         };
         let body = MessageBody::FlowListResponse {
             flows: vec![FlowSummary {
@@ -10505,6 +10520,24 @@ mod tests {
         let bytes = crate::cbor::encode(&detail).expect("encode");
         let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(decoded, detail);
+    }
+
+    /// The SLA fields were appended with `#[serde(default)]`: a status from an
+    /// older node decodes with no concurrency limit and nothing in flight.
+    #[test]
+    fn bus_consumer_status_decodes_without_the_sla_fields() {
+        let status: BusConsumerStatus = serde_json::from_value(serde_json::json!({
+            "state": "running", "since_epoch": 1, "node_id": "node-1",
+        }))
+        .expect("decode");
+        assert_eq!(
+            (
+                status.in_flight,
+                status.max_concurrency,
+                status.throttled_until
+            ),
+            (0, None, None)
+        );
     }
 
     #[test]

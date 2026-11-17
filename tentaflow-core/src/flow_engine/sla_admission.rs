@@ -176,8 +176,9 @@ impl SlaAdmission {
         }
     }
 
-    /// `permit` may be untracked (a bus run takes no slot) and still carry the
-    /// policy's timeout, which is the backstop the bus path lacked.
+    /// `permit` may be untracked (the caller holds the slot, as the bus reactor
+    /// does) and the admission still carries the policy's timeout, which is the
+    /// backstop the bus path lacked.
     pub(crate) fn governed(
         flow_id: &str,
         permit: SlaPermit,
