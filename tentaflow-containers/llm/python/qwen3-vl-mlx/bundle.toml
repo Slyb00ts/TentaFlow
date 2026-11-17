@@ -11,7 +11,7 @@ engine = "qwen3-vl-mlx"
 description = "Qwen3-VL (VLM chat) via mlx-vlm OpenAI server (Apple Silicon)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "mlx-vlm"
+pypi_package = "mlx-vlm==0.8.0"
 
 [launch]
 command = "python"

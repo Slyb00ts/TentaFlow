@@ -114,10 +114,28 @@ pub struct BundleMeta {
     /// build-isolation nie widzi runtime deps i build pada na ModuleNotFound.
     #[serde(default)]
     pub editable_no_build_isolation: bool,
-    /// source="vllm-metal": wersja upstream vllm tarballa z GitHub Releases
-    /// (np. "0.19.1"). Wymagana dla tego source.
+    /// source="vllm-metal": vLLM core version the plugin release is paired with
+    /// (e.g. "0.33.0"). Part of the prebuilt macOS arm64 wheel file name.
     #[serde(default)]
     pub vllm_version: Option<String>,
+    /// source="vllm-metal": vllm-project/vllm GitHub Release tag that carries the
+    /// core wheel. Not always `v<vllm_version>`: the vLLM 0.33.0 wheels are
+    /// assets of Release `v0.33.0rc3` (same commit); tag `v0.33.0` has no Release.
+    #[serde(default)]
+    pub vllm_release_tag: Option<String>,
+    /// source="vllm-metal": pinned plugin release (tag `v<vllm_metal_version>`).
+    /// Every plugin release requires one specific vLLM core, so following
+    /// `releases/latest` drifts away from `vllm_version`.
+    #[serde(default)]
+    pub vllm_metal_version: Option<String>,
+    /// source="vllm-metal": SHA-256 (lowercase hex) of the core wheel in
+    /// Release `vllm_release_tag`. Required; a mismatch aborts the install.
+    #[serde(default)]
+    pub vllm_core_wheel_sha256: Option<String>,
+    /// source="vllm-metal": SHA-256 (lowercase hex) of the plugin wheel of
+    /// Release `v<vllm_metal_version>`. Required; a mismatch aborts the install.
+    #[serde(default)]
+    pub vllm_metal_wheel_sha256: Option<String>,
     /// source="vllm-metal": repo pluginu w formacie "<owner>/<name>"
     /// (default "vllm-project/vllm-metal").
     #[serde(default)]
@@ -881,6 +899,18 @@ fn template_identity(
     if let Some(ver) = &spec.bundle.vllm_version {
         hasher.update(ver.as_bytes());
     }
+    if let Some(tag) = &spec.bundle.vllm_release_tag {
+        hasher.update(tag.as_bytes());
+    }
+    if let Some(ver) = &spec.bundle.vllm_metal_version {
+        hasher.update(ver.as_bytes());
+    }
+    if let Some(sha) = &spec.bundle.vllm_core_wheel_sha256 {
+        hasher.update(sha.as_bytes());
+    }
+    if let Some(sha) = &spec.bundle.vllm_metal_wheel_sha256 {
+        hasher.update(sha.as_bytes());
+    }
     if let Some(repo) = &spec.bundle.vllm_metal_repo {
         hasher.update(repo.as_bytes());
     }
@@ -1303,77 +1333,226 @@ pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
     })
 }
 
-/// Install flow dla `source = "vllm-metal"` — odwzorowuje
-/// https://github.com/vllm-project/vllm-metal/blob/main/install.sh:
-///   1) pobierz tarball vllm v<vllm_version> z GitHub Releases i rozpakuj
-///   2) `uv pip install -r vllm-<ver>/requirements/cpu.txt --index-strategy unsafe-best-match`
-///   3) `CXXFLAGS="-Wno-parentheses" uv pip install <vllm-<ver>/>`
-///   4) pobierz `.whl` z vllm-project/vllm-metal releases/latest → `uv pip install <wheel>`
+/// Install flow for `source = "vllm-metal"`, mirroring the release path (not
+/// the source-checkout path) of vllm-project/vllm-metal `install.sh`:
+///   1) download the prebuilt macOS arm64 vLLM core wheel from GitHub Release
+///      `<vllm_release_tag>` (`vllm-<vllm_version>+cpu-cp38-abi3-...`), verify
+///      it against `vllm_core_wheel_sha256` and install the local file
+///   2) download the plugin `.whl` from releases/tags/v<vllm_metal_version>,
+///      verify it against `vllm_metal_wheel_sha256` and install it
+///   3) `uv pip install -r vllm_metal/requirements-torch.txt` from the installed
+///      plugin — the plugin release overrides the core's torch pin with its own
 fn install_vllm_metal(installer: &Installer<'_>, meta: &BundleMeta, log: &LogSink) -> Result<()> {
     let vllm_ver = meta
         .vllm_version
         .as_deref()
         .context("source=vllm-metal wymaga pola vllm_version w [bundle]")?;
+    let vllm_tag = meta
+        .vllm_release_tag
+        .as_deref()
+        .context("source=vllm-metal wymaga pola vllm_release_tag w [bundle]")?;
+    let metal_ver = meta
+        .vllm_metal_version
+        .as_deref()
+        .context("source=vllm-metal wymaga pola vllm_metal_version w [bundle]")?;
+    let core_sha256 = sha256_pin(
+        "vllm_core_wheel_sha256",
+        meta.vllm_core_wheel_sha256.as_deref(),
+    )?;
+    let metal_sha256 = sha256_pin(
+        "vllm_metal_wheel_sha256",
+        meta.vllm_metal_wheel_sha256.as_deref(),
+    )?;
     let metal_repo = meta
         .vllm_metal_repo
         .as_deref()
         .unwrap_or("vllm-project/vllm-metal");
+    let python_tag = cpython_tag(&meta.python_version)?;
 
     installer.upgrade_pip()?;
 
-    let work = tempfile::tempdir().context("tmpdir dla vllm-metal")?;
-    let tarball_url = format!(
-        "https://github.com/vllm-project/vllm/releases/download/v{ver}/vllm-{ver}.tar.gz",
-        ver = vllm_ver
-    );
-    log(&format!("pobieram upstream vLLM {} tarball", vllm_ver));
-    download_and_extract(&tarball_url, work.path(), log)?;
+    let client = github_download_client()?;
+    let wheel_dir = tempfile::tempdir().context("tmpdir dla wheels vllm-metal")?;
 
-    let vllm_src = work.path().join(format!("vllm-{}", vllm_ver));
-    if !vllm_src.exists() {
-        anyhow::bail!(
-            "tarball vllm rozpakowal sie bez oczekiwanego podkatalogu {}",
-            vllm_src.display()
-        );
-    }
+    let core_name = vllm_metal_core_wheel_name(vllm_ver);
+    log(&format!(
+        "pobieram rdzen vLLM {} (prebuilt macOS arm64, release {})",
+        vllm_ver, vllm_tag
+    ));
+    let core_path = download_verified_wheel(
+        &client,
+        &vllm_metal_core_wheel_url(vllm_tag, vllm_ver),
+        &core_name,
+        core_sha256,
+        wheel_dir.path(),
+    )?;
+    installer.install_package(
+        core_path
+            .to_str()
+            .context("nie-UTF8 sciezka do wheel rdzenia vLLM")?,
+    )?;
 
-    let cpu_req = vllm_src.join("requirements").join("cpu.txt");
-    if !cpu_req.exists() {
-        anyhow::bail!(
-            "vllm tarball nie zawiera {} (zmiana upstream layoutu?)",
-            cpu_req.display()
-        );
-    }
-    log("instaluje vLLM requirements/cpu.txt (torch CPU)");
-    installer.install_requirements(&cpu_req)?;
-
-    log("kompiluje vLLM z CXXFLAGS=-Wno-parentheses");
-    let mut cmd = installer.cmd();
-    cmd.env("CXXFLAGS", "-Wno-parentheses");
-    cmd.arg("install");
-    installer.add_install_flags(&mut cmd);
-    cmd.arg(vllm_src.to_str().context("nie-UTF8 sciezka do vllm src")?);
-    run_with_logs(&mut cmd, log).context("kompilacja vllm ze zrodla")?;
-
-    let wheel_dir = tempfile::tempdir().context("tmpdir dla wheel vllm-metal")?;
-    let wheel_path = download_vllm_metal_wheel(metal_repo, wheel_dir.path(), log)?;
+    let (metal_name, metal_url) =
+        fetch_vllm_metal_wheel_asset(metal_repo, metal_ver, &python_tag, log)?;
+    log(&format!("pobieram wheel {}", metal_name));
+    let metal_path = download_verified_wheel(
+        &client,
+        &metal_url,
+        &metal_name,
+        metal_sha256,
+        wheel_dir.path(),
+    )?;
     log(&format!(
         "instaluje vllm-metal wheel: {}",
-        wheel_path.display()
+        metal_path.display()
     ));
     installer.install_package(
-        wheel_path
+        metal_path
             .to_str()
             .context("nie-UTF8 sciezka do wheel vllm-metal")?,
     )?;
 
+    let torch_req = vllm_metal_torch_requirements(&installer.venv)?;
+    log("instaluje pin torcha wydania vllm-metal (requirements-torch.txt)");
+    installer.install_requirements(&torch_req)?;
+
     Ok(())
 }
 
-/// Pobiera najnowszy asset `.whl` z GitHub Releases/latest danego repo i
-/// zapisuje do `dst_dir`. Zwraca sciezke do zapisanego pliku.
-fn download_vllm_metal_wheel(repo: &str, dst_dir: &Path, log: &LogSink) -> Result<PathBuf> {
-    let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+/// Hosts a GitHub release asset download may touch: the `releases/download`
+/// URL on github.com and the blob storage it redirects to.
+const GITHUB_RELEASE_DOWNLOAD_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+
+/// Returns the pinned SHA-256 named `field`, which must be 64 lowercase hex
+/// digits so it compares byte-for-byte with `hex::encode` of the digest.
+fn sha256_pin<'a>(field: &str, value: Option<&'a str>) -> Result<&'a str> {
+    let value =
+        value.with_context(|| format!("source=vllm-metal wymaga pola {field} w [bundle]"))?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        anyhow::bail!("{field} musi miec 64 znaki hex (male litery), jest {value:?}");
+    }
+    Ok(value)
+}
+
+/// CPython wheel tag of a `major.minor` Python version ("3.12" → "cp312").
+fn cpython_tag(python_version: &str) -> Result<String> {
+    let mut parts = python_version.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor))
+            if !major.is_empty()
+                && !minor.is_empty()
+                && major
+                    .bytes()
+                    .chain(minor.bytes())
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            Ok(format!("cp{major}{minor}"))
+        }
+        _ => anyhow::bail!("python_version {python_version:?} nie ma postaci major.minor"),
+    }
+}
+
+/// File name of the prebuilt macOS arm64 vLLM core wheel.
+fn vllm_metal_core_wheel_name(version: &str) -> String {
+    format!("vllm-{version}+cpu-cp38-abi3-macosx_11_0_arm64.whl")
+}
+
+/// URL of the prebuilt macOS arm64 vLLM core wheel in GitHub Release `tag`.
+/// The local-version `+` is percent-encoded, exactly as GitHub lists the asset.
+fn vllm_metal_core_wheel_url(tag: &str, version: &str) -> String {
+    format!(
+        "https://github.com/vllm-project/vllm/releases/download/{tag}/{}",
+        vllm_metal_core_wheel_name(version).replace('+', "%2B")
+    )
+}
+
+/// GitHub API endpoint of the pinned plugin release.
+fn vllm_metal_release_api_url(repo: &str, version: &str) -> String {
+    format!("https://api.github.com/repos/{repo}/releases/tags/v{version}")
+}
+
+/// Path of the installed plugin's `vllm_metal/requirements-torch.txt`. The
+/// pinned plugin release ships it, so its absence means a broken install.
+fn vllm_metal_torch_requirements(venv: &Path) -> Result<PathBuf> {
+    let python = venv_bin(venv, "python");
+    let out = Command::new(&python)
+        .arg("-I")
+        .arg("-c")
+        .arg(
+            "from importlib.metadata import distribution; \
+             print(distribution('vllm-metal').locate_file('vllm_metal/requirements-torch.txt'))",
+        )
+        .output()
+        .with_context(|| format!("uruchomienie {}", python.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "lokalizacja requirements-torch.txt vllm-metal: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if !path.is_file() {
+        anyhow::bail!("zainstalowany vllm-metal nie zawiera {}", path.display());
+    }
+    Ok(path)
+}
+
+/// Refuses an `https` URL outside `GITHUB_RELEASE_DOWNLOAD_HOSTS`.
+fn check_github_download_url(url: &reqwest::Url) -> Result<()> {
+    let allowed = url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| GITHUB_RELEASE_DOWNLOAD_HOSTS.contains(&host));
+    if !allowed {
+        anyhow::bail!("odmowa pobrania z {url}: dozwolone tylko https na hostach GitHub Releases");
+    }
+    Ok(())
+}
+
+/// Blocking client whose every redirect must stay on GitHub release hosts.
+fn github_download_client() -> Result<reqwest::blocking::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("za duzo przekierowan");
+        }
+        match check_github_download_url(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(e.to_string()),
+        }
+    });
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .user_agent("tentaflow")
+        .redirect(policy)
+        .build()?)
+}
+
+/// Refuses an asset name that is not a bare file name (separators, `..`),
+/// so joining it to the download directory cannot escape it.
+fn require_bare_file_name(name: &str) -> Result<()> {
+    if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+        anyhow::bail!("nazwa assetu {name:?} nie jest sama nazwa pliku");
+    }
+    Ok(())
+}
+
+/// Looks up the pinned plugin release and returns `(name, browser_download_url)`
+/// of its single wheel for `python_tag` on macOS arm64.
+fn fetch_vllm_metal_wheel_asset(
+    repo: &str,
+    version: &str,
+    python_tag: &str,
+    log: &LogSink,
+) -> Result<(String, String)> {
+    let api_url = vllm_metal_release_api_url(repo, version);
     log(&format!("GET {}", api_url));
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -1387,36 +1566,83 @@ fn download_vllm_metal_wheel(repo: &str, dst_dir: &Path, log: &LogSink) -> Resul
     if !resp.status().is_success() {
         anyhow::bail!("GitHub API {} zwrocil HTTP {}", api_url, resp.status());
     }
-    let json: serde_json::Value = resp.json().context("parse JSON z releases/latest")?;
+    let json: serde_json::Value = resp
+        .json()
+        .with_context(|| format!("parse JSON z {}", api_url))?;
     let assets = json
         .get("assets")
         .and_then(|a| a.as_array())
-        .context("brak `assets` w odpowiedzi releases/latest")?;
-    let (wheel_name, wheel_url) = assets
+        .with_context(|| format!("brak `assets` w odpowiedzi {}", api_url))?;
+    select_vllm_metal_wheel(assets, version, python_tag)
+}
+
+/// Picks the one asset named `vllm_metal-<version>-<tag>-<tag>-macosx_*_arm64.whl`;
+/// zero or several candidates are an error rather than a guess.
+fn select_vllm_metal_wheel(
+    assets: &[serde_json::Value],
+    version: &str,
+    python_tag: &str,
+) -> Result<(String, String)> {
+    let prefix = format!("vllm_metal-{version}-{python_tag}-{python_tag}-macosx_");
+    let matches: Vec<(&str, &str)> = assets
         .iter()
         .filter_map(|a| {
             let name = a.get("name").and_then(|n| n.as_str())?;
             let url = a.get("browser_download_url").and_then(|u| u.as_str())?;
-            if name.ends_with(".whl") {
-                Some((name.to_string(), url.to_string()))
-            } else {
-                None
-            }
+            (name.starts_with(&prefix) && name.ends_with("_arm64.whl")).then_some((name, url))
         })
-        .next()
-        .context("zadne z assets w releases/latest nie konczy sie na .whl")?;
-    log(&format!("pobieram wheel {}", wheel_name));
-    let dst = dst_dir.join(&wheel_name);
-    let resp = client
-        .get(&wheel_url)
-        .send()
-        .with_context(|| format!("GET {}", wheel_url))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("download wheel HTTP {}", resp.status());
+        .collect();
+    match matches.as_slice() {
+        [(name, url)] => {
+            require_bare_file_name(name)?;
+            Ok((name.to_string(), url.to_string()))
+        }
+        [] => anyhow::bail!("wydanie v{version} nie ma wheel {prefix}*_arm64.whl"),
+        many => anyhow::bail!(
+            "wydanie v{version} ma {} pasujace wheels ({}), oczekiwano jednego",
+            many.len(),
+            many.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+        ),
     }
-    let bytes = resp.bytes()?;
-    std::fs::write(&dst, &bytes).with_context(|| format!("zapis {}", dst.display()))?;
-    Ok(dst)
+}
+
+/// Downloads `url` (GitHub release hosts only, redirects included) and saves it
+/// as `dst_dir/<file_name>` only once its SHA-256 equals `sha256`.
+fn download_verified_wheel(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    file_name: &str,
+    sha256: &str,
+    dst_dir: &Path,
+) -> Result<PathBuf> {
+    require_bare_file_name(file_name)?;
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("niepoprawny URL {url}"))?;
+    check_github_download_url(&parsed)?;
+    let resp = client
+        .get(parsed)
+        .send()
+        .with_context(|| format!("GET {}", url))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download {} HTTP {}", file_name, resp.status());
+    }
+    let bytes = resp.bytes().with_context(|| format!("GET {}", url))?;
+    write_verified_file(&bytes, sha256, &dst_dir.join(file_name))
+}
+
+/// Writes `bytes` to `dst` when their SHA-256 equals `sha256`; on a mismatch
+/// nothing is written.
+fn write_verified_file(bytes: &[u8], sha256: &str, dst: &Path) -> Result<PathBuf> {
+    let actual = hex::encode(Sha256::digest(bytes));
+    if actual != sha256 {
+        anyhow::bail!(
+            "SHA-256 {} sie nie zgadza: oczekiwano {}, pobrano {}",
+            dst.display(),
+            sha256,
+            actual
+        );
+    }
+    std::fs::write(dst, bytes).with_context(|| format!("zapis {}", dst.display()))?;
+    Ok(dst.to_path_buf())
 }
 
 /// Naprawia znane upstream problemy w pyproject.toml sklonowanych repo.
@@ -2792,6 +3018,10 @@ mod tests {
                 install_mode: None,
                 editable_no_build_isolation: false,
                 vllm_version: None,
+                vllm_release_tag: None,
+                vllm_metal_version: None,
+                vllm_core_wheel_sha256: None,
+                vllm_metal_wheel_sha256: None,
                 vllm_metal_repo: None,
             },
             launch: LaunchSpec {
@@ -3299,5 +3529,219 @@ mod tests {
         };
         let id_env = template_identity(&base, Some(&variant), dir.path()).unwrap();
         assert_ne!(id0, id_env, "zmiana install_variants.env musi zmienic id");
+    }
+
+    #[test]
+    fn vllm_metal_core_wheel_url_targets_release_tag_not_version() {
+        assert_eq!(
+            vllm_metal_core_wheel_url("v0.33.0rc3", "0.33.0"),
+            "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/\
+             vllm-0.33.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
+        );
+    }
+
+    #[test]
+    fn vllm_metal_release_api_url_is_pinned_tag() {
+        let url = vllm_metal_release_api_url("vllm-project/vllm-metal", "0.33.0");
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/vllm-project/vllm-metal/releases/tags/v0.33.0"
+        );
+        assert!(!url.contains("latest"));
+    }
+
+    /// A vllm-metal `X.Y.*` release is built against vLLM core `X.Y`; a
+    /// mismatched pair (e.g. a `latest` plugin over an older core) breaks the
+    /// plugin at import time, so the bundle has to pin both sides together.
+    #[test]
+    fn shipped_vllm_metal_bundle_pins_matching_plugin_and_core() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tentaflow-containers/llm/python/vllm-metal");
+        let spec = read_bundle_spec_from_dir(&dir).unwrap();
+        let meta = &spec.bundle;
+        assert_eq!(meta.source, "vllm-metal");
+        let core = meta.vllm_version.as_deref().expect("vllm_version");
+        let tag = meta.vllm_release_tag.as_deref().expect("vllm_release_tag");
+        let plugin = meta
+            .vllm_metal_version
+            .as_deref()
+            .expect("vllm_metal_version");
+        let minor = |v: &str| v.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
+        assert_eq!(
+            minor(core),
+            minor(plugin),
+            "plugin {plugin} vs rdzen {core}"
+        );
+        assert!(
+            tag.starts_with(&format!("v{core}")),
+            "tag {tag} nie wskazuje wydania rdzenia {core}"
+        );
+        sha256_pin(
+            "vllm_core_wheel_sha256",
+            meta.vllm_core_wheel_sha256.as_deref(),
+        )
+        .unwrap();
+        sha256_pin(
+            "vllm_metal_wheel_sha256",
+            meta.vllm_metal_wheel_sha256.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(cpython_tag(&meta.python_version).unwrap(), "cp312");
+    }
+
+    #[test]
+    fn sha256_pin_requires_lowercase_hex_digest() {
+        let good = "74840d3eec2ec097de26c331f803e276b5c7eb235709e624cd9b58ee3cc5b5c8";
+        assert_eq!(sha256_pin("f", Some(good)).unwrap(), good);
+        assert!(sha256_pin("f", None).is_err());
+        assert!(sha256_pin("f", Some(&good.to_ascii_uppercase())).is_err());
+        assert!(sha256_pin("f", Some(&good[..63])).is_err());
+        assert!(sha256_pin("f", Some(&format!("{}g", &good[..63]))).is_err());
+    }
+
+    #[test]
+    fn write_verified_file_refuses_hash_mismatch_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("x.whl");
+        let other = hex::encode(Sha256::digest(b"other bytes"));
+        let err = write_verified_file(b"wheel bytes", &other, &dst).unwrap_err();
+        assert!(err.to_string().contains("SHA-256"), "{err}");
+        assert!(!dst.exists(), "plik o zlym hashu nie moze zostac zapisany");
+
+        let right = hex::encode(Sha256::digest(b"wheel bytes"));
+        assert_eq!(
+            write_verified_file(b"wheel bytes", &right, &dst).unwrap(),
+            dst
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"wheel bytes");
+    }
+
+    #[test]
+    fn github_download_url_check_allows_only_release_hosts_over_https() {
+        let ok = |u: &str| check_github_download_url(&reqwest::Url::parse(u).unwrap()).is_ok();
+        assert!(ok(
+            "https://github.com/vllm-project/vllm/releases/download/v1/a.whl"
+        ));
+        assert!(ok(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2"
+        ));
+        assert!(ok(
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/1"
+        ));
+        assert!(!ok(
+            "http://github.com/vllm-project/vllm/releases/download/v1/a.whl"
+        ));
+        assert!(!ok("https://evil.example/a.whl"));
+        assert!(!ok("https://github.com.evil.example/a.whl"));
+        assert!(!ok("https://api.github.com/repos/x/y"));
+    }
+
+    #[test]
+    fn download_verified_wheel_refuses_foreign_host_before_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = github_download_client().unwrap();
+        let sha = hex::encode(Sha256::digest(b""));
+        let err = download_verified_wheel(
+            &client,
+            "https://evil.example/vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl",
+            "vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl",
+            &sha,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("odmowa pobrania"), "{err}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    fn asset(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "browser_download_url": format!("https://github.com/vllm-project/vllm-metal/releases/download/v0.33.0/{name}"),
+        })
+    }
+
+    #[test]
+    fn select_vllm_metal_wheel_picks_single_cp_and_arm64_match() {
+        let assets = [
+            asset("vllm_metal-0.33.0-cp311-cp311-macosx_15_0_arm64.whl"),
+            asset("vllm_metal-0.33.0-cp312-cp312-macosx_15_0_x86_64.whl"),
+            asset("vllm_metal-0.33.0.tar.gz"),
+            asset("vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl"),
+        ];
+        let (name, url) = select_vllm_metal_wheel(&assets, "0.33.0", "cp312").unwrap();
+        assert_eq!(name, "vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl");
+        assert!(url.ends_with(&name));
+    }
+
+    #[test]
+    fn select_vllm_metal_wheel_refuses_ambiguous_or_missing_wheel() {
+        let assets = [
+            asset("vllm_metal-0.33.0-cp312-cp312-macosx_14_0_arm64.whl"),
+            asset("vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl"),
+        ];
+        let err = select_vllm_metal_wheel(&assets, "0.33.0", "cp312").unwrap_err();
+        assert!(err.to_string().contains("2 pasujace"), "{err}");
+
+        let err = select_vllm_metal_wheel(&assets[..1], "0.34.0", "cp312").unwrap_err();
+        assert!(err.to_string().contains("nie ma wheel"), "{err}");
+    }
+
+    #[test]
+    fn asset_names_with_path_components_are_refused() {
+        assert!(
+            require_bare_file_name("vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl").is_ok()
+        );
+        for bad in ["../x.whl", "a/b.whl", "/abs.whl", "..", ".", ""] {
+            assert!(require_bare_file_name(bad).is_err(), "{bad:?}");
+        }
+        let assets = [asset(
+            "vllm_metal-0.33.0-cp312-cp312-macosx_/../../evil_arm64.whl",
+        )];
+        assert!(select_vllm_metal_wheel(&assets, "0.33.0", "cp312").is_err());
+    }
+
+    #[test]
+    fn cpython_tag_from_major_minor() {
+        assert_eq!(cpython_tag("3.12").unwrap(), "cp312");
+        assert_eq!(cpython_tag("3.10.4").unwrap(), "cp310");
+        assert!(cpython_tag("3").is_err());
+        assert!(cpython_tag("3.x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_vllm_metal_torch_requirements_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let venv = tempfile::tempdir().unwrap();
+        let bin = venv.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let python = bin.join("python");
+        let missing = venv.path().join("vllm_metal/requirements-torch.txt");
+        std::fs::write(
+            &python,
+            format!("#!/bin/sh\necho '{}'\n", missing.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = vllm_metal_torch_requirements(venv.path()).unwrap_err();
+        assert!(err.to_string().contains("nie zawiera"), "{err}");
+
+        std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        std::fs::write(&missing, "torch==2.10.0\n").unwrap();
+        assert_eq!(vllm_metal_torch_requirements(venv.path()).unwrap(), missing);
+    }
+
+    #[test]
+    fn template_identity_changes_with_vllm_metal_wheel_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = vllm_bundle_spec();
+        let id0 = template_identity(&spec, None, dir.path()).unwrap();
+        spec.bundle.vllm_core_wheel_sha256 = Some("a".repeat(64));
+        let id_core = template_identity(&spec, None, dir.path()).unwrap();
+        assert_ne!(id0, id_core);
+        spec.bundle.vllm_metal_wheel_sha256 = Some("b".repeat(64));
+        let id_metal = template_identity(&spec, None, dir.path()).unwrap();
+        assert_ne!(id_core, id_metal);
     }
 }

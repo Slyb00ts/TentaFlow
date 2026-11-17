@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener LLM z vLLM 0.28.0 (PyPI wheels), direct-http (bez sidecara).
+# Opis: Kontener LLM z vLLM 0.34.0 (PyPI wheels), direct-http (bez sidecara).
 #       vLLM nasluchuje OpenAI API na 0.0.0.0:8000, Core gada HTTP wprost.
 # =============================================================================
 
@@ -13,10 +13,10 @@
 # wiec ten sam obraz dziala tez na Ampere/Ada/Hopper.
 ARG CUDA_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
-ARG TORCH_VERSION=2.13.0
-ARG TORCHVISION_VERSION=0.28.0
+ARG TORCH_VERSION=2.14.0
+ARG TORCHVISION_VERSION=0.29.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG VLLM_VERSION=0.28.0
+ARG VLLM_VERSION=0.34.0
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
 ARG TORCH_VERSION
@@ -45,9 +45,9 @@ RUN pip install --no-cache-dir \
     && pip install --no-cache-dir vllm==${VLLM_VERSION}
 
 # Ray w TYM SAMYM venv co vllm — wymagany do multi-node tensor-parallel
-# (head+worker, --distributed-executor-backend ray). 2.55.1 ma kola aarch64 +
-# x86_64 i jest kompatybilny z vLLM 0.28 / torch 2.13.
-RUN pip install --no-cache-dir ray==2.55.1
+# (head+worker, --distributed-executor-backend ray). 2.60.0 ma kola aarch64 +
+# x86_64 i jest kompatybilny z vLLM 0.34 / torch 2.14.
+RUN pip install --no-cache-dir ray==2.60.0
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
 # do pobierania zrodel safetensors. hf_transfer = szybsze rownolegle pobieranie.

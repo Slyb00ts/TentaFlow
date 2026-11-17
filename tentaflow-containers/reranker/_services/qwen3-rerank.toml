@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: reranker/_services/qwen3-rerank.toml
-# Opis: Reranker Qwen3 (cross-encoder) serwowany przez vLLM (--task score).
+# Opis: Reranker Qwen3 (cross-encoder) serwowany przez vLLM (--runner pooling).
 #       Apache-2.0, czysty komercyjnie. Wystawia OpenAI-compatible /v1/rerank +
 #       /v1/score. Warianty GGUF (`qwen3-rerank-gguf`) i MLX (`qwen3-rerank-mlx`)
 #       pokrywaja CPU/AMD/telefon i Apple Silicon. vLLM laduje model w trybie
@@ -13,8 +13,8 @@ backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calc
 provider = "tentaflow"
 category = "reranker"
 name = "Qwen3 Reranker"
-description_pl = "Reranker Qwen3 (cross-encoder) przez vLLM (--task score). Apache-2.0. Ranguje pasaze wzgledem zapytania. GGUF: qwen3-rerank-gguf, Apple: qwen3-rerank-mlx."
-description_en = "Qwen3 reranker (cross-encoder) via vLLM (--task score). Apache-2.0. Ranks passages against a query. GGUF: qwen3-rerank-gguf, Apple: qwen3-rerank-mlx."
+description_pl = "Reranker Qwen3 (cross-encoder) przez vLLM (--runner pooling). Apache-2.0. Ranguje pasaze wzgledem zapytania. GGUF: qwen3-rerank-gguf, Apple: qwen3-rerank-mlx."
+description_en = "Qwen3 reranker (cross-encoder) via vLLM (--runner pooling). Apache-2.0. Ranks passages against a query. GGUF: qwen3-rerank-gguf, Apple: qwen3-rerank-mlx."
 homepage = "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B"
 license = "Apache-2.0"
 icon = "vllm"

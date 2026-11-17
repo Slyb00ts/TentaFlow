@@ -1,5 +1,5 @@
 # Manifest serwisu IBM Granite Embedding — modele embeddingow serwowane przez
-# vLLM w trybie --task embed (dedykowany kontekst docker granite-embedding).
+# vLLM w trybie --runner pooling (dedykowany kontekst docker granite-embedding).
 
 [engine]
 id = "granite-embedding"
@@ -7,8 +7,8 @@ backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calc
 provider = "ibm"
 category = "embeddings"
 name = "IBM Granite Embedding"
-description_pl = "Modele embeddingów IBM Granite serwowane przez vLLM (--task embed). Wybierz wariant w kreatorze."
-description_en = "IBM Granite embedding models served via vLLM (--task embed). Pick a variant in the wizard."
+description_pl = "Modele embeddingów IBM Granite serwowane przez vLLM (--runner pooling). Wybierz wariant w kreatorze."
+description_en = "IBM Granite embedding models served via vLLM (--runner pooling). Pick a variant in the wizard."
 homepage = "https://huggingface.co/ibm-granite"
 license = "Apache-2.0"
 icon = "vllm"

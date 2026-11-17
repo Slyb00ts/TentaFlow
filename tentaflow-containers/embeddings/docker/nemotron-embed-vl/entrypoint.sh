@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: vLLM w trybie embeddings multimodalnych (vllm serve --task embed),
+# Opis: vLLM w trybie embeddings multimodalnych (vllm serve --runner pooling),
 #       direct-http (bez sidecara). vLLM laduje multimodalny model Nemotron
 #       Embed VL i serwuje /v1/embeddings dla tekstu i obrazow na
 #       0.0.0.0:${VLLM_PORT}. Flagi --trust-remote-code oraz --limit-mm-per-prompt
@@ -50,10 +50,11 @@ fi
 
 # Bind 0.0.0.0 WEWNATRZ kontenera: ruch z docker-publish (host 127.0.0.1:host_http)
 # trafia na interfejs kontenera, nie na jego loopback. Containment robi host bind.
-echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--task embed multimodal, ${#ENGINE_ARGS[@]} args)"
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--runner pooling multimodal, ${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \
   --host 0.0.0.0 \
   --port "$VLLM_PORT" \
+  --runner pooling \
   --trust-remote-code \
   --limit-mm-per-prompt "{\"image\": ${MM_IMAGE_LIMIT}}" \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \

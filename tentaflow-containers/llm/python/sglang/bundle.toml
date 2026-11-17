@@ -1,12 +1,12 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.17)"
+description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.23)"
 python_version = "3.12"
-# Pinned na najnowsza stabilna wersje sglang (2026-08, z sglang-kernel
-# pod cu130 wspierajaca sm_103 / B300). Update wymaga regeneracji
-# requirements.lock + bumpa pakietu.
+# Pinned na stabilna wersje sglang z sglang-kernel pod cu130 (sm_103 / B300);
+# od 0.5.20 sglang nie publikuje juz kol pod CUDA 12. Bump wymaga zmiany
+# pinow torcha w install_variants (sglang pinuje torch==X dokladnie).
 source = "pypi"
-pypi_package = "sglang[all]==0.5.17"
+pypi_package = "sglang[all]==0.5.23"
 
 [launch]
 command = "python"
@@ -45,13 +45,18 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-# Torch 2.11 cu130 to jedyne kola dla sm_103 / B300 (cu124/torch 2.6 NIE
+# Torch cu130 to jedyne kola dla sm_103 / B300 (cu124/torch 2.6 NIE
 # obsluguja Blackwella). Pinned, zeby uv trzymal sie wersji zgodnej z
-# SGLang 0.5.17.
-extras = ["torch==2.11.0", "torchvision==0.26.0"]
+# SGLang 0.5.23 (torch==2.14.1; torchvision 0.29.1 jest para tego torcha).
+#
+# sglang depends on the pre-release `flash-attn-4>=4.0.0b18`; uv only admits a
+# pre-release that a first-party requirement names, so without this entry a
+# clean venv fails to resolve sglang at all.
+extras = ["torch==2.14.1", "torchvision==0.29.1", "flash-attn-4>=4.0.0b18"]
 
 [[install_variants]]
 backend = "rocm"
-extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.11.0", "torchvision==0.26.0"]
+# rocm7.0 has no torch >= 2.11 wheels; rocm7.2 is the index that carries 2.14.1.
+extra_index = "https://download.pytorch.org/whl/rocm7.2"
+extras = ["torch==2.14.1", "torchvision==0.29.1", "flash-attn-4>=4.0.0b18"]
 install_hint = "SGLANG_BACKEND=rocm"

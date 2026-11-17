@@ -1,6 +1,6 @@
 # Manifest serwisu Jina Embeddings v5 (tekst) — modele embeddingow oparte na
 # Qwen3-0.6B (1024d, Matryoshka, last-token pooling) serwowane przez vLLM
-# (--task embed). Docker (direct-http) oraz natywny python-bundle (CUDA/ROCm).
+# (--runner pooling). Docker (direct-http) oraz natywny python-bundle (CUDA/ROCm).
 # Apple Silicon: osobny silnik `jina-embed-mlx`; lekki CPU/AMD/telefon:
 # `jina-embed-gguf`. Repo per-task maja wmergowany adapter (retrieval/
 # text-matching) zgodny z vLLM/TEI. Licencja CC-BY-NC-4.0 (niekomercyjna).
@@ -11,8 +11,8 @@ backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calc
 provider = "tentaflow"
 category = "embeddings"
 name = "Jina Embeddings v5 (Text)"
-description_pl = "Embeddingi tekstu Jina v5 (Qwen3-0.6B, 1024d, last-token) przez vLLM (--task embed). CUDA/ROCm. Apple: jina-embed-mlx, lekki CPU/telefon: jina-embed-gguf."
-description_en = "Jina v5 text embeddings (Qwen3-0.6B, 1024d, last-token) via vLLM (--task embed). CUDA/ROCm. Apple: jina-embed-mlx, light CPU/phone: jina-embed-gguf."
+description_pl = "Embeddingi tekstu Jina v5 (Qwen3-0.6B, 1024d, last-token) przez vLLM (--runner pooling). CUDA/ROCm. Apple: jina-embed-mlx, lekki CPU/telefon: jina-embed-gguf."
+description_en = "Jina v5 text embeddings (Qwen3-0.6B, 1024d, last-token) via vLLM (--runner pooling). CUDA/ROCm. Apple: jina-embed-mlx, light CPU/phone: jina-embed-gguf."
 homepage = "https://huggingface.co/jinaai"
 license = "cc-by-nc-4.0"
 icon = "vllm"

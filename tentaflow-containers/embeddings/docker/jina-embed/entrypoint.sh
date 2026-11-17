@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: vLLM w trybie embeddings (vllm serve --task embed), direct-http (bez
+# Opis: vLLM w trybie embeddings (vllm serve --runner pooling), direct-http (bez
 #       sidecara). Core gada HTTP wprost do host-mapped portu; vLLM laduje model
 #       embeddingow Jina v5 i serwuje /v1/embeddings na 0.0.0.0:${VLLM_PORT}.
 #       --trust-remote-code bo repo Jina dostarcza wlasny kod architektury.
@@ -13,7 +13,7 @@ MODEL="${MODEL:?MODEL env required, np. 'jinaai/jina-embeddings-v5-text-small-re
 VLLM_PORT="${VLLM_PORT:-8000}"
 
 # Argumenty silnika przychodza jako "$@" (bollard Cmd array zbudowany przez
-# Rust docker.rs). Defaulty (--task embed, --dtype, --max-model-len, gpu-memory)
+# Rust docker.rs). Defaulty (--dtype, --max-model-len, gpu-memory)
 # pochodza z Rust/bundle, nie z tego skryptu.
 ENGINE_ARGS=("$@")
 
@@ -42,10 +42,11 @@ fi
 
 # Bind 0.0.0.0 WEWNATRZ kontenera: ruch z docker-publish (host 127.0.0.1:host_http)
 # trafia na interfejs kontenera, nie na jego loopback. Containment robi host bind.
-echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--task embed, ${#ENGINE_ARGS[@]} args)"
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--runner pooling, ${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \
   --host 0.0.0.0 \
   --port "$VLLM_PORT" \
+  --runner pooling \
   --trust-remote-code \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
   "${ENGINE_ARGS[@]}"

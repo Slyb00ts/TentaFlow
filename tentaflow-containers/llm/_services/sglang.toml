@@ -11,7 +11,7 @@ license = "Apache-2.0"
 icon = "sglang"
 default_port = 30000
 api = "openai-compatible"
-version = "0.5.17"
+version = "0.5.23"
 
 [deploy.docker]
 context_path = "llm/docker/sglang"
@@ -24,12 +24,12 @@ transport = "direct-http"
 # ZADNYM indeksie (PyPI / docs.sglang.ai cu129 / cu130) nie ma kerneli sm80/86/89
 # — tylko sm90/sm100; a build ze zrodel pod sm86 nie kompiluje sie czysto na cu13.
 # (Docs sglang "sm75+" dotyczy FlashInfer-attention, nie sgl_kernel custom-ops.)
-# Na Ampere/Ada uzywaj vLLM (dziala). Gdy sglang dostanie prebuilt sm8x, wystarczy
-# dodac tu arch_variants z SGL_KERNEL_INDEX — Dockerfile to obsluguje.
+# Na Ampere/Ada uzywaj vLLM (dziala). Od 0.5.20 sglang nie wydaje kol pod CUDA 12,
+# wiec indeks cu129 (najwyzej sglang-kernel 0.4.6) nie jest juz droga do sm8x.
 [deploy.docker.default_build_args]
 CUDA_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
-SGLANG_VERSION = "0.5.17"
+SGLANG_VERSION = "0.5.23"
 
 [deploy.native]
 platforms = ["linux", "windows"]

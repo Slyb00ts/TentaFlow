@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: Dockerfile
 # Opis: Obraz Jina Reranker v3 = vLLM (PyPI wheels) w trybie score/rerank
-#       (--task score), direct-http (bez sidecara). vLLM nasluchuje OpenAI API na
+#       (--runner pooling), direct-http (bez sidecara). vLLM nasluchuje OpenAI API na
 #       0.0.0.0:${VLLM_PORT} (/v1/rerank + /v1/score); Core gada HTTP wprost do
 #       host-mapped portu. --trust-remote-code bo repo Jina dostarcza wlasny kod.
 # =============================================================================
@@ -16,12 +16,16 @@ RUN python3 -m venv /opt/vllm-venv
 ENV PATH="/opt/vllm-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
+# vLLM comes from its RELEASE index for the pinned version (the CUDA 13.0
+# build B300/sm_103 needs). Not the nightly index: it holds only dev builds, so
+# a release pin would silently resolve from PyPI. The URL embeds the version:
+# bump it with the pin.
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
-      torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
+      torch==2.14.0 torchvision==0.29.0 torchaudio==2.11.0 \
     && pip install --no-cache-dir \
-      --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
-      vllm==0.28.0
+      --extra-index-url https://wheels.vllm.ai/0.34.0/cu130 \
+      vllm==0.34.0
 
 RUN pip install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1

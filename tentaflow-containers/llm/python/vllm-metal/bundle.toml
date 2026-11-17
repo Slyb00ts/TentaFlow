@@ -3,11 +3,12 @@
 # Opis: vLLM dla Apple Silicon przez plugin vllm-project/vllm-metal (MLX
 #       backend). Source=vllm-metal uruchamia custom install flow w
 #       `tentaflow-core/src/deploy/python_venv.rs::install_vllm_metal()`
-#       ktory odwzorowuje upstream install.sh:
-#         1) curl tarball vllm v<vllm_version> z GitHub Releases
-#         2) uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-#         3) CXXFLAGS="-Wno-parentheses" uv pip install <vllm_src>
-#         4) uv pip install <wheel vllm-metal z GitHub Releases/latest>
+#       ktory odwzorowuje sciezke release upstream install.sh:
+#         1) uv pip install <prebuilt wheel rdzenia vllm macOS arm64 z GitHub
+#            Release vllm_release_tag, zweryfikowany vllm_core_wheel_sha256>
+#         2) uv pip install <wheel vllm-metal z GitHub Release v<vllm_metal_version>,
+#            zweryfikowany vllm_metal_wheel_sha256>
+#         3) uv pip install -r vllm_metal/requirements-torch.txt (pin torcha pluginu)
 # =============================================================================
 
 [bundle]
@@ -15,7 +16,19 @@ engine = "vllm-metal"
 description = "vLLM Metal plugin dla Apple Silicon (MLX)"
 python_version = "3.12"
 source = "vllm-metal"
-vllm_version = "0.26.0"
+# Plugin and core are pinned as a PAIR: a vllm-metal X.Y.* release requires
+# vLLM core X.Y (`.github/vllm-release-tag.commit` in the plugin repo). The
+# vLLM 0.33.0 wheels are assets of GitHub Release v0.33.0rc3 (same commit); the
+# v0.33.0 tag has no Release and therefore no assets.
+vllm_version = "0.33.0"
+vllm_release_tag = "v0.33.0rc3"
+vllm_metal_version = "0.33.0"
+# SHA-256 of the exact wheels the install downloads; changing a version above
+# requires recomputing the matching hash.
+# vllm-0.33.0+cpu-cp38-abi3-macosx_11_0_arm64.whl (vllm-project/vllm v0.33.0rc3)
+vllm_core_wheel_sha256 = "74840d3eec2ec097de26c331f803e276b5c7eb235709e624cd9b58ee3cc5b5c8"
+# vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl (vllm-project/vllm-metal v0.33.0)
+vllm_metal_wheel_sha256 = "fcf2224250976412a3a8304ec6f48525060f6d30a38c1afad0a97844e03c8dd0"
 vllm_metal_repo = "vllm-project/vllm-metal"
 
 [launch]
@@ -37,9 +50,3 @@ internal_port = 8000
 gpu_memory_gb = 8
 disk_gb = 20
 platforms = ["macos-aarch64"]
-
-[health]
-# vllm-metal install_vllm_metal() rebuilds C++ kernels with CXXFLAGS — uv pip
-# can sit silent for several minutes during linking on Apple Silicon, so we
-# extend the smart probe stagnation window past the default 300s.
-stagnation_window_secs = 600

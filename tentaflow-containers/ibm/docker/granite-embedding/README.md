@@ -1,9 +1,9 @@
-# IBM Granite Embedding (vLLM `--task embed`)
+# IBM Granite Embedding (vLLM `--runner pooling`)
 
 Obraz dla serwowania modeli embeddingów IBM Granite. Składa się z dwóch
 procesów uruchamianych równolegle przez `entrypoint.sh`:
 
-- **vLLM** w trybie embeddingów (`vllm serve $MODEL --task embed`), nasłuchuje
+- **vLLM** w trybie embeddingów (`vllm serve $MODEL --runner pooling`), nasłuchuje
   OpenAI-compatible API na `127.0.0.1:8000` i wystawia `/v1/embeddings`.
 - **sidecar TentaFlow** — opakowuje to API w QUIC (iroh) dla klientów mesh.
   Proxuje `/v1` (w tym `/v1/embeddings`) zgodnie z `config.default.toml`.
@@ -20,16 +20,14 @@ kontenera przy deployu (dostęp do repozytoriów gated).
 
 ## Ważna uwaga: wsparcie vLLM zależy od architektury modelu
 
-Tryb `--task embed` w vLLM obsługuje embeddingi tylko dla architektur, które
-dany build vLLM zna. Ten obraz pinuje **vLLM 0.28.0**:
+Tryb `--runner pooling` w vLLM obsługuje embeddingi tylko dla architektur, które
+dany build vLLM zna. Ten obraz pinuje **vLLM 0.34.0**, którego rejestr modeli
+embeddingowych zawiera architektury wszystkich trzech presetów:
 
-- Warianty Granite oparte o **RoBERTa / XLM-RoBERTa** (np.
-  `granite-embedding-30m-english`, `granite-embedding-278m-multilingual`) są
-  obsługiwane przez vLLM `--task embed`.
-- Nowsze warianty „r2" (`granite-embedding-english-r2`) bazują na
-  **ModernBERT** i mogą wymagać **nowszej wersji vLLM niż 0.28.0**. Jeśli
-  serwowanie wariantu r2 zwróci błąd nieobsługiwanej architektury, należy
-  zaktualizować pinowaną wersję vLLM w `Dockerfile`.
+- `RobertaModel` — `granite-embedding-30m-english`,
+- `XLMRobertaModel` — `granite-embedding-278m-multilingual`,
+- `ModernBertModel` — `granite-embedding-english-r2`.
 
-To jest realna zależność od wersji vLLM, a nie gwarancja działania każdego
-wariantu na pinowanej dziś wersji.
+Nowy wariant Granite o innej architekturze wymaga sprawdzenia, czy pinowana
+wersja vLLM ją rejestruje; jeśli nie, należy zaktualizować wersję vLLM
+w `Dockerfile`.

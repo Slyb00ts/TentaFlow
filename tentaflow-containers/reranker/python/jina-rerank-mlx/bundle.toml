@@ -10,7 +10,7 @@ engine = "jina-rerank-mlx"
 description = "jina-reranker-v3 via Jina MLX port + FastAPI /v1/rerank (Apple Silicon)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "mlx"
+pypi_package = "mlx==0.32.4"
 
 [launch]
 command = "uvicorn"
@@ -31,7 +31,7 @@ backend = "metal"
 extras = [
     "fastapi==0.115.6",
     "uvicorn==0.34.0",
-    "mlx-lm",
+    "mlx-lm==0.32.2",
     "transformers",
     "huggingface_hub",
 ]

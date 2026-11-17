@@ -1,9 +1,9 @@
 # =============================================================================
 # Plik: reranker/_services/jina-rerank.toml
 # Opis: Reranker jina-reranker-v3 (listwise, Qwen3-0.6B) serwowany przez vLLM
-#       (--task score). Wystawia OpenAI-compatible /v1/rerank + /v1/score.
+#       (--runner pooling). Wystawia OpenAI-compatible /v1/rerank + /v1/score.
 #       UWAGA: v3 jest listwise (jeden forward query+do 64 dokumentow), a vLLM
-#       --task score to pointwise cross-encoder — przy starszym vLLM ranking moze
+#       --runner pooling to pointwise cross-encoder — przy starszym vLLM ranking moze
 #       sie roznic od oficjalnego API Jina; zweryfikuj jakosc po deployu albo
 #       uzyj wariantu transformers. Licencja CC-BY-NC-4.0 (niekomercyjna).
 #       Warianty: GGUF `jina-rerank-gguf`, Apple MLX `jina-rerank-mlx`.
@@ -15,8 +15,8 @@ backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calc
 provider = "tentaflow"
 category = "reranker"
 name = "Jina Reranker v3"
-description_pl = "Reranker jina-reranker-v3 (listwise, Qwen3-0.6B) przez vLLM (--task score). Ranguje pasaze wzgledem zapytania. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. Licencja NC."
-description_en = "jina-reranker-v3 (listwise, Qwen3-0.6B) via vLLM (--task score). Ranks passages against a query. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. NC license."
+description_pl = "Reranker jina-reranker-v3 (listwise, Qwen3-0.6B) przez vLLM (--runner pooling). Ranguje pasaze wzgledem zapytania. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. Licencja NC."
+description_en = "jina-reranker-v3 (listwise, Qwen3-0.6B) via vLLM (--runner pooling). Ranks passages against a query. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. NC license."
 homepage = "https://huggingface.co/jinaai/jina-reranker-v3"
 license = "cc-by-nc-4.0"
 icon = "vllm"

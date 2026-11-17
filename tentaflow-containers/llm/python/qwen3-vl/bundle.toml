@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: llm/python/qwen3-vl/bundle.toml
 # Opis: Zamiennik VLM Qwen3-VL dla GPU nie-NVIDIA (AMD/ROCm) jako natywny
-#       python-bundle — vLLM (PyPI pinned 0.28.0) serwowany w trybie
+#       python-bundle — vLLM (PyPI pinned 0.34.0) serwowany w trybie
 #       generacyjnym chat z obsluga obrazow. CUDA (cu130) oraz ROCm (rocm7.0).
 #       Eksponuje OpenAI-compatible /v1/chat/completions z modalnoscia
 #       tekst + obraz.
@@ -9,16 +9,16 @@
 
 [bundle]
 engine = "qwen3-vl"
-description = "Qwen3-VL (VLM chat) via vLLM (PyPI, pinned 0.28.0)"
+description = "Qwen3-VL (VLM chat) via vLLM (PyPI, pinned 0.34.0)"
 python_version = "3.12"
-# Pinned na 0.28.0 dla reproducibility — git main moze rozjechac sie z deps.
+# Pinned na 0.34.0 dla reproducibility — git main moze rozjechac sie z deps.
 source = "pypi"
-pypi_package = "vllm==0.28.0"
+pypi_package = "vllm==0.34.0"
 
 [launch]
 command = "python"
 # Bundle dostarcza identity flags (model + transport) i baseline defaults.
-# Brak `--task embed` — silnik dziala generacyjnie (chat). `--trust-remote-code`
+# Brak `--runner pooling` — silnik dziala generacyjnie (chat). `--trust-remote-code`
 # laduje wlasny procesor multimodalny modelu Qwen3-VL, a `--limit-mm-per-prompt`
 # wlacza sciezke obrazow. `--gpu-memory-utilization` celowo NIE jest tu —
 # backend (`python_bundle.rs::prepare`) zarzadza ta flaga (auto-clamp wzgledem
@@ -47,12 +47,14 @@ gpu_memory_gb = 8
 disk_gb = 20
 platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 
-# vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny PyPI to cu129
-# i nie ma optymalizacji Blackwell. extra_index wskazuje nightly cu130 vLLM;
-# torch tez idzie z cu130 (Dockerfile pobiera go z download.pytorch.org/whl/cu130).
+# vLLM comes from its RELEASE index for the pinned version, which serves the
+# CUDA 13.0 build B300 (sm_103) needs. Not the nightly index: it holds only dev
+# builds (0.34.0rc1.devN), so a release pin would silently resolve from PyPI.
+# The URL embeds the version: bump it with `pypi_package`.
+# torch resolves from PyPI, whose torch 2.14.0 is itself a CUDA 13.0 build.
 [[install_variants]]
 backend = "cuda"
-extra_index = "https://wheels.vllm.ai/nightly/cu130"
+extra_index = "https://wheels.vllm.ai/0.34.0/cu130"
 extras = []
 
 [[install_variants]]

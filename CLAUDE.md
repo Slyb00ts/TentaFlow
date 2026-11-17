@@ -492,12 +492,20 @@ native (`python-bundle`) deployment.
   private/local subresource requests inside Playwright routing.
 - `test-runner` — see Project Studio below.
 
-LLM engine versions live in the container manifests: vLLM 0.28.0 on PyTorch 2.13.0 +
-torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
-official ROCm wheel index. DGX Spark builds vLLM 0.28.0 from source and the DeepSeek DSpark
-variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
-`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.28.0 needs
-`vllm-dspark-src`, because the old overlay no longer applies to current sources.
+LLM engine versions live in the container manifests: vLLM 0.34.0 on PyTorch 2.14.0 +
+torchvision 0.29.0 (cu130), SGLang 0.5.23 on PyTorch 2.14.1 + torchvision 0.29.1 (cu130 only —
+no CUDA 12 wheels since 0.5.20; ROCm torch from `whl/rocm7.2`). ROCm vLLM variants install from
+the official ROCm wheel index, whose vLLM wheel pins its own torch build — so the shared vLLM
+`requirements.lock` pins no torch and only the cuda variant carries the torch triple. vLLM
+0.34 has no `--task`: pooling engines (embeddings, rerankers) launch with `--runner pooling`.
+DGX Spark builds vLLM 0.34.0 from source (`vllm-spark`). The DeepSeek DSpark variant
+(`vllm-dspark-src`, and `scripts/build-vllm-spark-venv.sh` for the native cluster) stays on vLLM
+0.28.0, because its local `nvfp4_ds_mla` patch targets that tree: from 0.34 upstream defines
+`nvfp4_ds_mla` itself as a different, SM100-only NVFP4 format, while DeepSeek V4 still rejects it.
+Profile `vllm-dspark` is legacy (external vLLM 0.24 image + old overlay). vllm-metal is pinned as
+a PAIR in its bundle (`vllm_version` + `vllm_release_tag` + `vllm_metal_version`, never
+`releases/latest`): a plugin release X.Y requires vLLM core X.Y, installed from vLLM's prebuilt
+macOS arm64 wheel.
 
 vLLM recipes (`tentaflow-core/src/deploy/vllm_recipes.rs`) resolve in a cascade: exact HF id →
 normalized id (quantization/packaging suffixes stripped, same org then canonical orgs) →
