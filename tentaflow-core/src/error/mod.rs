@@ -72,6 +72,20 @@ pub enum CoreError {
     #[error("Service overloaded ({reason}), retry after {retry_after_ms} ms")]
     Overloaded { reason: String, retry_after_ms: u64 },
 
+    /// A model service already serves `max_concurrent` requests and none ended
+    /// within the service's `timeout_ms`. A capacity signal of the backend, not
+    /// a fault of the caller, so it is a 503 with `Retry-After` (unlike
+    /// `Overloaded`, which is a refusal under a policy of the caller's flow).
+    ///
+    /// `backend` names the service for logs. It is deliberately not in the
+    /// message, which reaches clients: the text starts with the stable code
+    /// `backend.busy`, like `sla.overloaded`, and carries no node or service id.
+    #[error("backend.busy: retry after {retry_after_ms} ms")]
+    BackendBusy {
+        backend: String,
+        retry_after_ms: u64,
+    },
+
     /// Timeout podczas oczekiwania na odpowiedz z backendu
     #[error("Timeout podczas komunikacji z backendem '{backend_url}': {timeout_ms}ms")]
     Timeout {
@@ -153,7 +167,7 @@ impl CoreError {
             // 503 Service Unavailable — backendy niedostepne lub kolejka pelna
             CoreError::AllBackendsUnavailable { .. } => 503,
             CoreError::SttServiceUnavailable => 503,
-            CoreError::QueueFull { .. } => 503,
+            CoreError::QueueFull { .. } | CoreError::BackendBusy { .. } => 503,
 
             // 504 Gateway Timeout
             CoreError::Timeout { .. } => 504,
@@ -176,7 +190,9 @@ impl CoreError {
                 "Model processing failed. Please try again later.".to_string()
             }
             CoreError::ModelNotFound { model_name } => format!("Model not found: {model_name}"),
-            CoreError::QueueFull { .. } | CoreError::Overloaded { .. } => {
+            CoreError::QueueFull { .. }
+            | CoreError::Overloaded { .. }
+            | CoreError::BackendBusy { .. } => {
                 "Service is busy. Please try again later.".to_string()
             }
             _ => self.to_string(),
@@ -188,7 +204,8 @@ impl CoreError {
     /// zero, so a client that obeys it always pauses.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            CoreError::Overloaded { retry_after_ms, .. } => {
+            CoreError::Overloaded { retry_after_ms, .. }
+            | CoreError::BackendBusy { retry_after_ms, .. } => {
                 Some(retry_after_ms.div_ceil(1000).max(1))
             }
             _ => None,
@@ -233,5 +250,19 @@ mod overloaded_tests {
         assert_eq!(overloaded(1_001).retry_after_secs(), Some(2));
         assert_eq!(overloaded(0).retry_after_secs(), Some(1), "never zero");
         assert_eq!(CoreError::SttServiceUnavailable.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn a_busy_backend_is_a_503_with_a_retry_after() {
+        let busy = CoreError::BackendBusy {
+            backend: "service 3".into(),
+            retry_after_ms: 1_500,
+        };
+        assert_eq!(busy.status_code(), 503);
+        assert_eq!(busy.retry_after_secs(), Some(2));
+        assert_eq!(
+            busy.client_message(),
+            "Service is busy. Please try again later."
+        );
     }
 }

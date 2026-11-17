@@ -522,10 +522,33 @@ pub fn update_health(conn: &Connection, id: i64, ok: bool, err: Option<&str>) ->
     Ok(())
 }
 
+/// Largest `max_concurrent` a service may be given.
+pub const MAX_CONCURRENT_LIMIT: u64 = 1024;
+
+/// Checks the in-flight limit of a service config. `max_concurrent` is a whole
+/// number from 1 to 1024, or 0, which means "not set" (no limit); a key that is
+/// absent also means no limit. Anything else (a string, a fraction, a negative
+/// number, more than 1024) is refused at the write boundary instead of being
+/// silently read as the default later.
+pub fn validate_max_concurrent(config: &serde_json::Value) -> std::result::Result<(), String> {
+    match config.get("max_concurrent") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(value) => match value.as_u64() {
+            Some(n) if n <= MAX_CONCURRENT_LIMIT => Ok(()),
+            _ => Err(format!(
+                "max_concurrent must be a whole number from 1 to {MAX_CONCURRENT_LIMIT} (0 = no limit), got {value}"
+            )),
+        },
+    }
+}
+
 /// Nadpisuje `config_json`. Używane przez `service_update` handler gdy
 /// admin edytuje serwis przez Edit modal — backend regeneruje konfigurację
 /// z manifest schema parameters i deserializuje całość do JSON.
 pub fn update_config_json(conn: &Connection, id: i64, config_json: &str) -> Result<()> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(config_json) {
+        validate_max_concurrent(&parsed).map_err(|e| anyhow!("update_config_json: {e}"))?;
+    }
     let n = conn.execute(
         "UPDATE services SET config_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
         params![id, config_json],
@@ -1027,5 +1050,32 @@ mod tests {
             },
         );
         assert!(err.is_err(), "duplicate (service_id, model_name) must fail");
+    }
+}
+
+#[cfg(test)]
+mod max_concurrent_tests {
+    use super::validate_max_concurrent;
+    use serde_json::json;
+
+    #[test]
+    fn max_concurrent_is_checked_at_the_write_boundary() {
+        for ok in [
+            json!({}),
+            json!({"max_concurrent": 1}),
+            json!({"max_concurrent": 1024}),
+            json!({"max_concurrent": 0}),
+            json!({"max_concurrent": null}),
+        ] {
+            assert!(validate_max_concurrent(&ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            json!({"max_concurrent": 1025}),
+            json!({"max_concurrent": -1}),
+            json!({"max_concurrent": "8"}),
+            json!({"max_concurrent": 2.5}),
+        ] {
+            assert!(validate_max_concurrent(&bad).is_err(), "{bad}");
+        }
     }
 }

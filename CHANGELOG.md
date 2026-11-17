@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
-### Limity i SLA usług (TB-03, etap 1–2)
+### Limity i SLA usług (TB-03)
 
 - Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,
   replikowane przez Sync Ledger w zakresie organizacji: polityka jest wspólna
@@ -33,6 +33,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kosztowny przepływ może się wykonać do trzech razy.
 - Przebiegi z magistrali na razie dostają tylko timeout jako zabezpieczenie.
   Limit dla magistrali przejmie reaktor w kolejnym kroku.
+- `max_concurrent` usługi AI jest teraz prawdziwym limitem równoczesnych
+  wywołań na węźle. Obejmuje usługi HTTP, QUIC i silniki wbudowane
+  (llama.cpp, MLX, sherpa) oraz endpointy `/v1/infer`, `/v1/rerank`,
+  `/v1/ranking` i generowanie obrazów. Strumień trzyma slot do końca.
+  Brak klucza oznacza brak limitu, jak dotąd; dozwolone wartości to 0–1024,
+  gdzie 0 też znaczy brak limitu.
+- Zajęte wywołanie czeka najwyżej `timeout_ms` usługi. Potem `/v1` zwraca 503
+  z `Retry-After`, a WebSocket błąd `backend.busy`. Komunikat nie zawiera
+  identyfikatorów usługi ani węzła.
+- Przy kilku replikach zajęta replika nie blokuje wolnej: żądanie bez
+  czekania przechodzi do następnej i czeka tylko na ostatniej. Odmowa z
+  powodu zajętości nie liczy się jako awaria w circuit breakerze.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

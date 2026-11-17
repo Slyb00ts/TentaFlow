@@ -7,11 +7,14 @@
 
 use crate::config::ServiceBackend;
 use crate::error::{CoreError, Result};
+use crate::services::limiter::{HoldUntilEnd, ServiceLimiter, ServicePermit};
+use crate::services::runtime::circuit_breaker::CallGuard;
 use crate::services::runtime::{CircuitBreaker, CircuitBreakerConfig};
 
 use crate::api::openai::types::*;
 
 use reqwest::{Client, StatusCode};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
@@ -82,6 +85,12 @@ pub struct BackendClient {
     ///     `request_override = true`; konsumowane przez embedded loader, nie
     ///     przez BackendClient (dla HTTP/QUIC trafia przez python_request).
     request_overrides: tentaflow_protocol::RequestTimeParameters,
+
+    /// In-flight limit of the service this client talks to. Comes from the
+    /// node-global map (`services::limiter`), so rebuilding the client does not
+    /// reset it. `None` for a client that belongs to no service (tests, ad-hoc
+    /// probes): nothing is limited.
+    limiter: Option<Arc<ServiceLimiter>>,
 
     /// Lazily-initialised ChatGPT subscription (Codex) credential cache. Only
     /// populated when `request_format == "codex"`; holds the refreshed
@@ -290,7 +299,7 @@ impl BackendClient {
         // Utworz reqwest::Client z timeout
         let client = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
-            .pool_max_idle_per_host(config.max_concurrent) // Connection pooling
+            .pool_max_idle_per_host(config.max_concurrent) // idle pool size only; the in-flight limit is `limiter`
             .build()
             .map_err(|e| CoreError::InternalError {
                 message: "Nie mozna utworzyc HTTP client".to_string(),
@@ -340,21 +349,44 @@ impl BackendClient {
             parse_url,
             infer_url,
             request_overrides,
+            limiter: None,
             codex_creds: tokio::sync::RwLock::new(None),
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn circuit_breaker(&self) -> &CircuitBreaker {
+        &self.circuit_breaker
+    }
+
+    /// Attaches the in-flight limit of the service this client talks to.
+    pub fn with_limiter(mut self, limiter: Arc<ServiceLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    /// Takes a slot of the service's in-flight limit, waiting at most the
+    /// service's `timeout_ms`. Called at the point a request is about to be sent
+    /// and held by the caller until the call (or the stream) ends. `None` when
+    /// the client has no limit.
+    pub(crate) async fn acquire_slot(&self) -> Result<Option<ServicePermit>> {
+        match &self.limiter {
+            Some(limiter) => Ok(Some(limiter.acquire().await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Sprawdza circuit breaker - zwraca blad jesli backend niedostepny (OPEN)
-    fn check_circuit_breaker(&self) -> Result<()> {
-        if !self.circuit_breaker.can_execute() {
-            return Err(CoreError::BackendError {
+    fn check_circuit_breaker(&self) -> Result<CallGuard> {
+        match self.circuit_breaker.admit() {
+            Some(guard) => Ok(guard),
+            None => Err(CoreError::BackendError {
                 backend_url: self.url.clone(),
                 message: "Circuit breaker OPEN - backend unavailable".to_string(),
                 source: None,
             }
-            .into());
+            .into()),
         }
-        Ok(())
     }
 
     /// Zastosuj model_name_override na podanym modelu jesli skonfigurowano
@@ -425,7 +457,10 @@ impl BackendClient {
         &self,
         mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
 
         // ChatGPT subscription (Codex) speaks the Responses API at a different
@@ -528,7 +563,8 @@ impl BackendClient {
         &self,
         mut request: ChatCompletionRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
-        self.check_circuit_breaker()?;
+        let slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
 
         // Wymuszamy stream = true
         request.stream = true;
@@ -536,14 +572,15 @@ impl BackendClient {
         self.apply_model_override(&mut request.model);
 
         if self.request_format.as_deref() == Some("codex") {
-            return super::codex::chat_completion_stream(
+            let stream = super::codex::chat_completion_stream(
                 &self.client,
                 &self.url,
                 &self.codex_creds,
                 &self.api_key,
                 &request,
             )
-            .await;
+            .await?;
+            return Ok(Box::pin(HoldUntilEnd::new(stream, slot)));
         }
 
         let url = &self.chat_completions_url;
@@ -668,7 +705,9 @@ impl BackendClient {
             .flat_map(futures::stream::iter)
             .map(|result| result.map_err(|e| e.into())); // Konwertuj CoreError -> anyhow::Error
 
-        Ok(Box::pin(stream))
+        // The slot is held while the body is read, not only until the headers
+        // arrive: the backend is busy for the whole generation.
+        Ok(Box::pin(HoldUntilEnd::new(Box::pin(stream), slot)))
     }
 
     /// Mapuje reqwest::Error na CoreError.
@@ -738,7 +777,10 @@ impl BackendClient {
         &self,
         mut request: EmbeddingRequest,
     ) -> Result<EmbeddingResponse> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
 
         // Wymuszamy base64 jako format TRANSPORTU do backendu: vLLM/OpenAI-compatible
@@ -815,7 +857,10 @@ impl BackendClient {
     /// POST do /v1/rerank (vLLM `--task score`, OpenAI/Cohere-compatible).
     /// Zwraca wyniki z `index` (pozycja w oryginalnej liście) + `relevance_score`.
     pub async fn rerank_request(&self, mut request: RerankRequest) -> Result<RerankResponse> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
 
         let url = &self.rerank_url;
@@ -882,7 +927,10 @@ impl BackendClient {
         image_bytes: &[u8],
         mime: &str,
     ) -> Result<crate::services::runtime::executor::DocumentParseResponse> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
 
         let url = &self.parse_url;
         debug!(
@@ -995,7 +1043,10 @@ impl BackendClient {
         mime: &str,
     ) -> Result<tentaflow_protocol::DocumentInferResult> {
         use base64::Engine as _;
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
 
         let url = &self.infer_url;
         let image_b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
@@ -1066,7 +1117,10 @@ impl BackendClient {
         &self,
         mut request: TranscriptionRequest,
     ) -> Result<TranscriptionResponse> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
 
         let url = &self.audio_transcriptions_url;
@@ -1184,7 +1238,10 @@ impl BackendClient {
         &self,
         request: &crate::api::openai::types::TTSRequest,
     ) -> Result<Vec<u8>> {
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
 
         let url = &self.audio_speech_url;
         let mut body = serde_json::json!({
@@ -1274,7 +1331,10 @@ impl BackendClient {
     ) -> Result<String> {
         use crate::api::openai::types::{ContentPart, ImageUrl, Message, MessageContent};
 
-        self.check_circuit_breaker()?;
+        // The slot comes first: a request that gave up waiting for one must not
+        // have used up a half-open probe of the breaker.
+        let _slot = self.acquire_slot().await?;
+        let _probe = self.check_circuit_breaker()?;
         self.apply_model_override(&mut model);
 
         let url = &self.chat_completions_url;

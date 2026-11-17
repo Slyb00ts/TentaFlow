@@ -99,6 +99,17 @@ pub enum ExecutorError {
     SttBackend(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// A model service is at its `max_concurrent` and no slot freed within the
+    /// service's `timeout_ms`. Typed so the edges answer 503 with `Retry-After`.
+    /// It does not abort the fallback chain: another candidate may be idle, so
+    /// the chain moves on (every candidate but the last is tried without
+    /// waiting) and only when every candidate was busy does `Busy` come out.
+    /// The text carries no node or service id; it reaches clients.
+    #[error("backend.busy: retry after {retry_after_ms} ms")]
+    Busy {
+        backend: String,
+        retry_after_ms: u64,
+    },
     /// The flow a model resolved onto refused the call under its SLA policy
     /// (`Overloaded`) or ran past the policy's timeout (`TimedOut`). Typed, not
     /// flattened into `Internal`, so the edges answer 429 with `Retry-After` or
@@ -108,6 +119,23 @@ pub enum ExecutorError {
 }
 
 impl ExecutorError {
+    /// For the flow dispatchers: a busy backend stays a typed `CoreError` at the
+    /// root of the error (so `DispatchError::from` can downcast it and the edge
+    /// answers 503); everything else becomes plain text, as before.
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Busy {
+                backend,
+                retry_after_ms,
+            } => crate::error::CoreError::BackendBusy {
+                backend,
+                retry_after_ms,
+            }
+            .into(),
+            other => anyhow::anyhow!("{other}"),
+        }
+    }
+
     /// A flow dispatch failure. Only the SLA outcomes keep their type; the rest
     /// stay the text they always were.
     fn from_dispatch(e: crate::flow_engine::dispatcher::DispatchError) -> Self {
@@ -119,6 +147,24 @@ impl ExecutorError {
     }
 }
 
+/// Maps the failure of a call to an HTTP or QUIC backend. A refusal by the
+/// service's concurrency limit keeps its type; everything else is flattened to
+/// text as before, prefixed with `prefix` when there is one.
+fn call_failed(prefix: &str, e: impl Into<anyhow::Error>) -> ExecutorError {
+    let e: anyhow::Error = e.into();
+    match e.downcast_ref::<crate::error::CoreError>() {
+        Some(crate::error::CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        }) => ExecutorError::Busy {
+            backend: backend.clone(),
+            retry_after_ms: *retry_after_ms,
+        },
+        _ if prefix.is_empty() => ExecutorError::Internal(e.to_string()),
+        _ => ExecutorError::Internal(format!("{prefix}: {e}")),
+    }
+}
+
 /// Maps an `SttRuntime` error onto the executor's typed variants, keeping
 /// "no STT service" distinguishable from a backend failure.
 fn stt_runtime_error(e: anyhow::Error) -> ExecutorError {
@@ -126,6 +172,13 @@ fn stt_runtime_error(e: anyhow::Error) -> ExecutorError {
         Some(crate::error::CoreError::SttServiceUnavailable) => {
             ExecutorError::SttServiceUnavailable
         }
+        Some(crate::error::CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        }) => ExecutorError::Busy {
+            backend: backend.clone(),
+            retry_after_ms: *retry_after_ms,
+        },
         _ => ExecutorError::SttBackend(e.to_string()),
     }
 }
@@ -533,6 +586,7 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
         let requested_model = request.model.clone();
         let mut candidates = ranked.into_iter().peekable();
@@ -540,6 +594,7 @@ impl ModelRuntimeExecutor {
         while let Some(target) = candidates.next() {
             attempts += 1;
             last_kind = target.telemetry_tag();
+            let is_last = candidates.peek().is_none();
             // Dispatch owns the request it receives, so only the final
             // candidate can take the original without a copy; earlier
             // attempts clone to keep a request alive for the next try.
@@ -551,9 +606,12 @@ impl ModelRuntimeExecutor {
             let Some(attempt_request) = attempt_request else {
                 continue;
             };
-            match self
-                .dispatch_chat_blocking(&target, attempt_request, ctx)
-                .await
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_chat_blocking(&target, attempt_request, ctx),
+            )
+            .await
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
@@ -576,6 +634,10 @@ impl ModelRuntimeExecutor {
                         Some(e2e_ms),
                     );
                     return Ok(response);
+                }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
                 }
                 Err(e) if e.aborts_fallback_chain() => {
                     // Config-level failure: trying the next candidate
@@ -604,6 +666,12 @@ impl ModelRuntimeExecutor {
 
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
         }
 
         // Request zakonczony bledem po wyczerpaniu wszystkich kandydatow — jeden
@@ -657,6 +725,7 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
         let requested_model = request.model.clone();
         let mut candidates = ranked.into_iter().peekable();
@@ -664,6 +733,7 @@ impl ModelRuntimeExecutor {
         while let Some(target) = candidates.next() {
             attempts += 1;
             last_kind = target.telemetry_tag();
+            let is_last = candidates.peek().is_none();
             // Dispatch owns the request it receives, so only the final
             // candidate can take the original without a copy; earlier
             // attempts clone to keep a request alive for the next try.
@@ -675,9 +745,12 @@ impl ModelRuntimeExecutor {
             let Some(attempt_request) = attempt_request else {
                 continue;
             };
-            match self
-                .dispatch_chat_stream(&target, attempt_request, ctx)
-                .await
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_chat_stream(&target, attempt_request, ctx),
+            )
+            .await
             {
                 Ok(stream) => {
                     // One line per stream-chat answering "where did this
@@ -703,6 +776,10 @@ impl ModelRuntimeExecutor {
                     );
                     return Ok(stream);
                 }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
+                }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
                     deferred_cutover.get_or_insert(kind);
@@ -721,12 +798,56 @@ impl ModelRuntimeExecutor {
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
+        }
 
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
             attempts,
             last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
         })
+    }
+
+    /// Runs one candidate's dispatch. Every candidate but the last is tried
+    /// without waiting for a slot of its service: if it is saturated the chain
+    /// moves on at once, because another candidate may be idle. The last one
+    /// waits up to the service's `timeout_ms`. Only a local backend has a slot
+    /// to wait for; a mesh or flow target is left alone, as are the calls its
+    /// own dispatch makes.
+    async fn under_slot_policy<F: std::future::Future>(
+        target: &ResolvedExecutionTarget,
+        is_last: bool,
+        dispatch: F,
+    ) -> F::Output {
+        if is_last || !matches!(target, ResolvedExecutionTarget::Local { .. }) {
+            dispatch.await
+        } else {
+            crate::services::limiter::without_waiting(dispatch).await
+        }
+    }
+
+    /// The slot of an embedded engine. HTTP and QUIC backends take theirs in the
+    /// client that sends the request; an in-process engine has no client, so the
+    /// executor takes it before the engine is touched (and before it is loaded).
+    async fn embedded_slot(
+        target: &ResolvedExecutionTarget,
+    ) -> Result<Option<crate::services::limiter::ServicePermit>, ExecutorError> {
+        match target {
+            ResolvedExecutionTarget::Local {
+                service_id,
+                handle: BackendHandle::Embedded { node_id, .. },
+                ..
+            } => crate::services::limiter::limiter_for(node_id, *service_id)
+                .acquire()
+                .await
+                .map(Some)
+                .map_err(|e| call_failed("", e)),
+            _ => Ok(None),
+        }
     }
 
     /// Per-target stream dispatch. MVP: Local Embedded / HTTP / QUIC. Mesh
@@ -739,6 +860,7 @@ impl ModelRuntimeExecutor {
         mut request: ChatCompletionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<ExecutorChunkStream, ExecutorError> {
+        let slot = Self::embedded_slot(target).await?;
         use crate::api::openai::types::{ChunkChoice, Delta};
         use futures::StreamExt;
         use tentaflow_protocol::*;
@@ -767,7 +889,11 @@ impl ModelRuntimeExecutor {
                     let stream = futures::stream::unfold(rx, |mut rx| async move {
                         rx.recv().await.map(|chunk| (Ok(chunk), rx))
                     });
-                    Ok(Box::pin(stream))
+                    // The engine is busy until the last chunk is out.
+                    Ok(Box::pin(crate::services::limiter::HoldUntilEnd::new(
+                        Box::pin(stream),
+                        slot,
+                    )))
                 }
                 BackendHandle::Http(client) => {
                     // Wymuszamy `include_usage` upstream — bez niego vLLM/sglang
@@ -784,7 +910,7 @@ impl ModelRuntimeExecutor {
                     let stream = client
                         .chat_completion_stream(request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        .map_err(|e| call_failed("", e))?;
                     Ok(Box::pin(ExternalPerfStream::new(
                         stream,
                         dispatch_at,
@@ -831,7 +957,7 @@ impl ModelRuntimeExecutor {
                     let quic_stream = quic_client
                         .send_request_stream(model_request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("QUIC stream: {}", e)))?;
+                        .map_err(|e| call_failed("QUIC stream", e))?;
 
                     // Map raw protocol StreamChunk → ChatCompletionChunk.
                     // Mirror dyzurnej logiki z `routing/streaming.rs::route_to_quic_llm_stream`
@@ -1213,6 +1339,7 @@ impl ModelRuntimeExecutor {
         mut request: ChatCompletionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
@@ -1248,7 +1375,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Http(client) => client
                     .chat_completion(request)
                     .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                    .map_err(|e| call_failed("", e)),
                 BackendHandle::Quic(handle) => Self::dispatch_chat_quic(handle, request).await,
             },
             ResolvedExecutionTarget::MeshForward {
@@ -1518,7 +1645,7 @@ impl ModelRuntimeExecutor {
         let model_response = quic_client
             .send_request(model_request)
             .await
-            .map_err(|e| ExecutorError::Internal(format!("QUIC send_request: {}", e)))?;
+            .map_err(|e| call_failed("QUIC send_request", e))?;
 
         match model_response.result {
             ModelResult::Completion(completion) => Ok(ChatCompletionResponse {
@@ -1610,13 +1737,19 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
-        for target in ranked {
+        let total = ranked.len();
+        for (idx, target) in ranked.into_iter().enumerate() {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self
-                .dispatch_embeddings_blocking(&target, request.clone(), ctx)
-                .await
+            let is_last = idx + 1 == total;
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_embeddings_blocking(&target, request.clone(), ctx),
+            )
+            .await
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
@@ -1645,6 +1778,10 @@ impl ModelRuntimeExecutor {
                     );
                     return Ok(response);
                 }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
+                }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
                     deferred_cutover.get_or_insert(kind);
@@ -1662,6 +1799,12 @@ impl ModelRuntimeExecutor {
 
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
         }
 
         // MeshForward error jest zapisywany przez zdalny wezel pod jego node_id
@@ -1758,6 +1901,7 @@ impl ModelRuntimeExecutor {
         mut request: EmbeddingRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<EmbeddingResponse, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         use tentaflow_protocol::*;
 
         self.ensure_resident(target).await?;
@@ -1784,7 +1928,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Http(client) => client
                     .embeddings_request(request)
                     .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                    .map_err(|e| call_failed("", e)),
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
                         ExecutorError::Internal(format!(
@@ -1823,7 +1967,7 @@ impl ModelRuntimeExecutor {
                     let response = quic_client
                         .send_request(model_request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("QUIC embeddings: {}", e)))?;
+                        .map_err(|e| call_failed("QUIC embeddings", e))?;
 
                     match response.result {
                         ModelResult::Embeddings(result) => {
@@ -2014,13 +2158,19 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
-        for target in ranked {
+        let total = ranked.len();
+        for (idx, target) in ranked.into_iter().enumerate() {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self
-                .dispatch_rerank_blocking(&target, request.clone(), ctx)
-                .await
+            let is_last = idx + 1 == total;
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_rerank_blocking(&target, request.clone(), ctx),
+            )
+            .await
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
@@ -2034,6 +2184,10 @@ impl ModelRuntimeExecutor {
                         target.telemetry_tag(),
                     );
                     return Ok(response);
+                }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
@@ -2053,6 +2207,12 @@ impl ModelRuntimeExecutor {
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
+        }
 
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
@@ -2071,6 +2231,7 @@ impl ModelRuntimeExecutor {
         mut request: RerankRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<RerankResponse, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
@@ -2084,7 +2245,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Http(client) => client
                     .rerank_request(request)
                     .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                    .map_err(|e| call_failed("", e)),
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
                         ExecutorError::Internal(format!(
@@ -2096,7 +2257,7 @@ impl ModelRuntimeExecutor {
                     let response = quic_client
                         .send_request(model_request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("QUIC rerank: {}", e)))?;
+                        .map_err(|e| call_failed("QUIC rerank", e))?;
                     rerank_result_to_response(response.result)
                 }
             },
@@ -2352,13 +2513,19 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
-        for target in ranked {
+        let total = ranked.len();
+        for (idx, target) in ranked.into_iter().enumerate() {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self
-                .dispatch_document_infer_blocking(&target, request.clone(), ctx)
-                .await
+            let is_last = idx + 1 == total;
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_document_infer_blocking(&target, request.clone(), ctx),
+            )
+            .await
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
@@ -2372,6 +2539,10 @@ impl ModelRuntimeExecutor {
                         target.telemetry_tag(),
                     );
                     return Ok(response);
+                }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
@@ -2390,6 +2561,12 @@ impl ModelRuntimeExecutor {
 
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
         }
 
         Err(ExecutorError::AllCandidatesFailed {
@@ -2430,7 +2607,7 @@ impl ModelRuntimeExecutor {
                             &request.mime,
                         )
                         .await
-                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        .map_err(|e| call_failed("", e))?;
                     Ok(DocumentInferResponse {
                         regions: result.regions,
                     })
@@ -2443,9 +2620,10 @@ impl ModelRuntimeExecutor {
                         ))
                     })?;
                     let model_request = document_infer_model_request(&request);
-                    let response = quic_client.send_request(model_request).await.map_err(|e| {
-                        ExecutorError::Internal(format!("QUIC document infer: {}", e))
-                    })?;
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| call_failed("QUIC document infer", e))?;
                     document_infer_result_to_response(response.result)
                 }
             },
@@ -2496,11 +2674,20 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
-        for target in ranked {
+        let total = ranked.len();
+        for (idx, target) in ranked.into_iter().enumerate() {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self.dispatch_camera_cv(&target, request.clone(), ctx).await {
+            let is_last = idx + 1 == total;
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_camera_cv(&target, request.clone(), ctx),
+            )
+            .await
+            {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.served_model = Some(target.requested_model().to_string());
@@ -2513,6 +2700,10 @@ impl ModelRuntimeExecutor {
                         target.telemetry_tag(),
                     );
                     return Ok(response);
+                }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
@@ -2531,6 +2722,12 @@ impl ModelRuntimeExecutor {
 
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
         }
 
         Err(ExecutorError::AllCandidatesFailed {
@@ -2552,6 +2749,7 @@ impl ModelRuntimeExecutor {
         mut request: CameraCvRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
@@ -2743,6 +2941,7 @@ impl ModelRuntimeExecutor {
         mut request: DocumentParseRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<DocumentParseResponse, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         self.ensure_resident(target).await?;
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
             if request.model != *model_name {
@@ -2781,7 +2980,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Http(client) => client
                     .parse_document(&request.model, &request.image_bytes, &request.mime)
                     .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                    .map_err(|e| call_failed("", e)),
                 // Obraz przez QUIC nie ma jeszcze wpiętego payloadu — odkładamy
                 // do follow-up. Internal, żeby failover spróbował HTTP/Flow.
                 BackendHandle::Quic(_) => {
@@ -2892,13 +3091,19 @@ impl ModelRuntimeExecutor {
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
+        let mut busy: Option<ExecutorError> = None;
 
-        for target in ranked {
+        let total = ranked.len();
+        for (idx, target) in ranked.into_iter().enumerate() {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self
-                .dispatch_tts_blocking(&target, request.clone(), ctx)
-                .await
+            let is_last = idx + 1 == total;
+            match Self::under_slot_policy(
+                &target,
+                is_last,
+                self.dispatch_tts_blocking(&target, request.clone(), ctx),
+            )
+            .await
             {
                 Ok(result) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
@@ -2912,6 +3117,10 @@ impl ModelRuntimeExecutor {
                         target.telemetry_tag(),
                     );
                     return Ok(result);
+                }
+                Err(e @ ExecutorError::Busy { .. }) => {
+                    // Not a failure: the service is saturated, not broken.
+                    busy = Some(e);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
                 Err(ExecutorError::TransportPendingCutover(kind)) => {
@@ -2930,6 +3139,12 @@ impl ModelRuntimeExecutor {
 
         if let Some(kind) = deferred_cutover {
             return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+        if last_err.is_none() {
+            if let Some(busy) = busy {
+                // Every candidate was saturated.
+                return Err(busy);
+            }
         }
 
         Err(ExecutorError::AllCandidatesFailed {
@@ -2953,6 +3168,7 @@ impl ModelRuntimeExecutor {
         mut request: TTSRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<TtsExecutionResult, ExecutorError> {
+        let _slot = Self::embedded_slot(target).await?;
         use tentaflow_protocol::*;
 
         if let ResolvedExecutionTarget::Local { model_name, .. } = target {
@@ -3094,7 +3310,7 @@ impl ModelRuntimeExecutor {
                     let bytes = client
                         .audio_speech(&request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        .map_err(|e| call_failed("", e))?;
                     let format = request
                         .response_format
                         .clone()
@@ -3132,7 +3348,7 @@ impl ModelRuntimeExecutor {
                     let response = quic_client
                         .send_request(model_request)
                         .await
-                        .map_err(|e| ExecutorError::Internal(format!("QUIC TTS: {}", e)))?;
+                        .map_err(|e| call_failed("QUIC TTS", e))?;
                     match response.result {
                         ModelResult::Audio(audio_result) => match audio_result.data {
                             AudioResultData::Audio(bytes) => {
@@ -3316,8 +3532,19 @@ impl ModelRuntimeExecutor {
                 ResolvedExecutionTarget::Local {
                     service_id,
                     model_name,
-                    ..
+                    ref handle,
                 } => {
+                    // An embedded engine has no client to take its slot; an HTTP
+                    // backend's client takes it inside `transcribe_for_service`.
+                    let _slot = match handle {
+                        BackendHandle::Embedded { node_id, .. } => Some(
+                            crate::services::limiter::limiter_for(node_id, service_id)
+                                .acquire()
+                                .await
+                                .map_err(|e| call_failed("", e))?,
+                        ),
+                        _ => None,
+                    };
                     // Lazy-load + memory guard: an UNPINNED embedded STT row is
                     // loaded on first use by residency (from the row's own
                     // config); pinned rows are loaded by the supervisor.
@@ -5036,6 +5263,7 @@ mod provenance_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Chunk 2: `bump_model_metric_row` mapuje `ModelMetricInput` na wiersz
     /// `model_metrics_rollup` — sprawdzamy wymiary (model/backend/service_key),
@@ -5234,6 +5462,217 @@ mod tests {
         .aborts_fallback_chain());
         assert!(!ExecutorError::Internal("z".into()).aborts_fallback_chain());
         assert!(!ExecutorError::FlowEmptyResult { model: "m".into() }.aborts_fallback_chain());
+    }
+
+    /// A refusal by a service's concurrency limit keeps its type across the
+    /// executor (it must reach the edge as a 503, not as a 500 string), aborts
+    /// the fallback chain moving on, and anything else is still flattened to text.
+    #[test]
+    fn a_busy_backend_stays_typed_through_the_executor() {
+        let busy = crate::error::CoreError::BackendBusy {
+            backend: "service 4".into(),
+            retry_after_ms: 1_000,
+        };
+        let mapped = call_failed("QUIC TTS", busy);
+        assert!(matches!(
+            mapped,
+            ExecutorError::Busy {
+                retry_after_ms: 1_000,
+                ..
+            }
+        ));
+        assert!(
+            !mapped.aborts_fallback_chain(),
+            "another candidate may be idle"
+        );
+
+        let other = call_failed(
+            "QUIC TTS",
+            crate::error::CoreError::InternalError {
+                message: "boom".into(),
+                source: None,
+            },
+        );
+        assert!(matches!(&other, ExecutorError::Internal(m) if m.starts_with("QUIC TTS: ")));
+
+        let edge = crate::routing::chat::executor_error_to_core(mapped, "m");
+        assert_eq!(edge.status_code(), 503);
+        assert_eq!(edge.retry_after_secs(), Some(1));
+    }
+
+    /// Executor over a catalog with one embeddings model served by the local
+    /// services `1` and `2`, both embedded engines with no model loaded (a
+    /// request that gets past the slot fails at once with `Internal`).
+    fn executor_with_two_replicas(node: &str) -> ModelRuntimeExecutor {
+        use crate::services::catalog::{
+            CatalogEntry, CatalogEntryKind, InputModality, ModelInstance, OutputModality,
+            ServiceSurface,
+        };
+        use crate::services::handles_cache::LiveHandlesCache;
+        use crate::services::runtime::resolver::AliasResolver;
+
+        let handles = Arc::new(LiveHandlesCache::new());
+        let mut instances = Vec::new();
+        for service_id in [1_i64, 2] {
+            handles.insert(
+                node.to_string(),
+                service_id,
+                BackendHandle::Embedded {
+                    model_name: "replicated-emb".into(),
+                    node_id: node.into(),
+                    engine_id: "test-engine".into(),
+                },
+            );
+            instances.push(ModelInstance {
+                node_id: node.to_string(),
+                node_hostname: None,
+                service_id,
+                status: "running".into(),
+                backend: Some("emb".into()),
+                size_mb: None,
+                loaded: true,
+                input_modalities: vec![],
+                output_modalities: vec![],
+                environment: tentaflow_protocol::environment::NodeEnvironment::default(),
+            });
+        }
+        let catalog = Arc::new(crate::services::catalog::CatalogProvider::new());
+        catalog.install_for_test(vec![CatalogEntry {
+            reasoning_levels: Vec::new(),
+            id: "replicated-emb".into(),
+            kind: CatalogEntryKind::ServiceModel { instances },
+            service_surfaces: vec![ServiceSurface::Embeddings],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Embedding],
+            diagnostic: None,
+        }]);
+        let resolver = Arc::new(AliasResolver::new_with_static_id(handles, node.to_string()));
+        ModelRuntimeExecutor::new(
+            catalog,
+            resolver,
+            None,
+            Arc::new(crate::inference::local::LocalInferenceHandler::new(
+                crate::inference::shared_inference_manager(),
+            )),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+        )
+    }
+
+    fn system_ctx() -> ExecutionContext {
+        ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        )
+    }
+
+    /// Two replicas, the first saturated and the second idle: the request goes
+    /// to the second at once, instead of waiting out the first one's wait (30 s
+    /// here) or failing with `Busy`.
+    #[tokio::test]
+    async fn a_saturated_first_candidate_is_skipped_without_waiting() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "chain-skip-node";
+        configure(node, 1, Some(1), Duration::from_secs(30));
+        let _held = limiter_for(node, 1).acquire().await.unwrap();
+
+        let exec = executor_with_two_replicas(node);
+        let started = std::time::Instant::now();
+        let outcome = exec
+            .execute_embeddings(make_request("replicated-emb"), &mut system_ctx())
+            .await;
+
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait");
+        // The idle second replica was reached: it has no model, so the chain
+        // ends in its failure, after two attempts, and not in `Busy`.
+        match outcome {
+            Err(ExecutorError::AllCandidatesFailed { attempts: 2, .. }) => {}
+            other => panic!("expected the chain to reach the second candidate: {other:?}"),
+        }
+        assert_eq!(limiter_for(node, 1).stats().rejected, 1);
+        assert_eq!(limiter_for(node, 2).stats().rejected, 0);
+    }
+
+    /// Every candidate saturated: the last one waits up to its wait, then the
+    /// caller gets `Busy` (a 503), not `AllCandidatesFailed`.
+    #[tokio::test]
+    async fn when_every_candidate_is_busy_the_last_waits_and_busy_comes_out() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "chain-all-busy-node";
+        configure(node, 1, Some(1), Duration::from_secs(30));
+        configure(node, 2, Some(1), Duration::from_millis(300));
+        let _a = limiter_for(node, 1).acquire().await.unwrap();
+        let _b = limiter_for(node, 2).acquire().await.unwrap();
+
+        let exec = executor_with_two_replicas(node);
+        let started = std::time::Instant::now();
+        let outcome = exec
+            .execute_embeddings(make_request("replicated-emb"), &mut system_ctx())
+            .await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the last candidate waits"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match outcome {
+            Err(ExecutorError::Busy { retry_after_ms, .. }) => {
+                assert_eq!(retry_after_ms, 1_000, "300 ms wait rounds up to 1 s");
+            }
+            other => panic!("expected Busy: {other:?}"),
+        }
+    }
+
+    /// An embedded engine takes a slot like any other backend: a saturated one
+    /// refuses before the engine is touched (which, with no model, would be an
+    /// `Internal` error), and a free slot lets the request through.
+    #[tokio::test]
+    async fn an_embedded_engine_is_limited_like_any_backend() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "embedded-limit-node";
+        configure(node, 7, Some(1), Duration::from_millis(100));
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 7,
+            model_name: "emb".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "emb".into(),
+                node_id: node.into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let exec = dummy_executor();
+
+        let held = limiter_for(node, 7).acquire().await.unwrap();
+        let busy = exec
+            .dispatch_embeddings_blocking(&target, make_request("emb"), &mut system_ctx())
+            .await
+            .expect_err("saturated");
+        assert!(matches!(busy, ExecutorError::Busy { .. }), "got {busy:?}");
+
+        drop(held);
+        let past_the_slot = exec
+            .dispatch_embeddings_blocking(&target, make_request("emb"), &mut system_ctx())
+            .await
+            .expect_err("no model is loaded");
+        assert!(matches!(past_the_slot, ExecutorError::Internal(_)));
+        assert_eq!(limiter_for(node, 7).in_flight(), 0, "the slot was returned");
+    }
+
+    /// STT: a busy HTTP STT service stays typed (503) instead of becoming an
+    /// `SttBackend` string, and its text carries no node or service id.
+    #[test]
+    fn a_busy_stt_service_stays_typed() {
+        let busy = crate::error::CoreError::BackendBusy {
+            backend: "service 5 on node deadbeef".into(),
+            retry_after_ms: 1_000,
+        };
+        let mapped = stt_runtime_error(anyhow::Error::from(busy).context("transcribe"));
+        assert!(matches!(mapped, ExecutorError::Busy { .. }), "got {mapped:?}");
+        assert!(!mapped.to_string().contains("deadbeef"));
+        assert!(mapped.to_string().starts_with("backend.busy:"));
     }
 
     /// `note_fallback` bramkuje metryke `alias_fallback_total{model}` flaga

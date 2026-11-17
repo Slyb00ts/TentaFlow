@@ -33,6 +33,7 @@ use crate::flow_engine::envelope::{
 };
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::resolver::LocalNodeIdProvider;
+use crate::services::runtime::ExecutorError;
 use base64::Engine;
 use std::sync::Arc;
 
@@ -241,7 +242,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
                 if let Some(event) = audit_event.as_ref() {
                     let _ = event.finish_failed(&msg);
                 }
-                return Err(anyhow!(msg));
+                return Err(super::dispatcher_failure("LlmDispatcher execute_chat", e));
             }
         };
 
@@ -377,7 +378,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             Err(e) => {
                 let message = format!("LlmDispatcher stream_chat: {e}");
                 fail_event(audit_event.as_ref(), &message);
-                return Err(anyhow!(message));
+                return Err(super::dispatcher_failure("LlmDispatcher stream_chat", e));
             }
         };
 
@@ -400,14 +401,13 @@ impl LlmDispatcher for LlmDispatcherImpl {
 /// Wykonuje future z deadline (`tokio::time::timeout`) + cancel
 /// (`select!` z `cancel.cancelled()`). Te dwa pola żyją w `LlmRequest`
 /// ale `ModelRuntimeExecutor` ich nie czyta — wrapper musi sam je honorować.
-async fn run_with_deadline_and_cancel<F, T, E>(
+async fn run_with_deadline_and_cancel<F, T>(
     fut: F,
     deadline: Option<Instant>,
     cancel: CancellationToken,
 ) -> Result<T>
 where
-    F: std::future::Future<Output = std::result::Result<T, E>>,
-    E: std::fmt::Display,
+    F: std::future::Future<Output = std::result::Result<T, ExecutorError>>,
 {
     tokio::pin!(fut);
     if let Some(dl) = deadline {
@@ -415,13 +415,13 @@ where
             biased;
             _ = cancel.cancelled() => Err(anyhow!("cancelled")),
             _ = sleep_until(dl.into()) => Err(anyhow!("deadline exceeded")),
-            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+            res = &mut fut => res.map_err(ExecutorError::into_anyhow),
         }
     } else {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(anyhow!("cancelled")),
-            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+            res = &mut fut => res.map_err(ExecutorError::into_anyhow),
         }
     }
 }

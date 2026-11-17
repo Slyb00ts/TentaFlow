@@ -659,6 +659,13 @@ pub(crate) fn executor_error_to_core(
             model_name: model.to_string(),
         },
         ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
+        ExecutorError::Busy {
+            backend,
+            retry_after_ms,
+        } => CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        },
         other => CoreError::InternalError {
             message: format!("direct backend dispatch failed: {other}"),
             source: None,

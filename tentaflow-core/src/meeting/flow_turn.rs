@@ -812,7 +812,7 @@ pub(crate) fn dispatch_error_chunk(e: &DispatchError) -> StreamChunkType {
         }
         // The message starts with the stable `sla.overloaded` code and carries
         // the retry delay, so the bot can wait instead of retrying blindly.
-        DispatchError::Overloaded { .. } => {
+        DispatchError::Overloaded { .. } | DispatchError::BackendBusy { .. } => {
             error_chunk(ErrorType::RateLimitExceeded, &e.to_string())
         }
         other => error_chunk(ErrorType::InternalError, &other.to_string()),

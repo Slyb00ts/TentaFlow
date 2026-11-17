@@ -5284,13 +5284,16 @@ inventory::submit! {
 // =============================================================================
 
 /// The text a stream edge reports for a failed flow dispatch. An SLA refusal or
-/// timeout keeps its stable `sla.overloaded: ...` / `sla.timeout: ...` text as
+/// timeout, or a busy model service, keeps its stable `sla.overloaded: ...` /
+/// `sla.timeout: ...` / `backend.busy: ...` text as
 /// the whole message so a client can recognise it and back off; any other
 /// failure keeps its "dispatch failed" prefix.
 fn dispatch_failure_text(e: &crate::flow_engine::dispatcher::DispatchError) -> String {
     use crate::flow_engine::dispatcher::DispatchError;
     match e {
-        DispatchError::Overloaded { .. } | DispatchError::TimedOut { .. } => e.to_string(),
+        DispatchError::Overloaded { .. }
+        | DispatchError::BackendBusy { .. }
+        | DispatchError::TimedOut { .. } => e.to_string(),
         _ => format!("dispatch failed: {e}"),
     }
 }
@@ -5301,6 +5304,15 @@ mod tests {
         find_stream_handler, stream_handler_count, SubscriptionEvent,
     };
     use super::super::SessionAuthKind;
+
+    #[test]
+    fn a_busy_model_service_keeps_its_stable_text_on_the_stream_edge() {
+        use crate::flow_engine::dispatcher::DispatchError;
+        let text = super::dispatch_failure_text(&DispatchError::BackendBusy {
+            retry_after_ms: 3_000,
+        });
+        assert_eq!(text, "backend.busy: retry after 3000 ms");
+    }
 
     #[test]
     fn chat_stream_handler_registered() {

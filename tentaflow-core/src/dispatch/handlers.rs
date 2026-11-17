@@ -5769,6 +5769,8 @@ pub async fn service_manifest_deploy(
         serde_json::from_str(&payload.config_json)
             .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
     };
+    crate::services_repo::services::validate_max_concurrent(&user_config)
+        .map_err(ProtocolError::bad_request)?;
     // Subscription login: the wizard sends an `oauth_flow_id` instead of a key.
     // Swap it for the tokens captured by the completed OAuth flow on this node
     // (the credential blob then follows the normal encrypted `api_key` path).

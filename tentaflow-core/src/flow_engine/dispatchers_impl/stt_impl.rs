@@ -77,7 +77,9 @@ impl SttDispatcher for SttDispatcherImpl {
                     anyhow::Error::from(crate::error::CoreError::SttServiceUnavailable)
                         .context("SttDispatcher execute_stt")
                 }
-                other => anyhow!("SttDispatcher execute_stt: {other}"),
+                other => {
+                    super::dispatcher_failure("SttDispatcher execute_stt", other.into_anyhow())
+                }
             })?;
 
         // Verbose pola serializujemy do JSON żeby przeszły przez SttResponse

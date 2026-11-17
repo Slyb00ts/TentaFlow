@@ -142,7 +142,10 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
                 if let Some(event) = audit_event.as_ref() {
                     let _ = event.finish_failed(&message);
                 }
-                return Err(anyhow!(message));
+                return Err(super::dispatcher_failure(
+                    "EmbeddingsDispatcher",
+                    e.into_anyhow(),
+                ));
             }
         };
         if let Some(event) = audit_event.as_ref() {

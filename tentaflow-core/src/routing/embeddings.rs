@@ -359,6 +359,13 @@ pub(crate) fn executor_err_to_core(
         },
         ExecutorError::SttServiceUnavailable => CoreError::SttServiceUnavailable,
         ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
+        ExecutorError::Busy {
+            backend,
+            retry_after_ms,
+        } => CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        },
         ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
             model_name: model.to_string(),
         },

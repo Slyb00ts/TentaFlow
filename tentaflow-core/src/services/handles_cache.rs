@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::ConnectionType;
 use crate::services::backend::client::BackendClient;
+use crate::services::limiter::limiter_for;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::runtime::quic_handle::{QuicServiceHandle, QuicServiceState};
 use crate::services::runtime::CircuitBreakerConfig;
@@ -269,6 +270,7 @@ pub fn build_handle(
                     request_format,
                     tts_config: None,
                 },
+                // Pool size only; the in-flight limit is the service's limiter.
                 max_concurrent: 8,
                 timeout_ms: INFERENCE_TIMEOUT_MS,
                 weight: 1,
@@ -283,7 +285,8 @@ pub fn build_handle(
                 None::<CircuitBreakerConfig>,
                 svc.request_time_parameters.clone(),
             )
-            .map_err(|e| anyhow!("BackendClient init failed: {}", e))?;
+            .map_err(|e| anyhow!("BackendClient init failed: {}", e))?
+            .with_limiter(limiter_for(&svc.node_id, svc.id));
             Ok(BackendHandle::Http(Arc::new(client)))
         }
         Transport::SidecarQuic => {
@@ -303,9 +306,9 @@ pub fn build_handle(
                 skip_tls_verify: true,
                 direct_addrs: Vec::new(),
             };
-            Ok(BackendHandle::Quic(Arc::new(QuicServiceHandle::new(
-                quic_config,
-            ))))
+            Ok(BackendHandle::Quic(Arc::new(
+                QuicServiceHandle::new(quic_config).with_limiter(limiter_for(&svc.node_id, svc.id)),
+            )))
         }
     }
 }
@@ -385,6 +388,9 @@ pub fn spawn_quic_reconnect_loop(handle: Arc<QuicServiceHandle>) -> JoinHandle<(
                     match crate::net::quic::QuicClient::connect(cfg, inner_shutdown).await {
                         Ok(client) => {
                             let client = Arc::new(client);
+                            if let Some(limiter) = handle.limiter() {
+                                client.set_limiter(limiter);
+                            }
                             handle.set_connected(client.clone()).await;
                             if let Some(task) = reverse_task.take() {
                                 task.abort();

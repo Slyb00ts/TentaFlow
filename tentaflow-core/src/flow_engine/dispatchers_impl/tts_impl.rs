@@ -67,7 +67,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
         let result = runtime
             .execute_tts(api_req, &mut rctx)
             .await
-            .map_err(|e| anyhow!("TtsDispatcher: {e}"))?;
+            .map_err(|e| super::dispatcher_failure("TtsDispatcher", e.into_anyhow()))?;
 
         let mime = format_to_mime(&result.format);
         let blob_ref = self.blobs.put(result.bytes, &mime).await?;

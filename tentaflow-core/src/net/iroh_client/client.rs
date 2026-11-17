@@ -6,7 +6,7 @@
 //       bez zmian — caly ruch do peera idzie przez wspolny iroh+CBOR kanal.
 // =============================================================================
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::stream::Stream;
@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::error::CoreError;
+use crate::services::limiter::{ServiceLimiter, ServicePermit};
 use tentaflow_protocol::{
     ModelPayload, ModelRequest, ModelResponse, ModelResult, ModelStreamChunk,
     PrefixCacheInitRequest, PrefixCacheInitResponse,
@@ -81,6 +82,10 @@ pub struct IrohServiceClient {
     /// Endpoint trzymany tu zeby zyl tak dlugo jak klient.
     _endpoint: Endpoint,
     shutdown_rx: watch::Receiver<bool>,
+    /// In-flight limit of the model service behind this connection, set once by
+    /// the service handle that owns the reconnect loop. Clients without one (a
+    /// reverse-listener connection, a mesh peer) are not limited.
+    limiter: OnceLock<Arc<ServiceLimiter>>,
 }
 
 impl IrohServiceClient {
@@ -115,11 +120,27 @@ impl IrohServiceClient {
             inner: Arc::new(inner),
             _endpoint: endpoint,
             shutdown_rx,
+            limiter: OnceLock::new(),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.config.name
+    }
+
+    /// Limits the requests in flight over this connection. Only the first call
+    /// takes effect.
+    pub fn set_limiter(&self, limiter: Arc<ServiceLimiter>) {
+        let _ = self.limiter.set(limiter);
+    }
+
+    /// Takes a slot of the service's limit just before a request is sent; the
+    /// caller holds it until the call (or the stream) ends.
+    async fn acquire_slot(&self) -> Result<Option<ServicePermit>, CoreError> {
+        match self.limiter.get() {
+            Some(limiter) => limiter.acquire().await.map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn url(&self) -> &str {
@@ -132,6 +153,7 @@ impl IrohServiceClient {
 
     /// Wysyla `ModelRequest` i czeka na pelny `ModelResponse`.
     pub async fn send_request(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+        let _slot = self.acquire_slot().await?;
         self.inner.request(request).await.map_err(map_transport_err)
     }
 
@@ -169,6 +191,7 @@ impl IrohServiceClient {
             }
         };
 
+        let slot = self.acquire_slot().await?;
         let (_send, mut recv) = self
             .inner
             .open_bi(request)
@@ -176,6 +199,8 @@ impl IrohServiceClient {
             .map_err(map_transport_err)?;
 
         Ok(async_stream::try_stream! {
+            // Held until the peer closes the stream or the stream is dropped.
+            let _slot = slot;
             loop {
                 match read_frame::<ModelStreamChunk>(&mut recv).await {
                     Ok(Some(chunk)) => yield chunk,

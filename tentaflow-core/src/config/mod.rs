@@ -661,7 +661,10 @@ pub struct ServerConfig {
     /// Maksymalna liczba jednoczesnych polaczen TCP
     pub max_total_connections: usize,
 
-    /// Maksymalna liczba rownoleglych requestow (active + queued)
+    /// Not enforced anywhere: nothing reads it. Kept only because `config.toml`
+    /// files in the field carry the key and the field has no serde default.
+    /// The in-flight limit that exists is per AI service (`max_concurrent` in
+    /// the service's `config_json`, enforced by `services::limiter`).
     pub max_concurrent_requests: usize,
 
     /// Maksymalna liczba requestow w kolejce (oczekujacych na backend)
@@ -954,7 +957,10 @@ pub struct ServiceBackend {
     #[serde(flatten)]
     pub connection: ConnectionType,
 
-    /// Max rownoczesnych requestow dla tego backendu
+    /// Idle connection pool size per host of the HTTP client
+    /// (`pool_max_idle_per_host`). It is NOT a limit on requests in flight: that
+    /// limit is enforced by `services::limiter`, from the service's
+    /// `max_concurrent` in `services.config_json`, wherever a request is sent.
     pub max_concurrent: usize,
 
     /// Timeout dla requestow do tego backendu (ms)

@@ -689,6 +689,17 @@ fn route_error_response(e: &anyhow::Error) -> Response<OpenAIBody> {
                 None => response,
             }
         }
+        Some(err @ crate::error::CoreError::BackendBusy { .. }) => {
+            let response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                err.client_message(),
+            );
+            match err.retry_after_secs() {
+                Some(secs) => super::server::with_retry_after(response, secs),
+                None => response,
+            }
+        }
         Some(err @ crate::error::CoreError::Timeout { .. }) => error_response(
             StatusCode::GATEWAY_TIMEOUT,
             "api_error",

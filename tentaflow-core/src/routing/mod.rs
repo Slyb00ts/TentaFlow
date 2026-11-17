@@ -64,6 +64,10 @@ pub(crate) fn dispatch_error_to_core(
             reason: reason.code().to_string(),
             retry_after_ms,
         },
+        DispatchError::BackendBusy { retry_after_ms } => crate::error::CoreError::BackendBusy {
+            backend: "model service of a flow node".to_string(),
+            retry_after_ms,
+        },
         DispatchError::TimedOut {
             flow_id,
             timeout_ms,

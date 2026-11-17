@@ -113,6 +113,11 @@ pub enum DispatchError {
         reason: RefusalReason,
         retry_after_ms: u64,
     },
+    /// A model service a node called is at its `max_concurrent` and no slot
+    /// freed in time. Typed so the edge answers 503 with `Retry-After`. The text
+    /// starts with the stable code `backend.busy` and names no service.
+    #[error("backend.busy: retry after {retry_after_ms} ms")]
+    BackendBusy { retry_after_ms: u64 },
     /// The policy's execution timeout elapsed before the run finished.
     #[error("sla.timeout: flow {flow_id} exceeded its {timeout_ms} ms timeout")]
     TimedOut { flow_id: String, timeout_ms: u64 },
@@ -135,6 +140,11 @@ impl From<anyhow::Error> for DispatchError {
             }
             Some(crate::error::CoreError::RateLimitExceeded { message }) => {
                 DispatchError::QuotaExceeded(message.clone())
+            }
+            Some(crate::error::CoreError::BackendBusy { retry_after_ms, .. }) => {
+                DispatchError::BackendBusy {
+                    retry_after_ms: *retry_after_ms,
+                }
             }
             _ => DispatchError::Internal(format!("{e:#}")),
         }
