@@ -38,8 +38,6 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=wrapper_common.h");
     println!("cargo:rerun-if-changed=wrapper_common.cpp");
-    println!("cargo:rerun-if-changed=wrapper_oai.h");
-    println!("cargo:rerun-if-changed=wrapper_oai.cpp");
     println!("cargo:rerun-if-changed=wrapper_speculative.h");
     println!("cargo:rerun-if-changed=wrapper_speculative.cpp");
     println!("cargo:rerun-if-changed=wrapper_utils.h");
@@ -47,7 +45,6 @@ fn main() {
     require(&include_dir.join("llama.h"));
     require(&include_dir.join("ggml.h"));
     require(&include_dir.join("gguf.h"));
-    require(&include_dir.join("common").join("chat.h"));
     require(&include_dir.join("common").join("json-schema-to-grammar.h"));
     require(&lib_dir.join(static_name("llama", &target)));
     require(&lib_dir.join(static_name("ggml", &target)));
@@ -160,7 +157,6 @@ fn compile_wrappers(include_dir: &Path, target_os: &TargetOs) {
     build
         .cpp(true)
         .file("wrapper_common.cpp")
-        .file("wrapper_oai.cpp")
         .file("wrapper_speculative.cpp")
         .include(include_dir)
         .include(Path::new("."))

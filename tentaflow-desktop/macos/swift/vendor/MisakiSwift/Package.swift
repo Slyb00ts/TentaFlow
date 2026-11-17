@@ -16,10 +16,15 @@ let package = Package(
     ),
   ],
   dependencies: [
-    // Vendored fork: upstream pinuje exact 0.30.2 co koliduje z mlx-swift 0.31.3
-    // wymaganym przez mlx-swift-lm 3.31.3 (LLM) w apce iOS. Jedna binarka = jeden
-    // mlx-swift, wiec luzujemy do range. MLXUtilsLibrary 0.0.6 juz uzywa from 0.29.1.
-    .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.2"),
+    // Vendored fork: upstream pins ml-explore/mlx-swift exact 0.30.2. One binary
+    // = one mlx-swift, so this points at the PrismML fork revision that MLXBridge,
+    // KokoroBridge and the iOS app pin (0.31.6 + Prism quantization kernels).
+    // MLXUtilsLibrary 0.0.6 asks for ml-explore from 0.29.1; the revision
+    // requirement overrides it.
+    .package(
+      url: "https://github.com/PrismML-Eng/mlx-swift.git",
+      revision: "9c3a80a4ce8be105540e378c2a703bfc9de57f25"
+    ),
     .package(url: "https://github.com/mlalma/MLXUtilsLibrary.git", exact: "0.0.6")
   ],
   targets: [

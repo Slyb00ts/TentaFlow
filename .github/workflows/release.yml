@@ -730,7 +730,7 @@ jobs:
           for pkg in MLXBridge KokoroBridge; do
             ( cd "tentaflow-desktop/macos/swift/$pkg" \
               && xcodebuild -scheme "$pkg" -destination 'platform=macOS,arch=arm64' \
-                   -configuration Release -skipMacroValidation \
+                   -configuration Release -skipMacroValidation -skipPackagePluginValidation \
                    -derivedDataPath build-xcode build )
           done
 

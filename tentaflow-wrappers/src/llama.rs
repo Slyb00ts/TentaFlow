@@ -306,6 +306,9 @@ pub struct LlamaLoadConfig {
     // rozkład na wszystkie karty. Waga 0.0 dla karty wyklucza ją z użycia, więc
     // to jedyny sposób zawężenia embedded llama.cpp do podzbioru kart.
     pub tensor_split: Vec<f32>,
+    // The NextN/MTP layers are skipped at load unless requested, and an MTP
+    // draft context on a model loaded without them aborts in graph build.
+    pub load_mtp: bool,
 }
 
 impl Default for LlamaLoadConfig {
@@ -318,6 +321,7 @@ impl Default for LlamaLoadConfig {
             flash_attn: DEFAULT_FLASH_ATTN,
             main_gpu: 0,
             tensor_split: Vec::new(),
+            load_mtp: false,
         }
     }
 }
@@ -606,6 +610,7 @@ impl LlamaRuntime {
         let mut params = unsafe { sys::llama_model_default_params() };
         params.n_gpu_layers = config.n_gpu_layers as i32;
         params.main_gpu = config.main_gpu;
+        params.load_mtp = config.load_mtp;
         // tensor_split przekazujemy jako surowy wskaźnik do FFI, więc wektor MUSI
         // żyć aż do końca llama_model_load_from_file. `tensor_split` jest tu lokalną
         // zmienną i nie jest dropowany przed loadem. Waga 0.0 wyklucza kartę —

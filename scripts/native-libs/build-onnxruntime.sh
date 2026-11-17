@@ -30,9 +30,10 @@
 #     archives. The aarch64 GPU runtime comes from the official PyPI
 #     `onnxruntime-gpu` manylinux aarch64 wheel of the same ONNXRUNTIME_REF,
 #     built against CUDA 13 (cudart/cublas 13) with cuDNN 9 loaded at run time.
-#     Its `libonnxruntime_providers_cuda.so` carries SASS for sm_89, sm_90a,
-#     sm_120a and sm_121a and no PTX (cuobjdump), so GB10 and GH200 run native
-#     kernels; any other SM (sm_100, sm_110, Ampere) has no CUDA EP.
+#     Its `libonnxruntime_providers_cuda.so` carries SASS for sm_87, sm_89,
+#     sm_90a, sm_100, sm_110a and sm_120 and no PTX (cuobjdump); sm_120 SASS
+#     also runs on GB10's sm_121, so GB10 and GH200 run native kernels, while
+#     Ampere (sm_80/sm_86) has no CUDA EP.
 #   - The base libonnxruntime.so comes from the SAME wheel so the provider
 #     bridge ABI matches (provider libs are NOT ABI-stable across ORT minors).
 #     The wheel has no C headers; they come from Microsoft's CPU aarch64
@@ -435,7 +436,7 @@ provision_aarch64_gpu_ort() {
   link_runtime_sonames
   sanity_check_gpu_linux libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so
   append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" \
-    "aarch64 GPU wheel (PyPI onnxruntime-gpu, CUDA 13): CUDA provider with sm_89/sm_90a/sm_120a/sm_121a SASS, no TensorRT EP; headers from the CPU tarball; ONNXRUNTIME_GPU=0 -> CPU-only Microsoft tarball."
+    "aarch64 GPU wheel (PyPI onnxruntime-gpu, CUDA 13): CUDA provider with sm_87/sm_89/sm_90a/sm_100/sm_110a/sm_120 SASS, no TensorRT EP; headers from the CPU tarball; ONNXRUNTIME_GPU=0 -> CPU-only Microsoft tarball."
 }
 
 # The linker resolves -lonnxruntime through libonnxruntime.so and the loader

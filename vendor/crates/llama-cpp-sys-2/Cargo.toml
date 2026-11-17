@@ -19,8 +19,6 @@ include = [
     "wrapper.h",
     "wrapper_common.h",
     "wrapper_common.cpp",
-    "wrapper_oai.h",
-    "wrapper_oai.cpp",
     "wrapper_speculative.h",
     "wrapper_speculative.cpp",
     "wrapper_utils.h",

@@ -140,7 +140,8 @@ Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model retur
 (wrong GPU logits) with no build error. `setup.sh` installs it; `tentaflow/build.rs` fails
 loudly if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
 metallib (`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBridge builds via
-`xcodebuild -skipMacroValidation` (SwiftPM CLI can't compile Metal shaders).
+`xcodebuild -skipMacroValidation -skipPackagePluginValidation` (SwiftPM CLI can't compile Metal
+shaders; mlx-swift's `CudaBuild` plugin is refused unless trusted).
 
 `tentaflow-core` features — default = `inference-whisper` + `camera` (GStreamer is mandatory
 for the video pipeline). Key opt-ins:
@@ -1080,6 +1081,11 @@ contract and the `native-libs` artifact mapping, so we can use upstream features
   to the new free position after acceptance — without them M-RoPE rejects the batch. MTP only
   pays off when the GPU is not saturated (a single or rare stream); with several parallel
   sequences the draft overhead outweighs the gain.
+- MTP traps: the model must be loaded with `LlamaLoadConfig.load_mtp` (llama.cpp skips the NextN
+  tensors otherwise and the MTP graph aborts on `nextn.eh_proj`); the engine sets it only for
+  `Mtp`. Since llama.cpp 1.0 the MTP drafter's destructor calls into `ctx_tgt`, so the
+  speculative handle is dropped BEFORE the target context. `common_speculative_process` takes a
+  `common_batch`; the C shim rebuilds it from the `llama_batch` just decoded on `ctx_tgt`.
 - Anti-hang contract: `submit_with_sink` takes a `Box<dyn EngineSink>` and the scheduler calls
   `sink.try_send` from its own thread (no thread per request). A `Full` token is deferred to the
   slot's `pending`, including the terminal token, and `release_slot` only frees the slot after
