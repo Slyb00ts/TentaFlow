@@ -19,6 +19,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   więc zachowanie aplikacji się nie zmienia.
 - Jeśli dwa węzły nadadzą polityce tę samą nazwę, na każdym węźle wygrywa ta
   sama, starsza polityka, a druga dostaje przyrostek z identyfikatora.
+- Polityka SLA działa przy uruchamianiu przepływu. Slot zajmuje tylko
+  wywołanie najwyższego poziomu; wywołania z wnętrza przebiegu (bloki,
+  addony, model opublikowany jako ten sam flow) slotu nie zajmują.
+- Gdy limit jest wyczerpany:
+  - `/v1` (OpenAI i Anthropic) zwraca 429 z `Retry-After` w sekundach;
+  - WebSocket zwraca błąd z kodem `sla.overloaded`;
+  - zadanie BPMN jest odkładane z kodem `FLOW_OVERLOADED` i ponawiane po
+    oknie.
+- Timeout z polityki anuluje przebieg i daje mu 2 s na zakończenie. Wiersz
+  wykonania kończy się wtedy jako `error`. `/v1` zwraca 504, a WebSocket
+  błąd `sla.timeout`. Klienci SDK OpenAI ponawiają 504 dwa razy, więc
+  kosztowny przepływ może się wykonać do trzech razy.
+- Przebiegi z magistrali na razie dostają tylko timeout jako zabezpieczenie.
+  Limit dla magistrali przejmie reaktor w kolejnym kroku.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

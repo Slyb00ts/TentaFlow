@@ -56,6 +56,7 @@ impl RerankDispatcher for RerankDispatcherImpl {
             provenance.origin,
             provenance.actor,
         );
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()

@@ -97,6 +97,10 @@ pub struct ExecutionContext {
     /// Telemetry bag — populated as dispatch proceeds, returned on the
     /// final response.
     pub route_metadata: RouteMetadata,
+    /// The call comes from a node of a flow run that is executing now (see
+    /// `CallProvenance::nested_in_run`). Copied onto `FlowRequestMeta` when a
+    /// model resolves onto a flow, so the nested run takes no SLA slot.
+    pub nested_in_run: bool,
 }
 
 /// Reasons an `enter_*` call refused to descend further. Always actionable
@@ -133,6 +137,7 @@ impl ExecutionContext {
             flow_stack: Vec::new(),
             alias_stack: Vec::new(),
             route_metadata: RouteMetadata::default(),
+            nested_in_run: false,
         }
     }
 

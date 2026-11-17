@@ -74,8 +74,9 @@ impl Router {
         );
         // Usage is booked by the embeddings dispatcher through the AI gateway,
         // once per backend call; booking it here as well would count it twice.
+        let nested = crate::routing::made_inside_a_run(context.as_ref());
         let routed = self
-            .route_embeddings_inner(request, user, origin, actor)
+            .route_embeddings_inner(request, user, origin, actor, nested)
             .await;
         if let Some(run) = run {
             match &routed {
@@ -97,6 +98,7 @@ impl Router {
         user: Option<crate::auth::acl::UserContext>,
         origin: crate::flow_engine::dispatcher::FlowOrigin,
         actor: crate::flow_engine::dispatcher::FlowActor,
+        nested_in_run: bool,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         debug!("Routing embeddings dla modelu: {}", request.model);
 
@@ -106,13 +108,14 @@ impl Router {
         // skonfigurowany, inaczej model embeddingów wykonywany bezpośrednio na
         // executorze (NotFound → direct execution wewnątrz dispatchera).
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let (initial, meta) =
+            let (initial, mut meta) =
                 crate::services::runtime::executor::embeddings_request_to_initial_envelope(
                     &request,
                     user.clone(),
                     origin,
                     actor.clone(),
                 );
+            meta.nested_in_run = nested_in_run;
             match dispatcher
                 .try_dispatch(&request.model, "embeddings", initial, meta)
                 .await
@@ -355,6 +358,7 @@ pub(crate) fn executor_err_to_core(
             source: None,
         },
         ExecutorError::SttServiceUnavailable => CoreError::SttServiceUnavailable,
+        ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
         ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
             model_name: model.to_string(),
         },

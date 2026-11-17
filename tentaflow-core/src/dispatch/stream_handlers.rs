@@ -463,11 +463,12 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         let exec = match dispatch {
             Ok(e) => e,
             Err(e) => {
+                let error = dispatch_failure_text(&e);
                 let _ = push_end(
                     &sub,
                     Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
                         finish_reason: "error".into(),
-                        error: Some(format!("dispatch failed: {e}")),
+                        error: Some(error),
                         text: None,
                     })),
                 );
@@ -2209,7 +2210,7 @@ fn project_studio_chat_stream_handler(
         let exec = match dispatch {
             Ok(e) => e,
             Err(e) => {
-                end_error(&sub, &chat_id, format!("dispatch failed: {e}"));
+                end_error(&sub, &chat_id, dispatch_failure_text(&e));
                 return;
             }
         };
@@ -3212,7 +3213,7 @@ fn project_studio_code_assist_stream_handler(
         {
             Ok(exec) => exec,
             Err(e) => {
-                end_error(&sub, format!("dispatch failed: {e}"));
+                end_error(&sub, dispatch_failure_text(&e));
                 return;
             }
         };
@@ -5281,6 +5282,18 @@ inventory::submit! {
 // =============================================================================
 // Testy
 // =============================================================================
+
+/// The text a stream edge reports for a failed flow dispatch. An SLA refusal or
+/// timeout keeps its stable `sla.overloaded: ...` / `sla.timeout: ...` text as
+/// the whole message so a client can recognise it and back off; any other
+/// failure keeps its "dispatch failed" prefix.
+fn dispatch_failure_text(e: &crate::flow_engine::dispatcher::DispatchError) -> String {
+    use crate::flow_engine::dispatcher::DispatchError;
+    match e {
+        DispatchError::Overloaded { .. } | DispatchError::TimedOut { .. } => e.to_string(),
+        _ => format!("dispatch failed: {e}"),
+    }
+}
 
 #[cfg(test)]
 mod tests {

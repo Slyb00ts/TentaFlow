@@ -169,6 +169,7 @@ impl Router {
                 origin,
                 actor.clone(),
             );
+            exec_ctx.nested_in_run = crate::routing::made_inside_a_run(compliance_context.as_ref());
             match executor.execute_chat(request.clone(), &mut exec_ctx).await {
                 Ok(response) => {
                     if let Some(run) = direct_run {
@@ -264,6 +265,7 @@ impl Router {
                     initial.meta.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
+            meta.nested_in_run = crate::routing::made_inside_a_run(compliance_context.as_ref());
             // §3.4: seed the turn's correlation key with the session event's
             // request_id so every per-call `llm` event in the flow links back to
             // this one row. Without a session event (no DB) there is nothing to
@@ -656,6 +658,7 @@ pub(crate) fn executor_error_to_core(
         ExecutorError::Resolve(_) => CoreError::ModelNotFound {
             model_name: model.to_string(),
         },
+        ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
         other => CoreError::InternalError {
             message: format!("direct backend dispatch failed: {other}"),
             source: None,

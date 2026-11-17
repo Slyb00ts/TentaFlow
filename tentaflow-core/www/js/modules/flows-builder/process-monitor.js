@@ -416,6 +416,7 @@ export const INCIDENT_TEXT_KEYS = Object.freeze({
   BLOCK_INPUT_INVALID: 'incident_block_input',
   BLOCK_UNAVAILABLE: 'incident_unavailable',
   FLOW_UNAVAILABLE: 'incident_unavailable',
+  FLOW_OVERLOADED: 'incident_unavailable',
   TOOL_UNAVAILABLE: 'incident_unavailable',
   TOOL_BUSY: 'incident_unavailable',
   SERVICE_SOURCE_UNREADABLE: 'incident_unavailable',

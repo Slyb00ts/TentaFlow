@@ -673,6 +673,35 @@ fn error_response(status: StatusCode, error_type: &str, message: String) -> Resp
     json_response(status, bytes)
 }
 
+/// Error answer for a failed route. A refusal by an SLA policy is a 429 with
+/// `Retry-After` and Anthropic's `rate_limit_error` type; everything else keeps
+/// the generic 500 `api_error`.
+fn route_error_response(e: &anyhow::Error) -> Response<OpenAIBody> {
+    match e.downcast_ref::<crate::error::CoreError>() {
+        Some(err @ crate::error::CoreError::Overloaded { .. }) => {
+            let response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                err.client_message(),
+            );
+            match err.retry_after_secs() {
+                Some(secs) => super::server::with_retry_after(response, secs),
+                None => response,
+            }
+        }
+        Some(err @ crate::error::CoreError::Timeout { .. }) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            err.client_message(),
+        ),
+        _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            e.to_string(),
+        ),
+    }
+}
+
 fn json_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
     let stream = futures::stream::once(async move { Ok(Frame::data(Bytes::from(body))) });
     let boxed: Pin<
@@ -753,11 +782,7 @@ pub async fn handle_messages(
             Ok(route_result) => Ok(anthropic_sse_response(route_result.response, model)),
             Err(e) => {
                 error!("Anthropic /v1/messages stream: {}", e);
-                Ok(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    e.to_string(),
-                ))
+                Ok(route_error_response(&e))
             }
         }
     } else {
@@ -790,11 +815,7 @@ pub async fn handle_messages(
             }
             Err(e) => {
                 error!("Anthropic /v1/messages: {}", e);
-                Ok(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    e.to_string(),
-                ))
+                Ok(route_error_response(&e))
             }
         }
     }
@@ -1300,6 +1321,23 @@ fn count_block_tokens(block: &AnthropicContentBlock) -> u64 {
 mod tests {
     use super::*;
     use crate::api::openai::types::{Choice, FunctionCallDelta, ToolCallDelta, Usage};
+
+    #[test]
+    fn an_sla_refusal_is_a_429_with_retry_after_in_the_anthropic_shape() {
+        let refusal: anyhow::Error = crate::error::CoreError::Overloaded {
+            reason: "calls_limit".into(),
+            retry_after_ms: 1_200,
+        }
+        .into();
+        let resp = route_error_response(&refusal);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(hyper::header::RETRY_AFTER).unwrap(), "2");
+
+        let other = anyhow::anyhow!("backend exploded");
+        let resp = route_error_response(&other);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_none());
+    }
 
     fn parse_request(json: serde_json::Value) -> AnthropicMessagesRequest {
         serde_json::from_value(json).expect("request parsuje sie")

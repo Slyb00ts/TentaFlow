@@ -25,7 +25,8 @@ pub use middleware::{ResolvedRoute, RouteMetadata, RouteResult};
 
 /// Stage 3d-0b-final: mapowanie typed `DispatchError` → `CoreError`.
 /// Plan v1.5: `Denied` → 404 (nie ujawniamy istnienia modelu klientom
-/// bez ACL); pozostałe → 500 z czytelnym message.
+/// bez ACL); `Overloaded` → 429 (`CoreError::Overloaded`, the edge adds
+/// `Retry-After`); `TimedOut` → 504; pozostałe → 500 z czytelnym message.
 pub(crate) fn dispatch_error_to_core(
     err: crate::flow_engine::dispatcher::DispatchError,
     model: &str,
@@ -56,6 +57,20 @@ pub(crate) fn dispatch_error_to_core(
         DispatchError::QuotaExceeded(message) => {
             crate::error::CoreError::RateLimitExceeded { message }
         }
+        DispatchError::Overloaded {
+            reason,
+            retry_after_ms,
+        } => crate::error::CoreError::Overloaded {
+            reason: reason.code().to_string(),
+            retry_after_ms,
+        },
+        DispatchError::TimedOut {
+            flow_id,
+            timeout_ms,
+        } => crate::error::CoreError::Timeout {
+            backend_url: format!("flow {flow_id}"),
+            timeout_ms,
+        },
     }
 }
 pub use router::{
@@ -79,6 +94,15 @@ pub(crate) fn records_runs(origin: FlowOrigin) -> bool {
     !matches!(origin, FlowOrigin::Mesh | FlowOrigin::Bus)
 }
 
+/// Whether the call is made from inside a flow run that is executing (an addon
+/// block lent to it): such a call takes no SLA slot of its own, for the same
+/// reason it is not recorded as a run of its own.
+pub(crate) fn made_inside_a_run(
+    context: Option<&crate::compliance::ai_gateway::AiGatewayContext>,
+) -> bool {
+    context.is_some_and(|ctx| ctx.parent_run.is_some())
+}
+
 /// [`records_runs`], and the call is not made on behalf of a run that is on the
 /// log already (an addon block inside a flow). A nested call's content belongs to
 /// the run that made it, and a call nested in a bus run is a bus call.
@@ -86,7 +110,7 @@ pub(crate) fn records_call(
     origin: FlowOrigin,
     context: Option<&crate::compliance::ai_gateway::AiGatewayContext>,
 ) -> bool {
-    records_runs(origin) && !context.is_some_and(|ctx| ctx.parent_run.is_some())
+    records_runs(origin) && !made_inside_a_run(context)
 }
 
 /// Puts a run on the Events log under a server-minted scope and settles the

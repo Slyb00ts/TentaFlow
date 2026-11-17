@@ -57,6 +57,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()

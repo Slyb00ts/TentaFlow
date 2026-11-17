@@ -215,6 +215,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
         // ModelRuntimeExecutor::execute_chat nie eksponuje tych pól.
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
@@ -354,6 +355,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.

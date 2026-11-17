@@ -99,6 +99,24 @@ pub enum ExecutorError {
     SttBackend(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// The flow a model resolved onto refused the call under its SLA policy
+    /// (`Overloaded`) or ran past the policy's timeout (`TimedOut`). Typed, not
+    /// flattened into `Internal`, so the edges answer 429 with `Retry-After` or
+    /// 504 instead of a 500.
+    #[error("{0}")]
+    Sla(crate::flow_engine::dispatcher::DispatchError),
+}
+
+impl ExecutorError {
+    /// A flow dispatch failure. Only the SLA outcomes keep their type; the rest
+    /// stay the text they always were.
+    fn from_dispatch(e: crate::flow_engine::dispatcher::DispatchError) -> Self {
+        use crate::flow_engine::dispatcher::DispatchError;
+        match e {
+            e @ (DispatchError::Overloaded { .. } | DispatchError::TimedOut { .. }) => Self::Sla(e),
+            other => Self::Internal(other.to_string()),
+        }
+    }
 }
 
 /// Maps an `SttRuntime` error onto the executor's typed variants, keeping
@@ -127,6 +145,7 @@ impl ExecutorError {
         matches!(
             self,
             Self::FlowDispatcherUnavailable
+                | Self::Sla(_)
                 | Self::SttRuntimeUnavailable
                 | Self::SttServiceUnavailable
                 | Self::SttBackend(_)
@@ -1366,14 +1385,14 @@ impl ModelRuntimeExecutor {
                     // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                     meta.addon_id = ctx.addon_id.clone();
                     meta.org_id = ctx.org_id.clone();
+                    meta.nested_in_run = ctx.nested_in_run;
                     dispatcher
                         .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                         .await
                 };
                 ctx.leave_flow();
 
-                let outcome =
-                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
 
                 // No flow-level metric row here: the flow's internal LLM node
                 // calls back into `ModelRuntimeExecutor::execute_chat`, which
@@ -1733,7 +1752,7 @@ impl ModelRuntimeExecutor {
     /// `LocalInferenceHandler::handle_embeddings` — engines that don't
     /// implement embeddings (the trait default is `bail!`) surface their
     /// own error rather than this dispatcher hard-rejecting them.
-    async fn dispatch_embeddings_blocking(
+    pub(crate) async fn dispatch_embeddings_blocking(
         &self,
         target: &ResolvedExecutionTarget,
         mut request: EmbeddingRequest,
@@ -1942,12 +1961,12 @@ impl ModelRuntimeExecutor {
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
+                meta.nested_in_run = ctx.nested_in_run;
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
                 ctx.leave_flow();
-                let outcome =
-                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
                 let expected_count = match &request.input {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
@@ -2116,12 +2135,12 @@ impl ModelRuntimeExecutor {
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
+                meta.nested_in_run = ctx.nested_in_run;
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
                 ctx.leave_flow();
-                let outcome =
-                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
                 flow_outcome_to_rerank_response(outcome)
             }
         }
@@ -2275,6 +2294,7 @@ impl ModelRuntimeExecutor {
         meta.flow_depth = ctx.flow_stack.len() as u8;
         meta.addon_id = ctx.addon_id.clone();
         meta.org_id = ctx.org_id.clone();
+        meta.nested_in_run = ctx.nested_in_run;
 
         // Blob dokumentu MUSI być skasowany po flow — `put` ląduje w trwałym
         // `CompositeBlobStore`, więc bez `delete` każdy ingest zostawia osierocony
@@ -2298,7 +2318,7 @@ impl ModelRuntimeExecutor {
             }
         }
 
-        let outcome = dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
         flow_outcome_to_ingest_response(outcome)
     }
 
@@ -2807,6 +2827,7 @@ impl ModelRuntimeExecutor {
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
+                meta.nested_in_run = ctx.nested_in_run;
                 // Obraz strony wrzucony do BlobStore MUSI być skasowany po
                 // zakończeniu flow (także przy błędzie) — `put` ląduje w trwałym
                 // store (`CompositeBlobStore`), więc bez jawnego `delete` częste
@@ -2826,8 +2847,7 @@ impl ModelRuntimeExecutor {
                         tracing::warn!(error = %e, "document parse: failed to delete page blob after flow");
                     }
                 }
-                let outcome =
-                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
                 flow_outcome_to_document_response(outcome)
             }
         }
@@ -3191,12 +3211,12 @@ impl ModelRuntimeExecutor {
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
+                meta.nested_in_run = ctx.nested_in_run;
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
                 ctx.leave_flow();
-                let outcome =
-                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
                 flow_outcome_to_tts_result(outcome, dispatcher.blobs()).await
             }
         }

@@ -439,6 +439,22 @@ impl ServiceGate {
     /// Admits one call or says why not. Cancel-safe: dropping the future while
     /// it waits gives the queue place and the reserved call back.
     pub async fn admit(self: &Arc<Self>, origin: AdmitOrigin) -> Result<SlaPermit, SlaRefusal> {
+        self.admit_with(origin, true).await
+    }
+
+    /// [`Self::admit`] that never waits: a call that finds no free slot is
+    /// refused at once (`QueueFull`) instead of joining the waiting queue. For a
+    /// caller that has somewhere better to put a call off than a queue held open
+    /// by its own lease, such as a BPMN job that can be deferred.
+    pub async fn try_admit(self: &Arc<Self>, origin: AdmitOrigin) -> Result<SlaPermit, SlaRefusal> {
+        self.admit_with(origin, false).await
+    }
+
+    async fn admit_with(
+        self: &Arc<Self>,
+        origin: AdmitOrigin,
+        may_wait: bool,
+    ) -> Result<SlaPermit, SlaRefusal> {
         let config = self.config();
         let limits = config.limits;
         let refuse = |reason: RefusalReason, retry_after_ms: u64| SlaRefusal {
@@ -455,12 +471,18 @@ impl ServiceGate {
                 return Err(refuse(RefusalReason::CallLimit, retry_after_ms));
             }
         };
-        if let Err(reason) = self.acquire_slot(&limits).await {
+        let acquired = if may_wait {
+            self.acquire_slot(&limits).await
+        } else {
+            self.try_acquire_slot()
+        };
+        if let Err(reason) = acquired {
             self.counters
                 .rejected_concurrency
                 .fetch_add(1, Ordering::Relaxed);
             return Err(refuse(reason, CONCURRENCY_RETRY_AFTER_MS));
         }
+        let window_epoch = reservation.epoch;
         reservation.commit();
         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
         self.counters.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -469,7 +491,18 @@ impl ServiceGate {
             started: Instant::now(),
             outcome: None,
             timeout: limits.timeout,
+            window_epoch,
         })
+    }
+
+    fn try_acquire_slot(&self) -> Result<(), RefusalReason> {
+        match self.semaphore.try_acquire() {
+            Ok(permit) => {
+                permit.forget();
+                Ok(())
+            }
+            Err(_) => Err(RefusalReason::QueueFull),
+        }
     }
 
     /// `Err` carries the milliseconds until the window rolls over.
@@ -566,6 +599,19 @@ impl ServiceGate {
         }
     }
 
+    /// Takes back an admission whose call never started: the slot is freed, the
+    /// call returns to the window and the call is not counted as accepted, so a
+    /// refusal that happens after admission (a denied ACL, a flow that does not
+    /// compile) costs the service nothing.
+    fn abandon(&self, window_epoch: Option<u32>) {
+        if let Some(epoch) = window_epoch {
+            self.refund_call(epoch);
+        }
+        self.counters.accepted.fetch_sub(1, Ordering::Relaxed);
+        self.counters.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.release_slot();
+    }
+
     fn finish(&self, outcome: Outcome, elapsed: Duration) {
         let c = &self.counters;
         let counter = match outcome {
@@ -594,6 +640,8 @@ pub struct SlaPermit {
     started: Instant,
     outcome: Option<Outcome>,
     timeout: Option<Duration>,
+    /// The call-window epoch the call was counted in, so `forgo` can return it.
+    window_epoch: Option<u32>,
 }
 
 impl SlaPermit {
@@ -605,6 +653,7 @@ impl SlaPermit {
             started: Instant::now(),
             outcome: None,
             timeout: None,
+            window_epoch: None,
         }
     }
 
@@ -623,6 +672,14 @@ impl SlaPermit {
 
     pub fn finish(mut self, outcome: Outcome) {
         self.outcome = Some(outcome);
+    }
+
+    /// Gives the admission back because the call never started: records
+    /// nothing, frees the slot and returns the call to its window.
+    pub fn forgo(mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.abandon(self.window_epoch);
+        }
     }
 }
 
@@ -1116,5 +1173,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(GateLimits::from_spec(&spec).call_limit, Some((3, 1)));
+    }
+
+    #[tokio::test]
+    async fn a_forgone_admission_returns_its_slot_and_its_call() {
+        let (clock, _now) = manual_clock(5_000);
+        let mut cfg = limits(Some(1), 0, 10);
+        cfg.call_limit = Some((1, 60));
+        let gate = ServiceGate::new("flow-1", config(cfg), clock);
+
+        let permit = gate.admit(AdmitOrigin::Request).await.unwrap();
+        assert_eq!(gate.stats().in_flight, 1);
+        permit.forgo();
+
+        let stats = gate.stats();
+        assert_eq!(
+            (stats.in_flight, stats.accepted, stats.window_calls),
+            (0, 0, 0),
+            "nothing is left of a call that never started"
+        );
+        assert_eq!((stats.ok, stats.errors, stats.cancelled), (0, 0, 0));
+        // Both limits are free again: one slot, one call per window.
+        gate.admit(AdmitOrigin::Request)
+            .await
+            .expect("the slot and the window call were returned");
+    }
+
+    #[tokio::test]
+    async fn try_admit_refuses_at_once_instead_of_queueing() {
+        let gate = gate(limits(Some(1), 5, 30_000));
+        let held = gate.try_admit(AdmitOrigin::Request).await.unwrap();
+
+        let started = Instant::now();
+        let refusal = gate.try_admit(AdmitOrigin::Request).await.unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::QueueFull);
+        assert!(refusal.retry_after_ms > 0);
+        assert!(started.elapsed() < Duration::from_secs(1), "no queueing");
+        let stats = gate.stats();
+        assert_eq!((stats.waiting, stats.rejected_concurrency), (0, 1));
+        drop(held);
+        gate.try_admit(AdmitOrigin::Request)
+            .await
+            .expect("free again once the holder is done");
     }
 }

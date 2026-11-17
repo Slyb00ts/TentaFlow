@@ -124,6 +124,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             provenance.origin,
             provenance.actor,
         );
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = match self.runtime.read().as_ref().cloned() {
             Some(runtime) => runtime,
             None => {

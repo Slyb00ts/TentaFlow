@@ -1938,6 +1938,8 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             cancel_token: cancel,
             progress_sink: Some(progress),
             flow_depth: 0,
+            nested_in_run: false,
+            settle: Default::default(),
             bus_source: None,
             progress_scope_override: None,
         };

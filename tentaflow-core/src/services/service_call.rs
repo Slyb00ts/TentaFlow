@@ -268,6 +268,13 @@ pub async fn dispatch(
             req.caller.actor(),
         )
         .with_addon_identity(Some(req.caller.addon_id.clone()), req.caller.org_id.clone());
+        // An addon block lent to a running flow makes its model calls on behalf
+        // of that run; an addon acting on its own behalf enters from outside.
+        exec_ctx.nested_in_run = req
+            .caller
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.parent.is_some());
         let routed = route_alias_via_executor(
             executor,
             &service_name,

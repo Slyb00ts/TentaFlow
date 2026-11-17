@@ -12586,6 +12586,22 @@ pub fn update_flow_execution(
     Ok(())
 }
 
+/// Settles the audit row `id` of a run that hit its SLA policy's timeout. Such a
+/// run is cancelled by the dispatcher or dropped outright, so its own finalizer
+/// may never run and the row stays `running`; the caller did not cancel it, so
+/// the row becomes `error`. A row the run already settled is left alone: the
+/// update is conditional on the row still being `running`, so a late close can
+/// never overwrite the finalizer's result. Returns how many rows changed.
+pub fn close_timed_out_flow_execution(pool: &DbPool, id: i64) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let changed = conn.execute(
+        "UPDATE flow_executions SET finished_at = COALESCE(finished_at, datetime('now')), \
+         status = 'error' WHERE id = ?1 AND status = 'running'",
+        rusqlite::params![id],
+    )?;
+    Ok(changed)
+}
+
 pub fn delete_flow_execution(pool: &DbPool, id: i64) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(

@@ -99,6 +99,18 @@ fn html_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
     asset_response(status, "text/html; charset=utf-8", body)
 }
 
+/// Adds `Retry-After` (whole seconds) to a refusal the caller may retry.
+pub(crate) fn with_retry_after(
+    mut response: Response<OpenAIBody>,
+    secs: u64,
+) -> Response<OpenAIBody> {
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from(secs),
+    );
+    response
+}
+
 /// Mapuje dowolny anyhow::Error (potencjalnie CoreError) na error response z odpowiednim HTTP status.
 /// The full error goes to the log here; the client receives `client_message`.
 fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
@@ -113,10 +125,15 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
                 "service_unavailable"
             }
             CoreError::Timeout { .. } => "timeout_error",
+            CoreError::Overloaded { .. } => "rate_limit_exceeded",
             _ => "internal_error",
         };
         let client_msg = err.client_message();
-        error_response(status, error_type, client_msg)
+        let response = error_response(status, error_type, client_msg);
+        match err.retry_after_secs() {
+            Some(secs) => with_retry_after(response, secs),
+            None => response,
+        }
     } else {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1443,10 +1460,22 @@ async fn handle_audio_speech_flow_stream(
                 crate::error::CoreError::ModelNotFound { .. } => {
                     (StatusCode::NOT_FOUND, "model_not_found")
                 }
+                crate::error::CoreError::Overloaded { .. } => {
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
+                }
+                crate::error::CoreError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "backend_error"),
             };
+            // The log keeps the raw dispatch error. The client gets
+            // `client_message()`, which is generic for the SLA, timeout and
+            // model-not-found statuses above; the 500 branch falls back to the
+            // error's own text and is not sanitized.
             error!("audio flow-stream init: {}", msg);
-            return Ok(error_response(status, code, msg));
+            let response = error_response(status, code, core_err.client_message());
+            return Ok(match core_err.retry_after_secs() {
+                Some(secs) => with_retry_after(response, secs),
+                None => response,
+            });
         }
     };
 
@@ -3009,6 +3038,51 @@ mod error_mapping_tests {
         let core = crate::routing::dispatch_error_to_core(dispatch, "whisper-1");
         assert!(matches!(core, CoreError::SttServiceUnavailable));
         assert_eq!(core.status_code(), 503);
+    }
+
+    /// A refusal by an SLA policy crosses the same two steps a real `/v1` call
+    /// takes (dispatch error -> core error -> HTTP answer) and comes out as a
+    /// 429 that tells the client how long to wait, in whole seconds rounded up.
+    #[test]
+    fn an_sla_refusal_is_a_429_with_retry_after() {
+        use crate::flow_engine::dispatcher::DispatchError;
+        use crate::sla::RefusalReason;
+
+        for (retry_after_ms, header) in [(1_000, "1"), (1_001, "2"), (2_500, "3"), (1, "1")] {
+            let dispatch = DispatchError::Overloaded {
+                reason: RefusalReason::QueueFull,
+                retry_after_ms,
+            };
+            let core = crate::routing::dispatch_error_to_core(dispatch, "any-model");
+            let err: anyhow::Error = core.into();
+            let resp = core_error_to_response(&err);
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                resp.headers().get(hyper::header::RETRY_AFTER).unwrap(),
+                header,
+                "{retry_after_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn other_failures_carry_no_retry_after() {
+        let err: anyhow::Error = CoreError::SttServiceUnavailable.into();
+        let resp = core_error_to_response(&err);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn a_policy_timeout_is_a_504() {
+        use crate::flow_engine::dispatcher::DispatchError;
+
+        let dispatch = DispatchError::TimedOut {
+            flow_id: "f1".into(),
+            timeout_ms: 100,
+        };
+        let core = crate::routing::dispatch_error_to_core(dispatch, "any-model");
+        let resp = core_error_to_response(&core.into());
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }
 

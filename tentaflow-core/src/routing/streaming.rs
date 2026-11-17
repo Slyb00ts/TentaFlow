@@ -787,6 +787,7 @@ impl Router {
                 origin,
                 actor.clone(),
             );
+            exec_ctx.nested_in_run = crate::routing::made_inside_a_run(compliance_context.as_ref());
             match executor.stream_chat(direct_req, &mut exec_ctx).await {
                 Ok(stream) => {
                     let stream = match direct_run {
@@ -856,6 +857,8 @@ impl Router {
                         .and_then(|ctx| ctx.org_id.as_deref()),
                 );
             }
+            meta_stream.nested_in_run =
+                crate::routing::made_inside_a_run(compliance_context.as_ref());
             // §3.4: seed the turn's correlation key with the session event's
             // request_id so per-call `llm` events in the flow link to this row.
             if let Some(handle) = compliance_event.as_ref() {

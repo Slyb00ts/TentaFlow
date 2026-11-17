@@ -66,6 +66,7 @@ impl SttDispatcher for SttDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         // Keep "no STT service" typed (downcastable) through the flow engine
         // so the HTTP edge can answer 503 instead of a generic 500.
         let response = runtime

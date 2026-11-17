@@ -256,6 +256,10 @@ fn chunk_carries_first_token(chunk: &LlmStreamChunk) -> bool {
             .is_some_and(|r| !r.is_empty())
 }
 
+/// The error a run ends with when `meta.deadline` passes between nodes. The
+/// dispatcher reads it to answer such a run as a timeout.
+pub(crate) const DEADLINE_EXCEEDED: &str = "deadline exceeded";
+
 pub struct StreamingExecution {
     pub stream: BoxStream<'static, Result<EnvelopeDelta>>,
     pub outcome: oneshot::Receiver<FlowExecutionOutcome>,
@@ -434,7 +438,7 @@ async fn execute_blocking_inner(
         }
         if let Some(dl) = ctx.effective_deadline() {
             if Instant::now() >= dl {
-                error = Some("deadline exceeded".into());
+                error = Some(DEADLINE_EXCEEDED.into());
                 last_finish_reason = Some(FinishReason::Error);
                 abort_join_set(&mut join_set).await;
                 break;
@@ -1948,7 +1952,7 @@ async fn execute_streaming_inner(
         }
         if let Some(dl) = ctx.effective_deadline() {
             if Instant::now() >= dl {
-                return Err(anyhow!("deadline exceeded"));
+                return Err(anyhow!(DEADLINE_EXCEEDED));
             }
         }
         let def_idx = compiled.execution_order[run_idx];
@@ -2172,7 +2176,7 @@ async fn execute_streaming_region(
         }
         if let Some(dl) = ctx.effective_deadline() {
             if Instant::now() >= dl {
-                return Err(anyhow!("deadline exceeded"));
+                return Err(anyhow!(DEADLINE_EXCEEDED));
             }
         }
         let def_idx = compiled.execution_order[run_idx];
@@ -3023,6 +3027,8 @@ async fn create_execution_record(
         )
     })
     .await??;
+    // Whoever bounds the run from outside finds its audit row through this.
+    ctx.settle.publish(id);
     Ok(id)
 }
 
@@ -3047,7 +3053,12 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
         return;
     }
     let pool = db.clone();
-    let status = if outcome.finish_reason == FinishReason::Cancelled {
+    // A run its SLA policy timed out stops on the cancel token the timeout fired,
+    // which looks like a cancellation; the caller cancelled nothing.
+    let timed_out = crate::flow_engine::sla_admission::repository_timed_out::take(execution_id);
+    let status = if timed_out {
+        "error"
+    } else if outcome.finish_reason == FinishReason::Cancelled {
         "cancelled"
     } else if outcome.error.is_some() {
         "error"

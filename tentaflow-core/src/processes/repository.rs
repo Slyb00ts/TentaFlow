@@ -26789,7 +26789,7 @@ pub fn claim_job_where(
         let still_queued: bool = tx.query_row(
             "SELECT status='queued' FROM bpmn_jobs WHERE job_id=?1", [job_id], |row| row.get(0))?;
         if still_queued {
-            defer_queued_on(&tx, job_id, instance_id, scope_id, node_id, code, now_ms)?;
+            defer_queued_on(&tx, job_id, instance_id, scope_id, node_id, code, 0, now_ms)?;
         }
     }
     for ((job_id, instance_id, scope_id, node_id, _, _), reason) in &broken {
@@ -27229,6 +27229,7 @@ fn defer_queued_on(
     scope_id: &str,
     node_id: &str,
     code: &str,
+    min_delay_ms: i64,
     now_ms: i64,
 ) -> Result<DeferOutcome> {
     let (count, first, last): (i64, Option<i64>, Option<String>) = tx.query_row(
@@ -27242,7 +27243,7 @@ fn defer_queued_on(
             "the task source stayed unavailable for too long before the task could start", now_ms)?;
         return Ok(DeferOutcome::Expired);
     }
-    let not_before = now_ms + defer_backoff_ms(count);
+    let not_before = now_ms.saturating_add(defer_backoff_ms(count).max(min_delay_ms));
     tx.execute(
         "UPDATE bpmn_jobs SET not_before_ms=?1,defer_count=?2,first_deferred_at_ms=?3,last_defer_code=?4,updated_at_ms=?5 WHERE job_id=?6 AND status='queued'",
         params![not_before, count + 1, first_at, code, now_ms, job_id],
@@ -27288,6 +27289,20 @@ pub fn defer_job(
     code: &str,
     now_ms: i64,
 ) -> Result<Option<DeferOutcome>> {
+    defer_job_for(pool, claimed, worker_id, code, 0, now_ms)
+}
+
+/// [`defer_job`] for a source that said how long it will stay unavailable: the
+/// job is not claimed again before `min_delay_ms` has passed, if that is longer
+/// than the usual backoff.
+pub fn defer_job_for(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    code: &str,
+    min_delay_ms: i64,
+    now_ms: i64,
+) -> Result<Option<DeferOutcome>> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     // The fenced update comes first: a claim that is no longer ours is simply
@@ -27308,7 +27323,7 @@ pub fn defer_job(
     )?;
     ensure!(on_hold, "only a job that has not been dispatched can be deferred");
     let outcome = defer_queued_on(&tx, &claimed.job.job_id, &claimed.job.instance_id,
-        &claimed.job.scope_id, &claimed.job.node_id, code, now_ms)?;
+        &claimed.job.scope_id, &claimed.job.node_id, code, min_delay_ms, now_ms)?;
     tx.commit()?;
     Ok(Some(outcome))
 }
