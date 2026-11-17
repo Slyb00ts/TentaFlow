@@ -265,8 +265,9 @@ pub(crate) mod test_support {
         defaults_allow: &[&str],
     ) -> String {
         let addon_id = format!("{package_id}-{suffix}");
-        let manifest = crate::addon::bundled::native_manifest(package_id)
-            .unwrap_or_else(|| panic!("'{package_id}' is not a bundled native package"));
+        let manifest = crate::addon::native_apps::hooks_for(package_id)
+            .unwrap_or_else(|| panic!("'{package_id}' is not a native app of this build"))
+            .manifest;
         let manifest = crate::addon::lifecycle::rewrite_manifest_for_instance(
             manifest,
             &addon_id,

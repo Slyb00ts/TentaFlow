@@ -67,6 +67,7 @@ pub struct FlushStats {
 /// DB writer; per-addon DB errors are handled in-band (re-mark + count) so the
 /// periodic loop keeps running.
 pub fn flush_once(db: &Db, store: &AddonStateStore) -> Result<FlushStats> {
+    let _order = flush_order();
     let mut stats = FlushStats::default();
 
     for addon_id in store.dirty_addons() {
@@ -113,6 +114,17 @@ pub fn flush_once(db: &Db, store: &AddonStateStore) -> Result<FlushStats> {
     }
 
     Ok(stats)
+}
+
+/// Serializes every flush from batch take to commit. Flushes run from the
+/// periodic task, an instance stop, an install and a mobile host going to the
+/// background;
+/// two of them overlapping on one addon could commit a key's older value after
+/// its newer one, leaving the stale value in SQLite with the key no longer
+/// dirty, so a restart would bring it back.
+fn flush_order() -> std::sync::MutexGuard<'static, ()> {
+    static ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ORDER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Apply one addon's dirty batch in a single transaction. Upserts and deletes
@@ -175,6 +187,7 @@ fn flush_batch(db: &Db, batch: &TakenBatch) -> Result<()> {
 /// addon has nothing pending (returns zeroed stats). On DB failure the batch is
 /// re-marked dirty (the next periodic flush, or a retry, will persist it).
 pub fn flush_addon(db: &Db, store: &AddonStateStore, addon_id: &str) -> Result<FlushStats> {
+    let _order = flush_order();
     let batch = store.take_dirty(addon_id);
     if batch.set().is_empty() {
         return Ok(FlushStats::default());

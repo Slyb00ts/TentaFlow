@@ -81,6 +81,13 @@ pub struct NodeSummary {
     /// older build wrote.
     #[serde(default)]
     pub armed_until: Option<String>,
+    /// The node runs TentaNas as a console for the others' storage
+    /// (`native_apps::console_only_node`): it has no disks, shares or
+    /// targets, so no node lists it. Carried by this replicated row rather
+    /// than by the mesh roster because an offline phone still has to stay
+    /// off every list. Defaulted for a row an older build wrote.
+    #[serde(default)]
+    pub console: bool,
 }
 
 /// The capability labels of a node, from the same feature probe the
@@ -404,14 +411,40 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         arrays_unmeasured: 0,
         armed_until: super::elevation::armed_until(),
         updated_at: super::db::now(),
+        console: false,
     }
 }
 
 /// Writes this node's summary row. Best-effort like `record_node_status`.
 pub async fn publish_local_summary(main_db: &DbPool, addon_id: &str, db: &DbPool) {
     let summary = local_summary(db).await;
-    let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
-    let Ok(value) = serde_json::to_string(&summary) else { return };
+    write_summary(main_db, addon_id, &local_node_key(), &summary);
+}
+
+/// Writes the summary of a console-only node: the one fact it publishes is
+/// that it is not a NAS node. No timestamp, so every boot writes the same
+/// bytes.
+pub fn publish_console_summary(main_db: &DbPool, addon_id: &str) {
+    let summary = NodeSummary {
+        console: true,
+        ..NodeSummary::default()
+    };
+    write_summary(main_db, addon_id, &local_node_key(), &summary);
+}
+
+fn local_node_key() -> String {
+    crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string())
+}
+
+pub(crate) fn write_summary(
+    main_db: &DbPool,
+    addon_id: &str,
+    node_id: &str,
+    summary: &NodeSummary,
+) {
+    let Ok(value) = serde_json::to_string(summary) else {
+        return;
+    };
     if let Err(e) = crate::db::repository::upsert_addon_config_value(
         main_db,
         addon_id,
@@ -555,7 +588,8 @@ pub(crate) fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
 }
 
 /// This node plus every trust-paired peer, each with its instance status
-/// and its last published summary.
+/// and its last published summary. A node whose summary says it is a
+/// console (`NodeSummary::console`) is left out.
 pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
     let statuses = prefixed_map(&ctx.state.db, addon_id, NODE_STATUS_KEY_PREFIX);
     let summaries = prefixed_map(&ctx.state.db, addon_id, SUMMARY_KEY_PREFIX);
@@ -570,6 +604,12 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
             ids.push((peer.node_id.clone(), peer.quic_connected));
         }
     }
+    ids.retain(|(node_id, _)| {
+        !summaries
+            .get(node_id)
+            .and_then(|v| serde_json::from_str::<NodeSummary>(v).ok())
+            .is_some_and(|s| s.console)
+    });
 
     ids.into_iter()
         .map(|(node_id, online)| {

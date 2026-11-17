@@ -51,7 +51,6 @@ clap = { workspace = true, features = ["derive"] }
 rustls = { workspace = true, features = ["ring"], default-features = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
-parking_lot = { workspace = true }
 # HTTP: health-check w `tentaflow status` (localhost, certyfikat self-signed
 # per-instalacja) — ta sama wersja i te same features co w rdzeniu, wiec nie
 # dokladamy osobnego drzewa zaleznosci.

@@ -175,6 +175,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                            name: UIApplication.didEnterBackgroundNotification, object: nil)
         center.addObserver(self, selector: #selector(handleWillEnterForeground),
                            name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleWillTerminate),
+                           name: UIApplication.willTerminateNotification, object: nil)
+    }
+
+    // Delivered only while the app is not suspended; a suspended app dies
+    // without a callback, which is why tentaflow_on_pause already flushes the
+    // addons' durable state.
+    @objc private func handleWillTerminate() {
+        NSLog("[TentaFlow] willTerminate — graceful shutdown Rust")
+        tentaflow_on_terminate()
     }
 
     @objc private func handleDidEnterBackground() {

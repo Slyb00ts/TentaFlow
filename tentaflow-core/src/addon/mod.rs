@@ -1494,21 +1494,12 @@ impl AddonManager {
         // reconciles; each node records its own outcome in the synced
         // `__node_status/` registry so the admin GUI shows the whole fleet.
         if manifest.is_native() {
-            if !native_apps::platform_supported(&manifest.platforms) {
+            if let Some(refusal) = native_apps::local_platform_refusal(&addon.package_id) {
                 info!(
                     "sync reconcile: native '{addon_id}' unsupported na tej platformie ({}) — pomijam init",
                     std::env::consts::OS
                 );
-                native_apps::record_node_status(
-                    &self.db,
-                    addon_id,
-                    "unsupported",
-                    &format!(
-                        "platform '{}' not in {:?}",
-                        std::env::consts::OS,
-                        manifest.platforms
-                    ),
-                );
+                native_apps::record_node_status(&self.db, addon_id, "unsupported", &refusal);
                 return;
             }
             let Some(hooks) = native_apps::hooks_for(&addon.package_id) else {
@@ -2651,22 +2642,13 @@ impl AddonManager {
             if !manifest.is_native() {
                 continue;
             }
-            if !native_apps::platform_supported(&manifest.platforms) {
+            if let Some(refusal) = native_apps::local_platform_refusal(&a.package_id) {
                 info!(
                     "start_installed_native_instances: native '{}' unsupported na tej platformie ({}) — pomijam init",
                     a.addon_id,
                     std::env::consts::OS
                 );
-                native_apps::record_node_status(
-                    &self.db,
-                    &a.addon_id,
-                    "unsupported",
-                    &format!(
-                        "platform '{}' not in {:?}",
-                        std::env::consts::OS,
-                        manifest.platforms
-                    ),
-                );
+                native_apps::record_node_status(&self.db, &a.addon_id, "unsupported", &refusal);
                 continue;
             }
             let Some(hooks) = native_apps::hooks_for(&a.package_id) else {
@@ -4547,6 +4529,66 @@ mod tests {
                 )
                 .expect("alias materialized for the disabled instance");
             assert_eq!(owner, "syncpkg-1");
+        });
+    }
+
+    /// An instance replicated from a build that did not list this node's
+    /// platform carries that build's `platforms` on its row. This node runs
+    /// the package anyway, because its OWN compiled manifest lists it, and an
+    /// `unsupported` recorded by an earlier boot is replaced by `ready`.
+    #[tokio::test]
+    async fn a_stale_instance_manifest_does_not_keep_a_supported_node_unsupported() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::db::migrations::run(&conn).unwrap();
+            let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+            let package = "benchmark-studio";
+            let addon_id = "benchmark-studio-0000beef";
+            let compiled = native_apps::hooks_for(package).expect("compiled app").manifest;
+            let compiled_platforms = lifecycle::parse_manifest_toml(compiled).unwrap().platforms;
+            let line = format!("platforms = {compiled_platforms:?}");
+            assert!(
+                compiled.contains(&line),
+                "manifest spells platforms as {line}"
+            );
+            let stale = lifecycle::rewrite_manifest_for_instance(
+                &compiled.replace(&line, "platforms = [\"solaris\"]"),
+                addon_id,
+                "Benchmark",
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            db.write()
+                .unwrap()
+                .execute(
+                    "INSERT INTO addons (addon_id, name, version, package_id, package_version, \
+                     runtime, manifest_json, is_enabled) \
+                     VALUES (?1, 'Benchmark', '1.0.0', ?2, '1.0.0', 'native', ?3, 1)",
+                    rusqlite::params![addon_id, package, stale],
+                )
+                .unwrap();
+            native_apps::record_node_status(
+                &db,
+                addon_id,
+                "unsupported",
+                "platform not in [\"solaris\"]",
+            );
+            let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+            let manager = AddonManager::new(db.clone(), cipher).expect("addon manager");
+
+            manager.start_installed_native_instances();
+
+            let status = crate::db::repository::list_addon_config_prefixed(
+                &db,
+                addon_id,
+                native_apps::NODE_STATUS_KEY_PREFIX,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, value, _)| serde_json::from_str::<serde_json::Value>(&value).unwrap())
+            .next()
+            .expect("node status recorded");
+            assert_eq!(status["status"], "ready", "{status}");
         });
     }
 

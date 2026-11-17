@@ -13,7 +13,7 @@ category = "productivity"
 author = "TentaFlow"
 icon = "folder"
 runtime = "native"
-platforms = ["linux", "macos", "windows"]
+platforms = ["linux", "macos", "windows", "ios"]
 
 [application]
 entry_panel = "main"

@@ -310,7 +310,19 @@ fn install_native_instance(
 
     // Install is GLOBAL (the row replicates fleet-wide) — an unsupported local
     // platform skips only the LOCAL init; supported nodes init via reconcile.
-    if crate::addon::native_apps::platform_supported(&manifest.platforms) {
+    if let Some(refusal) = crate::addon::native_apps::local_platform_refusal(package_id) {
+        info!(
+            "Native app '{}': platforma {} niewspierana — lokalny init pominiety",
+            manifest.addon_id,
+            std::env::consts::OS
+        );
+        crate::addon::native_apps::record_node_status(
+            db,
+            &manifest.addon_id,
+            "unsupported",
+            &refusal,
+        );
+    } else {
         let org_id = crate::services::org::DEFAULT_ORG_ID;
         let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, &manifest.addon_id)
             .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
@@ -321,22 +333,6 @@ fn install_native_instance(
             data_dir,
         })?;
         crate::addon::native_apps::record_node_status(db, &manifest.addon_id, "ready", "");
-    } else {
-        info!(
-            "Native app '{}': platforma {} niewspierana — lokalny init pominiety",
-            manifest.addon_id,
-            std::env::consts::OS
-        );
-        crate::addon::native_apps::record_node_status(
-            db,
-            &manifest.addon_id,
-            "unsupported",
-            &format!(
-                "platform '{}' not in {:?}",
-                std::env::consts::OS,
-                manifest.platforms
-            ),
-        );
     }
 
     info!(

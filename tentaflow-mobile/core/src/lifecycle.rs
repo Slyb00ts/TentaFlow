@@ -89,6 +89,18 @@ pub extern "C" fn tentaflow_on_pause() {
         lifecycle.on_pause();
     }
     tentaflow_core::lifecycle_signal::broadcast_pause();
+    // A backgrounded app can be killed without another callback.
+    crate::runtime::flush_durable_state();
+}
+
+/// iOS: `UIApplication.willTerminateNotification`. Not wired on Android: an
+/// Activity's `onDestroy` does not end the process, and the core cannot be
+/// started again inside the same process after a shutdown; there the pause
+/// flush is what protects durable state.
+#[no_mangle]
+pub extern "C" fn tentaflow_on_terminate() {
+    info!("Aplikacja konczy dzialanie");
+    crate::runtime::stop();
 }
 
 #[no_mangle]

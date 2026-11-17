@@ -20,8 +20,9 @@ icon = "cluster"
 runtime = "native"
 # Every platform gets the screens; what a NODE can actually run is decided by
 # the host probe, not by the catalog — a node without a hypervisor is a host in
-# state `needs_install`, not a missing application.
-platforms = ["linux", "macos", "windows"]
+# state `needs_install`, not a missing application. iOS is the exception: it
+# gets the screens as a console and publishes no host (`console_only_node`).
+platforms = ["linux", "macos", "windows", "ios"]
 
 [application]
 entry_panel = "main"

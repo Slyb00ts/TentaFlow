@@ -7939,6 +7939,37 @@ mod registration_tests {
         assert!(nodes[0].online);
     }
 
+    /// A console-only node (the phone) publishes a summary saying so, and the
+    /// fleet list leaves it out — its own, and every other node's, since the
+    /// row replicates.
+    #[tokio::test]
+    async fn a_node_that_published_a_console_summary_is_not_listed() {
+        let fixture = dispatch_fixture();
+        tentanas::fleet::write_summary(
+            &fixture.ctx.state.db,
+            &fixture.addon_id,
+            "test-node",
+            &tentanas::fleet::NodeSummary {
+                console: true,
+                ..Default::default()
+            },
+        );
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+
+        assert!(!is_error, "{answer:?}");
+        let MessageBody::TentaNasBody(P::NodesListResponse {
+            local_node_id,
+            nodes,
+        }) = answer
+        else {
+            panic!("expected NodesListResponse, got {answer:?}");
+        };
+        assert_eq!(local_node_id, "test-node");
+        assert!(nodes.is_empty(), "a console is not a NAS node: {nodes:?}");
+    }
+
     #[tokio::test]
     async fn an_anonymous_tentanas_frame_is_denied_through_dispatch() {
         let mut fixture = dispatch_fixture();

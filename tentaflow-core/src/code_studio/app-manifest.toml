@@ -13,7 +13,8 @@ category = "productivity"
 author = "TentaFlow"
 icon = "terminal"
 runtime = "native"
-platforms = ["linux", "macos", "windows"]
+# iOS reaches workspaces on other nodes and refuses to host one itself.
+platforms = ["linux", "macos", "windows", "ios"]
 
 [application]
 entry_panel = "main"

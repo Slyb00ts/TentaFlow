@@ -2987,7 +2987,9 @@ mod tests {
     /// and `quant.run` are `default = "allow"`, so a fixture without them would
     /// test an access configuration production never has.
     fn install_lab(fx: &mut Fixture, name: &str, user_id: &str, permissions: &[&str]) -> String {
-        let manifest = crate::addon::bundled::native_manifest(PACKAGE_ID).expect("manifest");
+        let manifest = crate::addon::native_apps::hooks_for(PACKAGE_ID)
+            .expect("compiled app")
+            .manifest;
         let defaults: Vec<&str> = crate::addon::lifecycle::parse_manifest_toml(manifest)
             .expect("manifest parses")
             .declared_permissions

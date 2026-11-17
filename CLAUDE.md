@@ -421,6 +421,23 @@ cancels LLM + TTS instead of running to the 120 s turn deadline. Independently,
 flow grinding. Transcripts and answers are personal data: logs on these paths carry lengths,
 latencies and ids only, never the text.
 
+## Node startup
+
+`tentaflow-core/src/bootstrap.rs` is the ONE startup sequence, called by both
+`tentaflow/src/main.rs` and `tentaflow-mobile/core/src/runtime.rs`, in phases:
+`open_database` → `init_core_state` → `build_router` → `CoreNode::start_router_and_addons` →
+`start_mesh` → `start_background_services` → `start_server`. A host puts only the steps its
+platform cannot share between phases (desktop: storage path overrides, cluster health, Ollama
+detection, Meeting Bot cleanup, deployment resume, vision workers, cameras; mobile: sandbox
+data root, model residency, diagnostics heartbeat, Bonjour FFI). Never re-add a startup step
+at one call site only: mobile was a hand copy that drifted until no addon or native app worked
+on iOS/Android (no `AddonManager` reached the server). Shutdown is shared the same way:
+`CoreNode::stop_process_runtime` then `CoreNode::shutdown` (desktop stops its vision workers in
+between). Mobile keeps the started node in `runtime::RUNNING`; iOS runs the shutdown from
+`tentaflow_on_terminate` (`willTerminate`, ~4 s budget), and every pause flushes the addons'
+durable state, because a suspended app is killed without a callback. Android has no terminate
+hook: an Activity's `onDestroy` does not end the process, and core state cannot start twice.
+
 ## Addons
 
 `tentaflow-core/build.rs` embeds bundled addons from `tentaflow-core/addons/` (addon.wasm +
@@ -445,6 +462,13 @@ stay as the DB left them; instances start via auto-start) — a restart must not
 addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
 (`ABI_OUTPUT_BUFFER_TOO_SMALL`: required length on `out_len_ptr`) by reallocating the
 `on_request` output buffer and retrying, up to 8 MB; code 2 and other errors still fail.
+
+Native apps compiled into core are listed ONCE, in `addon/native_apps.rs::REGISTRY`: each
+`NativeAppHooks` carries the package's compiled `manifest` and an optional `catalog_name`. The
+catalog registers the entries that have a name (TentaVM ships hooks with `None` until its tile
+has a route), and a node decides from its OWN compiled manifest's `platforms` whether it runs an
+instance (`local_platform_refusal`), never from the replicated instance row, which says what
+the installing build supported.
 
 Native packages may declare `[[install_step]]` (`addon/install_steps.rs`): the Addons install UI
 (`www/js/modules/addons/install-steps.js`) renders each step's field schema (`select`,
