@@ -83,6 +83,7 @@
 		A2000020 /* Frameworks/GStreamer.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Frameworks/GStreamer.xcframework; sourceTree = "<group>"; };
 		A3000010 /* AppleTTSEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleTTSEngine.swift; sourceTree = "<group>"; };
 		AF27372E3CE0E9A08BCC3F52 /* WhisperConfig.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperConfig.swift; sourceTree = "<group>"; };
+		D51DFBB241043F6D69B4A351 /* TentaFlowAI.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = TentaFlowAI.entitlements; sourceTree = "<group>"; };
 		DD7575C171E9112E6F63B7A9 /* WhisperModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperModel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -137,6 +138,7 @@
 				A2000002 /* ContentView.swift */,
 				A2000004 /* Assets.xcassets */,
 				A2000005 /* Info.plist */,
+				D51DFBB241043F6D69B4A351 /* TentaFlowAI.entitlements */,
 				A2000006 /* TentaFlowAI-Bridging-Header.h */,
 				EBE3A1DEF5510D79FEEB7552 /* Whisper */,
 			);
@@ -284,6 +286,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = TentaFlowAI/TentaFlowAI.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;
@@ -345,6 +348,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = TentaFlowAI/TentaFlowAI.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;

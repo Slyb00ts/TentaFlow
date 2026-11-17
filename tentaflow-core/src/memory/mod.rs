@@ -11,8 +11,12 @@ mod engine;
 mod guard;
 pub mod impls;
 mod state;
+#[cfg(target_os = "ios")]
+mod process_limit;
 
 pub use engine::LoadableEngine;
 pub use guard::{global as guard_global, MemoryGuard};
 pub use impls::{estimate_vram_for_model, DockerEngine, EmbeddedEngine, PythonBundleEngine};
 pub use state::{GpuAffinity, LoadState, ServiceMemState};
+#[cfg(target_os = "ios")]
+pub use process_limit::{process_memory, ProcessMemory};

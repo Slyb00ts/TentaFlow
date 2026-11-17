@@ -353,13 +353,54 @@ extern "C" fn rust_token_callback(
 pub struct MlxSwiftEngine {
     /// Cache model info z load_model — zeby model_info() nie traciło chat_template
     cached_info: std::sync::Mutex<Option<ModelInfo>>,
+    /// What loading the current model added to the app's footprint: MLX's
+    /// share of it, which the C callbacks do not report. `None` while no
+    /// model is loaded or when the footprint could not be read.
+    #[cfg(target_os = "ios")]
+    model_footprint_bytes: std::sync::Mutex<Option<u64>>,
 }
 
 impl MlxSwiftEngine {
     pub fn new() -> Self {
         Self {
             cached_info: std::sync::Mutex::new(None),
+            #[cfg(target_os = "ios")]
+            model_footprint_bytes: std::sync::Mutex::new(None),
         }
+    }
+
+    /// MLX memory budget handed to Swift (MB, 0 = no cap).
+    ///
+    /// On iOS jetsam kills the app once its WHOLE footprint reaches the per-app
+    /// limit, before MLX's allocator would fail, and the core, SQLite, TLS and
+    /// other engines share that footprint. MLX may therefore keep what it holds
+    /// now — the loaded model — and grow only into the headroom left for
+    /// models; a larger budget would let the Swift guard trip after the kill.
+    fn swift_memory_budget_mb(&self, requested_mb: u32) -> i32 {
+        #[cfg(target_os = "ios")]
+        let requested_mb = {
+            let model = *self
+                .model_footprint_bytes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match (model, crate::memory::process_memory()) {
+                (Some(model), Some(mem)) => {
+                    let cap_bytes = model.saturating_add(mem.model_headroom_bytes());
+                    // 0 means "no cap" to Swift; a node without room gets the
+                    // smallest cap instead, which fails the generation cleanly.
+                    let cap_mb = u32::try_from(cap_bytes / (1024 * 1024))
+                        .unwrap_or(u32::MAX)
+                        .max(1);
+                    if requested_mb == 0 {
+                        cap_mb
+                    } else {
+                        requested_mb.min(cap_mb)
+                    }
+                }
+                _ => requested_mb,
+            }
+        };
+        i32::try_from(requested_mb).unwrap_or(i32::MAX)
     }
 }
 
@@ -387,6 +428,11 @@ impl InferenceEngine for MlxSwiftEngine {
         let load_fn = callbacks.load_fn;
         let ctx = SendPtr::from_raw(callbacks.context);
 
+        // MLX evaluates the weights while loading, so they are part of the
+        // footprint once `load_fn` returns.
+        #[cfg(target_os = "ios")]
+        let footprint_before = crate::memory::process_memory().map(|m| m.footprint_bytes);
+
         // Wywolaj load_fn na dedykowanym watku — Swift moze blokowac
         let result = tokio::task::spawn_blocking(move || {
             let c_path = to_cstring(&path_str);
@@ -394,6 +440,20 @@ impl InferenceEngine for MlxSwiftEngine {
         })
         .await
         .context("Blad watku ladowania modelu")?;
+
+        #[cfg(target_os = "ios")]
+        {
+            let added = match (footprint_before, crate::memory::process_memory()) {
+                (Some(before), Some(after)) if result >= 0 => {
+                    Some(after.footprint_bytes.saturating_sub(before))
+                }
+                _ => None,
+            };
+            *self
+                .model_footprint_bytes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = added;
+        }
 
         if result < 0 {
             anyhow::bail!("Swift MLX: blad ladowania modelu (kod: {})", result);
@@ -444,6 +504,13 @@ impl InferenceEngine for MlxSwiftEngine {
         })
         .await
         .context("Blad watku wyladowania modelu")?;
+        #[cfg(target_os = "ios")]
+        {
+            *self
+                .model_footprint_bytes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
 
         Ok(())
     }
@@ -485,7 +552,7 @@ impl InferenceEngine for MlxSwiftEngine {
         let temperature = params.temperature;
         let top_p = params.top_p;
         let max_context_tokens = params.max_context_tokens as i32;
-        let memory_budget_mb = params.memory_budget_mb as i32;
+        let memory_budget_mb = self.swift_memory_budget_mb(params.memory_budget_mb);
 
         // Kanal do zbierania tokenow — bufor wystarczajacy na caly wynik
         let (tx, mut rx) = mpsc::channel::<StreamToken>(4096);
@@ -520,7 +587,7 @@ impl InferenceEngine for MlxSwiftEngine {
             anyhow::bail!(
                 "Brak pamieci: kontekst lub model przekracza limit (max_context_tokens={}, memory_budget_mb={}). Zadanie nie zostalo wykonane.",
                 params.max_context_tokens,
-                params.memory_budget_mb
+                memory_budget_mb
             );
         }
         if gen_result < 0 {
@@ -602,7 +669,7 @@ impl InferenceEngine for MlxSwiftEngine {
         let temperature = params.temperature;
         let top_p = params.top_p;
         let max_context_tokens = params.max_context_tokens as i32;
-        let memory_budget_mb = params.memory_budget_mb as i32;
+        let memory_budget_mb = self.swift_memory_budget_mb(params.memory_budget_mb);
 
         // Kanal do streamowania tokenow do callera
         let (tx, rx) = mpsc::channel::<StreamToken>(256);

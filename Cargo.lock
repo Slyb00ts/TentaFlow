@@ -14982,6 +14982,7 @@ dependencies = [
  "libloading 0.9.0",
  "lru",
  "lz4_flex 0.13.1",
+ "mach2",
  "memmap2",
  "milvus-sdk-rust",
  "minicbor",

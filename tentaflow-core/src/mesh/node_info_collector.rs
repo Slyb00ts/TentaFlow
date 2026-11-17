@@ -1765,24 +1765,39 @@ fn detect_android_gpu_temperature() -> Option<u32> {
 // GPU enrichment — iOS (unified memory)
 // =============================================================================
 
-/// iOS live metryki — bardzo ograniczone. iOS nie udostepnia GPU usage/temp/power.
-/// VRAM = RAM systemowy (unified memory, jak Apple Silicon Mac).
+/// iOS exposes no GPU usage/temperature/power and wgpu is not built there, so
+/// the single unified-memory GPU is added here. Its memory is the app's jetsam
+/// limit less the reserve kept for non-model memory, not physical RAM: a model
+/// sized to physical RAM gets the app killed long before it fits. Used = this
+/// app's whole footprint, so free = what a model may still add.
 #[cfg(target_os = "ios")]
-fn enrich_ios_live(gpus: &mut [PeerGpuInfo]) {
+fn enrich_ios_live(gpus: &mut Vec<PeerGpuInfo>) {
     if gpus.is_empty() {
-        return;
+        gpus.push(PeerGpuInfo {
+            name: "Apple GPU".to_string(),
+            vram_total_mb: 0,
+            vram_used_mb: 0,
+            usage_percent: 0.0,
+            temperature_c: 0,
+            power_draw_w: None,
+            power_limit_w: None,
+            vendor: crate::mesh::peer_store::GpuVendor::Apple,
+            pci_bus_id: None,
+            uuid: None,
+            fan_speed_percent: None,
+            pcie_link_gen: None,
+            pcie_link_width: None,
+            pcie_link_gen_current: None,
+            pcie_link_width_current: None,
+        });
     }
 
-    let total_ram_mb = {
-        let sys = sys().lock();
-        sys.total_memory() / (1024 * 1024)
+    let Some(mem) = crate::memory::process_memory() else {
+        return;
     };
-
-    // Unified memory — VRAM total = RAM, niezaleznie od usage (jak na macOS).
     for gpu in gpus.iter_mut() {
-        if gpu.vram_total_mb == 0 {
-            gpu.vram_total_mb = total_ram_mb;
-        }
+        gpu.vram_total_mb = mem.model_ceiling_bytes() / (1024 * 1024);
+        gpu.vram_used_mb = mem.footprint_bytes / (1024 * 1024);
     }
 }
 

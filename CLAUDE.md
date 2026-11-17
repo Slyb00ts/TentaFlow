@@ -143,6 +143,19 @@ metallib (`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBrid
 `xcodebuild -skipMacroValidation -skipPackagePluginValidation` (SwiftPM CLI can't compile Metal
 shaders; mlx-swift's `CudaBuild` plugin is refused unless trusted).
 
+**iOS memory ceiling.** iOS kills the app (jetsam) at a per-app limit far below physical RAM.
+Every iOS memory budget comes from ONE helper, `memory::process_memory()` (`TASK_VM_INFO`
+`phys_footprint` + `os_proc_available_memory()`). Models may use the limit less
+`JETSAM_RESERVE_BYTES` (`model_ceiling_bytes`), because core, SQLite, TLS and the Metal driver
+share the same footprint: the single "Apple GPU" that `enrich_ios_live` reports carries that
+ceiling as `vram_total_mb` and the whole footprint as `vram_used_mb`, so free = what a model
+may still add (MemoryGuard and the deploy wizard's MLX default size from it). `mlx_swift_bridge`
+caps `memory_budget_mb` at MLX's own share — the footprint its model load added — plus that
+headroom, never at the whole limit. `ram_total_mb` stays physical RAM — device info, never a
+budget. The
+app target signs with `TentaFlowAI.entitlements` (increased-memory-limit +
+extended-virtual-addressing); the App ID needs both capabilities.
+
 `tentaflow-core` features — default = `inference-whisper` + `camera` (GStreamer is mandatory
 for the video pipeline). Key opt-ins:
 

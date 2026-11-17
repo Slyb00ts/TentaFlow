@@ -57,6 +57,8 @@ let onCloseCallback = null;
 // Cache per-node GPU lists to avoid re-querying when switching back and forth.
 const gpuListByNode = new Map();
 
+const MLX_DEFAULT_MEMORY_MB = 16384;
+
 // Ordered step ids with optional skip predicate. Runtime order derived at
 // navigation time by filtering out steps whose skip() returns true.
 const STEPS = [
@@ -191,7 +193,7 @@ export async function openDeployWizard(engineId, opts = {}) {
       // realny `pool_tokens` (engine='mlx') z tego budzetu + wybranych kv-bits.
       // Default 16 GB — 8 GB jest mniejsze niz wagi modelu 7B+, wiec wizard
       // otwieralby sie w permanentnym overflow. User moze zwiekszyc.
-      mlx_max_memory_mb: 16384,
+      mlx_max_memory_mb: MLX_DEFAULT_MEMORY_MB,
       // MLX kv-bits: 'none' | '8' | '4'. Mapowane na request `kv_cache_dtype`
       // = none|kv8|kv4 (osobne od vLLM/llama, ale to samo pole wire).
       mlx_kv_bits: 'none',
@@ -253,6 +255,7 @@ export async function openDeployWizard(engineId, opts = {}) {
     const local = nodes.find((n) => n?.isLocal === true) || nodes[0];
     selection.nodeId = local ? local.nodeId : null;
   }
+  if (isMlxEngine()) selection.advanced.mlx_max_memory_mb = mlxDefaultMemoryMb(selection.nodeId);
 
   hostOs = opts.hostOs || pickHostOs(selection.nodeId);
   availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs, pickHostCaps(selection.nodeId));
@@ -956,6 +959,22 @@ function isLlamaCppEngine() {
 
 function isMlxEngine() {
   return engineId() === 'mlx';
+}
+
+// What one MLX device may still take is the node's FREE unified memory — on
+// iOS what the app's jetsam limit leaves above its current footprint, not
+// physical RAM — so the default budget never exceeds it: a budget the node
+// cannot hold only moves the failure from the calculator to a kill while
+// loading. A GPU that reports no usage counts its whole memory as free, and a
+// full one still yields 1 MB: a budget of 0 means "no cap" to the backend.
+function mlxDefaultMemoryMb(nodeId) {
+  const gpus = nodeGpus(nodeId).filter((g) => (Number(g.vramTotalMb) || 0) > 0);
+  if (gpus.length === 0) return MLX_DEFAULT_MEMORY_MB;
+  const freeMb = Math.max(...gpus.map((g) => {
+    const used = g.vramUsedMb == null ? 0 : Number(g.vramUsedMb) || 0;
+    return Math.max(0, Number(g.vramTotalMb) - used);
+  }));
+  return Math.max(1, Math.min(MLX_DEFAULT_MEMORY_MB, freeMb));
 }
 
 function isCameraCvEngine() {
@@ -2945,6 +2964,7 @@ function bindStepMethodInputs() {
       // GPU inventory is per-node; reset selection when target changes.
       selection.gpuSelectMode = 'all';
       selection.gpuIds = [];
+      if (isMlxEngine()) selection.advanced.mlx_max_memory_mb = mlxDefaultMemoryMb(selection.nodeId);
       refreshModal();
     });
   }
