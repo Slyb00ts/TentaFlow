@@ -6,7 +6,7 @@
 //! of one admitted call: dropping it releases the slot and records the outcome,
 //! so a cancelled future or a panicking task cannot leak a slot.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -165,12 +165,18 @@ const BUCKET_SLOTS: usize = LATENCY_BUCKETS_MS.len() + 1;
 #[derive(Debug)]
 pub struct LatencyHistogram {
     counts: [AtomicU64; BUCKET_SLOTS],
+    /// Sum of the recorded durations per bucket, in microseconds. It is
+    /// additive like the counts, so a window's mean per bucket is a difference
+    /// of two snapshots; `estimate_percentile_ms` uses it to place a quantile
+    /// inside its bucket.
+    sums_us: [AtomicU64; BUCKET_SLOTS],
 }
 
 impl Default for LatencyHistogram {
     fn default() -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            sums_us: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -180,11 +186,14 @@ impl LatencyHistogram {
         let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let slot = LATENCY_BUCKETS_MS.partition_point(|bound| ms > *bound);
         self.counts[slot].fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sums_us[slot].fetch_add(micros, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> HistogramSnapshot {
         HistogramSnapshot {
             counts: std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed)),
+            sums_us: std::array::from_fn(|i| self.sums_us[i].load(Ordering::Relaxed)),
         }
     }
 }
@@ -192,6 +201,7 @@ impl LatencyHistogram {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistogramSnapshot {
     counts: [u64; BUCKET_SLOTS],
+    sums_us: [u64; BUCKET_SLOTS],
 }
 
 impl HistogramSnapshot {
@@ -204,6 +214,7 @@ impl HistogramSnapshot {
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
             counts: std::array::from_fn(|i| self.counts[i].saturating_sub(earlier.counts[i])),
+            sums_us: std::array::from_fn(|i| self.sums_us[i].saturating_sub(earlier.sums_us[i])),
         }
     }
 
@@ -229,11 +240,63 @@ impl HistogramSnapshot {
     pub fn p95_ms(&self) -> Option<u64> {
         self.percentile_ms(0.95)
     }
+
+    /// The `quantile` (0..=1) in milliseconds, placed INSIDE its bucket rather
+    /// than reported as the bucket's upper bound (which says 300 for calls that
+    /// all took 210 ms). The calls of a bucket are taken to be spread evenly
+    /// around the bucket's observed mean, as widely as the bucket's edges allow:
+    /// all calls at 210 ms in the (200, 300] bucket give about 219, a bucket
+    /// spread evenly over its whole width gives the interpolated value. An
+    /// estimate, not a measurement.
+    ///
+    /// Limit: calls above the last bound share one open bucket, and for those
+    /// the answer is that bucket's mean, so a threshold above the last bound
+    /// (one hour) can only fire when the slow calls average above it.
+    pub fn estimate_percentile_ms(&self, quantile: f64) -> Option<f64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let rank = quantile.clamp(0.0, 1.0) * total as f64;
+        let mut before = 0u64;
+        for (slot, &count) in self.counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            if (before + count) as f64 >= rank {
+                let mean = self.sums_us[slot] as f64 / count as f64 / 1000.0;
+                if slot == LATENCY_BUCKETS_MS.len() {
+                    return Some(mean);
+                }
+                let lower = if slot == 0 {
+                    0.0
+                } else {
+                    LATENCY_BUCKETS_MS[slot - 1] as f64
+                };
+                let upper = LATENCY_BUCKETS_MS[slot] as f64;
+                let mean = mean.clamp(lower, upper);
+                let half_width = (mean - lower).min(upper - mean);
+                let position = ((rank - before as f64) / count as f64).clamp(0.0, 1.0);
+                return Some(mean + (position - 0.5) * 2.0 * half_width);
+            }
+            before += count;
+        }
+        LATENCY_BUCKETS_MS.last().map(|&bound| bound as f64)
+    }
+
+    pub fn estimate_p95_ms(&self) -> Option<f64> {
+        self.estimate_percentile_ms(0.95)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateStats {
+    /// Slots held: permits admitted and not yet ended, including those a bus
+    /// reactor only reserved ahead of a fetch.
     pub in_flight: u64,
+    /// Calls that are really running: admitted request calls, and bus permits
+    /// that began. This is what saturation and the in-flight metric read.
+    pub running: u64,
     pub waiting: u64,
     pub accepted: u64,
     pub rejected_concurrency: u64,
@@ -244,6 +307,9 @@ pub struct GateStats {
     pub cancelled: u64,
     /// Calls counted in the current window, `0` without a call limit.
     pub window_calls: u32,
+    /// Calls that actually started in the current window (a reservation that
+    /// was given back is not one), `0` without a call limit.
+    pub window_ran: u32,
     /// When the current window ends; `None` without a call limit.
     pub window_resets_at_ms: Option<u64>,
     pub latency: HistogramSnapshot,
@@ -252,6 +318,7 @@ pub struct GateStats {
 #[derive(Debug, Default)]
 struct Counters {
     in_flight: AtomicU64,
+    running: AtomicU64,
     accepted: AtomicU64,
     rejected_concurrency: AtomicU64,
     rejected_calls: AtomicU64,
@@ -288,6 +355,20 @@ pub struct ServiceGate {
     /// `epoch << 32 | count` of the fixed call window. One atomic, so the epoch
     /// roll-over and the count cannot be observed half-updated.
     window: AtomicU64,
+    /// Like `window`, but counts only calls that STARTED: a request call at
+    /// admission, a bus permit when it `begin`s. A bus reactor reserves permits
+    /// ahead of every fetch and gives them back when nothing arrived, and that
+    /// must not look like usage.
+    ran_window: AtomicU64,
+    /// Highest `ran_window` count since the evaluator last took it
+    /// (`take_window_peak`). A short window (1 s) rolls over many times between
+    /// two evaluations, so the live count would almost always miss the moment
+    /// the limit was reached. No lock; a plain load keeps the `fetch_max` off
+    /// the path of every call that does not set a new peak.
+    window_peak: AtomicU32,
+    /// When the gate was built, to tell a gate born during an evaluator's life
+    /// (all its counters are news) from one that was already running.
+    created: Instant,
     counters: Counters,
     latency: LatencyHistogram,
 }
@@ -342,9 +423,17 @@ impl ServiceGate {
             shrink_debt: Mutex::new(0),
             waiting: AtomicUsize::new(0),
             window: AtomicU64::new(0),
+            ran_window: AtomicU64::new(0),
+            window_peak: AtomicU32::new(0),
+            created: Instant::now(),
             counters: Counters::default(),
             latency: LatencyHistogram::default(),
         })
+    }
+
+    /// When the gate was built.
+    pub fn created(&self) -> Instant {
+        self.created
     }
 
     pub fn target_id(&self) -> &str {
@@ -377,6 +466,11 @@ impl ServiceGate {
         *capacity = target;
         if old.limits.call_limit.map(|(_, w)| w) != new.limits.call_limit.map(|(_, w)| w) {
             self.window.store(0, Ordering::Release);
+            self.ran_window.store(0, Ordering::Release);
+        }
+        if old.limits.call_limit != new.limits.call_limit {
+            // A peak measured against the old limit says nothing about the new one.
+            self.window_peak.store(0, Ordering::Release);
         }
     }
 
@@ -410,22 +504,40 @@ impl ServiceGate {
             || self.waiting.load(Ordering::Acquire) > 0
     }
 
-    pub fn stats(&self) -> GateStats {
-        let config = self.config();
+    /// `(calls counted in the current window, when it ends)`; `(0, None)`
+    /// without a call limit.
+    fn window_state(&self, limits: &GateLimits, cell: &AtomicU64) -> (u32, Option<u64>) {
         let now = (self.clock)();
-        let (window_calls, window_resets_at_ms) = match config.limits.call_limit {
+        match limits.call_limit {
             Some((_, secs)) => {
                 let window_ms = u64::from(secs.max(1)) * 1000;
                 let epoch = now / window_ms;
-                let (stored, count) = unpack(self.window.load(Ordering::Acquire));
+                let (stored, count) = unpack(cell.load(Ordering::Acquire));
                 let calls = if stored == epoch as u32 { count } else { 0 };
                 (calls, Some((epoch + 1) * window_ms))
             }
             None => (0, None),
-        };
+        }
+    }
+
+    /// The highest number of calls that started in the call window since the
+    /// previous call of this method (or since the limit last changed), at least
+    /// the count it holds now. Resets the peak, so there is exactly one reader: the
+    /// evaluator. `0` without a call limit.
+    pub fn take_window_peak(&self) -> u32 {
+        let limits = self.config().limits;
+        let (current, _) = self.window_state(&limits, &self.ran_window);
+        self.window_peak.swap(0, Ordering::AcqRel).max(current)
+    }
+
+    pub fn stats(&self) -> GateStats {
+        let config = self.config();
+        let (window_calls, window_resets_at_ms) = self.window_state(&config.limits, &self.window);
+        let (window_ran, _) = self.window_state(&config.limits, &self.ran_window);
         let c = &self.counters;
         GateStats {
             in_flight: c.in_flight.load(Ordering::Acquire),
+            running: c.running.load(Ordering::Acquire),
             waiting: self.waiting.load(Ordering::Acquire) as u64,
             accepted: c.accepted.load(Ordering::Relaxed),
             rejected_concurrency: c.rejected_concurrency.load(Ordering::Relaxed),
@@ -435,6 +547,7 @@ impl ServiceGate {
             timeouts: c.timeouts.load(Ordering::Relaxed),
             cancelled: c.cancelled.load(Ordering::Relaxed),
             window_calls,
+            window_ran,
             window_resets_at_ms,
             latency: self.latency.snapshot(),
         }
@@ -516,13 +629,20 @@ impl ServiceGate {
         reservation.commit();
         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
         self.counters.in_flight.fetch_add(1, Ordering::AcqRel);
-        Ok(SlaPermit {
+        let mut permit = SlaPermit {
             gate: Some(self.clone()),
             started: Instant::now(),
             outcome: None,
             timeout: limits.timeout,
             window_epoch,
-        })
+            began: false,
+        };
+        // A bus permit is a reservation until its reactor calls `begin`; every
+        // other call starts running the moment it is admitted.
+        if origin != AdmitOrigin::Bus {
+            permit.begin();
+        }
+        Ok(permit)
     }
 
     fn try_acquire_slot(&self) -> Result<(), RefusalReason> {
@@ -567,7 +687,7 @@ impl ServiceGate {
                     return Ok(CallReservation {
                         gate: self,
                         epoch: Some(epoch32),
-                    })
+                    });
                 }
                 Err(current) => state = current,
             }
@@ -629,21 +749,83 @@ impl ServiceGate {
         }
     }
 
+    /// A call starts running: counted in `running` and, with a call limit, in
+    /// the window it was admitted in (`epoch`). A call that was admitted in an
+    /// earlier window than the one stored is not counted: its window is gone.
+    fn start_call(&self, epoch: Option<u32>) {
+        self.counters.running.fetch_add(1, Ordering::AcqRel);
+        let Some(epoch) = epoch else {
+            return;
+        };
+        let mut state = self.ran_window.load(Ordering::Acquire);
+        let count = loop {
+            let (stored, count) = unpack(state);
+            let next = if stored == epoch {
+                pack(epoch, count.saturating_add(1))
+            } else if (epoch.wrapping_sub(stored) as i32) > 0 {
+                pack(epoch, 1)
+            } else {
+                return;
+            };
+            match self.ran_window.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break unpack(next).1,
+                Err(current) => state = current,
+            }
+        };
+        if self.window_peak.load(Ordering::Relaxed) < count {
+            self.window_peak.fetch_max(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes back a started call that is given back (`forgo`).
+    fn unstart_call(&self, epoch: u32) {
+        let mut state = self.ran_window.load(Ordering::Acquire);
+        loop {
+            let (stored, count) = unpack(state);
+            if stored != epoch || count == 0 {
+                return;
+            }
+            match self.ran_window.compare_exchange_weak(
+                state,
+                pack(stored, count - 1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => state = current,
+            }
+        }
+    }
+
     /// Takes back an admission whose call never started: the slot is freed, the
     /// call returns to the window and the call is not counted as accepted, so a
     /// refusal that happens after admission (a denied ACL, a flow that does not
     /// compile) costs the service nothing.
-    fn abandon(&self, window_epoch: Option<u32>) {
+    fn abandon(&self, window_epoch: Option<u32>, began: bool) {
         if let Some(epoch) = window_epoch {
             self.refund_call(epoch);
+            if began {
+                self.unstart_call(epoch);
+            }
+        }
+        if began {
+            self.counters.running.fetch_sub(1, Ordering::AcqRel);
         }
         self.counters.accepted.fetch_sub(1, Ordering::Relaxed);
         self.counters.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.release_slot();
     }
 
-    fn finish(&self, outcome: Outcome, elapsed: Duration) {
+    fn finish(&self, outcome: Outcome, elapsed: Duration, began: bool) {
         let c = &self.counters;
+        if began {
+            c.running.fetch_sub(1, Ordering::AcqRel);
+        }
         let counter = match outcome {
             Outcome::Ok => &c.ok,
             Outcome::Error | Outcome::Panicked => &c.errors,
@@ -672,6 +854,8 @@ pub struct SlaPermit {
     timeout: Option<Duration>,
     /// The call-window epoch the call was counted in, so `forgo` can return it.
     window_epoch: Option<u32>,
+    /// The call is running (see `ServiceGate::start_call`).
+    began: bool,
 }
 
 impl SlaPermit {
@@ -684,6 +868,7 @@ impl SlaPermit {
             outcome: None,
             timeout: None,
             window_epoch: None,
+            began: false,
         }
     }
 
@@ -706,16 +891,24 @@ impl SlaPermit {
 
     /// Restarts the permit's clock: the call is timed from here, not from
     /// admission. For a caller that takes its permit ahead of the work (the bus
-    /// reactor reserves before its fetch), so the wait is not latency.
+    /// reactor reserves before its fetch), so the wait is not latency. It is
+    /// also the moment a bus permit stops being a reservation and counts as a
+    /// running call, in `running` and in the call window's usage.
     pub fn begin(&mut self) {
         self.started = Instant::now();
+        if !self.began {
+            if let Some(gate) = &self.gate {
+                self.began = true;
+                gate.start_call(self.window_epoch);
+            }
+        }
     }
 
     /// Gives the admission back because the call never started: records
     /// nothing, frees the slot and returns the call to its window.
     pub fn forgo(mut self) {
         if let Some(gate) = self.gate.take() {
-            gate.abandon(self.window_epoch);
+            gate.abandon(self.window_epoch, self.began);
         }
     }
 }
@@ -730,7 +923,7 @@ impl Drop for SlaPermit {
         } else {
             Outcome::Cancelled
         });
-        gate.finish(outcome, self.started.elapsed());
+        gate.finish(outcome, self.started.elapsed(), self.began);
     }
 }
 

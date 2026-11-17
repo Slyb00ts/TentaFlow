@@ -47,6 +47,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   do połowy `queue_timeout` polityki.
 - Status konsumenta pokazuje `in_flight`, `max_concurrency` i
   `throttled_until`. Starsze węzły odczytują go bez tych pól.
+- Każdy węzeł co 30 s ocenia ostatnie 5 minut usług objętych polityką
+  i otwiera naruszenia: p95 czasu odpowiedzi, odsetek błędów, timeouty,
+  ostrzeżenie o wykorzystaniu limitu wywołań, osiągnięcie limitu oraz
+  nasycenie wątków trwające co najmniej 60 s. Naruszenie otwiera się raz,
+  aktualizuje, dopóki trwa, i zamyka przy pierwszej ocenie, w której warunek
+  już nie zachodzi albo polityka zniknęła. Flow busa, który tylko zwalnia,
+  też je otwiera, bo liczy się zapełnienie okna, a nie odmowy.
+- Węzeł zapisuje próbki minutowe usług (7 dni) i historię naruszeń (90 dni
+  po zamknięciu). Audyt `sla.calls.rejected`, `sla.concurrency.rejected`,
+  `sla.breach.raised` i `sla.breach.resolved` jest zbierany w oknach 60 s
+  ze stemplem organizacji polityki.
+- Eksport Zabbix ma cztery nowe metryki bez etykiet:
+  `tentaflow_sla_breaches_open`, `tentaflow_sla_rejected_total`,
+  `tentaflow_sla_timeouts_total` i `tentaflow_sla_inflight`; szablon Zabbix
+  zawiera pasujące pozycje.
 - `max_concurrent` usługi AI jest teraz prawdziwym limitem równoczesnych
   wywołań na węźle. Obejmuje usługi HTTP, QUIC i silniki wbudowane
   (llama.cpp, MLX, sherpa) oraz endpointy `/v1/infer`, `/v1/rerank`,

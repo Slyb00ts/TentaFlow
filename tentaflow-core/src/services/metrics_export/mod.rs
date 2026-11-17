@@ -150,6 +150,17 @@ pub struct ExportedMetrics {
     pub fs_available_bytes: u64,
     pub fs_used_percent: f32,
     pub system_uptime_seconds: u64,
+    // ---- TB-03 SLA, aggregated over every governed flow of this node (no
+    // labels, like the metrics above). The totals count since the node started:
+    // the gates' counters live in memory.
+    /// Breaches open on this node, of every organization.
+    pub sla_breaches_open: u64,
+    /// Calls refused by a call limit or a full concurrency queue.
+    pub sla_rejected_total: u64,
+    /// Calls that hit their execution timeout.
+    pub sla_timeouts_total: u64,
+    /// Calls in flight on governed flows right now.
+    pub sla_inflight: u64,
     // ---- TentaBus M2 (PLAN §8.4), multi-instance (plan-app-platform §3.7)
     // — see `collect_bus_metrics`'s doc for how each entry is sourced, what
     // "best-effort" means for it, and why this is a `Vec` (one rollup per
@@ -216,6 +227,7 @@ pub fn collect(
     };
 
     let bus_instances = collect_bus_metrics(db);
+    let sla = collect_sla_metrics(db);
 
     ExportedMetrics {
         cpu_usage_percent: fast.cpu_usage_percent,
@@ -249,8 +261,46 @@ pub fn collect(
         fs_available_bytes,
         fs_used_percent,
         system_uptime_seconds: sysinfo::System::uptime(),
+        sla_breaches_open: sla.breaches_open,
+        sla_rejected_total: sla.rejected_total,
+        sla_timeouts_total: sla.timeouts_total,
+        sla_inflight: sla.inflight,
         bus_instances,
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SlaRollup {
+    breaches_open: u64,
+    rejected_total: u64,
+    timeouts_total: u64,
+    inflight: u64,
+}
+
+/// Sums the gates and counts the open breaches. Best-effort like the rest of
+/// the snapshot: an unreadable breach table reads as none open. The totals are
+/// counters in memory: they restart with the node, and a service that loses its
+/// policy loses its gate once idle and its share of the sum, so the sum can
+/// step down. The items of the shipped template store the raw value without a
+/// delta step, so a graph shows such a step as a drop, not as a counter reset.
+fn collect_sla_metrics(db: &DbPool) -> SlaRollup {
+    let mut rollup = sum_gates(&crate::sla::global().gates());
+    rollup.breaches_open = crate::sla::breach::count_open(db).unwrap_or(0);
+    rollup
+}
+
+/// The gate-derived part of the rollup. `inflight` counts calls that are
+/// running, not slots a bus reactor holds in reserve.
+fn sum_gates(gates: &[(String, std::sync::Arc<crate::sla::ServiceGate>)]) -> SlaRollup {
+    gates
+        .iter()
+        .fold(SlaRollup::default(), |mut acc, (_, gate)| {
+            let stats = gate.stats();
+            acc.rejected_total += stats.rejected_calls + stats.rejected_concurrency;
+            acc.timeouts_total += stats.timeouts;
+            acc.inflight += stats.running;
+            acc
+        })
 }
 
 /// Intermediate result of `collect_bus_metrics`, before being flattened into
@@ -654,7 +704,7 @@ fn push_bus_metric(
 /// `tentaflow_bus_*` is the one label-bearing exception — see the module
 /// header's multi-instance note and `push_bus_metric`.
 pub fn format_zabbix(m: &ExportedMetrics) -> String {
-    let mut lines: Vec<(String, String)> = Vec::with_capacity(31 + m.bus_instances.len() * 16);
+    let mut lines: Vec<(String, String)> = Vec::with_capacity(35 + m.bus_instances.len() * 16);
     push_float(
         &mut lines,
         "tentaflow_cpu_usage_percent",
@@ -756,6 +806,22 @@ pub fn format_zabbix(m: &ExportedMetrics) -> String {
         "tentaflow_system_uptime_seconds",
         m.system_uptime_seconds,
     );
+    push_int(
+        &mut lines,
+        "tentaflow_sla_breaches_open",
+        m.sla_breaches_open,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_sla_rejected_total",
+        m.sla_rejected_total,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_sla_timeouts_total",
+        m.sla_timeouts_total,
+    );
+    push_int(&mut lines, "tentaflow_sla_inflight", m.sla_inflight);
 
     // ---- TentaBus M2 (PLAN §8.4), multi-instance (plan-app-platform §3.7):
     // counters, p99s, lag, dlq, counts, disk, isr, epoch, replication lag,
@@ -1092,6 +1158,10 @@ mod tests {
             fs_available_bytes: 400_000_000,
             fs_used_percent: 60.0,
             system_uptime_seconds: 86_400,
+            sla_breaches_open: 2,
+            sla_rejected_total: 15,
+            sla_timeouts_total: 4,
+            sla_inflight: 3,
             bus_instances: vec![(sample_bus_instance_id(), sample_bus_rollup())],
         }
     }
@@ -1122,7 +1192,7 @@ mod tests {
     }
 
     /// Every non-empty line is exactly `key value` (one space), the key set
-    /// is the stable 47-entry list (31 flat metrics + 16 `tentaflow_bus_*`
+    /// is the stable 51-entry list (35 flat metrics + 16 `tentaflow_bus_*`
     /// samples for the one running instance `sample_metrics` sets up), every
     /// key is a legal Prometheus metric name (`tentaflow_*`, no dots) with
     /// at most one `{bus_instance="..."}` label suffix, and every value
@@ -1132,7 +1202,7 @@ mod tests {
     fn format_zabbix_produces_stable_key_value_lines() {
         let text = format_zabbix(&sample_metrics());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 47, "expected 47 metric lines, got: {text}");
+        assert_eq!(lines.len(), 51, "expected 51 metric lines, got: {text}");
 
         let mut keys = Vec::with_capacity(lines.len());
         for line in &lines {
@@ -1161,6 +1231,10 @@ mod tests {
         assert!(base_names.contains("tentaflow_cpu_temperature_c"));
         assert!(base_names.contains("tentaflow_fs_used_percent"));
         assert!(base_names.contains("tentaflow_system_uptime_seconds"));
+        assert!(base_names.contains("tentaflow_sla_breaches_open"));
+        assert!(base_names.contains("tentaflow_sla_rejected_total"));
+        assert!(base_names.contains("tentaflow_sla_timeouts_total"));
+        assert!(base_names.contains("tentaflow_sla_inflight"));
         assert!(base_names.contains("tentaflow_bus_publish_msgs_total"));
         assert!(base_names.contains("tentaflow_bus_publish_bytes_total"));
         assert!(base_names.contains("tentaflow_bus_consume_msgs_total"));
@@ -1197,6 +1271,97 @@ mod tests {
         );
     }
 
+    /// The four SLA aggregates are label-less `key value` lines in the fixed
+    /// place after the system metrics (TB-03 section 3.5).
+    #[test]
+    fn format_zabbix_renders_the_sla_aggregates_without_labels() {
+        let text = format_zabbix(&sample_metrics());
+        let lines: Vec<&str> = text.lines().collect();
+        let uptime = lines
+            .iter()
+            .position(|l| l.starts_with("tentaflow_system_uptime_seconds "))
+            .expect("uptime line");
+        assert_eq!(
+            &lines[uptime + 1..uptime + 5],
+            [
+                "tentaflow_sla_breaches_open 2",
+                "tentaflow_sla_rejected_total 15",
+                "tentaflow_sla_timeouts_total 4",
+                "tentaflow_sla_inflight 3",
+            ]
+        );
+    }
+
+    /// The gate half of the rollup: refusals of both kinds and timeouts are
+    /// summed over the gates, and in-flight counts running calls only.
+    #[tokio::test]
+    async fn sum_gates_adds_refusals_timeouts_and_running_calls_over_the_gates() {
+        use crate::sla::{AdmitOrigin, BusOrdering, GateConfig, GateLimits, Outcome, ServiceGate};
+        let limits = GateLimits {
+            max_concurrency: Some(1),
+            max_queue: 0,
+            queue_timeout: std::time::Duration::from_millis(1),
+            call_limit: None,
+            timeout: None,
+            ordering: BusOrdering::default(),
+        };
+        let gate = |id: &str| {
+            ServiceGate::new(
+                id,
+                GateConfig {
+                    policy_id: "p".into(),
+                    org_id: "o".into(),
+                    limits,
+                },
+                crate::sla::gate::system_clock(),
+            )
+        };
+        let (a, b) = (gate("a"), gate("b"));
+        let running = a.admit(AdmitOrigin::Request).await.unwrap();
+        assert!(a.admit(AdmitOrigin::Request).await.is_err());
+        b.admit(AdmitOrigin::Request)
+            .await
+            .unwrap()
+            .finish(Outcome::Timeout);
+        let reserved = b.admit(AdmitOrigin::Bus).await.unwrap();
+
+        let rollup = sum_gates(&[("a".into(), a.clone()), ("b".into(), b.clone())]);
+        assert_eq!(
+            (
+                rollup.rejected_total,
+                rollup.timeouts_total,
+                rollup.inflight
+            ),
+            (1, 1, 1),
+            "a bus slot held in reserve is not a call in flight"
+        );
+        drop((running, reserved));
+    }
+
+    /// The open-breach count is read from this node's `sla_breaches`, and a
+    /// resolved breach does not count.
+    #[test]
+    fn collect_sla_metrics_counts_only_open_breaches() {
+        let pool = fresh_db();
+        {
+            let conn = pool.write().unwrap();
+            for (id, key, resolved) in [
+                ("b1", "o:f1:latency", None),
+                ("b2", "o:f2:errors", None),
+                ("b3", "o:f3:errors", Some(9)),
+            ] {
+                conn.execute(
+                    "INSERT INTO sla_breaches (id, org_id, target_id, policy_id, kind, node_id, \
+                        threshold, peak_value, raised_at_ms, resolved_at_ms, dedupe_key) \
+                     VALUES (?1, 'o', ?1, 'p', 'latency', 'n', 1, 2, 3, ?2, ?3)",
+                    rusqlite::params![id, resolved, key],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(collect_sla_metrics(&pool).breaches_open, 2);
+    }
+
     /// Zero running TentaBus instances (`ExportedMetrics::bus_instances`
     /// empty) emits none of the 16 `tentaflow_bus_*` lines at all — never a
     /// zero-valued line attributed to no instance (plan-app-platform §3.7).
@@ -1209,7 +1374,7 @@ mod tests {
             !text.contains("tentaflow_bus_"),
             "no bus_* line expected with zero running instances: {text}"
         );
-        assert_eq!(text.lines().count(), 47 - 16);
+        assert_eq!(text.lines().count(), 51 - 16);
     }
 
     /// When the platform exposes no CPU temperature sensor, the key is
@@ -1221,7 +1386,7 @@ mod tests {
         metrics.cpu_temperature_c = None;
         let text = format_zabbix(&metrics);
         assert!(!text.contains("tentaflow_cpu_temperature_c"));
-        assert_eq!(text.lines().count(), 46);
+        assert_eq!(text.lines().count(), 50);
     }
 
     /// A NaN or infinite reading is dropped from the body instead of being
@@ -1313,6 +1478,10 @@ mod tests {
             fs_available_bytes: 0,
             fs_used_percent: 0.0,
             system_uptime_seconds: 0,
+            sla_breaches_open: 0,
+            sla_rejected_total: 0,
+            sla_timeouts_total: 0,
+            sla_inflight: 0,
             // One all-zero-valued instance rather than an empty `Vec` — this
             // fixture's job (`template_item_keys_match_format_zabbix_keys`)
             // is to emit every `tentaflow_bus_*` metric NAME at least once so

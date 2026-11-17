@@ -705,6 +705,90 @@
                     </master_item>
                 </item>
                 <item>
+                    <uuid>10aca75d18cd4d1cb84553ec548474a2</uuid>
+                    <name>SLA breaches open</name>
+                    <type>DEPENDENT_ITEM</type>
+                    <key>tentaflow_sla_breaches_open</key>
+                    <history>7d</history>
+                    <value_type>UNSIGNED</value_type>
+                    <preprocessing>
+                        <step>
+                            <type>PROMETHEUS_PATTERN</type>
+                            <parameters>
+                                <parameter>tentaflow_sla_breaches_open</parameter>
+                                <parameter>value</parameter>
+                                <parameter/>
+                            </parameters>
+                        </step>
+                    </preprocessing>
+                    <master_item>
+                        <key>tentaflow_metrics_raw</key>
+                    </master_item>
+                </item>
+                <item>
+                    <uuid>ecd49dd79a754337b506b7ad15dee24a</uuid>
+                    <name>SLA calls rejected (total)</name>
+                    <type>DEPENDENT_ITEM</type>
+                    <key>tentaflow_sla_rejected_total</key>
+                    <history>7d</history>
+                    <value_type>UNSIGNED</value_type>
+                    <preprocessing>
+                        <step>
+                            <type>PROMETHEUS_PATTERN</type>
+                            <parameters>
+                                <parameter>tentaflow_sla_rejected_total</parameter>
+                                <parameter>value</parameter>
+                                <parameter/>
+                            </parameters>
+                        </step>
+                    </preprocessing>
+                    <master_item>
+                        <key>tentaflow_metrics_raw</key>
+                    </master_item>
+                </item>
+                <item>
+                    <uuid>159990e879d646e6a7beeb18dddea408</uuid>
+                    <name>SLA calls timed out (total)</name>
+                    <type>DEPENDENT_ITEM</type>
+                    <key>tentaflow_sla_timeouts_total</key>
+                    <history>7d</history>
+                    <value_type>UNSIGNED</value_type>
+                    <preprocessing>
+                        <step>
+                            <type>PROMETHEUS_PATTERN</type>
+                            <parameters>
+                                <parameter>tentaflow_sla_timeouts_total</parameter>
+                                <parameter>value</parameter>
+                                <parameter/>
+                            </parameters>
+                        </step>
+                    </preprocessing>
+                    <master_item>
+                        <key>tentaflow_metrics_raw</key>
+                    </master_item>
+                </item>
+                <item>
+                    <uuid>00a0a975649f428fb080f961cc49dfae</uuid>
+                    <name>SLA calls in flight</name>
+                    <type>DEPENDENT_ITEM</type>
+                    <key>tentaflow_sla_inflight</key>
+                    <history>7d</history>
+                    <value_type>UNSIGNED</value_type>
+                    <preprocessing>
+                        <step>
+                            <type>PROMETHEUS_PATTERN</type>
+                            <parameters>
+                                <parameter>tentaflow_sla_inflight</parameter>
+                                <parameter>value</parameter>
+                                <parameter/>
+                            </parameters>
+                        </step>
+                    </preprocessing>
+                    <master_item>
+                        <key>tentaflow_metrics_raw</key>
+                    </master_item>
+                </item>
+                <item>
                     <uuid>5f37247bf5db45a79fb059a63e2f295d</uuid>
                     <name>Bus publish messages (total)</name>
                     <type>DEPENDENT_ITEM</type>

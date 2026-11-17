@@ -1170,6 +1170,16 @@ async fn run_server(args: Args) -> Result<()> {
         .start(router.service_manager().shutdown_rx.clone())
         .await;
 
+    // TB-03: judges every governed flow against its SLA policy every 30 s and
+    // keeps the breaches and minute samples. Stops with the router's shutdown
+    // signal, like the collector above; the handle is awaited before the WAL
+    // checkpoint so its final audit flush is not lost.
+    let sla_evaluator = tentaflow_core::sla::evaluator::spawn(
+        db.clone(),
+        local_node_id_str.clone(),
+        router.service_manager().shutdown_rx.clone(),
+    );
+
     // Without a running mesh (disabled in config or failed to start) nothing
     // refreshes the local node's live metrics: the heartbeat sender does it only
     // as part of broadcasting. The dashboard must show them either way.
@@ -1354,6 +1364,19 @@ async fn run_server(args: Args) -> Result<()> {
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS
     if let Some(mesh) = _mesh_handles {
         mesh.shutdown().await;
+    }
+
+    // The evaluator stopped with the router's shutdown signal; let it write its
+    // pending audit rows before the checkpoint (bounded, a stuck round must not
+    // hang the shutdown).
+    if tokio::time::timeout(
+        tentaflow_core::sla::evaluator::SHUTDOWN_GRACE,
+        sla_evaluator,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("SLA evaluator did not stop in time; its last audit rows may be lost");
     }
 
     // Wymusz WAL checkpoint — bez tego baza moze zostac z niesfl ushowanym WAL

@@ -1510,8 +1510,12 @@ impl CycleCtx<'_> {
                 }
             };
             match admitted {
-                Ok(permit) => {
+                Ok(mut permit) => {
                     if !waited || self.still_usable_now().await {
+                        // Admitted for this very unit: it runs now, so it counts
+                        // as a call and as running (a reserved permit does the
+                        // same in `begin` above).
+                        permit.begin();
                         return Admission::Permit(permit);
                     }
                     permit.forgo();
@@ -5604,6 +5608,66 @@ mod tests {
         let stats = sla.gate.stats();
         assert_eq!((stats.accepted, stats.ok), (1, 1));
         assert_eq!(status.get("flow-sla").unwrap().max_concurrency, Some(1));
+    }
+
+    #[tokio::test]
+    async fn an_at_least_once_consumer_counts_its_calls_as_running_and_in_the_window() {
+        let (_dir, svc, _ctx) = filled_topic(1, 3, TopicOptions::default()).await;
+        let sla = govern(
+            &svc,
+            "flow-sla",
+            SlaPolicySpec {
+                max_concurrency: Some(1),
+                call_limit: Some(2),
+                call_window_secs: Some(3600),
+                ..Default::default()
+            },
+            SLA_FIRST_CLOCK_MS,
+        );
+        let status = StatusStore::default();
+        let spy = ParallelSpy::new(1);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = spy.clone();
+        let config = keyed_config(&svc, json!({"batch_size": 1}));
+
+        for _ in 0..2 {
+            let after = cycle(&svc, &config, &dispatch, &status, &sla).await;
+            assert!(matches!(after, AfterFailure::Continue));
+        }
+
+        let stats = sla.gate.stats();
+        assert_eq!((stats.accepted, stats.ok, stats.running), (2, 2, 0));
+        assert_eq!(
+            stats.window_ran, 2,
+            "the permits of the default mode are started"
+        );
+
+        // The limit is reached by calls that ran and nobody was refused: a
+        // throttled at-least-once flow still raises it through the evaluator.
+        let clock = sla.clock.clone();
+        let wall: crate::sla::gate::Clock =
+            Arc::new(move || clock.load(std::sync::atomic::Ordering::SeqCst));
+        let mut evaluator = crate::sla::evaluator::Evaluator::new(
+            "node-1",
+            wall.clone(),
+            wall,
+            Arc::new(crate::sla::evaluator::WindowViews::default()),
+        );
+        evaluator.tick(svc.db(), sla.registry);
+        let page = crate::sla::breach::list_breaches(
+            svc.db(),
+            "org-a",
+            Some("flow-sla"),
+            crate::sla::breach::BreachQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.rejected_calls, 0);
+        assert!(
+            page.items
+                .iter()
+                .any(|b| b.kind == crate::sla::breach::BreachKind::CallsLimit && b.is_open()),
+            "{:?}",
+            page.items
+        );
     }
 
     #[tokio::test]
