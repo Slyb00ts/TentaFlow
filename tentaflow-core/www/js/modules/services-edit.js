@@ -15,7 +15,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
-import { limitRefusal, limitsDelta, initialValues, limitsEditable, limitsFromConfig, readLimits, renderLimitsSection, savePlan, showLimitProblems, validateLimits } from '/js/modules/services-limits.js';
+import { limitRefusal, limitsDelta, initialValues, limitsEditable, limitsAfterSave, limitsFromService, readLimits, renderLimitsSection, savePlan, showLimitProblems, validateLimits } from '/js/modules/services-limits.js';
 
 // True when the engine is served by CUDA vLLM (manifest backend="vllm", not the
 // Metal variant) — single source of truth shared with the deploy wizard and the
@@ -127,7 +127,7 @@ export async function openEditModal(svc, opts = {}) {
 
   // What the window opened with: a save that changes nothing but the limits sends only the limits.
   const baseline = collectPayload(overlay, svc.id, opts.nodeId);
-  const initialLimits = limitsFromConfig(cfg);
+  let initialLimits = limitsFromService(svc);
   overlay.querySelectorAll('[data-limit]').forEach((input) => input.addEventListener('input', () => showLimitProblems(overlay, {})));
 
   // Save handler
@@ -159,6 +159,9 @@ export async function openEditModal(svc, opts = {}) {
         saveBtn.textContent = saveLabel;
         return;
       }
+      // The row the window was opened from keeps the saved limits until the list refreshes.
+      initialLimits = limitsAfterSave(initialLimits, plan.payload);
+      Object.assign(svc, initialLimits);
       closeModal();
       onSaved();
     } catch (e) {
@@ -715,7 +718,7 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
 
         ${isVllm ? renderEngineArgsSection(cfg, tk) : renderGenericArgsSection(tk)}
 
-        ${renderLimitsSection(limitsFromConfig(cfg), { editable: limitsEditable(svc) })}
+        ${renderLimitsSection(limitsFromService(svc), { editable: limitsEditable(svc) })}
 
         <div class="body-section">
           <div class="body-section-title">${escapeHtml(tk('immutable'))}</div>

@@ -14,9 +14,17 @@ const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '
 
 const positive = (value) => (Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : null);
 
-/** The limits the service has now, from its stored config; `null` for "no limit" (0 or absent). */
-export function limitsFromConfig(cfg) {
-  return { maxConcurrent: positive(cfg?.max_concurrent), timeoutMs: positive(cfg?.timeout_ms) };
+/** The limits the service has now, from its list row (`maxConcurrent`, `timeoutMs`); `null` for "not set". */
+export function limitsFromService(svc) {
+  return { maxConcurrent: positive(svc?.maxConcurrent), timeoutMs: positive(svc?.timeoutMs) };
+}
+
+/** The limits after a save that sent `delta` (see `limitsDelta`): 0 clears the thread limit. */
+export function limitsAfterSave(initial, delta) {
+  return {
+    maxConcurrent: 'maxConcurrent' in delta ? positive(delta.maxConcurrent) : initial.maxConcurrent,
+    timeoutMs: 'timeoutMs' in delta ? delta.timeoutMs : initial.timeoutMs,
+  };
 }
 
 /**
@@ -27,7 +35,7 @@ export function limitsFromConfig(cfg) {
 export const limitsEditable = (svc) => svc?.limitsEditable !== false;
 
 /**
- * The section's markup, filled from `initial` (see `limitsFromConfig`). With `editable: false`
+ * The section's markup, filled from `initial` (see `limitsFromService`). With `editable: false`
  * the fields are disabled and a note says why; the window then sends no limits.
  */
 export function renderLimitsSection(initial, { editable = true } = {}) {
@@ -41,7 +49,7 @@ export function renderLimitsSection(initial, { editable = true } = {}) {
   return `
     <div class="body-section" id="limity">
       <div class="body-section-title">${escapeHtml(tk('limits_title'))}</div>
-      <div class="adv-row-2">
+      <div class="adv-row-2 limits-grid">
         ${field('max_concurrent', 'threads', tk('limits_threads'), initial.maxConcurrent, `min="1" max="1024" placeholder="${escapeHtml(tk('limits_threads_placeholder'))}"`)}
         ${field('timeout_ms', 'timeout', tk('limits_timeout'), initial.timeoutMs, 'min="100"')}
       </div>
@@ -143,6 +151,7 @@ export function showLimitProblems(root, problems) {
     const message = problems[field] ?? '';
     if (box) { box.textContent = message; box.hidden = !message; }
     if (input) {
+      input.classList.toggle('tf-input-error', Boolean(message));
       if (message) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
     }
     if (message && !first) first = input;

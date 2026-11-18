@@ -129,3 +129,34 @@ test('only the newest request may draw: a late answer for an earlier one is stal
   requests.cancel();
   assert.equal(second(), false, 'an answer after the tab changed');
 });
+
+test('an empty queue field reads as the gate treats it: as long as the thread limit, up to 10 s', () => {
+  const spec = { name: 'S', maxConcurrency: 4, maxQueue: null, queueTimeoutMs: null, ordering: 'partition' };
+  const text = m.threadsText(spec);
+  assert.match(text.sub, /^kolejka 4, czekanie do 10 s, potem 429/);
+  assert.doesNotMatch(text.sub, /bez kolejki/);
+  assert.match(m.threadsText({ ...spec, maxQueue: 0 }).sub, /^bez kolejki, od razu 429/);
+  assert.match(m.threadsText({ ...spec, maxQueue: 2, queueTimeoutMs: 3000 }).sub, /^kolejka 2, czekanie do 3 s/);
+  assert.equal(m.effectiveQueue(spec), 4);
+});
+
+test('the bus captions show only for a policy a bus-fed flow uses', () => {
+  const spec = { name: 'S', maxConcurrency: 4, ordering: 'partition', callLimit: 600, callWindowSecs: 60, warnAtPct: 90 };
+  assert.doesNotMatch(m.threadsText(spec).sub, /bus/);
+  assert.equal(m.callsText(spec).sub, 'ostrzeżenie przy 90 %');
+  assert.equal(m.callsText({ ...spec, warnAtPct: null }).sub, '');
+  assert.doesNotMatch(m.threadsText({ ...spec, ordering: 'none' }).sub, /bus/);
+  assert.equal(m.threadsText(spec, { bus: true }).sub, 'bus: równolegle z różnych partycji');
+  assert.equal(m.threadsText({ ...spec, ordering: 'none' }, { bus: true }).sub, 'bus: bez zachowania kolejności');
+  assert.doesNotMatch(m.threadsText(spec, { bus: true }).sub, /429/);
+  assert.equal(m.callsText(spec, { bus: true }).sub, 'ostrzeżenie przy 90 %; bus tylko zwalnia');
+  assert.equal(m.callsText({ ...spec, warnAtPct: null }, { bus: true }).sub, 'bus tylko zwalnia');
+});
+
+test('durations read "60 s" up to two minutes, then in minutes', () => {
+  assert.equal(m.durationText(60000), '60 s');
+  assert.equal(m.durationText(30000), '30 s');
+  assert.equal(m.durationText(120000), '2 min');
+  assert.equal(m.durationText(600000), '10 min');
+  assert.equal(m.durationText(500), '500 ms');
+});

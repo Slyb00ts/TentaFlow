@@ -110,7 +110,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zapisie; zapis samych limitów nigdy nie restartuje serwisu. Węzeł ze
   starszą wersją odmawia zmiany limitów z prośbą o aktualizację, a okno
   pokazuje wtedy sekcję wyłączoną. Audyt `service.update` zapisuje faktyczny
-  restart i nowe limity.
+  restart i nowe limity. Lista serwisów i zdarzenia jej zmian podają
+  egzekwowane `max_concurrent` i `timeout_ms`.
 - Stan SLA podaje odmowy od lokalnej północy węzła. Tuż po północy licznik
   może przez około 30 s obejmować odmowy z ostatnich sekund poprzedniego
   dnia albo je zgubić, bo próbka minutowa zapisana po północy ma znacznik

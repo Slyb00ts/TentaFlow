@@ -16452,6 +16452,8 @@
     "queue_detail": "cola {queue}, espera hasta {wait}, luego 429",
     "queue_none": "sin cola, 429 al instante",
     "ordering_none_note": "bus: sin conservar el orden",
+    "bus_partition_note": "bus: en paralelo desde distintas particiones",
+    "bus_slows_note": "el bus solo se ralentiza",
     "calls_per": "{limit} por {window}",
     "calls_value": "{limit} / {window}",
     "warn_detail": "aviso al {pct} %",

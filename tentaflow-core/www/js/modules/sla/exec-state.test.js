@@ -178,3 +178,29 @@ test('a bus flow counts today in its "Wstrzymania limitem" column', async () => 
   assert.equal(host.querySelector('[data-v="refused-sub"]').textContent, 'dziś');
   card.dispose();
 });
+
+test('with no breaches the paging footer and the "none" line follow their hidden state even against .an-tfoot', async () => {
+  const host = document.createElement('div');
+  const card = startSlaState({
+    host, flow: { id: 'f1', slaPolicyId: 'p1' }, intervalMs: 3_600_000,
+    deps: { call: fakeCall({ statuses: { n1: { state: 'ok' } }, breaches: [], total: 0 }), nodes: async () => [NODES[0]], now: () => 1 },
+  });
+  await card.ready;
+  const more = host.querySelector('[data-v="breach-more-row"]');
+  const none = host.querySelector('[data-v="breach-empty"]');
+  assert.equal(more.hidden, true);
+  assert.equal(more.style.display, 'none', 'a class that sets display must not show a hidden footer');
+  assert.equal(none.style.display, '');
+  card.dispose();
+
+  const breaches = Array.from({ length: 3 }, (_, i) => ({ id: `b${i}`, nodeId: 'n1', kind: 'latency', peakValue: 900, threshold: 800, raisedAtMs: 1, resolvedAtMs: null }));
+  const full = document.createElement('div');
+  const second = startSlaState({
+    host: full, flow: { id: 'f1', slaPolicyId: 'p1' }, intervalMs: 3_600_000,
+    deps: { call: fakeCall({ statuses: { n1: { state: 'ok' } }, breaches, total: 3 }), nodes: async () => [NODES[0]], now: () => 1 },
+  });
+  await second.ready;
+  assert.equal(full.querySelector('[data-v="breach-more-row"]').style.display, 'none', 'all shown: no "Pokaż więcej"');
+  assert.equal(full.querySelector('[data-v="breach-empty"]').style.display, 'none');
+  second.dispose();
+});

@@ -102,6 +102,8 @@ pub fn project_service_row(
 
     let request_time_parameters = parse_request_time_parameters(&svc.config_json);
     let gpu_selection = gpu_selection_summary(&svc.config_json);
+    let (max_concurrent, timeout_ms) =
+        crate::services::supervisor::configured_limits(&svc.config_json);
     // The `_distributed` block's deployment id and coordinator travel in mesh
     // snapshots (both empty for ordinary services), so a stop/delete of a
     // member row on ANY dashboard can reach the whole cluster and the node
@@ -169,6 +171,8 @@ pub fn project_service_row(
         request_time_parameters,
         gpu_selection,
         limits_editable: true,
+        max_concurrent,
+        timeout_ms,
         cluster_deployment_id,
         cluster_coordinator_node_id,
     })

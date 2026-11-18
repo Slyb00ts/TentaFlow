@@ -23,7 +23,7 @@ function sprite(id) {
 }
 
 /** One row of the policy table (plain data, so an unchanged list can be recognised). */
-export function policyRow(policy) {
+export function policyRow(policy, { bus = false } = {}) {
   const { spec } = policy;
   const count = policy.assignedFlows ?? 0;
   return {
@@ -31,8 +31,8 @@ export function policyRow(policy) {
     name: spec.name,
     assignedFlows: count,
     nameHtml: `<strong>${escapeHtml(spec.name)}</strong>${sub(spec.description)}`,
-    threads: cell(threadsText(spec)),
-    calls: cell(callsText(spec)),
+    threads: cell(threadsText(spec, { bus })),
+    calls: cell(callsText(spec, { bus })),
     thresholds: cell(thresholdsText(spec)),
     services: count > 0
       ? `<tf-chip status="accent" size="sm" variant="outline">${escapeHtml(T('services_count', { count, n: count }))}</tf-chip>`
@@ -66,7 +66,7 @@ export function policyRowActions(row, current, handlers) {
  * Draws the tab into `host`. `response` is the `PolicyListResponse`;
  * `handlers` = `{ onNew, onEdit(id), onDelete(id) }`. Returns the table (or `null` when empty).
  */
-export function renderPolicyTab(host, response, handlers) {
+export function renderPolicyTab(host, response, handlers, { busPolicyIds = new Set() } = {}) {
   const { policies, canManage } = response;
   if (policies.length === 0) {
     host.innerHTML = `
@@ -91,11 +91,26 @@ export function renderPolicyTab(host, response, handlers) {
   if (canManage) {
     table.rowActions = (row, _index, current) => policyRowActions(row, current, handlers);
   }
-  table.rows = policies.map(policyRow);
+  table.rows = policies.map((policy) => policyRow(policy, { bus: busPolicyIds.has(policy.id) }));
   return table;
 }
 
 /** Reads the policies. The list answers for the caller's own organization. */
+/**
+ * The ids of the policies that govern at least one flow fed from TentaBus (its list row carries a
+ * `busConsumer`). One flow-list read for the whole tab; when it fails no policy is called a bus one.
+ */
+export async function loadBusPolicyIds() {
+  try {
+    const flows = await ApiBinary.list('flowListRequest', { arrayKey: 'flows' });
+    return busPolicyIdsOf(flows);
+  } catch {
+    return new Set();
+  }
+}
+
+export const busPolicyIdsOf = (flows) => new Set(flows.filter((flow) => flow.busConsumer && flow.slaPolicyId && !flow.isSystem).map((flow) => flow.slaPolicyId));
+
 export const loadPolicies = () => ApiBinary.one('slaPolicyListRequest', {});
 
 /** Index of a `PolicyListResponse` by policy id. */

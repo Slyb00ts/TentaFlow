@@ -16452,6 +16452,8 @@
     "queue_detail": "file {queue}, attente jusqu’à {wait}, puis 429",
     "queue_none": "pas de file, 429 aussitôt",
     "ordering_none_note": "bus : ordre non conservé",
+    "bus_partition_note": "bus : en parallèle depuis des partitions différentes",
+    "bus_slows_note": "le bus est seulement ralenti",
     "calls_per": "{limit} par {window}",
     "calls_value": "{limit} / {window}",
     "warn_detail": "alerte à {pct} %",

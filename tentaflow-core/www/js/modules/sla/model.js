@@ -37,7 +37,7 @@ export function durationText(ms) {
   const value = Number(ms);
   if (!Number.isFinite(value)) return '—';
   if (value >= 3_600_000 && value % 3_600_000 === 0) return T('dur_h', { value: num(value / 3_600_000) });
-  if (value >= 60_000 && value % 60_000 === 0) return T('dur_min', { value: num(value / 60_000) });
+  if (value >= 120_000 && value % 60_000 === 0) return T('dur_min', { value: num(value / 60_000) });
   if (value >= 1000 && value % 1000 === 0) return T('dur_s', { value: num(value / 1000) });
   return T('dur_ms', { value: num(value) });
 }
@@ -61,22 +61,30 @@ export function clockText(epochMs, withSeconds = false) {
 // ---------------------------------------------------------------------------
 
 /** `{ main, sub }` of the "Wątki" column. */
-export function threadsText(spec) {
+export function threadsText(spec, { bus = false } = {}) {
   const main = spec.maxConcurrency == null ? T('unlimited') : num(spec.maxConcurrency);
   if (spec.maxConcurrency == null) return { main, sub: '' };
-  const parts = [spec.maxQueue > 0
-    ? T('queue_detail', { queue: num(spec.maxQueue), wait: durationText(spec.queueTimeoutMs ?? 10_000) })
-    : T('queue_none')];
-  if (spec.ordering === 'none') parts.push(T('ordering_none_note'));
-  return { main, sub: parts.join('; ') };
+  // A bus consumer never gets a 429 (the limit only slows it down), so the queue wording would mislead.
+  if (bus) return { main, sub: T(spec.ordering === 'none' ? 'ordering_none_note' : 'bus_partition_note') };
+  const queue = effectiveQueue(spec);
+  const sub = queue > 0
+    ? T('queue_detail', { queue: num(queue), wait: durationText(spec.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS) })
+    : T('queue_none');
+  return { main, sub };
 }
 
+/** The gate's default: a queue as long as the thread limit, waiting up to this long (`sla/gate.rs`). */
+export const DEFAULT_QUEUE_TIMEOUT_MS = 10_000;
+
+/** How many calls wait for a free thread: the policy's queue, or as many as there are threads when it names none. */
+export const effectiveQueue = (spec) => spec.maxQueue ?? spec.maxConcurrency ?? 0;
+
 /** `{ main, sub }` of the "Limit / okno" column. */
-export function callsText(spec) {
+export function callsText(spec, { bus = false } = {}) {
   if (spec.callLimit == null) return { main: T('unlimited'), sub: '' };
   return {
     main: T('calls_value', { limit: num(spec.callLimit), window: windowName(spec.callWindowSecs) }),
-    sub: spec.warnAtPct == null ? '' : T('warn_detail', { pct: num(spec.warnAtPct) }),
+    sub: [spec.warnAtPct == null ? '' : T('warn_detail', { pct: num(spec.warnAtPct) }), bus ? T('bus_slows_note') : ''].filter(Boolean).join('; '),
   };
 }
 
@@ -277,7 +285,7 @@ export function nodeCells({ status, spec, consumer = null, nowMs, bus = false })
     nodeSub: bus && consumer?.state === 'running' ? T('cells.leads') : '',
     inFlightSub: bus
       ? (limit == null ? '' : T(spec.ordering === 'none' ? 'cells.unordered' : 'cells.in_partition'))
-      : (spec.maxQueue != null && limit != null && spec.maxQueue > 0 ? T('cells.queue', { waiting: num(status.waiting ?? 0), max: num(spec.maxQueue) }) : ''),
+      : (limit != null && effectiveQueue(spec) > 0 ? T('cells.queue', { waiting: num(status.waiting ?? 0), max: num(effectiveQueue(spec)) }) : ''),
     window: window ? `${num(window.used)}/${num(window.limit)}` : DASH,
     windowSub,
     p95: evaluation?.p95Ms == null ? DASH : T('cells.ms', { value: num(Math.round(evaluation.p95Ms)) }),

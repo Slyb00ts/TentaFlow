@@ -15114,6 +15114,75 @@ mod service_limits_update_tests {
         assert_eq!(limiter(&ctx, id).limit(), Some(2));
     }
 
+    fn listed(ctx: &HandlerContext, id: i64) -> tentaflow_protocol::ServiceInfo {
+        let req = MessageBody::ServiceBody(ServicePayload::ReqList(
+            tentaflow_protocol::ServiceListRequest {
+                engine_id_filter: None,
+                category_filter: None,
+            },
+        ));
+        let MessageBody::ServiceBody(ServicePayload::ResList(list)) =
+            service_list(&req, ctx).expect("list")
+        else {
+            panic!("unexpected response");
+        };
+        list.services
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("listed")
+    }
+
+    #[tokio::test]
+    async fn the_list_and_the_updated_event_carry_the_enforced_limits() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 25);
+        let _keep = limiter(&ctx, id);
+        let info = listed(&ctx, id);
+        assert_eq!((info.max_concurrent, info.timeout_ms), (None, None));
+
+        let mut req = request(id);
+        req.max_concurrent = Some(6);
+        req.timeout_ms = Some(4_000);
+        update(&ctx, req).await.expect("update");
+        let info = listed(&ctx, id);
+        assert_eq!(
+            (info.max_concurrent, info.timeout_ms),
+            (Some(6), Some(4_000))
+        );
+        // The row an Updated event is built from reads the same stored config.
+        let event = crate::services::snapshot_builder::build_one(&ctx.state.db, id, "test-node")
+            .expect("build")
+            .expect("row");
+        assert_eq!(
+            (event.max_concurrent, event.timeout_ms),
+            (Some(6), Some(4_000))
+        );
+
+        let mut clear = request(id);
+        clear.max_concurrent = Some(0);
+        update(&ctx, clear).await.expect("update");
+        let info = listed(&ctx, id);
+        assert_eq!((info.max_concurrent, info.timeout_ms), (None, Some(4_000)));
+    }
+
+    #[tokio::test]
+    async fn a_service_info_from_before_the_limits_decodes_with_defaults() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 26);
+        let mut value = serde_json::to_value(listed(&ctx, id)).expect("to value");
+        let object = value.as_object_mut().expect("object");
+        for key in ["max_concurrent", "timeout_ms", "limits_editable"] {
+            assert!(object.remove(key).is_some(), "{key}");
+        }
+        let bytes = tentaflow_protocol::cbor::encode(&value).expect("encode the old shape");
+        let info: tentaflow_protocol::ServiceInfo =
+            tentaflow_protocol::cbor::decode(&bytes).expect("decode");
+        assert_eq!(
+            (info.max_concurrent, info.timeout_ms, info.limits_editable),
+            (None, None, false)
+        );
+    }
+
     #[test]
     fn the_remote_command_forwards_the_limits() {
         let mut req = request(7);

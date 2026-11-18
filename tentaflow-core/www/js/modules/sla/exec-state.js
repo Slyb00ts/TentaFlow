@@ -13,7 +13,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { setAttr, setText } from '/js/lib/dom-patch.js';
 import '/js/components/tf-chip.js';
-import { T, breachCells, clockText, dayAndClock, bounded, leadingReading, nodeCells, overallState, stateChip, stateLabel, durationText, windowName, windowPer } from './model.js';
+import { T, breachCells, clockText, dayAndClock, bounded, leadingReading, nodeCells, overallState, stateChip, stateLabel, durationText, windowName, windowPer, effectiveQueue, DEFAULT_QUEUE_TIMEOUT_MS } from './model.js';
 
 const POLL_MS = 5000;
 const BREACH_PAGE = 20;
@@ -55,6 +55,12 @@ function cardHtml({ bus, policyName, windowTitle, nodes }) {
     <div class="an-tfoot" data-v="breach-empty" style="justify-content:flex-start">${escapeHtml(T('breaches_none'))}</div>
     <div class="an-tfoot" data-v="breach-more-row" hidden style="justify-content:flex-start;gap:12px"><span data-v="breach-shown"></span><tf-button variant="ghost" size="sm" data-v="breach-more">${escapeHtml(T('breaches_more'))}</tf-button></div>
     <div class="an-tfoot"><span>${escapeHtml(T('breach_foot_history'))}</span><span>${escapeHtml(T('breach_foot_closing'))}</span></div>`;
+}
+
+/** `hidden` loses to `.an-tfoot { display: flex }`, so the footers of this card also set `display`. */
+function setHidden(el, hidden) {
+  el.hidden = hidden;
+  el.style.display = hidden ? 'none' : '';
 }
 
 const rowOf = (root, nodeId) => [...root.querySelectorAll('tr[data-node]')].find((tr) => tr.dataset.node === nodeId);
@@ -220,7 +226,7 @@ export function startSlaState({ host, flow, onOpenPolicies = () => {}, deps = {}
         if (spec.callLimit != null) bits.push(T('foot.cluster_calls', { count: spec.callLimit * shown.length, window: windowPer(spec.callWindowSecs) }));
         left = T('foot.cluster', { nodes: shown.length, n: shown.length, limits: bits.join(` ${T('foot.and')} `) });
       }
-      if (spec.maxConcurrency != null && spec.maxQueue > 0) right = T('foot.queue', { wait: durationText(spec.queueTimeoutMs ?? 10_000) });
+      if (spec.maxConcurrency != null && effectiveQueue(spec) > 0) right = T('foot.queue', { wait: durationText(spec.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS) });
     }
     setText(host.querySelector('[data-v="foot-cluster"]'), left);
     setText(host.querySelector('[data-v="foot-queue"]'), right);
@@ -238,12 +244,11 @@ export function startSlaState({ host, flow, onOpenPolicies = () => {}, deps = {}
     const names = new Map(context.nodes.map((n) => [n.nodeId, n.name]));
     const open = openCount();
     const count = host.querySelector('[data-v="open-count"]');
-    count.hidden = open === 0;
+    setHidden(count, open === 0);
     setAttr(count, 'label', T('breaches_open', { count: open, n: open }));
     host.querySelector('[data-v="breach-table"]').hidden = breaches.length === 0;
-    host.querySelector('[data-v="breach-empty"]').hidden = breaches.length > 0;
-    const more = host.querySelector('[data-v="breach-more-row"]');
-    more.hidden = breaches.length >= total;
+    setHidden(host.querySelector('[data-v="breach-empty"]'), breaches.length > 0);
+    setHidden(host.querySelector('[data-v="breach-more-row"]'), breaches.length === 0 || breaches.length >= total);
     setText(host.querySelector('[data-v="breach-shown"]'), T('breaches_shown', { shown: breaches.length, total }));
     syncRows(host.querySelector('[data-v="breaches"]'), breaches.map((breach) => ({
       key: breach.id,

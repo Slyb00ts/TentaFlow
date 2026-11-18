@@ -6,18 +6,18 @@ const l = await import('./services-limits.js');
 
 const dom = (html) => { const root = document.createElement('div'); root.innerHTML = html; return root; };
 
-test('the section is prefilled from the stored config and carries the mockup texts', () => {
-  const root = dom(l.renderLimitsSection(l.limitsFromConfig({ max_concurrent: 4, timeout_ms: 120000 })));
+test('the section is prefilled from the service row (maxConcurrent, timeoutMs) and carries the mockup texts', () => {
+  const root = dom(l.renderLimitsSection(l.limitsFromService({ maxConcurrent: 4, timeoutMs: 120000 })));
   assert.equal(root.querySelector('[data-limit="max_concurrent"]').value, '4');
   assert.equal(root.querySelector('[data-limit="timeout_ms"]').value, '120000');
   assert.match(root.textContent, /Maks\. liczba wątków \(równoległych wykonań\)/);
   assert.match(root.textContent, /Timeout \(ms\)/);
   assert.match(root.textContent, /potem dostają odpowiedź 503 z nagłówkiem Retry-After\. Puste pole = bez limitu\./);
   assert.match(root.textContent, /Limity działają od razu po zapisie, bez restartu serwisu\./);
-  const empty = dom(l.renderLimitsSection(l.limitsFromConfig({ max_concurrent: 0 })));
-  assert.equal(empty.querySelector('[data-limit="max_concurrent"]').value, '', '0 in the config means no limit');
+  const empty = dom(l.renderLimitsSection(l.limitsFromService({ maxConcurrent: null })));
+  assert.equal(empty.querySelector('[data-limit="max_concurrent"]').value, '', 'no limit set');
   assert.equal(empty.querySelector('[data-limit="max_concurrent"]').placeholder, 'bez limitu');
-  assert.deepEqual(l.limitsFromConfig(undefined), { maxConcurrent: null, timeoutMs: null });
+  assert.deepEqual(l.limitsFromService(undefined), { maxConcurrent: null, timeoutMs: null });
 });
 
 test('only changed limits are sent; an emptied thread limit clears with 0, an empty one stays unsent', () => {
@@ -88,7 +88,7 @@ test('a service on a node without limit support gets a disabled section with the
   assert.equal(l.limitsEditable({ limitsEditable: false }), false);
   assert.equal(l.limitsEditable({ limitsEditable: true }), true);
   assert.equal(l.limitsEditable({}), true, 'a row that does not carry the flag is left to the server');
-  const initial = l.limitsFromConfig({ max_concurrent: 4, timeout_ms: 5000 });
+  const initial = l.limitsFromService({ maxConcurrent: 4, timeoutMs: 5000 });
   const root = dom(l.renderLimitsSection(initial, { editable: false }));
   for (const input of root.querySelectorAll('[data-limit]')) assert.ok(input.disabled);
   assert.match(root.querySelector('[data-limits-old-node]').textContent, /ma starszą wersję — zaktualizuj go, aby zmieniać limity\./);
@@ -105,4 +105,23 @@ test('the server\'s "too old" refusal reads as the localized note, not as a fiel
   assert.equal(refusal.field, null);
   assert.match(refusal.message, /starszą wersję/);
   assert.doesNotMatch(refusal.message, /upgrade it/);
+});
+
+test('clearing a limit the service has sends 0, and the window then holds the cleared value', () => {
+  const initial = l.limitsFromService({ maxConcurrent: 4, timeoutMs: 60000 });
+  const delta = l.limitsDelta(initial, { max_concurrent: '', timeout_ms: '60000' });
+  assert.deepEqual(delta, { maxConcurrent: 0 });
+  assert.deepEqual(l.limitsAfterSave(initial, delta), { maxConcurrent: null, timeoutMs: 60000 });
+  assert.deepEqual(l.limitsAfterSave(initial, { maxConcurrent: 8, timeoutMs: 100 }), { maxConcurrent: 8, timeoutMs: 100 });
+  assert.deepEqual(l.limitsDelta(l.limitsAfterSave(initial, delta), { max_concurrent: '', timeout_ms: '60000' }), {}, 'saved twice sends nothing the second time');
+  assert.ok(l.validateLimits({ max_concurrent: '', timeout_ms: '' }, initial).timeout_ms, 'the timeout the row carries makes an empty one invalid');
+});
+
+test('an invalid limit field gets the red border class of the other fields and loses it when fixed', () => {
+  const root = dom(l.renderLimitsSection(l.limitsFromService({})));
+  const input = root.querySelector('[data-limit="timeout_ms"]');
+  l.showLimitProblems(root, { timeout_ms: 'x' });
+  assert.ok(input.classList.contains('tf-input-error'));
+  l.showLimitProblems(root, {});
+  assert.ok(!input.classList.contains('tf-input-error'));
 });

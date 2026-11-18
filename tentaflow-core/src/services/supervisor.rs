@@ -1810,6 +1810,17 @@ pub(crate) fn apply_limits_from_row(db: &DbPool, node_id: &str, service_id: i64)
     );
 }
 
+/// The limits a config enforces, as the list shows them: the limiter's own
+/// reading of `max_concurrent` (absent or 0 = `None`) and `timeout_ms` only
+/// when the config sets it.
+pub(crate) fn configured_limits(config_json: &str) -> (Option<u32>, Option<u64>) {
+    let meta = parse_backend_meta(config_json);
+    let timeout_ms = serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|v| v.get("timeout_ms").and_then(|t| t.as_u64()));
+    (meta.max_concurrent, timeout_ms)
+}
+
 // ----- config_json materialisation ------------------------------------------
 
 /// Materialised form of `services.config_json` consumed by the snapshot
@@ -2853,6 +2864,8 @@ mod tests {
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
             limits_editable: false,
+            max_concurrent: None,
+            timeout_ms: None,
             cluster_deployment_id: String::new(),
             cluster_coordinator_node_id: String::new(),
         };

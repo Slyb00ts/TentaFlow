@@ -272,6 +272,8 @@ mod tests {
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
             limits_editable: false,
+            max_concurrent: None,
+            timeout_ms: None,
             cluster_deployment_id: dep.to_string(),
             cluster_coordinator_node_id: coordinator.to_string(),
         }

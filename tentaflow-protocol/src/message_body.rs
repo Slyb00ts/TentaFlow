@@ -152,6 +152,14 @@ pub struct ServiceInfo {
     /// refuse to forward limits to it instead of triggering a silent restart.
     #[serde(default)]
     pub limits_editable: bool,
+    /// Enforced in-flight limit of the service (`max_concurrent` of its
+    /// config, read as the limiter reads it). `None` = no limit (key absent or 0).
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    /// `timeout_ms` of the service config; `None` when not set (the limiter
+    /// then waits its default).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     /// Gdy niepuste: ten wiersz jest czlonkiem distributed-deploymentu klastra
     /// (head/worker kontenera TP) i niesie `deployment_cluster_id` calego
     /// klastra. GUI uzywa go do skierowania akcji stop/usun na CALY klaster

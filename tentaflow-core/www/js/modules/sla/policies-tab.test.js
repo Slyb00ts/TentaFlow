@@ -2,7 +2,7 @@ import '../tentabus/_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { renderPolicyTab, policyRowActions } = await import('./policies-tab.js');
+const { renderPolicyTab, policyRowActions, busPolicyIdsOf } = await import('./policies-tab.js');
 const { slaCellHtml, paintSlaCells } = await import('./flow-cell.js');
 const { slaView } = await import('./model.js');
 
@@ -52,4 +52,23 @@ test('a governed-elsewhere cell has no policy name of ours and a repaint keeps i
 
 test('system flows read "niedostępna"', () => {
   assert.match(slaCellHtml('s', slaView({ id: 's', isSystem: true }, new Map())), /niedostępna/);
+});
+
+test('bus captions appear only in the rows of policies that a bus-fed flow uses', () => {
+  const flows = [
+    { id: 'a', slaPolicyId: 'p-bus', busConsumer: { state: 'running' } },
+    { id: 'b', slaPolicyId: 'p-api' },
+    { id: 'c', slaPolicyId: 'p-sys', busConsumer: { state: 'running' }, isSystem: true },
+    { id: 'd', busConsumer: { state: 'running' } },
+  ];
+  const bus = busPolicyIdsOf(flows);
+  assert.deepEqual([...bus], ['p-bus']);
+  const withSpec = (id) => ({ id, assignedFlows: 1, spec: { name: id, maxConcurrency: 2, callLimit: 10, callWindowSecs: 60, ordering: 'partition' } });
+  const host = document.createElement('div');
+  const table = renderPolicyTab(host, { policies: [withSpec('p-bus'), withSpec('p-api')], canManage: false }, handlers, { busPolicyIds: bus });
+  const [busRow, apiRow] = table.rows;
+  assert.match(busRow.threads, /bus: równolegle z różnych partycji/);
+  assert.match(busRow.calls, /bus tylko zwalnia/);
+  assert.doesNotMatch(apiRow.threads, /bus/);
+  assert.doesNotMatch(apiRow.calls, /bus/);
 });

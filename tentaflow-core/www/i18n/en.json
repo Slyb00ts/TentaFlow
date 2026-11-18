@@ -17590,6 +17590,8 @@
     "queue_detail": "queue {queue}, waits up to {wait}, then 429",
     "queue_none": "no queue, 429 at once",
     "ordering_none_note": "bus: order not kept",
+    "bus_partition_note": "bus: parallel from different partitions",
+    "bus_slows_note": "bus is only slowed",
     "calls_per": "{limit} per {window}",
     "calls_value": "{limit} / {window}",
     "warn_detail": "warning at {pct} %",

@@ -17590,6 +17590,8 @@
     "queue_detail": "kolejka {queue}, czekanie do {wait}, potem 429",
     "queue_none": "bez kolejki, od razu 429",
     "ordering_none_note": "bus: bez zachowania kolejności",
+    "bus_partition_note": "bus: równolegle z różnych partycji",
+    "bus_slows_note": "bus tylko zwalnia",
     "calls_per": "{limit} na {window}",
     "calls_value": "{limit} / {window}",
     "warn_detail": "ostrzeżenie przy {pct} %",

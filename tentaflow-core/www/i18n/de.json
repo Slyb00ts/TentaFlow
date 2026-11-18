@@ -16452,6 +16452,8 @@
     "queue_detail": "Warteschlange {queue}, Wartezeit bis {wait}, dann 429",
     "queue_none": "keine Warteschlange, sofort 429",
     "ordering_none_note": "Bus: Reihenfolge nicht erhalten",
+    "bus_partition_note": "Bus: parallel aus verschiedenen Partitionen",
+    "bus_slows_note": "Bus wird nur gebremst",
     "calls_per": "{limit} pro {window}",
     "calls_value": "{limit} / {window}",
     "warn_detail": "Warnung bei {pct} %",

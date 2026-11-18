@@ -152,6 +152,8 @@
   padding: 8px 10px; outline: none; width: 100%;
 }
 .modal-shell .tf-input:focus, .modal-shell .tf-select:focus, .modal-shell .tf-textarea:focus { border-color: var(--accent-1); }
+.modal-shell .tf-input.tf-input-error { border-color: var(--tf-danger); }
+.modal-shell .tf-input.tf-input-error:focus { box-shadow: var(--tf-glow-danger); }
 .modal-shell .tf-input.mono, .modal-shell .tf-textarea.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 
 /* ===== buttons ===== */
@@ -180,3 +182,6 @@
   background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%); border: 2px solid var(--bg);
   margin-top: -7px; cursor: grab; box-shadow: 0 0 0 1px var(--accent-1);
 }
+
+/* The two limit labels wrap differently on a phone, so stack them there. */
+@media (max-width: 480px) { .modal-shell .adv-row-2.limits-grid { grid-template-columns: 1fr; } }

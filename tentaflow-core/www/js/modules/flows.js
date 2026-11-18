@@ -19,7 +19,7 @@ import { openFormWindow } from '/js/lib/actions/form-window.js';
 import { setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { Router } from '/js/router.js';
 import { slaCellHtml, paintSlaCells } from '/js/modules/sla/flow-cell.js';
-import { loadPolicies, policiesById, policyActions, renderPolicyTab } from '/js/modules/sla/policies-tab.js';
+import { loadBusPolicyIds, loadPolicies, policiesById, policyActions, renderPolicyTab } from '/js/modules/sla/policies-tab.js';
 import { openAssignPolicyWindow } from '/js/modules/sla/assign-window.js';
 import { startSlaState } from '/js/modules/sla/exec-state.js';
 import { T as slaT, assignAction, failureText, newestRequest, slaView } from '/js/modules/sla/model.js';
@@ -126,14 +126,14 @@ async function load() {
   const stale = () => mounted !== state || generation !== state.generation || !state.host.isConnected;
   try {
     if (selectedMode === 'sla') {
-      const response = await loadPolicies();
+      const [response, busPolicyIds] = await Promise.all([loadPolicies(), loadBusPolicyIds()]);
       if (stale()) return;
       state.policyList = response.policies;
       state.policies = policiesById(response.policies);
       state.canManagePolicies = response.canManage;
       byId('flows-subtitle').textContent = subtitleText('sla', state.canManagePolicies);
       button.hidden = !state.canManagePolicies;
-      renderPolicyTab(state.host, response, policyHandlers());
+      renderPolicyTab(state.host, response, policyHandlers(), { busPolicyIds });
       return;
     }
     if (selectedMode === 'bpmn') {

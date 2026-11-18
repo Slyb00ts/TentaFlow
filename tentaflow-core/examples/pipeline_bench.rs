@@ -245,6 +245,8 @@ fn embedded_service(id: i64, engine_id: &str, model_name: &str) -> ServiceInfo {
         request_time_parameters: RequestTimeParameters::default(),
         gpu_selection: String::new(),
         limits_editable: false,
+        max_concurrent: None,
+        timeout_ms: None,
     }
 }
 
