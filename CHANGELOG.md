@@ -74,6 +74,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Przy kilku replikach zajęta replika nie blokuje wolnej: żądanie bez
   czekania przechodzi do następnej i czeka tylko na ostatniej. Odmowa z
   powodu zajętości nie liczy się jako awaria w circuit breakerze.
+- Protokół ma nową rodzinę komunikatów `SlaBody`: lista, odczyt, zapis
+  i usunięcie polityki, przypisanie i zdjęcie polityki z flow, stan SLA oraz
+  stronicowana lista naruszeń. Starsze klienty ignorują nowe pola.
+- Migracja 213 dodaje uprawnienie `sla.manage`, nadawane tylko roli
+  `org_admin`. Zapis polityk wymaga `sla.manage`, a przypisanie do flow
+  dodatkowo roli `power_user` lub `admin`, tak jak edycja flow. Odczyty
+  dotyczą własnej organizacji; inną organizację może wskazać tylko
+  super-admin.
+- Odmowy, na które admin może zareagować, mają kody: `invalid_value`
+  (z nazwą pola), `name_taken`, `policy_in_use` (z liczbą przypisań),
+  `system_flow` i `governed_elsewhere`. Zmiany polityk i przypisań trafiają
+  do audytu `sla.policy.*` ze stanem przed i po.
+- Lista flow pokazuje przypisaną politykę i skrót stanu (ok, ostrzeżenie,
+  naruszenie, zajęcie, wykorzystanie okna). Flow objęty polityką innej
+  organizacji ma w skrócie znacznik `governed_elsewhere` z bieżącym stanem,
+  bez nazwy i identyfikatora polityki.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

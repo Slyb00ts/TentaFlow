@@ -41,6 +41,7 @@ pub mod project_studio;
 pub mod provider_account;
 pub mod map;
 pub mod robot_cloud;
+pub mod sla;
 pub mod storage;
 pub mod stream;
 pub mod tentanas;

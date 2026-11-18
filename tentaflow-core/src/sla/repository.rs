@@ -35,6 +35,13 @@ pub enum SlaError {
     PolicyInUse { policy_id: String, assignments: u32 },
     #[error("a policy named '{0}' already exists in this organization")]
     NameTaken(String),
+    /// Flows are node-global, so another organization may already govern the
+    /// flow; that assignment is not ours to replace or lift.
+    #[error("service {0} is governed by another organization")]
+    GovernedElsewhere(String),
+    /// A platform flow (`flows.is_system`): not the administrator's to govern.
+    #[error("system flow {0} cannot be governed by a policy")]
+    SystemFlow(String),
     #[error("invalid value for {field}: {reason}")]
     Invalid { field: &'static str, reason: String },
     #[error("storage error: {0}")]
@@ -48,6 +55,8 @@ impl SlaError {
             Self::NotFound { .. } => "not_found",
             Self::PolicyInUse { .. } => "policy_in_use",
             Self::NameTaken(_) => "name_taken",
+            Self::SystemFlow(_) => "system_flow",
+            Self::GovernedElsewhere(_) => "governed_elsewhere",
             Self::Invalid { .. } => "invalid_value",
             Self::Storage(_) => "storage_error",
         }
@@ -190,6 +199,20 @@ pub fn list_assignments(pool: &DbPool, org_id: &str) -> Result<Vec<SlaAssignment
     let conn = pool.read()?;
     let mut stmt = conn.prepare(&format!(
         "{ASSIGNMENT_SELECT} WHERE org_id = ?1 ORDER BY target_kind, target_id"
+    ))?;
+    let rows = stmt
+        .query_map([org_id], row_to_assignment)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The assignments other organizations hold. Flows are node-global, so what
+/// governs a flow the caller's organization also calls is the caller's to see
+/// as a state, never as a policy: the caller reads the state only.
+pub fn list_assignments_outside(pool: &DbPool, org_id: &str) -> Result<Vec<SlaAssignment>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(&format!(
+        "{ASSIGNMENT_SELECT} WHERE org_id <> ?1 ORDER BY target_kind, target_id"
     ))?;
     let rows = stmt
         .query_map([org_id], row_to_assignment)?
@@ -492,7 +515,16 @@ pub fn delete_policy(pool: &DbPool, org_id: &str, actor: &str, id: &str) -> Resu
     Ok(())
 }
 
+/// What an assignment changed: the row it replaced, read in the same
+/// transaction as the write, and the row now in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assigned {
+    pub previous: Option<SlaAssignment>,
+    pub current: SlaAssignment,
+}
+
 /// Binds `policy_id` to the service, replacing any policy it had.
+/// `GovernedElsewhere` when another organization already governs it.
 pub fn assign(
     pool: &DbPool,
     org_id: &str,
@@ -500,7 +532,7 @@ pub fn assign(
     target_kind: &str,
     target_id: &str,
     policy_id: &str,
-) -> Result<SlaAssignment> {
+) -> Result<Assigned> {
     if target_kind != SLA_TARGET_FLOW {
         return Err(SlaError::Invalid {
             field: "target_kind",
@@ -535,12 +567,7 @@ pub fn assign(
                 id: target_id.to_string(),
             })
         }
-        Some(true) => {
-            return Err(SlaError::Invalid {
-                field: "target_id",
-                reason: "a system flow cannot be governed by a policy".into(),
-            })
-        }
+        Some(true) => return Err(SlaError::SystemFlow(target_id.to_string())),
         Some(false) => {}
     }
     if policy_in_tx(&tx, org_id, policy_id)?.is_none() {
@@ -549,8 +576,8 @@ pub fn assign(
             id: policy_id.to_string(),
         });
     }
-    // The service may already be governed by another organization's policy; that
-    // row is not ours to replace, and its existence is not ours to reveal.
+    // The service may already be governed by another organization's policy;
+    // that row is not ours to replace.
     let owner: Option<String> = tx
         .query_row(
             "SELECT org_id FROM service_sla_assignments WHERE target_kind = ?1 AND target_id = ?2",
@@ -559,11 +586,9 @@ pub fn assign(
         )
         .optional()?;
     if owner.as_deref().is_some_and(|owner| owner != org_id) {
-        return Err(SlaError::NotFound {
-            entity: "service",
-            id: target_id.to_string(),
-        });
+        return Err(SlaError::GovernedElsewhere(target_id.to_string()));
     }
+    let previous = assignment_in_tx(&tx, org_id, target_kind, target_id)?;
     tx.execute(
         "INSERT INTO service_sla_assignments \
            (target_kind, target_id, policy_id, org_id, assigned_at_ms, assigned_by) \
@@ -584,7 +609,7 @@ pub fn assign(
         Kind::SlaAssignment,
         org_id,
         assignment_resource_id(target_kind, target_id),
-        if owner.is_some() {
+        if previous.is_some() {
             SqlWriteAction::Update
         } else {
             SqlWriteAction::Insert
@@ -594,27 +619,42 @@ pub fn assign(
     )?;
     tx.commit()?;
     super::bump_generation();
-    Ok(stored)
+    Ok(Assigned {
+        previous,
+        current: stored,
+    })
 }
 
-/// Lifts the policy from a service. Returns whether it had one.
+/// Lifts the policy from a service and returns the assignment it removed, read
+/// in the same transaction; `None` when it had none. `GovernedElsewhere` when
+/// another organization's policy governs it.
 pub fn unassign(
     pool: &DbPool,
     org_id: &str,
     actor: &str,
     target_kind: &str,
     target_id: &str,
-) -> Result<bool> {
+) -> Result<Option<SlaAssignment>> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let removed = tx.execute(
+    let Some(previous) = assignment_in_tx(&tx, org_id, target_kind, target_id)? else {
+        let foreign: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM service_sla_assignments \
+              WHERE target_kind = ?1 AND target_id = ?2)",
+            rusqlite::params![target_kind, target_id],
+            |r| r.get(0),
+        )?;
+        return if foreign {
+            Err(SlaError::GovernedElsewhere(target_id.to_string()))
+        } else {
+            Ok(None)
+        };
+    };
+    tx.execute(
         "DELETE FROM service_sla_assignments \
           WHERE target_kind = ?1 AND target_id = ?2 AND org_id = ?3",
         rusqlite::params![target_kind, target_id, org_id],
     )?;
-    if removed == 0 {
-        return Ok(false);
-    }
     record_core_capture_for_org_tx(
         &tx,
         Kind::SlaAssignment,
@@ -626,7 +666,7 @@ pub fn unassign(
     )?;
     tx.commit()?;
     super::bump_generation();
-    Ok(true)
+    Ok(Some(previous))
 }
 
 // -----------------------------------------------------------------------------
@@ -1111,16 +1151,22 @@ mod tests {
         ));
         assert!(get_policy(&pool, ORG, &policy.id).unwrap().is_some());
 
-        assert!(unassign(&pool, ORG, "a", "flow", "flow-1").unwrap());
+        assert!(unassign(&pool, ORG, "a", "flow", "flow-1")
+            .unwrap()
+            .is_some());
         assert_eq!(
             delete_policy(&pool, ORG, "a", &policy.id)
                 .unwrap_err()
                 .code(),
             "policy_in_use"
         );
-        assert!(unassign(&pool, ORG, "a", "flow", "flow-2").unwrap());
+        assert!(unassign(&pool, ORG, "a", "flow", "flow-2")
+            .unwrap()
+            .is_some());
         assert!(
-            !unassign(&pool, ORG, "a", "flow", "flow-2").unwrap(),
+            unassign(&pool, ORG, "a", "flow", "flow-2")
+                .unwrap()
+                .is_none(),
             "nothing left to lift"
         );
 
@@ -1141,12 +1187,20 @@ mod tests {
         let silver = create_policy(&pool, ORG, "a", &spec("Silver")).unwrap();
         let foreign = create_policy(&pool, OTHER, "a", &spec("Foreign")).unwrap();
 
-        let first = assign(&pool, ORG, "a", "flow", "flow-1", &gold.id).unwrap();
+        let first = assign(&pool, ORG, "a", "flow", "flow-1", &gold.id)
+            .unwrap()
+            .current;
         assert_eq!(
             (first.policy_id.as_str(), first.org_id.as_str()),
             (gold.id.as_str(), ORG)
         );
         let moved = assign(&pool, ORG, "a", "flow", "flow-1", &silver.id).unwrap();
+        assert_eq!(
+            moved.previous.as_ref(),
+            Some(&first),
+            "the replaced row is reported"
+        );
+        let moved = moved.current;
         assert_eq!(
             moved.policy_id, silver.id,
             "a second assignment replaces the first"
@@ -1157,7 +1211,19 @@ mod tests {
             get_assignment(&pool, OTHER, "flow", "flow-1").unwrap(),
             None
         );
-        assert!(!unassign(&pool, OTHER, "b", "flow", "flow-1").unwrap());
+        assert_eq!(
+            unassign(&pool, OTHER, "b", "flow", "flow-1")
+                .unwrap_err()
+                .code(),
+            "governed_elsewhere",
+            "another organization's assignment is not ours to lift"
+        );
+        assert!(
+            unassign(&pool, OTHER, "b", "flow", "flow-2")
+                .unwrap()
+                .is_none(),
+            "an ungoverned flow has nothing to lift"
+        );
 
         assert_eq!(
             assign(&pool, ORG, "a", "flow", "flow-2", &foreign.id)
@@ -1169,19 +1235,10 @@ mod tests {
         let missing = assign(&pool, OTHER, "b", "flow", "no-such-flow", &foreign.id).unwrap_err();
         assert_eq!(
             taken.code(),
-            "not_found",
+            "governed_elsewhere",
             "a service governed by another organization is not takeable"
         );
-        assert_eq!(
-            taken.code(),
-            missing.code(),
-            "the code does not tell which it was"
-        );
-        assert_eq!(
-            taken.to_string().replace("flow-1", "X"),
-            missing.to_string().replace("no-such-flow", "X"),
-            "nor does the message"
-        );
+        assert_eq!(missing.code(), "not_found");
         assert_eq!(
             assign(&pool, ORG, "a", "topic", "t", &gold.id)
                 .unwrap_err()
@@ -1606,7 +1663,7 @@ mod tests {
             assign(&pool, ORG, "a", "flow", "flow-3", &policy.id)
                 .unwrap_err()
                 .code(),
-            "invalid_value"
+            "system_flow"
         );
         assign(&pool, ORG, "a", "flow", "flow-1", &policy.id).unwrap();
     }

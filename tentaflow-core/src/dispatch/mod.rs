@@ -60,6 +60,7 @@ pub mod robots;
 pub mod org_structure;
 pub mod role_catalog;
 pub mod run_events;
+pub mod sla;
 pub mod state;
 pub mod storage_admin;
 pub mod stream;
@@ -3068,6 +3069,27 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             match p {
                 Rc::DevicesRequest { .. } => "RobotCloudDevicesRequest",
                 Rc::DevicesResponse { .. } => "RobotCloudDevicesResponse",
+            }
+        }
+        MessageBody::SlaBody(p) => {
+            use tentaflow_protocol::sla::SlaPayload as S;
+            match p {
+                S::PolicyListRequest { .. } => "SlaPolicyListRequest",
+                S::PolicyListResponse { .. } => "SlaPolicyListResponse",
+                S::PolicyGetRequest { .. } => "SlaPolicyGetRequest",
+                S::PolicyGetResponse { .. } => "SlaPolicyGetResponse",
+                S::PolicyUpsertRequest { .. } => "SlaPolicyUpsertRequest",
+                S::PolicyUpsertResponse { .. } => "SlaPolicyUpsertResponse",
+                S::PolicyDeleteRequest { .. } => "SlaPolicyDeleteRequest",
+                S::PolicyDeleteResponse { .. } => "SlaPolicyDeleteResponse",
+                S::AssignRequest { .. } => "SlaAssignRequest",
+                S::AssignResponse { .. } => "SlaAssignResponse",
+                S::UnassignRequest { .. } => "SlaUnassignRequest",
+                S::UnassignResponse { .. } => "SlaUnassignResponse",
+                S::StatusRequest { .. } => "SlaStatusRequest",
+                S::StatusResponse { .. } => "SlaStatusResponse",
+                S::BreachListRequest { .. } => "SlaBreachListRequest",
+                S::BreachListResponse { .. } => "SlaBreachListResponse",
             }
         }
     }

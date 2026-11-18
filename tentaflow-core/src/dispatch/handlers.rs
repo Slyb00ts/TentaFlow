@@ -2292,20 +2292,29 @@ pub fn hub_model_search(
 #[observed]
 pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flows = repository::list_flows(&ctx.state.db, 0, 1000).map_err(db_err)?;
+    let mut sla = super::sla::flow_sla_overview(ctx, crate::sla::global());
     let summaries: Vec<FlowSummary> = flows
         .into_iter()
-        .map(|f| FlowSummary {
-            id: f.id.to_string(),
-            name: f.name,
-            description: f.description,
-            created_at_epoch: parse_ts(&f.created_at),
-            updated_at_epoch: parse_ts(&f.updated_at),
-            enabled: f.status == "active",
-            is_default: f.is_default,
-            published_model_name: f.published_model_name,
-            is_factory: crate::db::seed::is_factory_flow(&f.id),
-            is_system: f.is_system,
-            bus_consumer: bus_consumer_status(&ctx.state.local_node_id, &f.id),
+        .map(|f| {
+            let (sla_policy_id, sla_brief) = match sla.remove(&f.id.to_string()) {
+                Some(found) => (found.policy_id, Some(found.brief)),
+                None => (None, None),
+            };
+            FlowSummary {
+                id: f.id.to_string(),
+                name: f.name,
+                description: f.description,
+                created_at_epoch: parse_ts(&f.created_at),
+                updated_at_epoch: parse_ts(&f.updated_at),
+                enabled: f.status == "active",
+                is_default: f.is_default,
+                published_model_name: f.published_model_name,
+                is_factory: crate::db::seed::is_factory_flow(&f.id),
+                is_system: f.is_system,
+                bus_consumer: bus_consumer_status(&ctx.state.local_node_id, &f.id),
+                sla_policy_id,
+                sla_brief,
+            }
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })

@@ -1406,7 +1406,7 @@ mod tests {
         );
 
         // flow-1 loses its policy.
-        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap());
+        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap().is_some());
         f.advance(ms(TICK));
         f.tick();
         let open: Vec<_> = f
@@ -1955,7 +1955,7 @@ mod tests {
         assert_eq!(f.audit(ACTION_BREACH_RAISED).len(), 1);
 
         // Unassigned while a call is still in flight: the gate drains.
-        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap());
+        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap().is_some());
         f.advance(30 * SECOND);
         f.tick();
         assert!(f.breaches("org-a").iter().all(|b| !b.is_open()));
@@ -1996,7 +1996,7 @@ mod tests {
         f.tick();
         assert!(f.breaches("org-a").is_empty());
 
-        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap());
+        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap().is_some());
         f.advance(30 * SECOND);
         f.tick();
         f.advance(20 * 60 * SECOND);
@@ -2138,7 +2138,7 @@ mod tests {
         let gate = f.gate("flow-1");
         call(&gate, Outcome::Error).await;
         f.tick();
-        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap());
+        assert!(unassign(&f.pool, "org-a", "admin", "flow", "flow-1").unwrap().is_some());
         let other = create_policy(
             &f.pool,
             "org-b",

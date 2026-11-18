@@ -963,6 +963,13 @@ pub struct FlowSummary {
     /// for a flow with no `bus_consume` entry that node's reactor knows of.
     #[serde(default)]
     pub bus_consumer: Option<BusConsumerStatus>,
+    /// The SLA policy governing the flow, in the caller's organization.
+    #[serde(default)]
+    pub sla_policy_id: Option<String>,
+    /// Small form of the flow's SLA state on the answering node; `None` for a
+    /// flow without a policy of the caller's organization.
+    #[serde(default)]
+    pub sla_brief: Option<crate::sla::SlaBrief>,
 }
 
 /// Where a `bus_consume` flow's consumer stands on one node (`bus::reactor`).
@@ -8824,6 +8831,13 @@ pub enum MessageBody {
         #[serde(default)]
         flows: Vec<ServiceAccountFlowUsage>,
     },
+    // ----- Service SLA policies (TB-03) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the family (request+response) in `SlaPayload`: policies, their
+    // assignment to flows, the live state of a governed flow and the breach
+    // history. Writes need `sla.manage`; reads are pinned to the caller's
+    // organization.
+    SlaBody(crate::sla::SlaPayload),
 }
 
 // =============================================================================
@@ -10538,6 +10552,60 @@ mod tests {
             ),
             (0, None, None)
         );
+    }
+
+    /// The SLA fields were appended with `#[serde(default)]`: a flow record from
+    /// an older node decodes without a policy, and a present brief survives a
+    /// CBOR round trip inside the list response.
+    #[test]
+    fn flow_summary_decodes_without_the_sla_fields_and_round_trips_with_them() {
+        let old_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+            "updated_at_epoch": 2, "enabled": true,
+        });
+        let old: FlowSummary = serde_json::from_value(old_json).expect("decode");
+        assert_eq!((old.sla_policy_id.as_deref(), old.sla_brief.as_ref()), (None, None));
+
+        let body = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                sla_policy_id: Some("p-1".to_string()),
+                sla_brief: Some(crate::sla::SlaBrief {
+                    state: "warn".to_string(),
+                    in_flight: 2,
+                    max_concurrency: Some(4),
+                    window_used: Some(57),
+                    window_limit: Some(60),
+                    governed_elsewhere: false,
+                }),
+                ..old
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+
+        // A brief from a node that predates `governed_elsewhere` reads as the
+        // flow's own policy; one that sets it round-trips with no policy id.
+        let old_brief: crate::sla::SlaBrief =
+            serde_json::from_value(serde_json::json!({ "state": "ok" })).expect("decode");
+        assert!(!old_brief.governed_elsewhere);
+        let foreign = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                sla_policy_id: None,
+                sla_brief: Some(crate::sla::SlaBrief {
+                    governed_elsewhere: true,
+                    ..old_brief
+                }),
+                ..serde_json::from_value(serde_json::json!({
+                    "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+                    "updated_at_epoch": 2, "enabled": true,
+                }))
+                .expect("decode")
+            }],
+        };
+        let bytes = crate::cbor::encode(&foreign).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, foreign);
     }
 
     #[test]

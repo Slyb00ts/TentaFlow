@@ -1347,6 +1347,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "sla_breaches_and_samples",
             MigrationStep::Sql(SLA_BREACHES_AND_SAMPLES),
         ),
+        (
+            213,
+            "sla_manage_permission",
+            MigrationStep::Rust(roles_add_sla_manage_permission),
+        ),
     ]
 }
 
@@ -1695,6 +1700,13 @@ BEGIN
     WHERE i.instance_id = NEW.instance_id;
 END;
 "#;
+
+/// v213 — `sla.manage` lets a role create, change and delete SLA policies and
+/// assign them to flows (TB-03, PLAN-TB03-LIMITY-SLA.md §3.7). Only org_admin
+/// holds it by default; assigning also needs the right to edit flows.
+fn roles_add_sla_manage_permission(conn: &Connection) -> Result<()> {
+    roles_add_permissions(conn, &["org_admin"], &["sla.manage"])
+}
 
 /// v207 — `processes.monitor` lets a role read every instance of the
 /// organization in the process monitor, with variable values withheld (BPMN
@@ -17314,7 +17326,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 212);
+        assert_eq!(head, 213);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -17333,7 +17345,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 33);
+        assert_eq!(applied_after_179.len(), 34);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -17355,6 +17367,7 @@ mod tests {
         assert_eq!(applied_after_179[30], "bpmn_incident_retry_attempts");
         assert_eq!(applied_after_179[31], "service_sla_policies");
         assert_eq!(applied_after_179[32], "sla_breaches_and_samples");
+        assert_eq!(applied_after_179[33], "sla_manage_permission");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17855,7 +17868,8 @@ mod tests {
             }
             let rungs: Vec<(i64, String)> = conn
                 .prepare(
-                    "SELECT version, name FROM _migrations WHERE version > 210 ORDER BY version",
+                    "SELECT version, name FROM _migrations WHERE version BETWEEN 211 AND 212 \
+                     ORDER BY version",
                 )
                 .unwrap()
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -17869,6 +17883,32 @@ mod tests {
                     (212, "sla_breaches_and_samples".to_string()),
                 ]
             );
+        }
+    }
+
+    /// v213: org_admin gains `sla.manage` once, the other roles stay without,
+    /// and running the rung again changes nothing.
+    #[test]
+    fn migration_213_grants_sla_manage_to_org_admin_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 212);
+        let perms = |conn: &Connection, role: &str| -> Vec<String> {
+            let json: String = conn
+                .query_row("SELECT permissions_json FROM roles WHERE name=?1", [role], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        assert!(!perms(&conn, "org_admin").iter().any(|p| p == "sla.manage"));
+
+        run(&conn).unwrap();
+        let count = |conn: &Connection| {
+            perms(conn, "org_admin").iter().filter(|p| *p == "sla.manage").count()
+        };
+        assert_eq!(count(&conn), 1, "the ladder itself grants the permission");
+        roles_add_sla_manage_permission(&conn).unwrap();
+        assert_eq!(count(&conn), 1, "the rung is idempotent");
+        for role in ["org_operator", "org_viewer"] {
+            assert!(!perms(&conn, role).iter().any(|p| p == "sla.manage"), "{role}");
         }
     }
 

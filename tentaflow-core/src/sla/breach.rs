@@ -273,6 +273,19 @@ pub fn open_breaches_of_org(
     Ok(rows)
 }
 
+/// Every open breach of the organizations other than `org_id`.
+pub fn open_breaches_outside_org(pool: &DbPool, org_id: &str) -> Result<Vec<Breach>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(&format!(
+        "{BREACH_SELECT} WHERE org_id <> ?1 AND resolved_at_ms IS NULL \
+         ORDER BY raised_at_ms DESC, id DESC"
+    ))?;
+    let rows = stmt
+        .query_map(params![org_id], row_to_breach)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// How many breaches are open on this node, for the metrics export.
 pub fn count_open(pool: &DbPool) -> Result<u64> {
     let conn = pool.read()?;

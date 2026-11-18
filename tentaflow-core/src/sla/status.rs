@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::breach::{self, Breach};
+use super::breach::{self, Breach, BreachKind};
 use super::evaluator::{WindowSummary, WindowViews};
 use super::policy::{SlaAssignment, SLA_TARGET_FLOW};
 use super::registry::SlaRegistry;
@@ -44,6 +44,45 @@ pub struct ServiceStatus {
     pub rejected_calls_total: u64,
     pub rejected_concurrency_total: u64,
     pub open_breaches: Vec<Breach>,
+}
+
+/// How a governed service stands, judged by its open breaches only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    /// Only the call-window warning is open: the limit is near, not reached.
+    Warn,
+    /// Any other breach is open.
+    Breach,
+}
+
+impl Health {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Breach => "breach",
+        }
+    }
+}
+
+impl ServiceStatus {
+    pub fn health(&self) -> Health {
+        health_of(&self.open_breaches)
+    }
+}
+
+pub fn health_of(open_breaches: &[Breach]) -> Health {
+    if open_breaches
+        .iter()
+        .any(|breach| breach.kind != BreachKind::CallsWarn)
+    {
+        Health::Breach
+    } else if open_breaches.is_empty() {
+        Health::Ok
+    } else {
+        Health::Warn
+    }
 }
 
 fn status_of(
@@ -123,6 +162,32 @@ pub fn list_service_statuses(
             .push(breach);
     }
     Ok(repository::list_assignments(pool, org_id)?
+        .iter()
+        .filter(|a| a.target_kind == SLA_TARGET_FLOW)
+        .map(|a| {
+            let breaches = open.remove(&a.target_id).unwrap_or_default();
+            status_of(registry, views, a, breaches)
+        })
+        .collect())
+}
+
+/// The status of every flow governed by an organization other than `org_id`:
+/// what the callers of such a flow actually meet, for the caller to explain a
+/// limit it did not set.
+pub fn list_foreign_service_statuses(
+    pool: &DbPool,
+    registry: &SlaRegistry,
+    views: &WindowViews,
+    org_id: &str,
+) -> Result<Vec<ServiceStatus>> {
+    let _ = registry.refresh_if_stale(pool);
+    let mut open: HashMap<String, Vec<Breach>> = HashMap::new();
+    for breach in breach::open_breaches_outside_org(pool, org_id)? {
+        open.entry(breach.target_id.clone())
+            .or_default()
+            .push(breach);
+    }
+    Ok(repository::list_assignments_outside(pool, org_id)?
         .iter()
         .filter(|a| a.target_kind == SLA_TARGET_FLOW)
         .map(|a| {
