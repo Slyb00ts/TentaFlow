@@ -18,6 +18,7 @@ pub async fn run_local_chat(
     model_name: &str,
     message: &str,
     max_tokens: u32,
+    attribution: Option<&crate::auth::acl::UserContext>,
 ) -> anyhow::Result<String> {
     let request = ChatCompletionRequest {
         reasoning_effort: None,
@@ -67,9 +68,14 @@ pub async fn run_local_chat(
         crate::flow_engine::dispatcher::FlowOrigin::System,
         crate::flow_engine::dispatcher::FlowActor::system_component("ml_studio"),
     );
-    let response = executor
-        .execute_chat(request, &mut exec_ctx)
-        .await
+    let response = crate::routing::direct_run::execute_chat_recorded(
+        &executor,
+        request,
+        &mut exec_ctx,
+        router.db.as_ref(),
+        attribution,
+    )
+    .await
         .map_err(|e| {
             anyhow::anyhow!("inferencja modelu '{}' nie powiodła się: {}", model_name, e)
         })?;

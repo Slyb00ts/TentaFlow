@@ -156,9 +156,742 @@ fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), P
     };
     let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
-    dispatcher
-        .validate_flow(&parsed)
-        .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
+    dispatcher.validate_flow(&parsed).map_err(|e| {
+        use crate::flow_engine::dispatcher::FlowSaveValidationError;
+        if let FlowSaveValidationError::BusConsumeConfig { node_id, detail } = &e {
+            if let Some(node) = parsed.nodes.iter().find(|n| &n.id == node_id) {
+                let label = node_label(node);
+                let group = node
+                    .config
+                    .get("group")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let kind = if detail.contains("invalid 'group'") {
+                    "invalid_group"
+                } else {
+                    "invalid_config"
+                };
+                return sa_error(
+                    ProtocolErrorCode::BadRequest,
+                    kind,
+                    serde_json::json!({"node": label, "group": group}),
+                    format!("flow validation failed: node '{label}': {detail}"),
+                );
+            }
+        }
+        ProtocolError::bad_request(format!("flow validation failed: {}", e))
+    })
+}
+
+/// One `bus_consume` node's service-account binding: the identity, the topic
+/// and the instance it reads — what the bind and unbind audit rows name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceAccountBinding {
+    node_id: String,
+    key_uid: String,
+    topic: String,
+    instance: String,
+    org_id: String,
+}
+
+/// What a flow save did to the flow's service-account bindings, relative to
+/// the version that was ACTIVE before it.
+#[derive(Debug, Default)]
+struct BindingChanges {
+    bound: Vec<ServiceAccountBinding>,
+    unbound: Vec<ServiceAccountBinding>,
+}
+
+/// Every `bus_consume` node of a flow document that names a service account;
+/// an unparseable document has none. Read leniently from the raw config: it
+/// describes what was stored, not what is about to be accepted.
+fn bus_service_account_bindings(flow_json: &str) -> Vec<ServiceAccountBinding> {
+    use crate::flow_engine::node_adapters::bus_consume;
+    let text = |config: &serde_json::Value, key: &str| {
+        config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    serde_json::from_str::<crate::flow_engine::types::FlowDefinition>(flow_json)
+        .map(|def| {
+            def.nodes
+                .into_iter()
+                .filter(|n| n.node_type == bus_consume::NODE_TYPE)
+                .filter_map(|n| {
+                    let key_uid = text(&n.config, "service_account");
+                    (!key_uid.is_empty()).then(|| ServiceAccountBinding {
+                        topic: text(&n.config, "topic"),
+                        instance: text(&n.config, "instance_id"),
+                        org_id: Some(text(&n.config, "org_id"))
+                            .filter(|o| !o.is_empty())
+                            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string()),
+                        node_id: n.id,
+                        key_uid,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `flow_json` of a stored flow while it is active, otherwise `None`: only an
+/// active flow reads under its service account, so only it counts as the
+/// "before" of a binding diff (a draft saved with a key, then activated, is a
+/// new binding).
+fn active_flow_json(flow: &crate::db::models::DbFlow) -> Option<&str> {
+    (flow.status == "active").then_some(flow.flow_json.as_str())
+}
+
+/// Bindings in `now` that `before` did not have (by node, key, topic AND
+/// instance) and bindings `before` had that `now` lacks.
+fn diff_service_account_bindings(before: Option<&str>, now: Option<&str>) -> BindingChanges {
+    let before = before.map(bus_service_account_bindings).unwrap_or_default();
+    let now = now.map(bus_service_account_bindings).unwrap_or_default();
+    BindingChanges {
+        bound: now
+            .iter()
+            .filter(|b| !before.contains(b))
+            .cloned()
+            .collect(),
+        unbound: before
+            .iter()
+            .filter(|b| !now.contains(b))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// A refusal of a service-account binding. The English `message` stands alone;
+/// the trailing `[sa:<kind> <json params>]` is what the Builder localises (the
+/// `flows_config.sa_error.<kind>` strings), so a person sees the node by its
+/// label and the key by its name, in their own language.
+fn sa_error(
+    code: ProtocolErrorCode,
+    kind: &str,
+    params: serde_json::Value,
+    message: String,
+) -> ProtocolError {
+    ProtocolError::new(code, format!("{message} [sa:{kind} {params}]"))
+}
+
+/// What a person calls a node: its label on the canvas, else its type. Never
+/// the generated id.
+fn node_label(node: &crate::flow_engine::types::FlowNode) -> String {
+    node.label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| node.node_type.clone())
+}
+
+/// The name an access key was given, falling back to a short form of its uid.
+fn key_display_name(db: &crate::db::DbPool, uid: &str) -> String {
+    repository::get_api_key_by_uid(db, uid)
+        .ok()
+        .flatten()
+        .map(|k| k.name)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| uid.chars().take(8).collect())
+}
+
+/// Resolves the data-hiding rule a service-account key meets on a topic for
+/// `direction`. A key that meets rules only for other subjects is refused
+/// (`KeyNeedsTopicWideRule`), and so is any other lookup failure: a rule that
+/// cannot be read must not become "unrestricted" at save time.
+fn require_key_field_policy(
+    db: &crate::db::DbPool,
+    instance: &str,
+    org_id: &str,
+    topic: &str,
+    key_uid: &str,
+    direction: crate::bus::field_policies::Direction,
+    node: &crate::flow_engine::types::FlowNode,
+) -> Result<(), ProtocolError> {
+    use crate::bus::field_policies::{resolve, PolicySubject};
+    use crate::bus::BusServiceError;
+    let label = node_label(node);
+    match resolve(
+        db,
+        instance,
+        org_id,
+        topic,
+        PolicySubject::Actor(crate::auth::actor::ActorKind::ApiKey, key_uid),
+        direction,
+    ) {
+        Ok(_) => Ok(()),
+        Err(BusServiceError::KeyNeedsTopicWideRule { .. }) => {
+            let key = key_display_name(db, key_uid);
+            Err(sa_error(
+                ProtocolErrorCode::BadRequest,
+                "needs_wide_rule",
+                serde_json::json!({"node": label, "key": key, "topic": topic,
+                    "direction": direction.as_str()}),
+                format!(
+                    "node '{label}': topic '{topic}' has data-hiding rules for other subjects \
+                     but none that cover the service account '{key}' — add a topic-wide rule \
+                     in Field policies"
+                ),
+            ))
+        }
+        Err(e) => Err(sa_error(
+            ProtocolErrorCode::BadRequest,
+            "field_policy_unreadable",
+            serde_json::json!({"node": label, "topic": topic}),
+            format!("node '{label}': the field policy of topic '{topic}' cannot be read: {e}"),
+        )),
+    }
+}
+
+/// Refuses what a service-account flow could use to act beyond what was
+/// checked at save: any node that starts agents or sub-agents
+/// (`SERVICE_ACCOUNT_FORBIDDEN_NODES`: their flows and tools are picked at run
+/// time and they inherit the key unchecked) and a `bus_publish` inside any
+/// flow the document reaches through `subflow`, `loop` or `map` nodes. Child
+/// flows run under the same key as the parent, but nobody vouched for their
+/// writes.
+///
+/// The walk is breadth-first, so a flow reachable by two paths is examined at
+/// its shallowest depth (the depth limit then never hides what a shorter path
+/// reaches), and it fails closed: a child that is missing or unreadable is a
+/// refusal, not a skip. `bundled` supplies flow documents that are about to be
+/// stored (an import) and take precedence over what the database holds.
+fn reject_unsafe_reachable_nodes(
+    db: &crate::db::DbPool,
+    def: &crate::flow_engine::types::FlowDefinition,
+    bundled: &std::collections::HashMap<String, String>,
+) -> Result<(), ProtocolError> {
+    use crate::flow_engine::node_adapters::bus_publish;
+    use crate::flow_engine::subflow_runner::{
+        nested_flow_id, MAX_SUBFLOW_DEPTH, SERVICE_ACCOUNT_FORBIDDEN_NODES,
+    };
+
+    let forbidden = |node: &crate::flow_engine::types::FlowNode| {
+        SERVICE_ACCOUNT_FORBIDDEN_NODES.contains(&node.node_type.as_str())
+    };
+    let mut queue: std::collections::VecDeque<(String, u8)> = std::collections::VecDeque::new();
+    for node in &def.nodes {
+        if forbidden(node) {
+            let label = node_label(node);
+            return Err(sa_error(
+                ProtocolErrorCode::BadRequest,
+                "forbidden_node",
+                serde_json::json!({"node": label, "type": node.node_type}),
+                format!(
+                    "node '{label}': a '{}' node cannot be used in a flow that runs as a \
+                     service account — it starts agents whose flow and tools are chosen at \
+                     run time",
+                    node.node_type
+                ),
+            ));
+        }
+        if let Some(child) = nested_flow_id(node) {
+            queue.push_back((child.to_string(), 1));
+        }
+    }
+    let mut visited = std::collections::HashSet::new();
+    while let Some((flow_id, depth)) = queue.pop_front() {
+        if depth > MAX_SUBFLOW_DEPTH || !visited.insert(flow_id.clone()) {
+            continue;
+        }
+        let (name, json) = match bundled.get(&flow_id) {
+            Some(json) => (flow_id.clone(), json.clone()),
+            None => {
+                let child = repository::get_flow(db, &flow_id)
+                    .map_err(db_err)?
+                    .ok_or_else(|| {
+                        sa_error(
+                            ProtocolErrorCode::BadRequest,
+                            "nested_missing",
+                            serde_json::json!({"flow": flow_id}),
+                            format!(
+                                "flow '{flow_id}' (reached through a subflow, loop or map) does \
+                                 not exist, so it cannot be checked for a service account"
+                            ),
+                        )
+                    })?;
+                (child.name, child.flow_json)
+            }
+        };
+        let child_def: crate::flow_engine::types::FlowDefinition = serde_json::from_str(&json)
+            .map_err(|_| {
+                sa_error(
+                    ProtocolErrorCode::BadRequest,
+                    "nested_unreadable",
+                    serde_json::json!({"flow": name}),
+                    format!(
+                        "flow '{name}' (reached through a subflow, loop or map) is unreadable, \
+                         so it cannot be checked for a service account"
+                    ),
+                )
+            })?;
+        for node in &child_def.nodes {
+            if forbidden(node) || node.node_type == bus_publish::NODE_TYPE {
+                let label = node_label(node);
+                return Err(sa_error(
+                    ProtocolErrorCode::BadRequest,
+                    "nested_node",
+                    serde_json::json!({"flow": name, "type": node.node_type, "node": label}),
+                    format!(
+                        "flow '{name}' (reached through a subflow, loop or map) has a '{}' \
+                         node '{label}': that is not allowed under a service account — keep \
+                         bus_publish in the flow itself",
+                        node.node_type
+                    ),
+                ));
+            }
+            if let Some(next) = nested_flow_id(node) {
+                queue.push_back((next.to_string(), depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Save-time guard for a flow that reads the bus as a service account
+/// (`bus_consume`'s `service_account`, a general API key). It closes the
+/// confused-deputy hole: nobody may point a flow at an identity to read, or
+/// write, data they cannot reach themselves.
+///
+/// For every `bus_consume` node:
+///   * a service account must be named, and be an existing, active, general key;
+///   * the caller must be at least a PowerUser, in the organisation the node
+///     names;
+///   * the caller PERSONALLY holds Consume on the topic (matrix `bus.read` plus
+///     the topic ACL, asked of the instance's authorizer directly, so it works
+///     even where the engine is not running);
+///   * the key itself holds Consume on the topic under its flow group;
+///   * for every `bus_publish` node of the flow (its topic is a static
+///     string): the caller and the key both hold Produce on it, and
+///     `create_if_missing` is refused — a key never creates topics.
+///
+/// The key reads and publishes under ONE identity across the whole run, so the
+/// guard also covers what the flow can reach: a `bus_publish` in a subflow,
+/// loop or map body (or in a flow those reach) is refused, and so is an
+/// `agent` node, whose flow and tools are chosen at run time. `bus_publish`
+/// belongs at the top level of a service-account flow, where it is checked
+/// above; the run-time guard in `SubflowRunner::prepare` enforces the same
+/// for bodies edited after binding.
+///
+/// Runs on EVERY save of an active flow that contains such a node, not only
+/// when the binding changes: any edit can add a node that sends the data
+/// elsewhere. `previous_active_json` is the stored `flow_json` while that flow
+/// was active (`None` otherwise); the result lists the bindings this save
+/// added and removed, for the audit rows the caller writes once the flow is
+/// stored.
+fn validate_bus_service_accounts(
+    ctx: &HandlerContext,
+    flow_json: &str,
+    previous_active_json: Option<&str>,
+) -> Result<BindingChanges, ProtocolError> {
+    validate_bus_service_accounts_with(
+        ctx,
+        flow_json,
+        previous_active_json,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// [`validate_bus_service_accounts`] with `bundled`: flow documents that are
+/// being stored together with this one (an import), consulted before the
+/// database when the child-flow walk resolves a nested flow id.
+fn validate_bus_service_accounts_with(
+    ctx: &HandlerContext,
+    flow_json: &str,
+    previous_active_json: Option<&str>,
+    bundled: &std::collections::HashMap<String, String>,
+) -> Result<BindingChanges, ProtocolError> {
+    use crate::auth::actor::ActorKind;
+    use crate::bus::{BusAction, BusAuthorizer, BusCallContext};
+    use crate::flow_engine::node_adapters::{bus_consume, bus_publish};
+    use crate::services::bus_authorizer::{
+        api_key_topic_allows, service_account_problem, InstanceBusAuthorizer, ServiceAccountProblem,
+    };
+
+    let def: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
+    let consumers: Vec<_> = def
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == bus_consume::NODE_TYPE)
+        .collect();
+    if consumers.is_empty() {
+        return Ok(diff_service_account_bindings(previous_active_json, None));
+    }
+    let publishers: Vec<_> = def
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == bus_publish::NODE_TYPE)
+        .collect();
+    if !crate::dispatch::SessionAuthKind::PowerUser.session_satisfies(&ctx.session) {
+        return Err(sa_error(
+            ProtocolErrorCode::PolicyDenied,
+            "not_power_user",
+            serde_json::json!({}),
+            "binding a bus_consume node to a service account requires the PowerUser or Admin role"
+                .to_string(),
+        ));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    let checker = ctx
+        .state
+        .permission_checker
+        .clone()
+        .ok_or_else(|| ProtocolError::internal("permission checker unavailable"))?;
+    let db = &ctx.state.db;
+    let denied = ProtocolErrorCode::PolicyDenied;
+    let bad = ProtocolErrorCode::BadRequest;
+    reject_unsafe_reachable_nodes(db, &def, bundled)?;
+
+    for node in consumers {
+        let label = node_label(node);
+        let config = bus_consume::ConsumeConfig::from_config(&node.config).map_err(|e| {
+            sa_error(
+                bad,
+                "invalid_config",
+                serde_json::json!({"node": label}),
+                format!("bus_consume node '{label}': {e}"),
+            )
+        })?;
+        let key_uid = config.service_account.clone().ok_or_else(|| {
+            sa_error(
+                bad,
+                "no_account",
+                serde_json::json!({"node": label}),
+                format!(
+                    "bus_consume node '{label}': pick a service account (a general access key)"
+                ),
+            )
+        })?;
+        if let Some(problem) = service_account_problem(db, &key_uid) {
+            let (kind, why) = match problem {
+                ServiceAccountProblem::NotFound => {
+                    ("key_not_found", "the service account key does not exist")
+                }
+                ServiceAccountProblem::Disabled => {
+                    ("key_disabled", "the service account key is disabled")
+                }
+                ServiceAccountProblem::NotServiceKey => (
+                    "key_not_service",
+                    "a key bound to a user or a group cannot be a service account",
+                ),
+                ServiceAccountProblem::LookupFailed => {
+                    ("key_unreadable", "the service account key cannot be read")
+                }
+            };
+            return Err(sa_error(
+                bad,
+                kind,
+                serde_json::json!({"node": label}),
+                format!("bus_consume node '{label}': {why}"),
+            ));
+        }
+        let key_name = key_display_name(db, &key_uid);
+        if org.org_id != config.org_id {
+            return Err(sa_error(
+                denied,
+                "org_mismatch",
+                serde_json::json!({"node": label, "org": config.org_id}),
+                format!(
+                    "bus.org_mismatch: bus_consume node '{label}' reads organisation '{}', but \
+                     you act in another one",
+                    config.org_id
+                ),
+            ));
+        }
+
+        let user_ctx = |instance: &crate::bus::instance::BusInstanceId| BusCallContext {
+            instance_id: instance.clone(),
+            org_id: org.org_id.clone(),
+            actor: Some(org.user_id.clone()),
+            actor_kind: ActorKind::User,
+            correlation_id: None,
+            origin: "ui".to_string(),
+        };
+        let key_ctx = |instance: &crate::bus::instance::BusInstanceId| BusCallContext {
+            instance_id: instance.clone(),
+            org_id: org.org_id.clone(),
+            actor: Some(key_uid.clone()),
+            actor_kind: ActorKind::ApiKey,
+            correlation_id: None,
+            origin: crate::flow_engine::dispatcher::FlowOrigin::Bus
+                .as_str()
+                .to_string(),
+        };
+        let authorizer =
+            InstanceBusAuthorizer::new(db.clone(), config.instance_id.clone(), checker.clone());
+        authorizer
+            .authorize(
+                &user_ctx(&config.instance_id),
+                BusAction::Consume,
+                &config.topic,
+            )
+            .map_err(|_| {
+                sa_error(
+                    denied,
+                    "user_no_read",
+                    serde_json::json!({"node": label, "topic": config.topic}),
+                    format!(
+                        "bus_consume node '{label}': you do not hold read access to topic '{}'",
+                        config.topic
+                    ),
+                )
+            })?;
+        let group = config.effective_group().unwrap_or_default();
+        authorizer
+            .authorize_group(
+                &key_ctx(&config.instance_id),
+                BusAction::Consume,
+                &config.topic,
+                &group,
+            )
+            .map_err(|_| {
+                sa_error(
+                    bad,
+                    "key_no_read",
+                    serde_json::json!({"node": label, "key": key_name, "topic": config.topic}),
+                    format!(
+                        "bus_consume node '{label}': the service account '{key_name}' has no \
+                         read access to topic '{}' — grant it in Access keys",
+                        config.topic
+                    ),
+                )
+            })?;
+        // The reactor's pre-start check asks the same question: a key that
+        // meets data-hiding rules only for other subjects is refused at
+        // fetch time, so refuse it here instead of saving a flow that never
+        // reads.
+        require_key_field_policy(
+            db,
+            config.instance_id.as_str(),
+            &org.org_id,
+            &config.topic,
+            &key_uid,
+            crate::bus::field_policies::Direction::Read,
+            node,
+        )?;
+
+        for publisher in &publishers {
+            let publisher_label = node_label(publisher);
+            let instance = publisher
+                .config
+                .get("instance_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .ok_or_else(|| {
+                    sa_error(
+                        bad,
+                        "invalid_config",
+                        serde_json::json!({"node": publisher_label}),
+                        format!("bus_publish node '{publisher_label}': instance_id required"),
+                    )
+                })
+                .and_then(|id| {
+                    crate::bus::instance::BusInstanceId::parse(id).map_err(|e| {
+                        sa_error(
+                            bad,
+                            "invalid_config",
+                            serde_json::json!({"node": publisher_label}),
+                            format!("bus_publish node '{publisher_label}': {e}"),
+                        )
+                    })
+                })?;
+            let topic = publisher
+                .config
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    sa_error(
+                        bad,
+                        "invalid_config",
+                        serde_json::json!({"node": publisher_label}),
+                        format!("bus_publish node '{publisher_label}': topic required"),
+                    )
+                })?;
+            if publisher
+                .config
+                .get("create_if_missing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(sa_error(
+                    bad,
+                    "create_if_missing",
+                    serde_json::json!({"node": publisher_label}),
+                    format!(
+                        "bus_publish node '{publisher_label}': create_if_missing cannot be \
+                         used in a flow that runs as a service account — a key never creates \
+                         topics"
+                    ),
+                ));
+            }
+            let publish_authorizer =
+                InstanceBusAuthorizer::new(db.clone(), instance.clone(), checker.clone());
+            publish_authorizer
+                .authorize(&user_ctx(&instance), BusAction::Produce, topic)
+                .map_err(|_| {
+                    sa_error(
+                        denied,
+                        "user_no_write",
+                        serde_json::json!({"node": publisher_label, "topic": topic}),
+                        format!(
+                            "bus_publish node '{publisher_label}': you do not hold write \
+                             access to topic '{topic}'"
+                        ),
+                    )
+                })?;
+            if !api_key_topic_allows(
+                db,
+                instance.as_str(),
+                &org.org_id,
+                topic,
+                &key_uid,
+                BusAction::Produce,
+            ) {
+                return Err(sa_error(
+                    bad,
+                    "key_no_write",
+                    serde_json::json!({"node": publisher_label, "key": key_name, "topic": topic}),
+                    format!(
+                        "bus_publish node '{publisher_label}': the service account \
+                         '{key_name}' has no write access to topic '{topic}' — grant it in \
+                         Access keys"
+                    ),
+                ));
+            }
+            require_key_field_policy(
+                db,
+                instance.as_str(),
+                &org.org_id,
+                topic,
+                &key_uid,
+                crate::bus::field_policies::Direction::Write,
+                publisher,
+            )?;
+        }
+    }
+    Ok(diff_service_account_bindings(
+        previous_active_json,
+        Some(flow_json),
+    ))
+}
+
+/// What an environment import did to the service-account bindings of the flows
+/// it writes: the audit rows to write once the import is stored, and the flows
+/// that were imported as drafts because their binding did not pass the save
+/// check.
+#[derive(Default)]
+pub(crate) struct ImportedBindings {
+    changes: Vec<(String, BindingChanges)>,
+    demoted: Vec<(String, String)>,
+    demoted_names: Vec<String>,
+}
+
+impl ImportedBindings {
+    /// Names of the flows that were imported as drafts.
+    pub(crate) fn demoted_names(&self) -> Vec<String> {
+        self.demoted_names.clone()
+    }
+}
+
+/// Screens the selected flows of an imported bundle the way a save would: an
+/// active flow whose `bus_consume` binding fails `validate_bus_service_accounts`
+/// is imported as a draft instead, so an import is never a way around the
+/// check. The caller applies the (possibly adjusted) bundle, then calls
+/// `audit_imported_bindings`.
+pub(crate) fn screen_imported_flows(
+    ctx: &HandlerContext,
+    bundle: &mut crate::services::config_bundle::ConfigBundle,
+    selected_resource_keys: &[String],
+) -> ImportedBindings {
+    let mut out = ImportedBindings::default();
+    let bundled: std::collections::HashMap<String, String> = bundle
+        .flows
+        .iter()
+        .filter(|f| selected_resource_keys.contains(&format!("flows:{}", f.id)))
+        .map(|f| (f.id.clone(), f.flow_json.clone()))
+        .collect();
+    for flow in &mut bundle.flows {
+        if !selected_resource_keys.contains(&format!("flows:{}", flow.id)) {
+            continue;
+        }
+        let stored = repository::get_flow(&ctx.state.db, &flow.id).ok().flatten();
+        let previous = stored.as_ref().and_then(active_flow_json);
+        let changes = if flow.status == "active" {
+            match validate_bus_service_accounts_with(ctx, &flow.flow_json, previous, &bundled) {
+                Ok(changes) => changes,
+                Err(e) => {
+                    flow.status = "draft".to_string();
+                    out.demoted.push((flow.id.clone(), e.message.clone()));
+                    out.demoted_names.push(flow.name.clone());
+                    diff_service_account_bindings(previous, None)
+                }
+            }
+        } else {
+            diff_service_account_bindings(previous, None)
+        };
+        if !changes.bound.is_empty() || !changes.unbound.is_empty() {
+            out.changes.push((flow.id.clone(), changes));
+        }
+    }
+    out
+}
+
+/// Writes the audit rows `screen_imported_flows` collected, once the import
+/// is stored.
+pub(crate) fn audit_imported_bindings(ctx: &HandlerContext, imported: &ImportedBindings) {
+    for (flow_id, changes) in &imported.changes {
+        audit_service_account_bindings(ctx, flow_id, changes);
+    }
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    for (flow_id, reason) in &imported.demoted {
+        audit(
+            ctx,
+            user_id.as_deref(),
+            "flow.service_account.import_demoted",
+            Some(&format!("flow:{flow_id}")),
+            Some(&format!("imported as draft: {reason}")),
+        );
+    }
+}
+
+/// Writes the `flow.service_account.bind` / `.unbind` audit rows for the
+/// bindings a stored flow gained and lost.
+fn audit_service_account_bindings(ctx: &HandlerContext, flow_id: &str, changes: &BindingChanges) {
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    let rows = changes
+        .bound
+        .iter()
+        .map(|b| ("flow.service_account.bind", b))
+        .chain(
+            changes
+                .unbound
+                .iter()
+                .map(|b| ("flow.service_account.unbind", b)),
+        );
+    for (action, b) in rows {
+        audit(
+            ctx,
+            user_id.as_deref(),
+            action,
+            Some(&format!("flow:{flow_id}")),
+            Some(&format!(
+                "node={} service_account=api_key:{} name={:?} instance={} org={} topic={}",
+                b.node_id,
+                b.key_uid,
+                key_display_name(&ctx.state.db, &b.key_uid),
+                b.instance,
+                b.org_id,
+                b.topic
+            )),
+        );
+    }
 }
 
 // =============================================================================
@@ -497,6 +1230,90 @@ pub fn api_key_list_request(
         .collect();
 
     Ok(MessageBody::ApiKeyListResponse { keys: summaries })
+}
+
+/// The Flow Builder's service-account picker: every active general key by uid
+/// and name, nothing else. `ApiKeyListRequest` is Admin-only, but a PowerUser
+/// may bind a `bus_consume` node, so the picker needs this narrower view. It
+/// grants no right: binding still passes `validate_bus_service_accounts`.
+#[handler(variant = "ServiceAccountListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn service_account_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let keys = repository::list_api_keys(&ctx.state.db).map_err(db_err)?;
+    let accounts = keys
+        .into_iter()
+        .filter(|k| k.is_active && k.key_type == "general")
+        .map(|k| tentaflow_protocol::ServiceAccountOption {
+            key_id: k.uid,
+            name: k.name,
+        })
+        .collect();
+    Ok(MessageBody::ServiceAccountListResponse { accounts })
+}
+
+/// The active flows of the caller's organisation whose `bus_consume` node reads
+/// under `key_uid`, for the warning an Admin sees before revoking, disabling or
+/// deleting that key. Admin-only, like the key list itself. A binding counts
+/// when its node reads the caller's organisation (the same rule the bind-time
+/// check applies), so another tenant's flows are neither named nor counted.
+#[handler(variant = "ServiceAccountUsageRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_account_usage(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ServiceAccountUsageRequest { key_uid } => key_uid.trim(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceAccountUsageRequest",
+            ))
+        }
+    };
+    if key_uid.is_empty() {
+        return Err(ProtocolError::bad_request("key_uid is required"));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    const PAGE: i64 = 200;
+    let mut flows = Vec::new();
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page = repository::list_active_flows_after(
+            &ctx.state.db,
+            after
+                .as_ref()
+                .map(|(name, id)| (name.as_str(), id.as_str())),
+            PAGE,
+        )
+        .map_err(db_err)?;
+        let Some(last) = page.last() else { break };
+        after = Some((last.name.clone(), last.id.clone()));
+        let full = page.len() as i64 == PAGE;
+        flows.extend(
+            page.into_iter()
+                .filter(|f| {
+                    bus_service_account_bindings(&f.flow_json)
+                        .iter()
+                        .any(|b| b.key_uid == key_uid && b.org_id == org.org_id)
+                })
+                .map(|f| tentaflow_protocol::ServiceAccountFlowUsage {
+                    flow_id: f.id,
+                    name: f.name,
+                    status: f.status,
+                }),
+        );
+        if !full {
+            break;
+        }
+    }
+    Ok(MessageBody::ServiceAccountUsageResponse { flows })
 }
 
 /// Shared validation for a general key's scope resource. `resource_type` must be
@@ -1475,19 +2292,29 @@ pub fn hub_model_search(
 #[observed]
 pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flows = repository::list_flows(&ctx.state.db, 0, 1000).map_err(db_err)?;
+    let mut sla = super::sla::flow_sla_overview(ctx, crate::sla::global());
     let summaries: Vec<FlowSummary> = flows
         .into_iter()
-        .map(|f| FlowSummary {
-            id: f.id.to_string(),
-            name: f.name,
-            description: f.description,
-            created_at_epoch: parse_ts(&f.created_at),
-            updated_at_epoch: parse_ts(&f.updated_at),
-            enabled: f.status == "active",
-            is_default: f.is_default,
-            published_model_name: f.published_model_name,
-            is_factory: crate::db::seed::is_factory_flow(&f.id),
-            is_system: f.is_system,
+        .map(|f| {
+            let (sla_policy_id, sla_brief) = match sla.remove(&f.id.to_string()) {
+                Some(found) => (found.policy_id, Some(found.brief)),
+                None => (None, None),
+            };
+            FlowSummary {
+                id: f.id.to_string(),
+                name: f.name,
+                description: f.description,
+                created_at_epoch: parse_ts(&f.created_at),
+                updated_at_epoch: parse_ts(&f.updated_at),
+                enabled: f.status == "active",
+                is_default: f.is_default,
+                published_model_name: f.published_model_name,
+                is_factory: crate::db::seed::is_factory_flow(&f.id),
+                is_system: f.is_system,
+                bus_consumer: bus_consumer_status(&ctx.state.local_node_id, &f.id),
+                sla_policy_id,
+                sla_brief,
+            }
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })
@@ -1506,11 +2333,32 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
 
-    Ok(MessageBody::FlowDetailResponse(flow_detail_body(flow)))
+    Ok(MessageBody::FlowDetailResponse(flow_detail_body(
+        flow,
+        &ctx.state.local_node_id,
+    )))
 }
 
-fn flow_detail_body(flow: db::models::DbFlow) -> FlowDetail {
+/// The flow's consumer status on this node, for the wire.
+fn bus_consumer_status(
+    node_id: &str,
+    flow_id: &str,
+) -> Option<tentaflow_protocol::BusConsumerStatus> {
+    crate::bus::reactor::consumer_status(flow_id).map(|s| tentaflow_protocol::BusConsumerStatus {
+        state: s.state.as_str().to_string(),
+        reason: s.reason.map(str::to_string),
+        detail: s.detail,
+        since_epoch: s.since_epoch,
+        node_id: node_id.to_string(),
+        in_flight: s.in_flight,
+        max_concurrency: s.max_concurrency,
+        throttled_until: s.throttled_until,
+    })
+}
+
+fn flow_detail_body(flow: db::models::DbFlow, node_id: &str) -> FlowDetail {
     FlowDetail {
+        bus_consumer: bus_consumer_status(node_id, &flow.id),
         is_factory: crate::db::seed::is_factory_flow(&flow.id),
         id: flow.id.to_string(),
         name: flow.name,
@@ -1536,6 +2384,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     }
 
     validate_flow_json_str(ctx, &payload.graph_json)?;
+    let bindings = validate_bus_service_accounts(ctx, &payload.graph_json, None)?;
 
     // Validate the catalog publish name against active aliases and other
     // published flows before writing — guards/D.19 collision detection
@@ -1573,6 +2422,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         None,
         Some(&ctx.state.local_node_id),
     );
+    audit_service_account_bindings(ctx, &id, &bindings);
 
     Ok(MessageBody::FlowCreateResponse {
         flow_id: id.to_string(),
@@ -1603,7 +2453,24 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             "factory flow cannot be deleted — restore its factory version instead",
         ));
     }
+    // Run history references the flow row without an `ON DELETE` action, so a
+    // delete would fail half-way at the database; refuse it up front, before any
+    // write, and leave the (medical) execution history untouched.
+    let has_history = !repository::list_flow_executions_for_flow(&ctx.state.db, flow_id, 1)
+        .map_err(db_err)?
+        .is_empty();
+    if has_history {
+        return Err(ProtocolError::bad_request(
+            "this flow has run history and cannot be deleted - deactivate it instead [flow:has_history]",
+        ));
+    }
     repository::delete_flow(&ctx.state.db, flow_id).map_err(db_err)?;
+    // An active flow read under a service account; its bindings end here.
+    audit_service_account_bindings(
+        ctx,
+        flow_id,
+        &diff_service_account_bindings(active_flow_json(&existing), None),
+    );
     // A deleted flow that was published as a model must drop out of the
     // catalog immediately — without this the snapshot keeps it until the
     // next alias mutation or supervisor tick.
@@ -1652,6 +2519,9 @@ pub fn flow_executions_list(
             status: e.status.unwrap_or_else(|| "unknown".into()),
             started_at_epoch: e.started_at.as_deref().map(parse_ts).unwrap_or(0),
             completed_at_epoch: e.finished_at.as_deref().map(parse_ts),
+            request_id: e.request_id,
+            correlation_id: e.correlation_id,
+            origin: e.origin,
         })
         .collect();
     Ok(MessageBody::FlowExecutionsListResponse {
@@ -1664,7 +2534,7 @@ pub fn flow_executions_list(
 // =============================================================================
 
 #[handler(variant = "FlowUpdateRequest", since = (1, 0))]
-#[policy(Admin)]
+#[policy(PowerUser)]
 #[observed]
 pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
@@ -1710,6 +2580,13 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             "the default chat flow must stay active — it is the resolver fallback",
         ));
     }
+    // A flow that is not active consumes nothing, so deactivating or editing a
+    // draft is never blocked; activating it runs the check.
+    let bindings = if new_status == "active" {
+        validate_bus_service_accounts(ctx, &new_flow_json, active_flow_json(&existing))?
+    } else {
+        diff_service_account_bindings(active_flow_json(&existing), None)
+    };
 
     // Resolve the publish-name update: `Some(Some)` writes a new value,
     // `Some(None)` clears it, `None` leaves the existing value alone.
@@ -1766,6 +2643,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         Some(&format!("flow:{}", flow_id)),
         Some(&new_name),
     );
+    audit_service_account_bindings(ctx, flow_id, &bindings);
 
     Ok(MessageBody::FlowUpdateResponseBody(
         tentaflow_protocol::FlowUpdateResponse { ok: true },
@@ -1997,7 +2875,7 @@ pub fn flow_version_get(
 }
 
 #[handler(variant = "FlowVersionRestoreRequest", since = (1, 0))]
-#[policy(Admin)]
+#[policy(PowerUser)]
 #[observed]
 pub fn flow_version_restore(
     req: &MessageBody,
@@ -2028,6 +2906,11 @@ pub fn flow_version_restore(
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
     validate_flow_json_str(ctx, flow_json)?;
+    let bindings = if version.status.as_deref() == Some("active") {
+        validate_bus_service_accounts(ctx, flow_json, active_flow_json(&existing))?
+    } else {
+        diff_service_account_bindings(active_flow_json(&existing), None)
+    };
     let user_id_opt = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     // Restoring an old version keeps whatever publish name the live flow
     // currently advertises — old versions never tracked the catalog field.
@@ -2067,6 +2950,7 @@ pub fn flow_version_restore(
         Some(&format!("flow:{}", flow_id)),
         Some(&format!("version:{}", version_id)),
     );
+    audit_service_account_bindings(ctx, flow_id, &bindings);
 
     Ok(MessageBody::FlowVersionRestoreResponseBody(
         tentaflow_protocol::FlowVersionRestoreResponse { ok: true },
@@ -2074,7 +2958,7 @@ pub fn flow_version_restore(
 }
 
 #[handler(variant = "FlowFactoryRestoreRequest", since = (1, 0))]
-#[policy(Admin)]
+#[policy(PowerUser)]
 #[observed]
 pub fn flow_factory_restore(
     req: &MessageBody,
@@ -2105,6 +2989,7 @@ pub fn flow_factory_restore(
     // The canonical graph still goes through R1-R8: a node adapter may have
     // disappeared from this build since the seed was written.
     validate_flow_json_str(ctx, factory_json)?;
+    let bindings = validate_bus_service_accounts(ctx, factory_json, active_flow_json(&existing))?;
 
     let user_id_opt = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     // Default Chat is the resolver fallback, so a restore also re-pins its
@@ -2154,11 +3039,15 @@ pub fn flow_factory_restore(
         Some(&format!("flow:{}", flow_id)),
         Some(&existing.name),
     );
+    audit_service_account_bindings(ctx, flow_id, &bindings);
 
     let restored = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
-    Ok(MessageBody::FlowDetailResponse(flow_detail_body(restored)))
+    Ok(MessageBody::FlowDetailResponse(flow_detail_body(
+        restored,
+        &ctx.state.local_node_id,
+    )))
 }
 
 // =============================================================================
@@ -4892,6 +5781,8 @@ pub async fn service_manifest_deploy(
         serde_json::from_str(&payload.config_json)
             .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
     };
+    crate::services_repo::services::validate_max_concurrent(&user_config)
+        .map_err(ProtocolError::bad_request)?;
     // Subscription login: the wizard sends an `oauth_flow_id` instead of a key.
     // Swap it for the tokens captured by the completed OAuth flow on this node
     // (the credential blob then follows the normal encrypted `api_key` path).
@@ -8884,15 +9775,32 @@ pub fn agent_run_detail(
 /// ACL for answering a run's interaction (§3.13): a non-admin may reply only to
 /// a run whose principal is themselves; an unattended (no-principal) run is
 /// admin-only. A missing run is reported as not-found (not leaking existence).
-fn assert_run_reply_access(ctx: &HandlerContext, run_id: &str) -> Result<(), ProtocolError> {
+///
+/// A card raised by a flow that has no managed agent run (a chat flow's
+/// `ask_user` block, an agent node outside the run manager) names the flow's own
+/// run id, which has no `agent_runs` row. Such a card carries the authenticated
+/// owner of the flow run, and that owner (or an admin) may answer it.
+/// `interaction_id` is the card being answered; actions on a run itself
+/// (cancel) pass `None` and need the row.
+fn assert_run_reply_access(
+    ctx: &HandlerContext,
+    run_id: &str,
+    interaction_id: Option<&str>,
+) -> Result<(), ProtocolError> {
     let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
-    let run = repository::get_agent_run(&ctx.state.db, run_id)
-        .map_err(db_err)?
-        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {run_id}")))?;
+    let not_found = || ProtocolError::not_found(format!("agent run not found: {run_id}"));
+    let run = repository::get_agent_run(&ctx.state.db, run_id).map_err(db_err)?;
+    let Some(run) = run else {
+        let owned_card = interaction_id
+            .and_then(|id| crate::agents::interaction_registry_global().info(id))
+            .is_some_and(|card| {
+                card.run_id == run_id
+                    && (session_is_admin(ctx) || card.user_id.as_deref() == Some(actor_id.as_str()))
+            });
+        return if owned_card { Ok(()) } else { Err(not_found()) };
+    };
     if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
-        return Err(ProtocolError::not_found(format!(
-            "agent run not found: {run_id}"
-        )));
+        return Err(not_found());
     }
     Ok(())
 }
@@ -8909,7 +9817,7 @@ pub fn agent_run_reply(
         _ => return Err(ProtocolError::bad_request("expected AgentRunReplyRequest")),
     };
     // ACL: the run's principal or an admin may answer its questions (§3.13 A).
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, Some(&payload.question_id))?;
 
     let registry = crate::agents::interaction_registry_global();
     // The interaction must belong to the named run (an answer cannot be routed
@@ -8947,7 +9855,7 @@ pub fn agent_permission_reply(
             ))
         }
     };
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, Some(&payload.request_id))?;
 
     let decision = crate::agents::PermissionDecision::parse(&payload.decision)
         .ok_or_else(|| ProtocolError::bad_request("unknown permission decision"))?;
@@ -8985,7 +9893,7 @@ pub fn agent_run_cancel(
         _ => return Err(ProtocolError::bad_request("expected AgentRunCancelRequest")),
     };
     // ACL: the run's principal or an admin may cancel it (§3.3).
-    assert_run_reply_access(ctx, &payload.run_id)?;
+    assert_run_reply_access(ctx, &payload.run_id, None)?;
 
     let user_id = require_user_id(ctx)?;
     let cancelled = crate::agents::agent_run_manager_global()
@@ -9270,7 +10178,12 @@ pub async fn agent_builder_assist(
             // §2.5 — Agent Builder assist is a dashboard builder surface.
             crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
             handler_actor(ctx),
-            None,
+            // The organisation the session is acting in; without it the run
+            // would be filed under whichever the user joined first.
+            Some(crate::compliance::ai_gateway::AiGatewayContext {
+                org_id: ctx.org_context.as_ref().map(|org| org.org_id.clone()),
+                ..Default::default()
+            }),
         )
         .await
         .map_err(|e| ProtocolError::internal(format!("builder assist LLM call failed: {e}")))?;
@@ -12622,5 +13535,1292 @@ mod bus_instance_save_validation_tests {
         .to_string();
         validate_flow_json_str(&c, &flow_json)
             .expect("a flow with no bus_* node must not be gated by the TentaBus instance check");
+    }
+}
+
+/// Save-time guard for a flow that reads the bus as a service account
+/// (`validate_bus_service_accounts`): nobody may bind an identity to data they
+/// cannot reach themselves, and a key must be a live general key with the
+/// rights the flow needs.
+#[cfg(test)]
+mod bus_service_account_save_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use tentaflow_protocol::SessionAuth;
+
+    const INSTANCE: &str = "tentabus-aaaaaaaa";
+    const ORG: &str = "org-default";
+    const USER: &str = "u-binder";
+
+    struct Fx {
+        ctx: HandlerContext,
+    }
+
+    fn acl_id(topic: &str) -> String {
+        crate::services::bus_authorizer::topic_acl_resource_id(INSTANCE, ORG, topic)
+    }
+
+    /// A caller of `role` holding the given bus matrix permissions on the
+    /// instance, acting in `org`.
+    fn fixture(role: &str, matrix: &[&str], org: &str) -> Fx {
+        let state = AppState::for_test();
+        state
+            .db
+            .write()
+            .expect("db lock")
+            .execute(
+                "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
+                 VALUES (?1, ?1, '1.0.0', 'tentabus', 1)",
+                rusqlite::params![INSTANCE],
+            )
+            .expect("seed bus instance row");
+        for perm in matrix {
+            repository::upsert_permission(&state.db, INSTANCE, "user", USER, perm, "allow", None)
+                .expect("grant");
+        }
+        state
+            .permission_checker
+            .as_ref()
+            .expect("checker")
+            .refresh_addon(INSTANCE);
+        Fx {
+            ctx: HandlerContext {
+                origin: crate::dispatch::RequestOrigin::Local,
+                session: SessionAuth::UserSession {
+                    user_id: [7u8; 16],
+                    role: Some(role.to_string()),
+                },
+                correlation_id: 1,
+                connection_id: 0,
+                resume_secret: None,
+                state,
+                org_context: Some(crate::services::rbac::OrgContext {
+                    user_id: USER.to_string(),
+                    org_id: org.to_string(),
+                    role_id: "role".to_string(),
+                    permissions: Default::default(),
+                }),
+            },
+        }
+    }
+
+    fn key(fx: &Fx, key_type: &str, rights: &[(&str, &str)]) -> String {
+        let subject = (key_type == "user").then_some("u-owner");
+        let (_, uid) = repository::create_api_key(
+            &fx.ctx.state.db,
+            &format!("verifier-{}", uuid::Uuid::new_v4()),
+            "sk-...abcdef",
+            "Flow SA",
+            key_type,
+            subject,
+            60,
+        )
+        .expect("key");
+        for (topic, action) in rights {
+            repository::resource_permissions::set_with_action(
+                &fx.ctx.state.db,
+                "topic",
+                &acl_id(topic),
+                "api_key",
+                &uid,
+                action,
+                "allow",
+            )
+            .expect("key right");
+        }
+        uid
+    }
+
+    fn flow(service_account: &str, org: Option<&str>, publish: Option<(&str, bool)>) -> String {
+        let mut consume = serde_json::json!({
+            "instance_id": INSTANCE, "service_account": service_account,
+            "topic": "orders.raw", "group": "g1"
+        });
+        if let Some(org) = org {
+            consume["org_id"] = serde_json::json!(org);
+        }
+        let mut nodes =
+            vec![serde_json::json!({"id": "c", "type": "bus_consume", "config": consume})];
+        if let Some((topic, create)) = publish {
+            nodes.push(
+                serde_json::json!({"id": "p", "type": "bus_publish", "config": {
+                    "instance_id": INSTANCE, "topic": topic, "create_if_missing": create
+                }}),
+            );
+        }
+        serde_json::json!({"nodes": nodes, "edges": []}).to_string()
+    }
+
+    fn denied(r: Result<BindingChanges, ProtocolError>) -> String {
+        r.err().expect("must be refused").message
+    }
+
+    #[test]
+    fn an_admin_who_reads_the_topic_binds_a_key_that_reads_it() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let changes =
+            validate_bus_service_accounts(&fx.ctx, &flow(&k, None, None), None).expect("accepted");
+        let bindings = changes.bound;
+        assert!(changes.unbound.is_empty());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            (bindings[0].node_id.as_str(), bindings[0].key_uid.as_str()),
+            ("c", k.as_str())
+        );
+        assert_eq!(bindings[0].topic, "orders.raw");
+    }
+
+    /// Owner decision 14.11.2026: a PowerUser may bind too, on the same terms.
+    #[test]
+    fn a_power_user_may_bind_on_the_same_terms() {
+        let fx = fixture("power_user", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        validate_bus_service_accounts(&fx.ctx, &flow(&k, None, None), None).expect("accepted");
+    }
+
+    /// A refusal names the node by its label and the key by its name, and
+    /// carries a machine-readable `[sa:<kind> <json>]` suffix the UI turns into
+    /// the person's own language. The generated node id never reaches the text.
+    #[test]
+    fn a_refusal_names_the_node_and_key_and_carries_a_localisable_suffix() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&flow(&k, None, Some(("orders.done", false)))).unwrap();
+        json["nodes"][1]["label"] = serde_json::json!("Publish results");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &json.to_string(),
+            None,
+        ));
+        assert!(m.contains("Publish results"), "{m}");
+        assert!(m.contains("'Flow SA'"), "{m}");
+        assert!(m.contains("[sa:key_no_write {"), "{m}");
+        let params = m
+            .split("[sa:key_no_write ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']');
+        let params: serde_json::Value = serde_json::from_str(params).expect("params are JSON");
+        assert_eq!(params["node"], "Publish results");
+        assert_eq!(params["key"], "Flow SA");
+        assert_eq!(params["topic"], "orders.done");
+        assert!(!m.contains("\"p\""), "the node id must not be shown: {m}");
+    }
+
+    const VALID_FLOW: &str = r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#;
+
+    fn plain_flow(fx: &Fx, json: &str, status: &str) -> String {
+        repository::create_flow(
+            &fx.ctx.state.db,
+            &db::models::FlowParams {
+                name: "Edited flow",
+                description: None,
+                is_default: false,
+                service_type: None,
+                flow_json: json,
+                status,
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("flow")
+    }
+
+    async fn run(fx: &Fx, body: MessageBody) -> (MessageBody, bool) {
+        crate::dispatch::seed_session_account(&fx.ctx);
+        crate::dispatch::dispatch(&body, &fx.ctx).await
+    }
+
+    fn update_body(flow_id: &str, json: &str, status: &str) -> MessageBody {
+        MessageBody::FlowUpdateRequestBody(tentaflow_protocol::FlowUpdateRequest {
+            flow_id: flow_id.to_string(),
+            name: None,
+            description: None,
+            flow_json: Some(json.to_string()),
+            status: Some(status.to_string()),
+            published_model_name: None,
+        })
+    }
+
+    /// Owner decision 14.11.2026 (18): a PowerUser may edit flows.
+    #[tokio::test]
+    async fn a_power_user_may_update_and_restore_a_flow() {
+        let fx = fixture("power_user", &[], ORG);
+        let id = plain_flow(&fx, VALID_FLOW, "draft");
+        let (body, is_err) = run(&fx, update_body(&id, VALID_FLOW, "active")).await;
+        assert!(!is_err, "PowerUser update refused: {body:?}");
+        let versions = repository::list_flow_versions(&fx.ctx.state.db, &id).expect("versions");
+        let (body, is_err) = run(
+            &fx,
+            MessageBody::FlowVersionRestoreRequestBody(
+                tentaflow_protocol::FlowVersionRestoreRequest {
+                    flow_id: id.clone(),
+                    version_id: versions[0].id.to_string(),
+                },
+            ),
+        )
+        .await;
+        assert!(!is_err, "PowerUser restore refused: {body:?}");
+    }
+
+    /// The opened tier keeps the binder's own-rights rule: a PowerUser who does
+    /// not hold the topic read right cannot hand it to a service account.
+    #[tokio::test]
+    async fn a_power_user_without_the_topic_right_cannot_bind_through_an_update() {
+        let fx = fixture("power_user", &[], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let id = plain_flow(&fx, VALID_FLOW, "draft");
+        let (body, is_err) = run(&fx, update_body(&id, &flow(&k, None, None), "active")).await;
+        assert!(is_err, "must be refused: {body:?}");
+        assert!(format!("{body:?}").contains("sa:user_no_read"), "{body:?}");
+        let stored = repository::get_flow(&fx.ctx.state.db, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "draft");
+        assert!(!stored.flow_json.contains("service_account"));
+    }
+
+    #[tokio::test]
+    async fn a_user_or_viewer_may_still_not_edit_a_flow() {
+        for role in ["user", "viewer"] {
+            let fx = fixture(role, &[], ORG);
+            let id = plain_flow(&fx, VALID_FLOW, "draft");
+            let (body, is_err) = run(&fx, update_body(&id, VALID_FLOW, "active")).await;
+            assert!(is_err, "{role} must be refused: {body:?}");
+            let (body, is_err) = run(
+                &fx,
+                MessageBody::FlowVersionRestoreRequestBody(
+                    tentaflow_protocol::FlowVersionRestoreRequest {
+                        flow_id: id.clone(),
+                        version_id: "v".to_string(),
+                    },
+                ),
+            )
+            .await;
+            assert!(is_err, "{role} restore must be refused: {body:?}");
+            let (body, is_err) = run(
+                &fx,
+                MessageBody::FlowFactoryRestoreRequestBody(
+                    tentaflow_protocol::FlowFactoryRestoreRequest {
+                        flow_id: id.clone(),
+                    },
+                ),
+            )
+            .await;
+            assert!(is_err, "{role} factory restore must be refused: {body:?}");
+            let stored = repository::get_flow(&fx.ctx.state.db, &id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, "draft");
+        }
+    }
+
+    /// Owner decision 14.11.2026 (19): a flow with run history is refused before
+    /// any write, and the history stays; one without history is deleted.
+    #[tokio::test]
+    async fn a_flow_with_run_history_cannot_be_deleted() {
+        let fx = fixture("admin", &[], ORG);
+        let id = plain_flow(&fx, VALID_FLOW, "active");
+        repository::create_flow_execution(
+            &fx.ctx.state.db,
+            &db::models::NewFlowExecution {
+                flow_id: &id,
+                request_id: "req-1",
+                status: "completed",
+                parent_execution_id: None,
+                origin: "test",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
+            },
+        )
+        .expect("execution");
+        let (body, is_err) = run(
+            &fx,
+            MessageBody::FlowDeleteRequest {
+                flow_id: id.clone(),
+            },
+        )
+        .await;
+        assert!(is_err, "must be refused: {body:?}");
+        assert!(format!("{body:?}").contains("flow:has_history"), "{body:?}");
+        assert!(repository::get_flow(&fx.ctx.state.db, &id)
+            .unwrap()
+            .is_some());
+        let runs = repository::list_flow_executions_for_flow(&fx.ctx.state.db, &id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "the run history must stay untouched");
+
+        let fresh = plain_flow(&fx, VALID_FLOW, "draft");
+        let (body, is_err) = run(
+            &fx,
+            MessageBody::FlowDeleteRequest {
+                flow_id: fresh.clone(),
+            },
+        )
+        .await;
+        assert!(!is_err, "{body:?}");
+        assert!(repository::get_flow(&fx.ctx.state.db, &fresh)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_plain_user_may_not_bind() {
+        let fx = fixture("user", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("PowerUser or Admin"), "{m}");
+    }
+
+    /// The confused deputy: an admin who cannot read the topic must not read
+    /// it through a key that can.
+    #[test]
+    fn a_caller_without_read_on_the_topic_cannot_bind_a_key_that_has_it() {
+        let fx = fixture("admin", &[], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("you do not hold read access"), "{m}");
+    }
+
+    /// A user-level deny on the topic ACL is as good as no matrix grant.
+    #[test]
+    fn a_topic_deny_for_the_caller_blocks_the_binding() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        repository::resource_permissions::set_with_action(
+            &fx.ctx.state.db,
+            "topic",
+            &acl_id("orders.raw"),
+            "user",
+            USER,
+            "read",
+            "deny",
+        )
+        .expect("deny");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("you do not hold read access"), "{m}");
+    }
+
+    #[test]
+    fn a_key_without_read_on_the_topic_is_refused() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("no read access"), "{m}");
+    }
+
+    #[test]
+    fn a_service_account_must_be_named_live_and_general() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow("", None, None),
+            None,
+        ));
+        assert!(m.contains("pick a service account"), "{m}");
+
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&unknown, None, None),
+            None,
+        ));
+        assert!(m.contains("does not exist"), "{m}");
+
+        let bound = key(&fx, "user", &[("orders.raw", "read")]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&bound, None, None),
+            None,
+        ));
+        assert!(m.contains("user or a group"), "{m}");
+
+        let off = key(&fx, "general", &[("orders.raw", "read")]);
+        repository::set_api_key_active(&fx.ctx.state.db, &off, false).expect("disable");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&off, None, None),
+            None,
+        ));
+        assert!(m.contains("disabled"), "{m}");
+    }
+
+    #[test]
+    fn the_caller_must_act_in_the_organisation_the_node_reads() {
+        let fx = fixture("admin", &["bus.read"], "org-other");
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("[sa:org_mismatch "), "{m}");
+    }
+
+    #[test]
+    fn a_bus_publish_topic_needs_write_for_the_caller_and_the_key() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let reads_only = key(&fx, "general", &[("orders.raw", "read")]);
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&reads_only, None, Some(("orders.done", false))),
+            None,
+        ));
+        assert!(m.contains("has no write access"), "{m}");
+
+        let both = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&both, None, Some(("orders.done", false))),
+            None,
+        )
+        .expect("accepted");
+
+        // The caller needs write personally, whatever the key holds.
+        let no_write = fixture("admin", &["bus.read"], ORG);
+        let k = key(
+            &no_write,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        let m = denied(validate_bus_service_accounts(
+            &no_write.ctx,
+            &flow(&k, None, Some(("orders.done", false))),
+            None,
+        ));
+        assert!(m.contains("you do not hold write access"), "{m}");
+    }
+
+    /// A key never creates topics, so the flag could only ever fail at run time.
+    #[test]
+    fn create_if_missing_is_refused_in_a_bound_flow() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let k = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, Some(("orders.done", true))),
+            None,
+        ));
+        assert!(m.contains("create_if_missing"), "{m}");
+    }
+
+    /// The check runs on every save, not only when the binding changes: an
+    /// unchanged bound flow saved by someone who cannot read the topic is
+    /// refused, and one saved by someone who can reports no new binding.
+    #[test]
+    fn every_save_of_a_bound_flow_is_checked() {
+        let allowed = fixture("admin", &["bus.read"], ORG);
+        let k = key(&allowed, "general", &[("orders.raw", "read")]);
+        let json = flow(&k, None, None);
+        let again = validate_bus_service_accounts(&allowed.ctx, &json, Some(&json)).expect("ok");
+        assert!(
+            again.bound.is_empty() && again.unbound.is_empty(),
+            "an unchanged binding is not audited again"
+        );
+
+        let blind = fixture("admin", &[], ORG);
+        let k2 = key(&blind, "general", &[("orders.raw", "read")]);
+        let json2 = flow(&k2, None, None);
+        assert!(validate_bus_service_accounts(&blind.ctx, &json2, Some(&json2)).is_err());
+    }
+
+    #[test]
+    fn a_flow_without_bus_consume_is_untouched() {
+        let fx = fixture("user", &[], ORG);
+        let json = serde_json::json!({"nodes": [{"id": "t", "type": "trigger", "config": {}}], "edges": []})
+            .to_string();
+        let changes = validate_bus_service_accounts(&fx.ctx, &json, None).expect("accepted");
+        assert!(changes.bound.is_empty() && changes.unbound.is_empty());
+    }
+
+    /// The whole handler: a bound flow is stored and the bind is audited; one
+    /// the caller may not bind is not stored at all.
+    #[test]
+    fn flow_create_audits_the_binding_and_refuses_a_bad_one() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let create = |graph: String| {
+            flow_create(
+                &MessageBody::FlowCreateRequestBody(tentaflow_protocol::FlowCreateRequest {
+                    name: "bound".to_string(),
+                    description: None,
+                    graph_json: graph,
+                    published_model_name: None,
+                }),
+                &fx.ctx,
+            )
+        };
+        fx.ctx
+            .state
+            .db
+            .write()
+            .expect("db lock")
+            .execute(
+                "INSERT INTO user_accounts (id, username, password_hash, role) \
+                 VALUES ('07070707-0707-0707-0707-070707070707', 'binder', 'x', 'admin')",
+                [],
+            )
+            .expect("seed the acting user");
+        let unbound = key(&fx, "general", &[]);
+        assert!(create(flow(&unbound, None, None)).is_err());
+        assert!(repository::list_flows(&fx.ctx.state.db, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|f| f.name != "bound"));
+
+        create(flow(&k, None, None)).expect("created");
+        let audited: i64 = fx
+            .ctx
+            .state
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'flow.service_account.bind' \
+                 AND details LIKE ?1",
+                [format!("%api_key:{k}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    fn test_topic(name: &str) -> crate::db::repository::DbBusTopic {
+        crate::db::repository::DbBusTopic {
+            instance_id: INSTANCE.to_string(),
+            org_id: ORG.to_string(),
+            name: name.to_string(),
+            partitions: 4,
+            retention_ms: 86_400_000,
+            retention_bytes: 1_073_741_824,
+            cleanup_policy: "delete".to_string(),
+            delivery: "at_least_once".to_string(),
+            idempotency_key: None,
+            dedup_window_ms: 60_000,
+            max_delivery_attempts: 5,
+            retry_backoff_ms: 1_000,
+            schema_id: None,
+            validation: "off".to_string(),
+            content_type: "application/json".to_string(),
+            replication_factor: 1,
+            acks: "all".to_string(),
+            durability: "fsync_batch".to_string(),
+            max_inline_bytes: 1_048_576,
+            compression: "lz4".to_string(),
+            environment: "test".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            durability_class: None,
+            generation: 0,
+            description: Some(String::new()),
+            created_by: None,
+        }
+    }
+
+    fn store_flow(fx: &Fx, name: &str, flow_json: &str, status: &str) -> String {
+        repository::create_flow(
+            &fx.ctx.state.db,
+            &crate::db::models::FlowParams {
+                name,
+                description: None,
+                is_default: false,
+                service_type: Some("chat"),
+                flow_json,
+                status,
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("store flow")
+    }
+
+    /// `bound` flow reading `orders.raw` plus one extra node.
+    fn flow_with_node(key: &str, node: serde_json::Value) -> String {
+        let mut def: serde_json::Value = serde_json::from_str(&flow(key, None, None)).unwrap();
+        def["nodes"].as_array_mut().unwrap().push(node);
+        def.to_string()
+    }
+
+    fn publish_body() -> String {
+        serde_json::json!({"nodes": [{"id": "bp", "type": "bus_publish", "config": {
+            "instance_id": INSTANCE, "topic": "orders.done"
+        }}], "edges": []})
+        .to_string()
+    }
+
+    /// Child flows run under the parent's key, so a `bus_publish` reached
+    /// through a subflow, loop or map (at any depth) is refused at save.
+    #[test]
+    fn a_publish_reached_through_a_nested_flow_is_refused() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let k = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        let leaf = store_flow(&fx, "leaf", &publish_body(), "active");
+        let middle = store_flow(
+            &fx,
+            "middle",
+            &serde_json::json!({"nodes": [{"id": "s", "type": "subflow",
+                "config": {"flow_id": leaf}}], "edges": []})
+            .to_string(),
+            "active",
+        );
+        for (kind, config) in [
+            ("subflow", serde_json::json!({"flow_id": leaf})),
+            ("loop", serde_json::json!({"body_flow_id": leaf})),
+            ("map", serde_json::json!({"body_flow_id": leaf})),
+            ("subflow", serde_json::json!({"flow_id": middle})),
+        ] {
+            let m = denied(validate_bus_service_accounts(
+                &fx.ctx,
+                &flow_with_node(
+                    &k,
+                    serde_json::json!({"id": "n", "type": kind, "config": config}),
+                ),
+                None,
+            ));
+            assert!(m.contains("bus_publish"), "{kind}: {m}");
+        }
+    }
+
+    #[test]
+    fn a_nested_flow_without_a_publish_is_accepted_even_when_it_loops_back() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let stored = store_flow(&fx, "selfref", r#"{"nodes":[],"edges":[]}"#, "active");
+        // A flow that names itself as its own body: the walk must end.
+        let body = serde_json::json!({"nodes": [{"id": "s", "type": "subflow",
+            "config": {"flow_id": stored}}], "edges": []})
+        .to_string();
+        fx.ctx
+            .state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE flows SET flow_json = ?2 WHERE id = ?1",
+                rusqlite::params![stored, body],
+            )
+            .unwrap();
+        validate_bus_service_accounts(
+            &fx.ctx,
+            &flow_with_node(
+                &k,
+                serde_json::json!({"id": "n", "type": "subflow", "config": {"flow_id": stored}}),
+            ),
+            None,
+        )
+        .expect("accepted");
+    }
+
+    /// The walk fails closed: a child that does not exist, or cannot be read,
+    /// is a refusal, not something to skip.
+    #[test]
+    fn a_missing_or_unreadable_child_is_refused() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let nested = |id: &str| {
+            flow_with_node(
+                &k,
+                serde_json::json!({"id": "n", "type": "subflow", "config": {"flow_id": id}}),
+            )
+        };
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &nested("no-such-flow"),
+            None,
+        ));
+        assert!(m.contains("does not exist"), "{m}");
+        let broken = store_flow(&fx, "broken", "{not json", "active");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &nested(&broken),
+            None,
+        ));
+        assert!(m.contains("unreadable"), "{m}");
+    }
+
+    /// An import stores a bound parent together with its new child: the child
+    /// is not in the database yet, so it is resolved from the bundle.
+    #[test]
+    fn an_imported_child_is_checked_from_the_bundle() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let k = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        let parent = flow_with_node(
+            &k,
+            serde_json::json!({"id": "n", "type": "subflow", "config": {"flow_id": "new-child"}}),
+        );
+        let publishing =
+            std::collections::HashMap::from([("new-child".to_string(), publish_body())]);
+        let m = denied(validate_bus_service_accounts_with(
+            &fx.ctx,
+            &parent,
+            None,
+            &publishing,
+        ));
+        assert!(m.contains("bus_publish"), "{m}");
+        let harmless = std::collections::HashMap::from([(
+            "new-child".to_string(),
+            r#"{"nodes":[],"edges":[]}"#.to_string(),
+        )]);
+        validate_bus_service_accounts_with(&fx.ctx, &parent, None, &harmless).expect("accepted");
+    }
+
+    /// A flow reachable by two paths is examined at its shallowest depth: the
+    /// long path must not use up the depth budget first and hide what the
+    /// short one reaches.
+    #[test]
+    fn a_flow_reached_by_a_short_and_a_long_path_is_checked_through_the_short_one() {
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let k = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        let leaf = store_flow(&fx, "leaf", &publish_body(), "active");
+        let shared = store_flow(
+            &fx,
+            "shared",
+            &serde_json::json!({"nodes": [{"id": "s", "type": "subflow",
+                "config": {"flow_id": leaf}}], "edges": []})
+            .to_string(),
+            "active",
+        );
+        // top -> c1 -> c2 -> c3 -> shared (depth 4); shared -> leaf would be 5.
+        let mut next = shared.clone();
+        for name in ["c3", "c2", "c1"] {
+            next = store_flow(
+                &fx,
+                name,
+                &serde_json::json!({"nodes": [{"id": "s", "type": "subflow",
+                    "config": {"flow_id": next}}], "edges": []})
+                .to_string(),
+                "active",
+            );
+        }
+        let mut def: serde_json::Value = serde_json::from_str(&flow(&k, None, None)).unwrap();
+        // The direct reference is listed FIRST, the long chain last.
+        for target in [shared.as_str(), next.as_str()] {
+            def["nodes"].as_array_mut().unwrap().push(serde_json::json!(
+                {"id": format!("n-{target}"), "type": "subflow", "config": {"flow_id": target}}
+            ));
+        }
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &def.to_string(),
+            None,
+        ));
+        assert!(m.contains("bus_publish"), "{m}");
+    }
+
+    #[test]
+    fn an_agent_node_is_refused_at_the_top_level_and_in_a_nested_flow() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        for kind in ["agent", "agent_context", "spawn", "await_subagents"] {
+            let node = serde_json::json!({"id": "a", "type": kind, "config": {}});
+            let m = denied(validate_bus_service_accounts(
+                &fx.ctx,
+                &flow_with_node(&k, node),
+                None,
+            ));
+            assert!(m.contains(kind), "{kind}: {m}");
+        }
+        let agent = serde_json::json!({"id": "a", "type": "spawn", "config": {}});
+
+        let child = store_flow(
+            &fx,
+            "agentic",
+            &serde_json::json!({"nodes": [agent], "edges": []}).to_string(),
+            "active",
+        );
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow_with_node(
+                &k,
+                serde_json::json!({"id": "n", "type": "subflow", "config": {"flow_id": child}}),
+            ),
+            None,
+        ));
+        assert!(m.contains("spawn"), "{m}");
+    }
+
+    /// An environment import goes through the same check: a flow whose binding
+    /// fails lands as a draft, a valid one stays active, both audited.
+    #[test]
+    fn an_import_demotes_a_flow_that_fails_the_save_check() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let good_key = key(&fx, "general", &[("orders.raw", "read")]);
+        let bad_key = key(&fx, "general", &[]);
+        let db_flow = |id: &str, json: String| crate::db::models::DbFlow {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            version: 1,
+            is_default: false,
+            service_type: Some("chat".to_string()),
+            flow_json: json,
+            status: "active".to_string(),
+            published_model_name: None,
+            is_system: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let mut bundle = crate::services::config_bundle::ConfigBundle {
+            format_version: 1,
+            source_node_id: "donor".to_string(),
+            source_environment: tentaflow_protocol::environment::NodeEnvironment::Dev,
+            exported_at: String::new(),
+            flows: vec![
+                db_flow("imp-good", flow(&good_key, None, None)),
+                db_flow("imp-bad", flow(&bad_key, None, None)),
+            ],
+            flow_model_bindings: Vec::new(),
+            model_aliases: Vec::new(),
+            settings: Vec::new(),
+        };
+        let selected = vec!["flows:imp-good".to_string(), "flows:imp-bad".to_string()];
+        let screened = screen_imported_flows(&fx.ctx, &mut bundle, &selected);
+        assert_eq!(bundle.flows[0].status, "active");
+        assert_eq!(bundle.flows[1].status, "draft");
+        assert_eq!(screened.demoted.len(), 1);
+        assert_eq!(screened.demoted[0].0, "imp-bad");
+        assert_eq!(screened.changes.len(), 1);
+        assert_eq!(screened.changes[0].0, "imp-good");
+
+        audit_imported_bindings(&fx.ctx, &screened);
+        let count = |action: &str| -> i64 {
+            fx.ctx
+                .state
+                .db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE action = ?1",
+                    [action],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("flow.service_account.bind"), 1);
+        assert_eq!(count("flow.service_account.import_demoted"), 1);
+    }
+
+    /// Draft saved with a key, then activated: the stored draft was not
+    /// reading, so activation is a bind. A change of topic is one too.
+    #[test]
+    fn the_diff_counts_activation_and_topic_changes_and_reports_removals() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let json = flow(&k, None, None);
+
+        let draft = store_flow(&fx, "draft", &json, "draft");
+        let stored = repository::get_flow(&fx.ctx.state.db, &draft)
+            .unwrap()
+            .unwrap();
+        let activated =
+            validate_bus_service_accounts(&fx.ctx, &json, active_flow_json(&stored)).expect("ok");
+        assert_eq!(activated.bound.len(), 1, "activation is a binding");
+
+        let moved = json.replace("orders.raw", "orders.other");
+        let changes = diff_service_account_bindings(Some(&json), Some(&moved));
+        assert_eq!(changes.bound.len(), 1);
+        assert_eq!(changes.unbound.len(), 1);
+        assert_eq!(changes.unbound[0].topic, "orders.raw");
+
+        let removed = validate_bus_service_accounts(
+            &fx.ctx,
+            &serde_json::json!({"nodes": [], "edges": []}).to_string(),
+            Some(&json),
+        )
+        .expect("ok");
+        assert!(removed.bound.is_empty());
+        assert_eq!(removed.unbound.len(), 1);
+        assert_eq!(removed.unbound[0].key_uid, k);
+    }
+
+    #[test]
+    fn deactivating_a_bound_flow_reports_an_unbind() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let json = flow(&k, None, None);
+        let changes = diff_service_account_bindings(Some(&json), None);
+        assert!(changes.bound.is_empty());
+        assert_eq!(changes.unbound.len(), 1);
+    }
+
+    /// The organisation is part of what a binding is: moving the node to
+    /// another organisation is an unbind and a bind.
+    #[test]
+    fn a_change_of_organisation_is_a_new_binding() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let json = flow(&k, None, None);
+        let moved = flow(&k, Some("org-other"), None);
+        let changes = diff_service_account_bindings(Some(&json), Some(&moved));
+        assert_eq!(changes.bound.len(), 1);
+        assert_eq!(changes.unbound.len(), 1);
+        assert_eq!(changes.bound[0].org_id, "org-other");
+        assert_eq!(changes.unbound[0].org_id, ORG);
+        // Naming the default organisation is the same as leaving it out.
+        let explicit = flow(&k, Some(ORG), None);
+        let same = diff_service_account_bindings(Some(&json), Some(&explicit));
+        assert!(same.bound.is_empty() && same.unbound.is_empty());
+    }
+
+    /// Deleting a bound active flow ends its bindings, and says so.
+    #[test]
+    fn deleting_a_bound_flow_audits_the_unbind() {
+        let fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let id = store_flow(&fx, "doomed", &flow(&k, None, None), "active");
+        flow_delete(
+            &MessageBody::FlowDeleteRequest {
+                flow_id: id.clone(),
+            },
+            &fx.ctx,
+        )
+        .expect("deleted");
+        let unbound: i64 = fx
+            .ctx
+            .state
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'flow.service_account.unbind' \
+                 AND details LIKE ?1",
+                [format!("%api_key:{k}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unbound, 1);
+    }
+
+    /// The write-side rule of a publish target is asked at save as well: a key
+    /// that meets write rules only for other subjects could not publish.
+    #[test]
+    fn a_publish_target_with_rules_only_for_others_is_refused() {
+        use crate::bus::field_policies as fp;
+        let fx = fixture("admin", &["bus.read", "bus.write"], ORG);
+        let names = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        for topic in ["orders.raw", "orders.done"] {
+            repository::bus_topic_create(&fx.ctx.state.db, &test_topic(topic)).expect("topic");
+        }
+        let k = key(
+            &fx,
+            "general",
+            &[("orders.raw", "read"), ("orders.done", "write")],
+        );
+        fp::set_policy(
+            &fx.ctx.state.db,
+            INSTANCE,
+            ORG,
+            "orders.done",
+            "user",
+            "someone-else",
+            fp::Direction::Write,
+            &names(&["id"]),
+            &names(&[]),
+            &names(&[]),
+            &names(&[]),
+            repository::BusFieldPolicyExpect::Any,
+        )
+        .expect("write rule for another subject");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, Some(("orders.done", false))),
+            None,
+        ));
+        assert!(
+            m.contains("bus_publish") && m.contains("topic-wide rule"),
+            "{m}"
+        );
+    }
+
+    /// The reactor refuses a key that meets data-hiding rules only for other
+    /// subjects; the save refuses it too, instead of storing a flow that never
+    /// reads.
+    #[test]
+    fn a_key_without_a_topic_wide_rule_is_refused_when_rules_exist() {
+        use crate::bus::field_policies as fp;
+        let fx = fixture("admin", &["bus.read"], ORG);
+        repository::bus_topic_create(&fx.ctx.state.db, &test_topic("orders.raw")).expect("topic");
+        // After the topic: creating it clears access entries keyed by its name.
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        let names = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        fp::set_policy(
+            &fx.ctx.state.db,
+            INSTANCE,
+            ORG,
+            "orders.raw",
+            "user",
+            "someone-else",
+            fp::Direction::Read,
+            &names(&["id"]),
+            &names(&[]),
+            &names(&[]),
+            &names(&[]),
+            repository::BusFieldPolicyExpect::Any,
+        )
+        .expect("rule for another subject");
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("topic-wide rule"), "{m}");
+    }
+
+    /// An API-key session (the WebSocket kind) is no PowerUser: only a user
+    /// session with the role binds, and the `PowerUser` tier that gates
+    /// `service_account_list` rejects it the same way.
+    #[test]
+    fn an_api_key_session_may_neither_bind_nor_list() {
+        let mut fx = fixture("admin", &["bus.read"], ORG);
+        let k = key(&fx, "general", &[("orders.raw", "read")]);
+        fx.ctx.session = SessionAuth::ApiKey {
+            key_id: "key-1".to_string(),
+        };
+        let m = denied(validate_bus_service_accounts(
+            &fx.ctx,
+            &flow(&k, None, None),
+            None,
+        ));
+        assert!(m.contains("PowerUser or Admin"), "{m}");
+        assert!(!crate::dispatch::SessionAuthKind::PowerUser.session_satisfies(&fx.ctx.session));
+    }
+
+    #[test]
+    fn the_picker_lists_only_active_general_keys_by_uid_and_name() {
+        let fx = fixture("power_user", &[], ORG);
+        let live = key(&fx, "general", &[]);
+        let off = key(&fx, "general", &[]);
+        repository::set_api_key_active(&fx.ctx.state.db, &off, false).expect("disable");
+        key(&fx, "user", &[]);
+        let MessageBody::ServiceAccountListResponse { accounts } =
+            service_account_list(&MessageBody::ServiceAccountListRequest, &fx.ctx).expect("list")
+        else {
+            panic!("unexpected response");
+        };
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].key_id, live);
+        assert_eq!(accounts[0].name, "Flow SA");
+    }
+
+    fn bound_flow(fx: &Fx, name: &str, json: &str, status: &str) -> String {
+        repository::create_flow(
+            &fx.ctx.state.db,
+            &db::models::FlowParams {
+                name,
+                description: None,
+                is_default: false,
+                service_type: None,
+                flow_json: json,
+                status,
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("flow")
+    }
+
+    fn usage_of(fx: &Fx, key_uid: &str) -> Vec<(String, String, String)> {
+        let MessageBody::ServiceAccountUsageResponse { flows } = service_account_usage(
+            &MessageBody::ServiceAccountUsageRequest {
+                key_uid: key_uid.to_string(),
+            },
+            &fx.ctx,
+        )
+        .expect("usage") else {
+            panic!("unexpected response");
+        };
+        flows
+            .into_iter()
+            .map(|f| (f.flow_id, f.name, f.status))
+            .collect()
+    }
+
+    #[test]
+    fn usage_names_only_active_flows_of_the_callers_org_bound_to_that_key() {
+        let fx = fixture("admin", &[], ORG);
+        let k = key(&fx, "general", &[]);
+        let other = key(&fx, "general", &[]);
+        let mine = bound_flow(&fx, "Orders in", &flow(&k, None, None), "active");
+        bound_flow(&fx, "Draft reader", &flow(&k, None, None), "draft");
+        bound_flow(&fx, "Other key", &flow(&other, None, None), "active");
+        bound_flow(
+            &fx,
+            "Foreign tenant",
+            &flow(&k, Some("org-foreign"), None),
+            "active",
+        );
+        bound_flow(&fx, "No consumer", VALID_FLOW, "active");
+
+        assert_eq!(
+            usage_of(&fx, &k),
+            vec![(mine, "Orders in".to_string(), "active".to_string())]
+        );
+        assert!(usage_of(&fx, "unknown-uid").is_empty());
+    }
+
+    #[test]
+    fn usage_is_read_per_organisation_of_the_caller() {
+        let fx = fixture("admin", &[], "org-foreign");
+        let k = key(&fx, "general", &[]);
+        bound_flow(&fx, "Default tenant", &flow(&k, None, None), "active");
+        let theirs = bound_flow(
+            &fx,
+            "Foreign tenant",
+            &flow(&k, Some("org-foreign"), None),
+            "active",
+        );
+        let found = usage_of(&fx, &k);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, theirs);
+    }
+
+    #[tokio::test]
+    async fn usage_is_admin_only() {
+        let key_uid = {
+            let fx = fixture("admin", &[], ORG);
+            key(&fx, "general", &[])
+        };
+        let request = MessageBody::ServiceAccountUsageRequest { key_uid };
+        for role in ["power_user", "user"] {
+            let fx = fixture(role, &[], ORG);
+            let (body, is_err) = run(&fx, request.clone()).await;
+            assert!(is_err, "{role} must be refused: {body:?}");
+        }
+        let fx = fixture("admin", &[], ORG);
+        let (body, is_err) = run(&fx, request).await;
+        assert!(!is_err, "admin refused: {body:?}");
+        assert!(matches!(
+            body,
+            MessageBody::ServiceAccountUsageResponse { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod flow_executions_list_tests {
+    //! `FlowExecutionsListResponse` carries the request id, the correlation id
+    //! and the origin of each run (TB-02), so a screen can jump from a run to
+    //! its chain.
+    use super::*;
+    use crate::db::models::NewFlowExecution;
+
+    fn ctx() -> HandlerContext {
+        HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [7u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: crate::dispatch::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        }
+    }
+
+    #[test]
+    fn the_list_names_request_correlation_and_origin() {
+        let ctx = ctx();
+        let flow_id = repository::create_flow(
+            &ctx.state.db,
+            &crate::db::models::FlowParams {
+                name: "tb02-list",
+                description: None,
+                is_default: false,
+                service_type: Some("chat"),
+                flow_json: r#"{"nodes":[],"edges":[]}"#,
+                status: "active",
+                published_model_name: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("create flow");
+        let flow_id = flow_id.as_str();
+        for (request_id, correlation_id) in [("run-1", Some("chain-1")), ("run-2", None)] {
+            repository::create_flow_execution(
+                &ctx.state.db,
+                &NewFlowExecution {
+                    flow_id,
+                    request_id,
+                    status: "completed",
+                    parent_execution_id: None,
+                    origin: "bus",
+                    actor_kind: "system",
+                    actor_id: None,
+                    actor_user_id: None,
+                    correlation_id,
+                },
+            )
+            .expect("insert run");
+        }
+        let response = flow_executions_list(
+            &MessageBody::FlowExecutionsListRequest {
+                flow_id: flow_id.to_string(),
+            },
+            &ctx,
+        )
+        .expect("list");
+        let MessageBody::FlowExecutionsListResponse { executions } = response else {
+            panic!("unexpected response");
+        };
+        let by_request: std::collections::HashMap<_, _> = executions
+            .iter()
+            .map(|e| (e.request_id.clone().unwrap_or_default(), e))
+            .collect();
+        assert_eq!(by_request.len(), 2);
+        assert_eq!(
+            by_request["run-1"].correlation_id.as_deref(),
+            Some("chain-1")
+        );
+        assert_eq!(by_request["run-1"].origin.as_deref(), Some("bus"));
+        assert_eq!(by_request["run-2"].correlation_id, None);
     }
 }

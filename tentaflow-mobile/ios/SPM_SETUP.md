@@ -28,3 +28,21 @@ Dodaj w Xcode: File > Add Package Dependencies...
 - Wymaga Xcode 15.4+ i macOS 14.5+
 - Kompilacja MLX wymaga Apple Silicon (arm64)
 - Minimalny iOS deployment target: 16.0
+
+## Limit pamieci aplikacji (entitlements)
+
+Target `TentaFlowAI` podpisuje sie plikiem `TentaFlowAI/TentaFlowAI.entitlements`
+(`CODE_SIGN_ENTITLEMENTS` w konfiguracjach Debug i Release) z dwoma uprawnieniami:
+
+- `com.apple.developer.kernel.increased-memory-limit` — podnosi limit jetsam aplikacji,
+- `com.apple.developer.kernel.extended-virtual-addressing` — wieksza przestrzen adresowa
+  dla mapowanych wag modeli.
+
+App ID `ai.tentaflow.mobile` musi miec wlaczone capabilities "Increased Memory Limit"
+i "Extended Virtual Addressing". Przy automatycznym podpisywaniu Xcode rejestruje je
+w App ID podczas buildu, jesli zespol (KZXD4ZWQ85) na to pozwala; w przeciwnym razie
+wlacz je recznie w Certificates, Identifiers & Profiles i odswiez profil.
+
+TentaFlow raportuje jako pamiec GPU iOS realny limit aplikacji
+(`os_proc_available_memory()` + biezacy `phys_footprint`), a nie fizyczny RAM —
+po zmianie uprawnien sprawdz wartosc w panelu wezla.

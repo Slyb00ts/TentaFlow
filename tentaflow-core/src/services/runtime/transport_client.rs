@@ -157,7 +157,8 @@ pub fn entry_to_service_backend(
 
     Ok(ServiceBackend {
         connection,
-        max_concurrent: svc.max_concurrent.max(1) as usize,
+        // Pool size only; the in-flight limit is `services::limiter`.
+        max_concurrent: svc.max_concurrent.unwrap_or(16).max(1) as usize,
         timeout_ms: svc.timeout_ms,
         weight: svc.weight,
         model_name_override: svc.model_name_override.clone(),
@@ -277,7 +278,7 @@ mod tests {
                 is_default: true,
             }],
             timeout_ms: 30_000,
-            max_concurrent: 16,
+            max_concurrent: Some(16),
             weight,
             model_name_override: None,
             extra_config: HashMap::new(),

@@ -8,7 +8,9 @@
 // VISIBILITY is the load-bearing part of this file, so it is stated once here
 // and enforced in exactly two places below.
 //
-//   `events.read_all` -> every run on the node.
+//   `events.read_all` -> every run of the caller's organisation (the browse is
+//                        pinned to it; only the platform super-admin, the
+//                        account role `admin`, browses across organisations).
 //   `events.read`     -> ONLY runs whose `actor_user_id` is the calling
 //                        principal. `actor_user_id`, not `actor_id`: a run made
 //                        by an API key bound to this user is this user's run,
@@ -93,6 +95,55 @@ fn resolve_scope(ctx: &HandlerContext) -> Result<Scope, ProtocolError> {
             "this operation requires a logged-in user session",
         )),
     }
+}
+
+/// The organisation a browse page is restricted to.
+///
+/// Always the caller's own, whatever the request names and whatever scope the
+/// caller holds: `events.read_all` widens WHICH RUNS OF THE ORGANISATION are
+/// visible, not which organisation. Only the platform super-admin (the account
+/// role `admin`, as `tentanas` reads it) may browse across organisations, and
+/// then the request's `org_id` filter applies as before (`None` = every
+/// organisation). Without the pin a `read_all` holder of one organisation read
+/// another's runs by naming it.
+fn browse_org_filter(
+    ctx: &HandlerContext,
+    requested: Option<&str>,
+) -> Result<Option<String>, ProtocolError> {
+    if super::SessionAuthKind::Admin.session_satisfies(&ctx.session) {
+        return Ok(requested.map(str::to_string));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    Ok(Some(org.org_id.clone()))
+}
+
+/// `Scope::Node` reads one run only inside the caller's organisation, the same
+/// pin as the browse; the super-admin is exempt. A run of another organisation,
+/// a run without one and a run that does not exist answer identically.
+fn ensure_run_in_callers_org(
+    ctx: &HandlerContext,
+    scope: &Scope,
+    pool: &crate::db::DbPool,
+    run_id: &str,
+    not_found: impl Fn() -> ProtocolError,
+) -> Result<(), ProtocolError> {
+    if !matches!(scope, Scope::Node)
+        || super::SessionAuthKind::Admin.session_satisfies(&ctx.session)
+    {
+        return Ok(());
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    let run_org = events::run_org_id(pool, run_id)
+        .map_err(|e| db_error("run_org", e))?
+        .ok_or_else(&not_found)?;
+    if run_org.as_deref() != Some(org.org_id.as_str()) {
+        return Err(not_found());
+    }
+    Ok(())
 }
 
 fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
@@ -270,10 +321,17 @@ fn browse(ctx: &HandlerContext, req: &EventsBrowseRequest) -> Result<MessageBody
         Scope::Node => None,
         Scope::OwnRuns(user_id) => Some(user_id.as_str()),
     };
+    // The pin is a `Scope::Node` rule; a plain `events.read` holder is already
+    // narrowed to their own runs, NULL-org ones included.
+    let requested_org = req.org_id.as_deref().filter(|s| !s.is_empty());
+    let org_id = match &scope {
+        Scope::Node => browse_org_filter(ctx, requested_org)?,
+        Scope::OwnRuns(_) => requested_org.map(str::to_string),
+    };
     let filter = EventFilter {
         origins: origins.as_deref(),
         actor_id: req.actor_id.as_deref().filter(|s| !s.is_empty()),
-        org_id: req.org_id.as_deref().filter(|s| !s.is_empty()),
+        org_id: org_id.as_deref(),
         session_id: req.session_id.as_deref().filter(|s| !s.is_empty()),
         correlation_id: req.correlation_id.as_deref().filter(|s| !s.is_empty()),
         from_ms: req.from_ms,
@@ -333,6 +391,7 @@ fn run_timeline(
             return Err(not_found());
         }
     }
+    ensure_run_in_callers_org(ctx, &scope, &pool, &req.run_id, not_found)?;
 
     let limit = if req.limit == 0 {
         DEFAULT_PAGE
@@ -340,7 +399,7 @@ fn run_timeline(
         req.limit as usize
     };
     let limit = limit.clamp(1, MAX_READ_LIMIT);
-    let events = events::read_run(&pool, &req.run_id, req.after_seq, limit)
+    let events = events::read_run_headers(&pool, &req.run_id, req.after_seq, limit)
         .map_err(|e| db_error("read_run", e))?;
     // A short page is the only evidence the run's log ended here; a full page
     // yields a resume point even when nothing follows it.
@@ -380,6 +439,7 @@ fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBod
             return Err(not_found());
         }
     }
+    ensure_run_in_callers_org(ctx, &scope, &pool, &req.run_id, not_found)?;
 
     let row = events::read_run(&pool, &req.run_id, req.seq - 1, 1)
         .map_err(|e| db_error("read_run", e))?
@@ -397,15 +457,43 @@ fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBod
         return Err(not_found());
     };
     let body = events::step_io::unpack(&z).map_err(|e| db_error("step_io_unpack", e))?;
+    // The log keeps up to `MAX_SIDE_BYTES` per side; one frame cannot carry two
+    // of them. The reply is a preview, cut with the same flag a stored cut sets.
+    let (input, input_omitted) = fit_to_frame(body.input);
+    let (output, output_omitted) = fit_to_frame(body.output);
     Ok(MessageBody::EventsBody(EventsPayload::StepIoResponse(
         EventsStepIoResponse {
-            input: body.input,
-            output: body.output,
+            input,
+            output,
             input_bytes,
             output_bytes,
-            truncated,
+            truncated: truncated || input_omitted > 0 || output_omitted > 0,
+            input_omitted_bytes: input_omitted as u64,
+            output_omitted_bytes: output_omitted as u64,
         },
     )))
+}
+
+/// Largest side one `StepIoResponse` carries: two sides plus the envelope stay
+/// well inside a transport frame.
+const RESPONSE_SIDE_BYTES: usize = tentaflow_transport::MAX_FRAME_SIZE / 8 * 3;
+const _: () = assert!(2 * RESPONSE_SIDE_BYTES < tentaflow_transport::MAX_FRAME_SIZE);
+
+/// Cuts a side to [`RESPONSE_SIDE_BYTES`] on a character boundary and returns
+/// how many bytes were left out; the bytes themselves stay whole in the log.
+/// The count travels as data, not as words in the text, so the screen can say it
+/// in the viewer's language.
+fn fit_to_frame(mut text: String) -> (String, usize) {
+    if text.len() <= RESPONSE_SIDE_BYTES {
+        return (text, 0);
+    }
+    let mut end = RESPONSE_SIDE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    text.truncate(end);
+    (text, dropped)
 }
 
 #[handler(variant = "EventsBody", since = (1, 0))]
@@ -469,6 +557,22 @@ mod tests {
     use crate::flow_engine::dispatcher::FlowActor;
     use crate::services::rbac::OrgContext;
 
+    /// A side the log kept whole (up to 16 MiB) must still leave the node in one
+    /// frame: the reply is cut on a character boundary and says so.
+    #[test]
+    fn a_side_larger_than_the_frame_share_is_previewed_not_dropped() {
+        let (kept, omitted) = fit_to_frame("short".to_string());
+        assert_eq!((kept.as_str(), omitted), ("short", 0));
+
+        let huge = "ż".repeat(RESPONSE_SIDE_BYTES);
+        let total = huge.len();
+        let (preview, omitted) = fit_to_frame(huge);
+        assert!(omitted > 0);
+        assert!(preview.len() <= RESPONSE_SIDE_BYTES);
+        assert_eq!(preview.len() + omitted, total, "every byte is kept or counted");
+        assert!(2 * preview.len() < tentaflow_transport::MAX_FRAME_SIZE);
+    }
+
     /// The event log is reached through a process-global pool, so the tests
     /// share ONE temporary database — kept alive here for the length of the
     /// process. Every test therefore scopes its assertions to a session id of
@@ -487,6 +591,7 @@ mod tests {
             flow_id: None,
             service_type: Some("llm".into()),
             modality: Some("text".into()),
+            bus_source: None,
         }
     }
 
@@ -529,11 +634,10 @@ mod tests {
 
     /// Seeds one run owned by `who`, inside `session_id` so the test can find
     /// its own rows in the shared log.
-    fn seed_run(ctx: &HandlerContext, run_id: &str, session_id: &str, who: &str, at_ms: i64) {
+    fn seed_run(run_id: &str, session_id: &str, who: &str, at_ms: i64) {
         let pool = events_pool();
         append(
             &pool,
-            &ctx.state.db,
             RunEvent::new(
                 run_id,
                 at_ms,
@@ -541,7 +645,25 @@ mod tests {
                 &FlowActor::user(who),
                 request_started(),
             )
-            .with_session(session_id),
+            .with_session(session_id)
+            .with_org("org-test"),
+        )
+        .expect("append");
+    }
+
+    /// Like `seed_run`, in another organisation.
+    fn seed_run_in_org(run_id: &str, session_id: &str, org_id: &str) {
+        append(
+            &events_pool(),
+            RunEvent::new(
+                run_id,
+                300,
+                FlowOrigin::Chat,
+                &FlowActor::user("someone"),
+                request_started(),
+            )
+            .with_session(session_id)
+            .with_org(org_id),
         )
         .expect("append");
     }
@@ -569,11 +691,10 @@ mod tests {
         let anna = principal();
         let marek = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&marek_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &marek_ctx).await;
         assert!(!is_err, "unexpected error body: {body:?}");
@@ -596,11 +717,10 @@ mod tests {
         let marek = principal();
         let admin = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let admin_ctx = ctx_with(&admin, &[PERM_READ, PERM_READ_ALL]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&anna_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &admin_ctx).await;
         assert!(!is_err, "unexpected error body: {body:?}");
@@ -624,11 +744,10 @@ mod tests {
         let marek = principal();
         let auditor = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
 
-        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
-        seed_run(&anna_ctx, "run-marek", &session, &marek.uuid, 200);
+        seed_run("run-anna", &session, &anna.uuid, 100);
+        seed_run("run-marek", &session, &marek.uuid, 200);
 
         let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &auditor_ctx).await;
         assert!(!is_err, "read_all alone must not be a denial: {body:?}");
@@ -664,6 +783,180 @@ mod tests {
         }
     }
 
+    /// `events.read_all` widens the runs of the caller's organisation, never the
+    /// organisation: naming another one in the request does not reach it.
+    #[tokio::test]
+    async fn read_all_is_pinned_to_the_callers_organisation() {
+        let auditor = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
+        seed_run("run-own-org", &session, "anna", 100);
+        seed_run_in_org("run-other-org", &session, "org-other");
+
+        let unnamed = expect_browse(
+            browse(
+                &auditor_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = unnamed.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-own-org"]);
+
+        let named = expect_browse(
+            browse(
+                &auditor_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    org_id: Some("org-other".into()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = named.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            runs,
+            vec!["run-own-org"],
+            "naming another organisation must not reach its runs"
+        );
+    }
+
+    /// The platform super-admin (account role `admin`) is the one caller who
+    /// browses across organisations: unnamed it sees all, named it filters.
+    #[tokio::test]
+    async fn the_platform_admin_browses_across_organisations() {
+        let admin = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let mut admin_ctx = ctx_with(&admin, &[PERM_READ_ALL]);
+        admin_ctx.session = SessionAuth::UserSession {
+            user_id: admin.bytes,
+            role: Some("admin".to_string()),
+        };
+        seed_run("run-own-org", &session, "anna", 100);
+        seed_run_in_org("run-other-org", &session, "org-other");
+
+        let all = expect_browse(
+            browse(
+                &admin_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let mut runs: Vec<&str> = all.rows.iter().map(|r| r.run_id.as_str()).collect();
+        runs.sort();
+        assert_eq!(runs, vec!["run-other-org", "run-own-org"]);
+
+        let other = expect_browse(
+            browse(
+                &admin_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    org_id: Some("org-other".into()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = other.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-other-org"]);
+    }
+
+    /// `events.read_all` reads a run only inside the caller's organisation, on
+    /// both single-run RPCs; a run of another organisation, one without an
+    /// organisation and one that does not exist all answer `not_found`. The
+    /// super-admin is exempt.
+    #[tokio::test]
+    async fn single_run_reads_are_pinned_to_the_callers_organisation() {
+        let auditor = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
+        let own = format!("run-own-{}", uuid::Uuid::new_v4());
+        let foreign = format!("run-foreign-{}", uuid::Uuid::new_v4());
+        seed_run(&own, &session, "anna", 100);
+        seed_run_in_org(&foreign, &session, "org-other");
+
+        let timeline = |ctx: &HandlerContext, run: &str| {
+            run_timeline(
+                ctx,
+                &EventsRunRequest {
+                    run_id: run.to_string(),
+                    ..EventsRunRequest::default()
+                },
+            )
+        };
+        let content = |ctx: &HandlerContext, run: &str| {
+            step_io(
+                ctx,
+                &EventsStepIoRequest {
+                    run_id: run.to_string(),
+                    seq: 1,
+                },
+            )
+        };
+        assert!(timeline(&auditor_ctx, &own).is_ok());
+        for run in [foreign.as_str(), "run-that-does-not-exist"] {
+            assert_eq!(
+                timeline(&auditor_ctx, run).unwrap_err().code,
+                ProtocolErrorCode::NotFound,
+                "timeline of {run}"
+            );
+            assert_eq!(
+                content(&auditor_ctx, run).unwrap_err().code,
+                ProtocolErrorCode::NotFound,
+                "step content of {run}"
+            );
+        }
+
+        let admin = principal();
+        let mut admin_ctx = ctx_with(&admin, &[PERM_READ_ALL]);
+        admin_ctx.session = SessionAuth::UserSession {
+            user_id: admin.bytes,
+            role: Some("admin".to_string()),
+        };
+        assert!(timeline(&admin_ctx, &foreign).is_ok(), "super-admin passes");
+    }
+
+    /// The org pin is a `Scope::Node` rule: a plain `events.read` user keeps
+    /// seeing their own runs, including one recorded without an organisation.
+    #[tokio::test]
+    async fn an_own_run_without_an_organisation_stays_visible_to_events_read() {
+        let anna = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        append(
+            &events_pool(),
+            RunEvent::new(
+                "run-null-org",
+                100,
+                FlowOrigin::Chat,
+                &FlowActor::user(&anna.uuid),
+                request_started(),
+            )
+            .with_session(&session),
+        )
+        .expect("append");
+        let page = expect_browse(
+            browse(
+                &anna_ctx,
+                &EventsBrowseRequest {
+                    session_id: Some(session.clone()),
+                    ..EventsBrowseRequest::default()
+                },
+            )
+            .expect("browse"),
+        );
+        let runs: Vec<&str> = page.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-null-org"]);
+        assert!(page.scoped_to_self);
+    }
+
     /// The criterion the whole feature exists to satisfy: the visibility scope
     /// comes from the SESSION, and nothing in the request can widen it.
     ///
@@ -678,13 +971,12 @@ mod tests {
         let anna = principal();
         let marek = principal();
         let session = format!("sess-{}", uuid::Uuid::new_v4());
-        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let anna_run = format!("run-anna-{}", uuid::Uuid::new_v4());
         let marek_run = format!("run-marek-{}", uuid::Uuid::new_v4());
 
-        seed_run(&anna_ctx, &anna_run, &session, &anna.uuid, 100);
-        seed_run(&marek_ctx, &marek_run, &session, &marek.uuid, 200);
+        seed_run(&anna_run, &session, &anna.uuid, 100);
+        seed_run(&marek_run, &session, &marek.uuid, 200);
 
         // The payload names anna as the actor. `actor_user_id` is derived from
         // marek's session and the two are ANDed, so the page is empty — the
@@ -754,7 +1046,7 @@ mod tests {
     /// asserts on that field rather than on the decoded value behind it.
     #[tokio::test]
     async fn an_omitted_assistant_body_never_reaches_the_wire() {
-        const SECRET: &str = "the answer nobody opted in to keep";
+        const SECRET: &str = "the answer a Bus run never keeps";
         let anna = principal();
         let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let session = format!("sess-{}", uuid::Uuid::new_v4());
@@ -762,11 +1054,10 @@ mod tests {
         let pool = events_pool();
         append(
             &pool,
-            &anna_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 100,
-                FlowOrigin::Chat,
+                FlowOrigin::Bus,
                 &FlowActor::user(&anna.uuid),
                 EventPayload::AssistantMessage {
                     body: crate::events::ResponseBody::Text(SECRET.to_string()),
@@ -774,8 +1065,8 @@ mod tests {
                 },
             )
             .with_session(&session)
-            // An organisation that never opted in, which is every organisation
-            // by default — so the writer stores the omission marker.
+            // A Bus run keeps no content — so the writer stores the omission
+            // marker.
             .with_org("org-test"),
         )
         .expect("append");
@@ -835,7 +1126,7 @@ mod tests {
         let anna_ctx = ctx_with(&anna, &[PERM_READ]);
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
-        seed_run(&anna_ctx, &run_id, &session, &anna.uuid, 100);
+        seed_run(&run_id, &session, &anna.uuid, 100);
 
         let existing = MessageBody::EventsBody(EventsPayload::RunRequest(EventsRunRequest {
             run_id: run_id.clone(),
@@ -893,7 +1184,6 @@ mod tests {
         let pool = events_pool();
         append(
             &pool,
-            &service_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 100,
@@ -925,11 +1215,10 @@ mod tests {
         let marek_ctx = ctx_with(&marek, &[PERM_READ]);
         let session = format!("sess-{}", uuid::Uuid::new_v4());
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
-        seed_run(&anna_ctx, &run_id, &session, &anna.uuid, 100);
+        seed_run(&run_id, &session, &anna.uuid, 100);
         let packed = crate::events::step_io::pack("prompt do modelu", "odpowiedź").unwrap();
         let appended = append(
             &events_pool(),
-            &anna_ctx.state.db,
             RunEvent::new(
                 &run_id,
                 101,
@@ -946,7 +1235,8 @@ mod tests {
                     completion_tokens: None,
                 },
             )
-            .with_session(&session),
+            .with_session(&session)
+            .with_org("org-test"),
         )
         .expect("append step io");
 

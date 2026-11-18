@@ -65,3 +65,23 @@ export function retryRefusal(incident) {
   }
   return null;
 }
+
+/** A moment as the reader's locale writes it; the same form the monitor uses for every other time. */
+const retryTime = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
+
+/**
+ * What the retry policy has done to this incident, in one sentence: the repeat
+ * that is waiting (its number among the allowed ones and the moment it is planned
+ * for) or, once none will start by itself, how many were made. The moment is
+ * absolute, so the sentence stays true on a screen nobody redraws. Null for a
+ * step without a policy.
+ */
+export function retryAttemptsText(incident) {
+  const attempts = incident.attempts;
+  if (!attempts) return null;
+  if (attempts.nextAttemptAtMs != null) {
+    return text('attempts_pending', { number: attempts.made + 1, limit: attempts.limit,
+      time: retryTime(attempts.nextAttemptAtMs) });
+  }
+  return text('attempts_ended', { made: attempts.made, limit: attempts.limit });
+}

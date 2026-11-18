@@ -127,6 +127,18 @@ impl SchemaType {
         self.required_payload_format().is_none()
     }
 
+    /// How a field policy reads and rewrites records of this kind: `Some` for
+    /// exactly the binary kinds (F4 B6), whose bytes only the schema can name
+    /// the fields of.
+    pub fn field_format(self) -> Option<&'static dyn SchemaAwareFieldFormat> {
+        match self {
+            SchemaType::Avro => Some(&avro::AVRO_OPS),
+            SchemaType::Protobuf => Some(&protobuf::PROTOBUF_OPS),
+            SchemaType::Thrift => Some(&thrift::THRIFT_OPS),
+            SchemaType::JsonSchema | SchemaType::Xsd | SchemaType::Hl7v2Profile => None,
+        }
+    }
+
     /// The one payload format a topic must carry to bind a subject of this
     /// kind; `None` for kinds that describe their own wire encoding
     /// (the binary ones) and so bind independently of `content_type`.
@@ -469,6 +481,149 @@ pub trait SchemaKindOps: Send + Sync {
         new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError>;
+}
+
+/// Field policies on a topic whose messages are Avro, Protobuf or Thrift
+/// (F4 B6, `SUM/tentabus/POLITYKI-POL-FORMATY.md` decision 1: a read is
+/// re-encoded under a sub-schema). The payload cannot be read without the
+/// schema it was written with, so unlike `payload_format::PayloadFieldFormat`
+/// every call takes the writer's [`CompiledSchema`], compiled once and cached.
+///
+/// Addresses are the names of the TOP-LEVEL fields of the schema's root
+/// record / designated message / root struct (the same level JSON, XML and
+/// HL7 policies work at). Every method walks the payload with the format's own
+/// strict, bounded, iterative walker (the one `validate` uses), so a record
+/// that is not valid under its writer schema is an `Err` — never a guess —
+/// and the caller's convention is to fail closed. An `Err` never carries a
+/// payload value, only a path and a constraint. The walk is charged to the
+/// caller's [`ValidationBudget`] (a publish batch, a fetch batch), so many
+/// hostile records cost what their bytes justify, as in `validate_metered`.
+pub trait SchemaAwareFieldFormat: Send + Sync {
+    /// Names of the top-level fields the schema declares, in schema order.
+    /// `Err` when the schema has no such level (an Avro root that is not a
+    /// record).
+    fn declared_fields(&self, compiled: &CompiledSchema) -> Result<Vec<String>, SchemaError>;
+
+    /// The top-level fields `payload` SETS (write-path validation). Protobuf
+    /// and Thrift: the fields whose tag / id is on the wire; a tag the schema
+    /// does not declare is listed as `#<number>` (never a name a rule can
+    /// allow). Avro, where every field is always on the wire: the fields whose
+    /// value is not the field's empty value (its declared default, else `null`
+    /// of a nullable union; a field with neither is always set).
+    fn list_fields(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        budget: &mut ValidationBudget,
+    ) -> Result<BTreeSet<String>, SchemaError>;
+
+    /// `payload` re-encoded in the same format and protocol with only the
+    /// top-level fields named in `visible` — exactly what a record written
+    /// under the schema `derive_subschema(.., visible)` looks like. A field not
+    /// declared by the schema is never kept (the sub-schema cannot describe it).
+    fn project(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        budget: &mut ValidationBudget,
+    ) -> Result<Vec<u8>, SchemaError>;
+
+    /// The declared top-level fields whose type reaches the root type again
+    /// (through unions, arrays, maps, optionals, named types, aliases and any
+    /// number of other types): a value of such a field holds a nested copy of
+    /// the root, with ALL its fields. A projection narrows the root only, so
+    /// kept bytes of that field would carry the fields the rule hides.
+    fn self_referencing_fields(
+        &self,
+        compiled: &CompiledSchema,
+    ) -> Result<BTreeSet<String>, SchemaError>;
+
+    /// Whether a record may carry fields its schema version does not declare
+    /// (Protobuf and Thrift: a tag a newer version added, kept verbatim inside
+    /// a nested message). A projection strips such fields at the root only, so
+    /// a rule that shows every declared field of such a version still hides
+    /// what the nested copy of the root carries (see [`leaking_field`]).
+    fn carries_unknown_fields(&self) -> bool {
+        false
+    }
+
+    /// What a WRITE rule that allows exactly `allowed` cannot live with, as a
+    /// sentence for the administrator (`None` = nothing). Default: nothing.
+    fn write_rule_obstacle(
+        &self,
+        _compiled: &CompiledSchema,
+        _allowed: &BTreeSet<String>,
+    ) -> Result<Option<String>, SchemaError> {
+        Ok(None)
+    }
+}
+
+/// The first field `kept` shows (or allows) that refers back to the root type
+/// while another declared field is left out: the case a rule cannot cover,
+/// because the nested copy of the root keeps what the rule leaves out. `None`
+/// when no kept field reaches the root, or (a format whose records carry only
+/// declared fields) the rule leaves nothing out. A format that can carry fields
+/// the version does not declare has no such case: showing every declared field
+/// leaves out whatever a newer version added.
+pub fn leaking_field(
+    format: &dyn SchemaAwareFieldFormat,
+    compiled: &CompiledSchema,
+    kept: &BTreeSet<String>,
+) -> Result<Option<String>, SchemaError> {
+    let declared = format.declared_fields(compiled)?;
+    if !format.carries_unknown_fields() && declared.iter().all(|name| kept.contains(name)) {
+        return Ok(None);
+    }
+    let reaching = format.self_referencing_fields(compiled)?;
+    Ok(declared
+        .into_iter()
+        .find(|name| kept.contains(name) && reaching.contains(name)))
+}
+
+/// What a rule that shows `field` is refused with (and a sub-schema is not
+/// derived with): see [`leaking_field`].
+pub fn leaking_field_refusal(field: &str) -> String {
+    format!(
+        "field '{field}' refers back to the message itself and cannot be shown without \
+         the fields the rule hides"
+    )
+}
+
+/// Id of the sub-schema a reader with `kept` visible top-level fields gets
+/// for the version of `subject` whose text hashes to `content_hash`
+/// (`blake3(domain | org | subject | content_hash | each kept name)`, `u32`,
+/// `0` — "no schema" — remapped). It is stamped into the records of the
+/// projection (`FetchedRecordMeta::schema_id`) the way `schema_ref_id_for`'s
+/// id is stamped into a stored record, and resolved back by
+/// `BusService::schema_for_reader`. `kept` must be the fields the projection
+/// really keeps (the allowed names that the version declares), so two
+/// readers that see the same data share an id.
+pub fn derived_ref_id_for(
+    org_id: &str,
+    subject: &str,
+    content_hash: &str,
+    kept: &BTreeSet<String>,
+) -> u32 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tentabus-derived-schema\0");
+    hasher.update(org_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(subject.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(content_hash.as_bytes());
+    for name in kept {
+        hasher.update(&[0]);
+        hasher.update(name.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    let id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if id == 0 {
+        1
+    } else {
+        id
+    }
 }
 
 /// Node-independent, content-derived id stamped into each validated

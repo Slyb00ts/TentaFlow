@@ -56,6 +56,7 @@ fn frame_from(rgb: Vec<u8>, width: u32, height: u32) -> CvFrameLocal {
 /// (widoczność aliasów / permission gating).
 fn runtime_ctx(caller_addon_id: Option<String>, provenance: CallProvenance) -> RuntimeContext {
     let mut ctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
+    ctx.nested_in_run = provenance.nested_in_run;
     ctx.addon_id = caller_addon_id;
     ctx
 }

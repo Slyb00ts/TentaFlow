@@ -206,6 +206,74 @@ export function processTimeoutProblem(config) {
   const seconds = config?.timeoutSeconds;
   return Number.isInteger(seconds) && seconds >= 1 && seconds <= ceiling ? null : ceiling;
 }
+// The limits the model accepts for the retry policy of a Service task.
+export const PROCESS_RETRY_LIMITS = Object.freeze({ attempts: 10, minDelay: 1, maxDelay: 86400, minFactor: 101, maxFactor: 1000 });
+const RETRY_DEFAULT_DELAY_SECONDS = 30;
+const RETRY_DEFAULT_FACTOR_PERCENT = 200;
+
+/** `'Fixed'` or `'Exponential'`: the wait pattern of a policy (a step without one repeats nothing, so Fixed). */
+export function processRetryMode(retry) {
+  return retry?.backoff?.Exponential ? 'Exponential' : 'Fixed';
+}
+
+/**
+ * The policy after the author changed one field of the retry section. Zero
+ * attempts removes the policy (the step repeats nothing, as before). Fields
+ * that appear with a first attempt or a switch to growing waits start at values
+ * the section shows, never at values only the model knows.
+ */
+export function processRetryChange(retry, key, raw) {
+  const number = raw === '' || raw == null ? NaN : Number(raw);
+  if (key === 'retryAttempts') {
+    if (!Number.isFinite(number) || number === 0) return null;
+    return { delaySeconds: RETRY_DEFAULT_DELAY_SECONDS, backoff: 'Fixed', ...retry, maxAttempts: number };
+  }
+  if (!retry) return null;
+  if (key === 'retryDelaySeconds') return { ...retry, delaySeconds: number };
+  if (key === 'retryBackoff') {
+    if (raw !== 'Exponential') return { ...retry, backoff: 'Fixed' };
+    if (processRetryMode(retry) === 'Exponential') return retry;
+    const cap = Number.isFinite(retry.delaySeconds) ? Math.min(PROCESS_RETRY_LIMITS.maxDelay, retry.delaySeconds * 16) : PROCESS_RETRY_LIMITS.maxDelay;
+    return { ...retry, backoff: { Exponential: { factorPercent: RETRY_DEFAULT_FACTOR_PERCENT, maxDelaySeconds: cap } } };
+  }
+  const grown = retry.backoff?.Exponential;
+  if (!grown) return retry;
+  if (key === 'retryFactorPercent') return { ...retry, backoff: { Exponential: { ...grown, factorPercent: number } } };
+  if (key === 'retryMaxDelaySeconds') return { ...retry, backoff: { Exponential: { ...grown, maxDelaySeconds: number } } };
+  return retry;
+}
+
+/** Which fields of a policy break the model's limits, by the control key; an empty object for a valid policy or none. */
+export function processRetryProblems(retry) {
+  if (!retry) return {};
+  const { attempts, minDelay, maxDelay, minFactor, maxFactor } = PROCESS_RETRY_LIMITS;
+  const whole = (value, low, high) => Number.isInteger(value) && value >= low && value <= high;
+  const problems = {};
+  if (!whole(retry.maxAttempts, 1, attempts)) problems.retryAttempts = { max: attempts };
+  if (!whole(retry.delaySeconds, minDelay, maxDelay)) problems.retryDelaySeconds = { min: minDelay, max: maxDelay };
+  const grown = retry.backoff?.Exponential;
+  if (grown) {
+    if (!whole(grown.factorPercent, minFactor, maxFactor)) problems.retryFactorPercent = { min: minFactor, max: maxFactor };
+    const floor = Number.isInteger(retry.delaySeconds) ? retry.delaySeconds : minDelay;
+    if (!whole(grown.maxDelaySeconds, floor, maxDelay)) problems.retryMaxDelaySeconds = { min: floor, max: maxDelay };
+  }
+  return problems;
+}
+
+const RETRY_PROBLEM_TEXT_KEYS = Object.freeze({
+  retryAttempts: 'bpmn.retry_attempts_invalid',
+  retryDelaySeconds: 'bpmn.retry_delay_invalid',
+  retryFactorPercent: 'bpmn.retry_factor_invalid',
+  retryMaxDelaySeconds: 'bpmn.retry_max_delay_invalid',
+});
+
+/** The inspector's sentence for the first broken field of a retry policy, naming the step; `null` when the policy is valid or absent. */
+export function processRetryRefusalText(nodeName, retry) {
+  const [field, limits] = Object.entries(processRetryProblems(retry))[0] || [];
+  if (!field) return null;
+  return I18n.t('bpmn.retry_out_of_range', { node: nodeName, reason: I18n.t(RETRY_PROBLEM_TEXT_KEYS[field], limits) });
+}
+
 const AGENT_STEP_DEFAULT_ITERATIONS = 10;
 // The model accepts 1..=100 iterations whatever the agent allows.
 const AGENT_STEP_MAX_ITERATIONS = 100;
@@ -955,6 +1023,15 @@ export function processExplainError(message, model, options = null) {
   }
   const unbound = /UNBOUND_IMPLEMENTATION: service task ([\w.-]+) has no implementation/.exec(text);
   if (unbound && names.has(unbound[1])) return processUnboundRefusal([names.get(unbound[1])]).join('\n');
+  // `validate_retry_policy`: the server states no code, the limits are the ones the inspector already checks.
+  const retryRefused = /service task ([\w.-]+) retry (attempts|delay|factor|delay cap) (?:are|is) outside /.exec(text);
+  if (retryRefused) {
+    const field = { attempts: 'retryAttempts', delay: 'retryDelaySeconds', factor: 'retryFactorPercent', 'delay cap': 'retryMaxDelaySeconds' }[retryRefused[2]];
+    const { attempts, minDelay, maxDelay, minFactor, maxFactor } = PROCESS_RETRY_LIMITS;
+    const limits = { retryAttempts: { max: attempts }, retryDelaySeconds: { min: minDelay, max: maxDelay }, retryFactorPercent: { min: minFactor, max: maxFactor },
+      retryMaxDelaySeconds: { min: Number(/outside (\d+)\.\./.exec(text)?.[1]) || minDelay, max: maxDelay } }[field];
+    return I18n.t('bpmn.retry_out_of_range', { node: names.get(retryRefused[1]) || retryRefused[1], reason: I18n.t(RETRY_PROBLEM_TEXT_KEYS[field], limits) });
+  }
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
   // A publication names every refused step, one per line; two steps of one name carry their occurrence number.

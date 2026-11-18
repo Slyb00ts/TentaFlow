@@ -53,6 +53,7 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
         // reached only from a document node inside a flow that an entry point
         // already stamped.
         let mut rctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()
@@ -91,6 +92,7 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
         // reached only from a document node inside a flow that an entry point
         // already stamped.
         let mut rctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()

@@ -37,6 +37,7 @@
 use bytes::Bytes;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use serde::{Deserialize, Serialize};
+use tentaflow_protocol::bus::{CORRELATION_ID_HEADER, TF_CORRELATION_ID_HEADER};
 
 use super::codec::encode;
 use super::topics::{TopicConfig, TopicOptions};
@@ -187,12 +188,38 @@ pub fn compute_backoff_ms(attempts: u32, base_ms: u32, cap_ms: u32, jitter_seed:
 /// producer put on its own record, or a `dlq.retry_of` of a record that
 /// failed again, would otherwise stand in for the broker's values.
 fn carried_headers(original: &PublishRecord) -> Vec<(String, Bytes)> {
-    original
+    let mut headers: Vec<(String, Bytes)> = original
         .headers
         .iter()
         .filter(|(k, _)| !k.starts_with("tf.") && !k.starts_with("dlq."))
         .cloned()
-        .collect()
+        .collect();
+    promote_stamped_correlation_id(original, &mut headers);
+    headers
+}
+
+/// Turns the source record's broker-stamped `tf.correlation_id` (dropped
+/// with the rest of `tf.*`) into the input `correlation-id` header, so the
+/// DLQ copy, and a later retry of it, stay in the same correlation chain.
+/// A valid `correlation-id` header the record already carries is left alone;
+/// an invalid one does not block the stamped id.
+fn promote_stamped_correlation_id(original: &PublishRecord, headers: &mut Vec<(String, Bytes)>) {
+    if super::correlation::from_headers(headers).is_some() {
+        return;
+    }
+    let stamped = original
+        .headers
+        .iter()
+        .find(|(k, _)| k == TF_CORRELATION_ID_HEADER)
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .filter(|id| super::correlation::validate(id));
+    if let Some(id) = stamped {
+        headers.retain(|(k, _)| k != CORRELATION_ID_HEADER);
+        headers.push((
+            CORRELATION_ID_HEADER.to_string(),
+            Bytes::from(id.to_string()),
+        ));
+    }
 }
 
 /// Builds the DLQ copy of a failed record: same key/payload, the union of
@@ -339,6 +366,10 @@ pub fn build_retry_record(
         .filter(|(k, _)| !k.starts_with("dlq."))
         .cloned()
         .collect();
+    // A DLQ copy written before TB-02 carries only the stamped `tf.*` value,
+    // which `publish` strips: re-send it as the input header so the retry
+    // keeps the original chain instead of taking the retrying caller's id.
+    promote_stamped_correlation_id(dlq_record, &mut headers);
     headers.push((
         "dlq.retry_of".to_string(),
         Bytes::from(format!("{dlq_topic}#{dlq_offset}")),
@@ -1233,6 +1264,110 @@ mod tests {
             .clone();
         assert_eq!(retry_of, Bytes::from_static(b"__dlq.orders#7"));
         assert_eq!(retry.payload, dlq_rec.payload);
+    }
+
+    fn record_with(headers: Vec<(&str, &str)>) -> PublishRecord {
+        PublishRecord {
+            key: Some(Bytes::from_static(b"k")),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), Bytes::from(v.to_string())))
+                .collect(),
+            payload: Bytes::from_static(b"payload"),
+            timestamp_ms: 1_000,
+            schema_id: 0,
+        }
+    }
+
+    fn header<'a>(r: &'a PublishRecord, name: &str) -> Option<&'a [u8]> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_ref())
+    }
+
+    #[test]
+    fn an_invalid_input_correlation_id_does_not_block_the_stamped_one() {
+        let original = record_with(vec![
+            ("correlation-id", "bad id with spaces"),
+            ("tf.correlation_id", "chain-1"),
+        ]);
+        let dlq = build_dlq_record(
+            "orders",
+            0,
+            5,
+            "g",
+            1,
+            1,
+            2,
+            DlqReason::ConsumerError,
+            "x",
+            &original,
+        );
+        assert_eq!(header(&dlq, "correlation-id"), Some(&b"chain-1"[..]));
+    }
+
+    #[test]
+    fn build_dlq_record_carries_the_stamped_correlation_id_as_input_header() {
+        let original = record_with(vec![("tf.correlation_id", "chain-1")]);
+        let dlq = build_dlq_record(
+            "orders",
+            0,
+            5,
+            "g",
+            1,
+            1,
+            2,
+            DlqReason::ConsumerError,
+            "x",
+            &original,
+        );
+        assert_eq!(header(&dlq, "correlation-id"), Some(&b"chain-1"[..]));
+        assert!(header(&dlq, "tf.correlation_id").is_none());
+    }
+
+    #[test]
+    fn build_dlq_record_keeps_an_explicit_input_header_over_the_stamped_one() {
+        let original = record_with(vec![
+            ("correlation-id", "input-1"),
+            ("tf.correlation_id", "stamped-1"),
+        ]);
+        let dlq = build_dlq_record(
+            "orders",
+            0,
+            5,
+            "g",
+            1,
+            1,
+            2,
+            DlqReason::ConsumerError,
+            "x",
+            &original,
+        );
+        assert_eq!(header(&dlq, "correlation-id"), Some(&b"input-1"[..]));
+        assert_eq!(
+            dlq.headers
+                .iter()
+                .filter(|(k, _)| k == "correlation-id")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn build_retry_record_keeps_the_original_correlation_id() {
+        let with_input = record_with(vec![("correlation-id", "chain-2"), ("dlq.reason", "x")]);
+        let retry = build_retry_record(&with_input, "__dlq.orders", 1);
+        assert_eq!(header(&retry, "correlation-id"), Some(&b"chain-2"[..]));
+
+        // A DLQ copy written before TB-02 only has the stamped value.
+        let legacy = record_with(vec![("tf.correlation_id", "chain-3")]);
+        let retry = build_retry_record(&legacy, "__dlq.orders", 2);
+        assert_eq!(header(&retry, "correlation-id"), Some(&b"chain-3"[..]));
+
+        let invalid = record_with(vec![("tf.correlation_id", "bad id")]);
+        let retry = build_retry_record(&invalid, "__dlq.orders", 3);
+        assert!(header(&retry, "correlation-id").is_none());
     }
 
     // ---- DiscardStore (M1-R2 review N-5, coordinator decision 2) ------

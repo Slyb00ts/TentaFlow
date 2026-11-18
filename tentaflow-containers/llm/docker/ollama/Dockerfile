@@ -3,7 +3,7 @@
 # Opis: Kontener LLM z Ollama, direct-http (bez sidecara).
 # =============================================================================
 
-FROM ollama/ollama:latest
+FROM ollama/ollama:0.40.16
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*

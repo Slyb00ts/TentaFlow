@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::db::{repository, DbPool};
+use crate::flow_engine::dispatcher::DispatchError;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::CompletionFilter;
 use crate::flow_engine::types::FlowDefinition;
@@ -62,6 +63,14 @@ pub trait ReactorFlowDispatch: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// A reactive run the dispatcher refused or stopped. Typed (not flattened to
+/// text) so a caller that holds the run's permit (the bus reactor) can tell a
+/// timeout, a run that never started and a refusal from a plain failure; it
+/// reads like every other reactive dispatch failure.
+#[derive(Debug, thiserror::Error)]
+#[error("reactive flow dispatch failed: {0}")]
+pub struct ReactiveDispatchError(pub DispatchError);
+
 /// Production dispatch: drives an event-driven flow through the FlowDispatcher's
 /// background path (no foreground deadline; governed by its own flow). Holds a
 /// `Weak` to the dispatcher to avoid an ownership cycle — a dropped dispatcher
@@ -90,16 +99,8 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
             .dispatcher
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("flow dispatcher dropped (shutdown)"))?;
-        let request_id = uuid::Uuid::new_v4().to_string();
-        // §2.5 — a reactive run is not a fresh anonymous request: it continues
-        // the finished child's work, so it carries that run's provenance.
-        let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
-            request_id,
-            principal.origin,
-            principal.actor.clone(),
-        );
-        meta.user_id = principal.user_id.clone();
-        meta.org_id = principal.org_id.clone();
+        let mut meta = reactive_run_meta(uuid::Uuid::new_v4().to_string(), &principal);
+        meta.bus_source = bus_source_of(&initial, &principal);
         let outcome = dispatcher
             .dispatch_by_flow_id_background(
                 crate::flow_engine::dispatcher::FlowRef::live(flow_id),
@@ -107,12 +108,67 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
                 meta,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("reactive flow dispatch failed: {e}"))?;
+            .map_err(|e| anyhow::Error::new(ReactiveDispatchError(e)))?;
         if let Some(err) = outcome.error {
             return Err(anyhow::anyhow!("reactive flow failed: {err}"));
         }
         Ok(())
     }
+}
+
+/// Coordinates of the single bus record a bus-origin run was seeded from, read
+/// from the envelope the reactor itself built (`bus_topic` / `bus_partition` /
+/// `bus_offset`). `None` for any other origin and for a batch, which has no one
+/// triggering record. Coordinates only: the record's content never goes here.
+pub fn bus_source_of(
+    initial: &FlowEnvelope,
+    principal: &AgentPrincipal,
+) -> Option<crate::events::store::BusRecordRef> {
+    if principal.origin != crate::flow_engine::dispatcher::FlowOrigin::Bus {
+        return None;
+    }
+    let meta = &initial.meta;
+    Some(crate::events::store::BusRecordRef {
+        instance_id: meta
+            .get("bus_instance")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        topic: meta.get("bus_topic")?.as_str()?.to_string(),
+        partition: u32::try_from(meta.get("bus_partition")?.as_u64()?).ok()?,
+        offset: meta.get("bus_offset")?.as_u64()?,
+    })
+}
+
+/// The request meta of a reactive run (sub-agent completion or bus record).
+///
+/// §2.5 — a reactive run is not a fresh anonymous request: it continues the
+/// finished child's work, so it carries that run's provenance, including the
+/// correlation id. The progress sink puts the run on the `run_events`
+/// timeline (without a sink the run is silent, and a bus-triggered chain
+/// would be invisible in the Events browser).
+pub fn reactive_run_meta(
+    request_id: String,
+    principal: &AgentPrincipal,
+) -> crate::flow_engine::dispatcher::FlowRequestMeta {
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        request_id,
+        principal.origin,
+        principal.actor.clone(),
+    );
+    meta.user_id = principal.user_id.clone();
+    meta.org_id = principal.org_id.clone();
+    meta.correlation_id = principal.correlation_id.clone();
+    // A bus-origin run needs no slot of its own: the bus reactor holds the permit
+    // of the run it starts, and whatever else runs under that provenance (a
+    // sub-agent completion reaction, an agent run the flow started) continues
+    // work that was admitted already. Refusing it would drop that work.
+    meta.slot_held_by_caller = principal.origin == crate::flow_engine::dispatcher::FlowOrigin::Bus;
+    meta.progress_sink = Some(Arc::new(
+        crate::flow_engine::progress_broker::BrokerProgressSink::new(
+            crate::flow_engine::progress_broker::global_broker(),
+        ),
+    ));
+    meta
 }
 
 /// One flow subscribed to sub-agent completions: its id + parsed filter.
@@ -414,6 +470,57 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn reactive_run_meta_carries_the_correlation_id_and_a_progress_sink() {
+        let principal = AgentPrincipal::new(
+            Some("u1".into()),
+            Some("org-1".into()),
+            FlowOrigin::Bus,
+            FlowActor::system(),
+        )
+        .with_correlation_id(Some("chain-1".into()));
+        let meta = reactive_run_meta("req-1".into(), &principal);
+        assert_eq!(meta.correlation_id.as_deref(), Some("chain-1"));
+        assert_eq!(meta.org_id.as_deref(), Some("org-1"));
+        assert_eq!(meta.user_id.as_deref(), Some("u1"));
+        assert!(meta.progress_sink.is_some());
+
+        let bare = AgentPrincipal::new(None, None, FlowOrigin::Bus, FlowActor::system());
+        assert!(reactive_run_meta("req-2".into(), &bare)
+            .correlation_id
+            .is_none());
+    }
+
+    #[test]
+    fn a_bus_run_carries_the_coordinates_of_its_single_triggering_record() {
+        let bus = AgentPrincipal::new(None, None, FlowOrigin::Bus, FlowActor::system());
+        let mut single = FlowEnvelope::empty();
+        single
+            .meta
+            .insert("bus_topic".into(), json!("zgloszenia.nowe"));
+        single.meta.insert("bus_partition".into(), json!(0));
+        single.meta.insert("bus_offset".into(), json!(18402));
+        single.payload = FlowValue::Json(json!({"secret": "record body"}));
+        let source = bus_source_of(&single, &bus).expect("coordinates");
+        assert_eq!(source.topic, "zgloszenia.nowe");
+        assert_eq!((source.partition, source.offset), (0, 18402));
+
+        let mut batch = FlowEnvelope::empty();
+        batch
+            .meta
+            .insert("bus_topic".into(), json!("zgloszenia.nowe"));
+        assert!(
+            bus_source_of(&batch, &bus).is_none(),
+            "a batch has no single record"
+        );
+
+        let api = AgentPrincipal::new(None, None, FlowOrigin::Api, FlowActor::system());
+        assert!(
+            bus_source_of(&single, &api).is_none(),
+            "only bus-origin runs"
+        );
+    }
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");

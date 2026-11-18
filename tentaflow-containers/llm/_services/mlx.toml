@@ -73,8 +73,8 @@ quantization = "int4"
 # rozmowy PL. Wymaga ~7-8 GB VRAM po 4-bit; M2 Pro / M3 / Mac Pro.
 [[model_preset]]
 id = "bielik-11b-instruct-mlx-4bit"
-display_name = "Bielik 11B Instruct (MLX 4-bit)"
-repo = "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"
+display_name = "Bielik 11B v3.1 Instruct (MLX 4-bit)"
+repo = "speakleash/Bielik-11B-v3.1-Instruct-MLX-4bit"
 quantization = "int4"
 
 # Qwen 3.5 9B — wieksza alternatywa Qwen, multijezykowa, ~6-7 GB VRAM 4-bit.

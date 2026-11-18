@@ -80,6 +80,8 @@ mod notices_tests;
 #[cfg(test)]
 mod retry_tests;
 #[cfg(test)]
+mod retry_policy_tests;
+#[cfg(test)]
 mod output_retry_tests;
 #[cfg(test)]
 mod simulation_tests;
@@ -95,6 +97,8 @@ pub(crate) mod simulation_scope_tests;
 mod simulation_repetition_tests;
 #[cfg(test)]
 mod simulation_call_tests;
+#[cfg(test)]
+mod sla_flow_tests;
 #[cfg(test)]
 mod tool_task_tests;
 #[cfg(test)]

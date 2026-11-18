@@ -87,7 +87,9 @@
 // map — `BusService::consumer_partitions` is a `Weak`-referenced side
 // registry kept exactly for that (see its own doc).
 
+mod binary_projection;
 pub mod codec;
+pub mod correlation;
 pub mod db;
 pub mod dedup;
 pub mod dlq;
@@ -115,6 +117,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use tentaflow_protocol::bus::TF_CORRELATION_ID_HEADER;
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use crate::auth::actor::ActorKind;
@@ -246,13 +249,19 @@ pub fn running_instances() -> Vec<Arc<BusService>> {
 
 /// Any incoming header using this prefix is silently STRIPPED before the
 /// broker's own provenance headers (`tf.org`/`tf.actor`/
-/// `tf.correlation_id`/`tf.origin`/`tf.content_type`/`tf.env`) are stamped
-///. A consumer/UI reading `tf.*` needs the guarantee that it was
-/// never caller-controllable — without this, `record.headers` was appended
+/// `tf.correlation_id`/`tf.origin`/`tf.content_type`/`tf.env`) are stamped.
+/// A consumer/UI reading `tf.*` needs the guarantee that it was never
+/// caller-controllable — without this, `record.headers` was appended
 /// FIRST, then the broker's own `tf.*` pushed again, so a forged
 /// `tf.actor` from the wire sat right next to the real one with no
 /// deduplication; whichever a reader happened to pick first on a
 /// duplicate-key lookup could be the forged value.
+///
+/// The one nuance is `tf.correlation_id`: it means "validated,
+/// caller-asserted". The broker derives it from the record's input
+/// `correlation-id` header (else `BusCallContext::correlation_id`) after
+/// `correlation::validate`, so it is a label the caller chose, never proof of
+/// identity (attribution is `tf.actor`/`tf.org`).
 ///
 /// STRIP rather than REJECT (the task's other option) because `publish` is
 /// also used internally to re-thread an already-published record forward —
@@ -1351,11 +1360,35 @@ fn dlq_retry_settled(result: &PublishResult) -> bool {
     dlq_republished(result) || result.schema_rejected > 0
 }
 
+/// How a topic's records are read through a rule: as text of one of the
+/// payload formats, or — for a topic checked with an Avro, Protobuf or Thrift
+/// pattern — re-encoded under a sub-schema (`binary_projection`).
+enum ReadCodec {
+    Text(payload_format::PayloadFormat),
+    Binary(binary_projection::BinaryRead),
+}
+
+/// What `ReadProjection::resolve` needs to know of the topic whose records are
+/// read: the two fields that decide what its messages are.
+struct ReadTopicInfo {
+    content_type: String,
+    schema_id: Option<String>,
+}
+
+impl From<&topics::TopicConfig> for ReadTopicInfo {
+    fn from(cfg: &topics::TopicConfig) -> ReadTopicInfo {
+        ReadTopicInfo {
+            content_type: cfg.content_type.clone(),
+            schema_id: cfg.schema_id.clone(),
+        }
+    }
+}
+
 /// A reader's field-policy READ projection (`BusService::read_projection`),
 /// resolved once per read and applied record by record.
 struct ReadProjection {
     policy: field_policies::FieldPolicy,
-    format: payload_format::PayloadFormat,
+    codec: ReadCodec,
     dlq: bool,
     /// The organization's key, resolved once when the policy hashes a field.
     hash_key: Option<Arc<field_hash_key::FieldHashKey>>,
@@ -1367,19 +1400,20 @@ impl ReadProjection {
     /// source's content type (`dlq_topic_options`), and its policy IS the
     /// source's (`field_policies::resolve`): the payload is read in the
     /// source's format, or an HL7 or XML record would be parsed as JSON and
-    /// come back empty. `content_type_of` names the content type of the topic
-    /// whose format applies. Its error text falls under the same rule
+    /// come back empty. `topic_info_of` names the topic whose format applies
+    /// (the source for a DLQ topic). Its error text falls under the same rule
     /// (`dlq::hide_error_message`).
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         db: &DbPool,
         hash_keys: &field_hash_key::FieldHashKeys,
+        projector: &Arc<binary_projection::BinaryProjector>,
         instance_id: &str,
         org_id: &str,
         actor_kind: crate::auth::actor::ActorKind,
         actor: &str,
         topic: &str,
-        content_type_of: impl FnOnce(&str) -> Result<String, BusServiceError>,
+        topic_info_of: impl FnOnce(&str) -> Result<ReadTopicInfo, BusServiceError>,
     ) -> Result<Option<ReadProjection>, BusServiceError> {
         let Some(policy) = field_policies::resolve(
             db,
@@ -1393,28 +1427,77 @@ impl ReadProjection {
             return Ok(None);
         };
         let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
-        let content_type = content_type_of(dlq_source.unwrap_or(topic))?;
+        let info = topic_info_of(dlq_source.unwrap_or(topic))?;
         let hash_key = policy.hash_key(hash_keys, org_id);
+        let codec = match field_policies::topic_kind(
+            db,
+            instance_id,
+            org_id,
+            &info.content_type,
+            info.schema_id.as_deref(),
+        )? {
+            field_policies::TopicKind::Binary { subject, .. } => ReadCodec::Binary(
+                binary_projection::BinaryRead::new(Arc::clone(projector), org_id, subject),
+            ),
+            field_policies::TopicKind::Text(format) => ReadCodec::Text(format),
+            // A rule cannot be written for such a topic (`set_policy`); one
+            // that is there anyway reads binary records as JSON, which fails
+            // closed (nothing parses).
+            field_policies::TopicKind::BinaryUnbound => {
+                ReadCodec::Text(payload_format::PayloadFormat::Json)
+            }
+        };
         Ok(Some(ReadProjection {
             policy,
-            format: payload_format::PayloadFormat::from_content_type(&content_type),
+            codec,
             dlq: dlq_source.is_some(),
             hash_key,
         }))
     }
 
     fn apply(&self, rec: &mut FetchedRecordMeta) {
-        rec.payload = field_policies::project_read(
-            &self.policy,
-            self.format,
-            &rec.payload,
-            self.hash_key.as_deref(),
-        );
-        self.apply_headers(rec);
+        match &self.codec {
+            ReadCodec::Text(format) => {
+                rec.payload = field_policies::project_read(
+                    &self.policy,
+                    *format,
+                    &rec.payload,
+                    self.hash_key.as_deref(),
+                );
+            }
+            ReadCodec::Binary(binary) => {
+                // Mask and hash replace text: a binary record shows a field
+                // whole or not at all (a rule cannot carry them, and one that
+                // does — a peer's — hides those fields).
+                let visible: std::collections::BTreeSet<String> = self
+                    .policy
+                    .fields
+                    .iter()
+                    .filter(|f| {
+                        !self.policy.masked_fields.contains(*f)
+                            && !self.policy.hashed_fields.contains(*f)
+                    })
+                    .cloned()
+                    .collect();
+                let (payload, schema_id) = binary.project(&visible, rec.schema_id, &rec.payload);
+                rec.payload = payload;
+                rec.schema_id = schema_id;
+            }
+        }
+        self.hide_error_text(rec);
     }
 
-    /// What the rule does to a record besides its payload.
+    /// What the rule does to a record whose payload is not kept: its headers,
+    /// and the id of the full pattern a binary record was written under (it
+    /// names a schema the reader may not be allowed to know).
     fn apply_headers(&self, rec: &mut FetchedRecordMeta) {
+        if matches!(self.codec, ReadCodec::Binary(_)) {
+            rec.schema_id = 0;
+        }
+        self.hide_error_text(rec);
+    }
+
+    fn hide_error_text(&self, rec: &mut FetchedRecordMeta) {
         if self.dlq {
             dlq::hide_error_message(&mut rec.headers);
         }
@@ -1843,6 +1926,37 @@ pub struct FetchedRecordMeta {
     pub schema_id: u32,
 }
 
+/// `BusService::preview_binary_record`'s answer.
+#[derive(Debug, Clone)]
+pub struct BinaryPreview {
+    pub payload: Bytes,
+    /// Id of the schema the payload is written under; `0` with an empty
+    /// payload = the record could not be projected.
+    pub schema_id: u32,
+    /// The fields the record sets, with whether the preview shows each.
+    pub fields: Vec<(String, bool)>,
+    /// The record sets a field the CALLER's own read rule withholds, so
+    /// `fields` leaves it out. Independent of the subject's rule: it holds
+    /// even when subject and caller see exactly the same fields.
+    pub caller_withheld: bool,
+}
+
+/// `BusService::schema_for_reader`'s answer.
+#[derive(Debug, Clone)]
+pub struct ReaderSchema {
+    pub subject: String,
+    pub schema_type: schema_registry::SchemaType,
+    /// The version the record was written under (for a sub-schema: the
+    /// version it was derived from).
+    pub version: u32,
+    /// The id the record carries and this schema answers to.
+    pub schema_ref_id: u32,
+    /// `true` when `schema_text` is the sub-schema of a reader whose rule
+    /// hides fields, not a registered version.
+    pub derived: bool,
+    pub schema_text: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FetchedBatch {
     pub records: Vec<FetchedRecordMeta>,
@@ -1860,6 +1974,43 @@ pub struct PeekResult {
     pub records: Vec<FetchedRecordMeta>,
     pub high_watermark: u64,
     pub earliest_offset: u64,
+    /// `Some` only for a correlation-filtered read (`peek_filtered`): the
+    /// offset after the last record EXAMINED, which is where the next page
+    /// resumes. The scan is bounded, so it can end well before the page is
+    /// full or the partition is exhausted.
+    pub next_offset: Option<u64>,
+}
+
+/// A correlation-filtered read examines at most this many records per
+/// request (all partitions together).
+pub const PEEK_FILTER_SCAN_MAX_RECORDS: usize = 10_000;
+
+/// A correlation-filtered read examines at most this many bytes of record
+/// payload and headers per request (all partitions together).
+pub const PEEK_FILTER_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// What is left of a correlation-filtered read's scan allowance. One budget
+/// is shared by every partition a request walks, so a topic with many
+/// partitions cannot multiply the work a single request may cause.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanBudget {
+    pub records: usize,
+    pub bytes: usize,
+}
+
+impl Default for ScanBudget {
+    fn default() -> Self {
+        Self {
+            records: PEEK_FILTER_SCAN_MAX_RECORDS,
+            bytes: PEEK_FILTER_SCAN_MAX_BYTES,
+        }
+    }
+}
+
+impl ScanBudget {
+    pub fn is_spent(&self) -> bool {
+        self.records == 0 || self.bytes == 0
+    }
 }
 
 /// `peek`'s hard ceiling on records per call, regardless of what a caller
@@ -2796,6 +2947,10 @@ pub struct BusService {
     /// The organizations' keys of hashed fields, shared with every
     /// `ConsumerHandle` this service opens.
     field_hash_keys: Arc<field_hash_key::FieldHashKeys>,
+    /// The compiled writer versions and derived sub-schemas behind the read
+    /// projection of Avro, Protobuf and Thrift records (`binary_projection`),
+    /// shared with every `ConsumerHandle` this service opens.
+    binary_projector: Arc<binary_projection::BinaryProjector>,
     /// `lag_history::TrendState` per (org, group, topic): rebuilt from the
     /// persisted samples once when the sampler starts (so a restarted node
     /// reports its trend straight away), then advanced by each new sample —
@@ -3096,6 +3251,10 @@ impl BusService {
             cfg.db.clone(),
             cfg.settings_cipher.clone(),
         ));
+        let binary_projector = Arc::new(binary_projection::BinaryProjector::new(
+            cfg.db.clone(),
+            cfg.instance_id.to_string(),
+        ));
         let svc = Self {
             instance_id: cfg.instance_id.to_string(),
             bus_dir: cfg.bus_dir,
@@ -3148,6 +3307,7 @@ impl BusService {
             partition_handle_lru: cfg.partition_handle_lru,
             publish_ack_timeout: cfg.publish_ack_timeout,
             field_hash_keys,
+            binary_projector,
             lag_trends: DashMap::new(),
             lag_history_lock: parking_lot::Mutex::new(()),
             #[cfg(test)]
@@ -4558,6 +4718,271 @@ impl BusService {
         Ok(derived)
     }
 
+    /// F4 B6: the schema a reader needs to decode a record it read from
+    /// `topic` (`FetchedRecordMeta::schema_id` is `schema_ref_id`). For a
+    /// reader whose read rule hides fields that is the SUB-SCHEMA of the
+    /// version the record was written under, derived for the fields the rule
+    /// shows (`derived: true`) — the same id the projection stamped; the full
+    /// pattern is never served to such a reader, and a rule changed since the
+    /// record was read answers `SchemaNotFound`. A reader no rule restricts gets
+    /// the version whose id the record carries. Same authorization as
+    /// reading the topic (`BusAction::Consume`); a DLQ topic answers for its
+    /// source's pattern and rule.
+    pub fn schema_for_reader(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        schema_ref_id: u32,
+    ) -> Result<ReaderSchema, BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        self.authorizer
+            .authorize(ctx, BusAction::Consume, topic)
+            .map_err(|_| {
+                self.audit_windowed(
+                    ctx,
+                    "bus.consume.denied",
+                    Some(topic),
+                    Some("action=schema"),
+                );
+                deny(BusAction::Consume, topic)
+            })?;
+        let source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX).unwrap_or(topic);
+        let cfg = self.topic_config(&ctx.org_id, source)?;
+        let not_found = || BusServiceError::SchemaNotFound {
+            subject: String::new(),
+        };
+        let field_policies::TopicKind::Binary {
+            subject,
+            schema_type,
+            ..
+        } = field_policies::topic_kind(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            &cfg.content_type,
+            cfg.schema_id.as_deref(),
+        )?
+        else {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "topic '{source}' carries no binary messages checked with a message pattern"
+            )));
+        };
+        let Some(policy) = field_policies::resolve(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            topic,
+            field_policies::PolicySubject::Actor(
+                ctx.actor_kind,
+                ctx.actor.as_deref().unwrap_or(""),
+            ),
+            field_policies::Direction::Read,
+        )?
+        else {
+            let version = self
+                .binary_projector
+                .writer_of(&ctx.org_id, &subject, schema_ref_id)?
+                .filter(|_| schema_ref_id != 0)
+                .ok_or_else(|| BusServiceError::SchemaNotFound {
+                    subject: subject.clone(),
+                })?;
+            let (info, text) = schema_registry::registry::get(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                &subject,
+                Some(version.version),
+            )?;
+            return Ok(ReaderSchema {
+                subject,
+                schema_type,
+                version: info.version,
+                schema_ref_id,
+                derived: false,
+                schema_text: text,
+            });
+        };
+        let visible: std::collections::BTreeSet<String> = policy
+            .fields
+            .iter()
+            .filter(|f| !policy.masked_fields.contains(*f) && !policy.hashed_fields.contains(*f))
+            .cloned()
+            .collect();
+        let (version, derived) = self
+            .binary_projector
+            .derived_by_id(&ctx.org_id, &subject, &visible, schema_ref_id)?
+            .filter(|_| schema_ref_id != 0)
+            .ok_or_else(not_found)?;
+        Ok(ReaderSchema {
+            subject,
+            schema_type,
+            version: version.version,
+            schema_ref_id,
+            derived: true,
+            schema_text: derived.text.clone(),
+        })
+    }
+
+    /// F4 B6: the topics checked with the Avro, Protobuf or Thrift pattern
+    /// `subject` on which a read rule applies to the caller. A caller with
+    /// such a rule sees records through the sub-schema of what its rule shows
+    /// (`schema_for_reader`); the whole pattern (the names, types and
+    /// documentation of the fields the rule hides) is not served to it, so the
+    /// registry's own readers (`SchemaGet`, `SchemaFieldsGet`) ask this first.
+    /// Empty for a subject of another kind or one no topic uses.
+    pub fn topics_hiding_pattern_from(
+        &self,
+        ctx: &BusCallContext,
+        subject: &str,
+    ) -> Result<Vec<String>, BusServiceError> {
+        self.check_instance(ctx)?;
+        let is_binary = crate::db::repository::bus_schema_subject_get(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            subject,
+        )?
+        .and_then(|row| schema_registry::SchemaType::parse(&row.schema_type))
+        .is_some_and(|kind| kind.is_binary());
+        if !is_binary {
+            return Ok(Vec::new());
+        }
+        let mut used_by =
+            schema_registry::registry::topics_by_subject(&self.db, &self.instance_id, &ctx.org_id)?;
+        let mut hiding = Vec::new();
+        for topic in used_by.remove(subject).unwrap_or_default() {
+            let rule = field_policies::resolve(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                &topic,
+                field_policies::PolicySubject::Actor(
+                    ctx.actor_kind,
+                    ctx.actor.as_deref().unwrap_or(""),
+                ),
+                field_policies::Direction::Read,
+            )?;
+            if rule.is_some() {
+                hiding.push(topic);
+            }
+        }
+        Ok(hiding)
+    }
+
+    /// F4 B6: one record of a binary topic as an administrator's "how does X
+    /// see it" preview shows it. Read from the log as it is and projected
+    /// through the subject's rule (`subject_visible`; `None` = no rule, every
+    /// field) narrowed to what the CALLER may see (`caller_visible`; `None` =
+    /// unrestricted), so a preview never shows the caller more than its own
+    /// read would. The caller has peeked the record already (authorization,
+    /// audit): this only reads it again without the caller's own projection.
+    /// `fields` lists every field of the record's writer version the record
+    /// sets, with whether the preview shows it.
+    pub fn preview_binary_record(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        subject_visible: Option<&std::collections::BTreeSet<String>>,
+        caller_visible: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<BinaryPreview, BusServiceError> {
+        self.check_instance(ctx)?;
+        self.authorizer
+            .authorize(ctx, BusAction::Consume, topic)
+            .map_err(|_| deny(BusAction::Consume, topic))?;
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        let field_policies::TopicKind::Binary { subject, .. } = field_policies::topic_kind(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            &cfg.content_type,
+            cfg.schema_id.as_deref(),
+        )?
+        else {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "topic '{topic}' carries no binary messages checked with a message pattern"
+            )));
+        };
+        let raw = self
+            .raw_record(&ctx.org_id, topic, partition, offset, &cfg)?
+            .ok_or_else(|| {
+                BusServiceError::InvalidArgument(format!(
+                    "partition {partition} has no record at offset {offset}"
+                ))
+            })?;
+        let withheld = BinaryPreview {
+            payload: Bytes::new(),
+            schema_id: 0,
+            fields: Vec::new(),
+            caller_withheld: false,
+        };
+        let Some(version) =
+            self.binary_projector
+                .writer_of(&ctx.org_id, &subject, raw.schema_id)?
+        else {
+            return Ok(withheld);
+        };
+        if version.schema_type.field_format().is_none() {
+            return Ok(withheld);
+        }
+        let shown = |name: &String| {
+            subject_visible.is_none_or(|s| s.contains(name))
+                && caller_visible.is_none_or(|c| c.contains(name))
+        };
+        let visible: std::collections::BTreeSet<String> = version
+            .declared
+            .iter()
+            .filter(|n| shown(n))
+            .cloned()
+            .collect();
+        let mut budget = schema_registry::ValidationBudget::for_batch(&ctx.org_id, 0);
+        let Ok(present) = self
+            .binary_projector
+            .present_fields(&version, &raw.payload, &mut budget)
+        else {
+            return Ok(withheld);
+        };
+        // A field the CALLER may not see is not listed either, not even as one
+        // the preview hides: its name would tell the record sets it.
+        let present: Vec<String> = present
+            .into_iter()
+            .filter(|name| version.declared.contains(name))
+            .collect();
+        let caller_withheld = present
+            .iter()
+            .any(|name| !caller_visible.is_none_or(|c| c.contains(name)));
+        let fields = present
+            .into_iter()
+            .filter(|name| caller_visible.is_none_or(|c| c.contains(name)))
+            .map(|name| {
+                let is_shown = shown(&name);
+                (name, is_shown)
+            })
+            .collect();
+        if subject_visible.is_none() && caller_visible.is_none() {
+            return Ok(BinaryPreview {
+                payload: raw.payload,
+                schema_id: raw.schema_id,
+                fields,
+                caller_withheld,
+            });
+        }
+        let read = binary_projection::BinaryRead::new(
+            Arc::clone(&self.binary_projector),
+            &ctx.org_id,
+            subject,
+        );
+        let (payload, schema_id) = read.project(&visible, raw.schema_id, &raw.payload);
+        Ok(BinaryPreview {
+            payload,
+            schema_id,
+            fields,
+            caller_withheld,
+        })
+    }
+
     fn next_round_robin(&self, org_id: &str, topic: &str, partitions: u32) -> u32 {
         let entry = self
             .round_robin
@@ -5480,7 +5905,21 @@ impl BusService {
         topic: &str,
         batch: PublishBatch,
     ) -> Result<PublishResult, BusServiceError> {
-        self.publish_routed(ctx, topic, batch, None)
+        self.publish_routed(ctx, topic, batch, None, false)
+    }
+
+    /// `publish` for a write the BROKER makes into `__dlq.<topic>` (the
+    /// dead letter of a failed delivery, the quarantine of a rejected
+    /// publish). Authorization is unchanged; only the field-policy write rule
+    /// is skipped, see `publish_routed`. Never reachable from a public
+    /// publish path.
+    fn publish_dead_letter(
+        &self,
+        ctx: &BusCallContext,
+        dlq_topic: &str,
+        batch: PublishBatch,
+    ) -> Result<PublishResult, BusServiceError> {
+        self.publish_routed(ctx, dlq_topic, batch, None, true)
     }
 
     /// `publish`, with the partition of `__dlq.<topic>` a `validation = dlq`
@@ -5494,6 +5933,7 @@ impl BusService {
         topic: &str,
         mut batch: PublishBatch,
         quarantine_partition: Option<u32>,
+        broker_dead_letter: bool,
     ) -> Result<PublishResult, BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
@@ -5524,22 +5964,85 @@ impl BusService {
         // batch pays none of that cost and never partially lands. `None`
         // (the overwhelmingly common case — no policy row for this
         // topic/actor) costs one indexed point lookup and nothing else.
-        if let Some(policy) = field_policies::resolve(
-            &self.db,
-            &self.instance_id,
-            &ctx.org_id,
-            topic,
-            field_policies::PolicySubject::Actor(
-                ctx.actor_kind,
-                ctx.actor.as_deref().unwrap_or(""),
-            ),
-            field_policies::Direction::Write,
-        )? {
-            let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
-            for r in &batch.records {
-                if let Err(e) = field_policies::validate_write(&policy, format, &r.payload, topic) {
-                    self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
-                    return Err(e);
+        //
+        // A dead-letter topic is written by the broker (`note_delivery_failure`,
+        // the quarantine of a rejected publish) on behalf of whoever consumed
+        // or published the record, with the payload of the SOURCE topic: the
+        // source's write rule judged the producer already, and applied to
+        // the DLQ topic (`resolve` redirects it) it would read a binary
+        // payload as the DLQ topic's own text format and refuse the dead
+        // letter, leaving the delivery to be retried for ever. Only those
+        // broker writes (`broker_dead_letter`, never derived from the topic
+        // name) skip the rule. A public publish to `__dlq.<topic>` carries a
+        // payload nobody can judge against the source's rule (it is a dead
+        // letter envelope), yet `dlq_retry` would move it into the source
+        // topic, so a producer the rule binds is refused instead.
+        let write_policy = if broker_dead_letter {
+            None
+        } else {
+            field_policies::resolve(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                topic,
+                field_policies::PolicySubject::Actor(
+                    ctx.actor_kind,
+                    ctx.actor.as_deref().unwrap_or(""),
+                ),
+                field_policies::Direction::Write,
+            )?
+        };
+        if write_policy.is_some() && topic.starts_with(dlq::DLQ_TOPIC_PREFIX) {
+            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+            return Err(deny(BusAction::Produce, topic));
+        }
+        if let Some(policy) = write_policy {
+            match field_policies::topic_kind(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                &cfg.content_type,
+                cfg.schema_id.as_deref(),
+            )? {
+                // F4 B6: the fields of an Avro, Protobuf or Thrift record are
+                // read with the pattern the topic validates with.
+                field_policies::TopicKind::Binary { subject, .. } => {
+                    let resolved =
+                        self.resolve_validator(&ctx.org_id, &subject)?
+                            .ok_or_else(|| BusServiceError::SchemaNotFound {
+                                subject: subject.clone(),
+                            })?;
+                    let mut work = schema_registry::ValidationBudget::for_batch(
+                        &ctx.org_id,
+                        batch.records.iter().map(|r| r.payload.len()).sum(),
+                    );
+                    for r in &batch.records {
+                        if let Err(e) = field_policies::validate_write_binary(
+                            &policy,
+                            resolved.schema_type,
+                            &resolved.compiled,
+                            &r.payload,
+                            topic,
+                            &mut work,
+                        ) {
+                            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+                            return Err(e);
+                        }
+                    }
+                }
+                kind => {
+                    let format = match kind {
+                        field_policies::TopicKind::Text(format) => format,
+                        _ => payload_format::PayloadFormat::Json,
+                    };
+                    for r in &batch.records {
+                        if let Err(e) =
+                            field_policies::validate_write(&policy, format, &r.payload, topic)
+                        {
+                            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -5700,8 +6203,32 @@ impl BusService {
                 };
                 let dlq_topic = dlq::dlq_topic_name(topic);
                 let violation_count = violations.len();
-                let dlq_result = self.ensure_dlq_topic(ctx, topic, &cfg).and_then(|_| {
-                    self.publish(
+                // `ensure_dlq_topic` only PROPOSES the DLQ partitions'
+                // assignments; the coordinator applies them asynchronously.
+                // On a fresh topic the first quarantine write would meet
+                // `NotLeader (leader_node_id=None)` and the record be lost,
+                // so wait (bounded) for the assignments first. A DLQ
+                // partition still unassigned after the wait fails the
+                // publish — the caller retries, nothing is dropped. Any
+                // other DLQ failure (a partition another node leads, too few
+                // replicas, ...) keeps the non-fatal drop below, or every
+                // batch with an invalid record would fail for good.
+                let dlq_cfg = self.ensure_dlq_topic(ctx, topic, &cfg);
+                if let Ok(dlq_cfg) = &dlq_cfg {
+                    if let Err(e) = self.await_dlq_placement(&ctx.org_id, dlq_cfg) {
+                        self.schema_dlq_write_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                            violation_count, error = %e,
+                            "the DLQ has no partition assignment; failing the \
+                             publish instead of dropping the schema-violating records"
+                        );
+                        return Err(e);
+                    }
+                }
+                let dlq_result = dlq_cfg.and_then(|_| {
+                    self.publish_dead_letter(
                         &quarantine_ctx,
                         &dlq_topic,
                         PublishBatch {
@@ -5887,6 +6414,14 @@ impl BusService {
         let mut seen_this_call: HashSet<Bytes> = HashSet::new();
 
         let node_env = self.cached_environment();
+        // Validated once per publish: an invalid ctx id is not stamped.
+        let ctx_correlation_id = ctx.correlation_id.as_deref().filter(|id| {
+            let ok = correlation::validate(id);
+            if !ok {
+                tracing::warn!("bus: ignoring invalid correlation id on the call context");
+            }
+            ok
+        });
         let mut acks: Vec<PartitionAck> = Vec::with_capacity(groups.len());
         let mut total_accepted = 0u32;
         let mut total_accepted_bytes = 0u64;
@@ -6038,8 +6573,13 @@ impl BusService {
                     // are both bare strings.
                     rec = rec.with_header("tf.actor_kind", ctx.actor_kind.as_str());
                 }
-                if let Some(cid) = &ctx.correlation_id {
-                    rec = rec.with_header("tf.correlation_id", cid.clone());
+                // Record header wins over the ctx id; an invalid header
+                // was never promoted (see `correlation::from_headers`).
+                if let Some(cid) = correlation::from_headers(&r.headers).or(ctx_correlation_id) {
+                    rec = rec.with_header(
+                        tentaflow_protocol::bus::TF_CORRELATION_ID_HEADER,
+                        cid.to_string(),
+                    );
                 }
                 rec = rec.with_header("tf.origin", ctx.origin.clone());
                 rec = rec.with_header("tf.content_type", cfg.content_type.clone());
@@ -7069,6 +7609,7 @@ impl BusService {
                     cursor: parking_lot::Mutex::new(ConsumerCursor::new(committed, applied_reset)),
                     environment: env_byte,
                     gap_audited: std::sync::atomic::AtomicBool::new(false),
+                    topic_generation: topic_cfg.generation,
                 });
             }
         }
@@ -7113,6 +7654,7 @@ impl BusService {
             group: group.to_string(),
             commit_mode: cfg.commit_mode,
             partitions,
+            next_start: std::sync::atomic::AtomicUsize::new(0),
             offsets: Arc::clone(&self.offsets),
             db: self.db.clone(),
             local_db: self.local_db.clone(),
@@ -7130,6 +7672,7 @@ impl BusService {
             replication: Arc::clone(&self.replication),
             consume_msgs_total: Arc::clone(&self.consume_msgs_total),
             field_hash_keys: Arc::clone(&self.field_hash_keys),
+            binary_projector: Arc::clone(&self.binary_projector),
         })
     }
 
@@ -7173,6 +7716,63 @@ impl BusService {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PeekResult, BusServiceError> {
+        self.peek_filtered(
+            ctx,
+            topic,
+            partition,
+            from_offset,
+            max_records,
+            max_bytes,
+            None,
+        )
+    }
+
+    /// `peek_filtered_within` with a fresh default `ScanBudget`: one
+    /// partition, one budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peek_filtered(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        correlation_id: Option<&str>,
+    ) -> Result<PeekResult, BusServiceError> {
+        self.peek_filtered_within(
+            ctx,
+            topic,
+            partition,
+            from_offset,
+            max_records,
+            max_bytes,
+            correlation_id,
+            &mut ScanBudget::default(),
+        )
+    }
+
+    /// `peek` that keeps only the records stamped with `correlation_id`
+    /// (`tf.correlation_id`; TB-02). There is no per-record index: the scan
+    /// reads the log from `from_offset` and is BOUNDED by `budget`, which the
+    /// scan spends down so a caller can share one budget across partitions.
+    /// A page can come back short or empty well before the partition ends;
+    /// `PeekResult::next_offset` says how far it got (`from_offset` when the
+    /// budget was already spent). Authorization, leader rule, projection and
+    /// audit are `peek`'s (the audit row is written only when at least one
+    /// record is returned, and names the filter). `None` is exactly `peek`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peek_filtered_within(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        correlation_id: Option<&str>,
+        budget: &mut ScanBudget,
+    ) -> Result<PeekResult, BusServiceError> {
         let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
         let max_records = max_records.min(PEEK_MAX_RECORDS);
         let max_bytes = max_bytes.min(PEEK_MAX_BYTES);
@@ -7180,26 +7780,83 @@ impl BusService {
         let reader = part.open_reader();
         let high_watermark = reader.high_watermark();
         let earliest_offset = reader.earliest_offset();
-        let batches = reader
-            .fetch_from_offset(from_offset, max_bytes)
-            .map_err(|e| map_engine_error(e, topic, partition))?;
 
         let mut records = Vec::new();
-        'batches: for view in &batches {
-            for rv in view.records_from(from_offset) {
-                if records.len() >= max_records {
-                    break 'batches;
+        let mut next_offset = None;
+        match correlation_id {
+            None => {
+                let batches = reader
+                    .fetch_from_offset(from_offset, max_bytes)
+                    .map_err(|e| map_engine_error(e, topic, partition))?;
+                'batches: for view in &batches {
+                    for rv in view.records_from(from_offset) {
+                        if records.len() >= max_records {
+                            break 'batches;
+                        }
+                        records.push(fetched_record(topic, partition, view, rv?));
+                    }
                 }
-                records.push(fetched_record(topic, partition, view, rv?));
+            }
+            Some(_) if budget.is_spent() => next_offset = Some(from_offset),
+            Some(wanted) => {
+                let wanted = wanted.as_bytes();
+                let mut cursor = from_offset;
+                // The first fetch always runs, so an offset out of range
+                // fails exactly like an unfiltered `peek`.
+                'scan: loop {
+                    let batches = reader
+                        .fetch_from_offset(cursor, max_bytes)
+                        .map_err(|e| map_engine_error(e, topic, partition))?;
+                    let before = cursor;
+                    for view in &batches {
+                        for rv in view.records_from(cursor) {
+                            let rv = rv?;
+                            let offset = view.header().base_offset + rv.offset_delta as u64;
+                            cursor = offset + 1;
+                            budget.records = budget.records.saturating_sub(1);
+                            budget.bytes = budget.bytes.saturating_sub(
+                                rv.payload.len()
+                                    + rv.headers
+                                        .iter()
+                                        .map(|(k, v)| k.len() + v.len())
+                                        .sum::<usize>(),
+                            );
+                            let matches = rv.headers.iter().any(|(k, v)| {
+                                k.as_ref() == TF_CORRELATION_ID_HEADER.as_bytes()
+                                    && v.as_ref() == wanted
+                            });
+                            if matches {
+                                let mut rec = fetched_record(topic, partition, view, rv);
+                                // Copied so the fetched batch is freed
+                                // instead of pinned by a small match.
+                                rec.payload = Bytes::copy_from_slice(&rec.payload);
+                                records.push(rec);
+                                if records.len() >= max_records {
+                                    break 'scan;
+                                }
+                            }
+                            if budget.is_spent() {
+                                break 'scan;
+                            }
+                        }
+                    }
+                    if cursor == before || cursor >= high_watermark {
+                        break;
+                    }
+                }
+                next_offset = Some(cursor);
             }
         }
 
         if !records.is_empty() {
+            let filter = correlation_id
+                .map(|id| format!(" correlation_id={id}"))
+                .unwrap_or_default();
             self.audit_browse(
                 ctx,
                 topic,
                 &format!(
-                    "partition={partition} from_offset={from_offset} count={}",
+                    "partition={partition} from_offset={from_offset} count={}{filter}",
                     records.len()
                 ),
             );
@@ -7217,6 +7874,7 @@ impl BusService {
             records,
             high_watermark,
             earliest_offset,
+            next_offset,
         })
     }
 
@@ -7296,6 +7954,7 @@ impl BusService {
             records,
             high_watermark,
             earliest_offset,
+            next_offset: None,
         })
     }
 
@@ -7358,6 +8017,7 @@ impl BusService {
         ReadProjection::resolve(
             &self.db,
             &self.field_hash_keys,
+            &self.binary_projector,
             &self.instance_id,
             &ctx.org_id,
             ctx.actor_kind,
@@ -7365,15 +8025,54 @@ impl BusService {
             topic,
             |named| {
                 if named == topic {
-                    Ok(cfg.content_type.clone())
+                    Ok(ReadTopicInfo::from(cfg))
                 } else {
-                    Ok(self.topic_config(&ctx.org_id, named)?.content_type)
+                    Ok(ReadTopicInfo::from(&self.topic_config(&ctx.org_id, named)?))
                 }
             },
         )
     }
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
+
+    /// Waits, up to `DLQ_PLACEMENT_WAIT`, until every partition of the DLQ
+    /// topic has an assignment this node has applied. Only the "no
+    /// assignment yet" state is waited out: a partition another node leads
+    /// (or one without enough ISR) is not going to change within the wait.
+    /// Returns the `NotLeader` error `publish` would have produced when a
+    /// partition is still unassigned at the deadline; the only DLQ state
+    /// that fails the publish itself.
+    fn await_dlq_placement(
+        &self,
+        org_id: &str,
+        dlq_cfg: &topics::TopicConfig,
+    ) -> Result<(), BusServiceError> {
+        const DLQ_PLACEMENT_WAIT: Duration = Duration::from_secs(2);
+        const DLQ_PLACEMENT_POLL: Duration = Duration::from_millis(10);
+        let Some(coordinator) = self.replication() else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + DLQ_PLACEMENT_WAIT;
+        for partition in 0..dlq_cfg.partitions {
+            loop {
+                let role = coordinator.role(org_id, &dlq_cfg.name, partition);
+                let unassigned = matches!(
+                    role,
+                    PartitionRole::Unavailable {
+                        reason: UnavailableReason::NoAssignment
+                    }
+                );
+                if !unassigned {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(role_not_leader_error(role));
+                }
+                std::thread::sleep(DLQ_PLACEMENT_POLL);
+            }
+        }
+        Ok(())
+    }
 
     fn ensure_dlq_topic(
         &self,
@@ -7463,6 +8162,77 @@ impl BusService {
         ) {
             tracing::warn!("__bus.metrics: publish failed: {e}");
         }
+    }
+
+    /// Whether `handle` still matches this engine and its topics: the engine
+    /// is running, and every topic the handle subscribed to still has the same
+    /// incarnation and partition count it was opened with. `open_consumer`
+    /// fixes the partition list, so a kept handle must be dropped once a topic
+    /// grew partitions or was deleted and recreated (the new incarnation may
+    /// carry different access rules). A topic that cannot be read counts as
+    /// changed.
+    pub fn consumer_is_current(&self, handle: &ConsumerHandle) -> bool {
+        if self.sweeper_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut checked: Vec<&str> = Vec::new();
+        for cp in &handle.partitions {
+            let topic = cp.topic.as_str();
+            if checked.contains(&topic) {
+                continue;
+            }
+            checked.push(topic);
+            let Ok(cfg) = self.topic_config(&handle.org_id, topic) else {
+                return false;
+            };
+            let opened = handle
+                .partitions
+                .iter()
+                .filter(|other| other.topic == topic)
+                .count();
+            if cfg.generation != cp.topic_generation || cfg.partitions as usize != opened {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `ctx` may consume `topic` under `group`: the instance, name and
+    /// authorizer checks `open_consumer` makes, plus (for an API key) the
+    /// field-policy lookup a fetch would fail on, with no side effect and no
+    /// audit row. It does not cover what only opening can tell (the topic
+    /// existing, the instance leading). For a supervisor that re-asks on a
+    /// timer (the flow reactor's pre-start check) and must neither open a
+    /// consumer nor fill the audit log.
+    pub fn check_consume_access(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        group: &str,
+    ) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        validate_group_name(group)?;
+        self.authorizer
+            .authorize_group(ctx, BusAction::Consume, topic, group)
+            .map_err(|_| deny(BusAction::Consume, topic))?;
+        // A key that meets data-hiding rules only for other subjects is
+        // refused at fetch time (`KeyNeedsTopicWideRule`); asking here lets a
+        // supervisor see it without opening a consumer.
+        if ctx.actor_kind == crate::auth::actor::ActorKind::ApiKey {
+            field_policies::resolve(
+                &self.db,
+                &self.instance_id,
+                &ctx.org_id,
+                topic,
+                field_policies::PolicySubject::Actor(
+                    ctx.actor_kind,
+                    ctx.actor.as_deref().unwrap_or(""),
+                ),
+                field_policies::Direction::Read,
+            )?;
+        }
+        Ok(())
     }
 
     /// Records one failed delivery attempt for (group, topic, partition,
@@ -7589,8 +8359,23 @@ impl BusService {
             &original,
         );
         let dlq_topic_name = dlq::dlq_topic_name(topic);
-        self.publish(
-            ctx,
+        // The caller's Consume right on the source topic was verified above.
+        // A general API key holds no right on a reserved `__dlq.*` topic
+        // (`api_key_topic_allows` refuses every `__` topic), so the broker
+        // writes the dead letter itself, under the same internal context as
+        // the schema quarantine. It is a write to broker infrastructure that
+        // exists only on the strength of the key's own read right; the
+        // `bus.dlq.sent` audit row below still names the key.
+        let dead_letter_ctx = match ctx.actor_kind {
+            crate::auth::actor::ActorKind::ApiKey => BusCallContext {
+                actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+                actor_kind: crate::auth::actor::ActorKind::System,
+                ..ctx.clone()
+            },
+            _ => ctx.clone(),
+        };
+        self.publish_dead_letter(
+            &dead_letter_ctx,
             &dlq_topic_name,
             PublishBatch {
                 partition: None,
@@ -7823,6 +8608,7 @@ impl BusService {
                 records: vec![retry_record],
             },
             Some(dlq_partition),
+            false,
         )?;
         if !dlq_retry_settled(&result) {
             let (topic, partition, offset) = (dlq_topic.to_string(), dlq_partition, dlq_offset);
@@ -8713,6 +9499,9 @@ struct ConsumerPartition {
     /// `seek_to_earliest`, since a later gap (a second retention pass) is a
     /// new occurrence worth auditing again.
     gap_audited: AtomicBool,
+    /// `TopicConfig::generation` (the topic incarnation) this partition was
+    /// opened under — compared by `BusService::consumer_is_current`.
+    topic_generation: u64,
 }
 
 pub struct ConsumerHandle {
@@ -8722,6 +9511,9 @@ pub struct ConsumerHandle {
     pub group: String,
     pub commit_mode: groups::CommitMode,
     partitions: Vec<ConsumerPartition>,
+    /// Where the next `fetch` call starts its partition scan, advanced by one
+    /// per call so a backlog on one partition cannot starve the others.
+    next_start: std::sync::atomic::AtomicUsize,
     offsets: Arc<groups::GroupOffsetStore>,
     /// The shared platform database — audit rows, field policies, topic
     /// config: everything except `bus_groups`. See `BusService::db`.
@@ -8771,6 +9563,9 @@ pub struct ConsumerHandle {
     /// Shared with `BusService::field_hash_keys`: `fetch` hashes with it when
     /// a read rule hashes a field.
     field_hash_keys: Arc<field_hash_key::FieldHashKeys>,
+    /// Shared with `BusService::binary_projector`: `fetch` re-encodes a record
+    /// of a binary topic under the reader's sub-schema with it.
+    binary_projector: Arc<binary_projection::BinaryProjector>,
 }
 
 impl ConsumerHandle {
@@ -8924,8 +9719,10 @@ impl ConsumerHandle {
         Ok(cursor.advance(from, new_next))
     }
 
-    /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition
-    /// round-robin up to `max_bytes` total, long-polling up to
+    /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition up
+    /// to `max_bytes` total, starting each call one partition further along
+    /// (round-robin ACROSS calls, so a backlog on one partition cannot
+    /// starve the rest when a bound ends the scan early), long-polling up to
     /// `max_wait_ms` if nothing is available yet.
     ///
     /// BLOCKING: this calls `PartitionReader::fetch_from_offset`,
@@ -8937,6 +9734,20 @@ impl ConsumerHandle {
     pub fn fetch(
         &self,
         max_bytes: usize,
+        max_wait_ms: u32,
+    ) -> Result<FetchedBatch, BusServiceError> {
+        self.fetch_up_to(max_bytes, usize::MAX, max_wait_ms)
+    }
+
+    /// `fetch` that also returns at most `max_records` records in total
+    /// (across all subscribed partitions). The cursor advances only past the
+    /// records returned, so the rest is read by the next fetch, and the
+    /// engine read stops at about `max_records` instead of `max_bytes`.
+    /// Same BLOCKING contract as `fetch`.
+    pub fn fetch_up_to(
+        &self,
+        max_bytes: usize,
+        max_records: usize,
         max_wait_ms: u32,
     ) -> Result<FetchedBatch, BusServiceError> {
         self.revalidate()?;
@@ -8972,20 +9783,25 @@ impl ConsumerHandle {
             self.apply_offset_resets_locked()?;
         }
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
+        let partition_count = self.partitions.len().max(1);
+        let start = self.next_start.fetch_add(1, Ordering::Relaxed) % partition_count;
         loop {
             let mut records = Vec::new();
             let mut consumed = 0usize;
-            for cp in &self.partitions {
-                if consumed >= max_bytes {
+            for offset in 0..self.partitions.len() {
+                let cp = &self.partitions[(start + offset) % partition_count];
+                if consumed >= max_bytes || records.len() >= max_records {
                     break;
                 }
+                let remaining = max_records - records.len();
                 self.check_environment(cp)?;
                 check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
                 let from = cp.cursor.lock().next;
-                let batches = match cp
-                    .reader
-                    .fetch_from_offset(from, max_bytes.saturating_sub(consumed))
-                {
+                let batches = match cp.reader.fetch_from_offset_limited(
+                    from,
+                    max_bytes.saturating_sub(consumed),
+                    remaining,
+                ) {
                     Ok(b) => b,
                     Err(tentaflow_bus::BusError::OffsetOutOfRange {
                         requested,
@@ -9026,10 +9842,16 @@ impl ConsumerHandle {
                 };
                 let (records_before, consumed_before) = (records.len(), consumed);
                 let mut new_next = from;
-                for view in &batches {
+                'batches: for view in &batches {
                     for rv in view.records_from(from) {
                         let rv = rv?;
                         let offset = view.header().base_offset + rv.offset_delta as u64;
+                        if records.len() - records_before == remaining {
+                            // Cut inside this batch: the cursor stops at the
+                            // first record not returned.
+                            new_next = offset;
+                            break 'batches;
+                        }
                         consumed += rv.payload.len();
                         records.push(FetchedRecordMeta {
                             topic: cp.topic.clone(),
@@ -9074,6 +9896,7 @@ impl ConsumerHandle {
                             let resolved = ReadProjection::resolve(
                                 &self.db,
                                 &self.field_hash_keys,
+                                &self.binary_projector,
                                 &self.instance_id,
                                 &self.org_id,
                                 self.ctx.actor_kind,
@@ -9086,8 +9909,11 @@ impl ConsumerHandle {
                                         &self.org_id,
                                         named,
                                     )?
-                                    .map(|cfg| cfg.content_type)
-                                    .unwrap_or_default())
+                                    .map(|cfg| ReadTopicInfo::from(&cfg))
+                                    .unwrap_or(ReadTopicInfo {
+                                        content_type: String::new(),
+                                        schema_id: None,
+                                    }))
                                 },
                             )?;
                             projections.insert(rec.topic.clone(), resolved);
@@ -9231,6 +10057,25 @@ impl ConsumerHandle {
             }
             let mut cursor = cp.cursor.lock();
             cursor.next = cursor.next.max(offset);
+        }
+        Ok(())
+    }
+
+    /// The group's durable committed offset on one subscribed partition. For a
+    /// caller that commits a position it computed itself and must not ask for
+    /// one behind what is stored (a dead letter advances the store on its own).
+    pub fn committed_offset(&self, topic: &str, partition: u32) -> Result<u64, BusServiceError> {
+        self.offsets
+            .committed_offset(&self.org_id, &self.group, topic, partition)
+    }
+
+    /// Whether this node still leads every subscribed partition (consumption
+    /// and commits are leader-only). For a caller that paused after a fetch and
+    /// must not hand the records out when the leadership moved meanwhile.
+    pub fn check_leadership(&self) -> Result<(), BusServiceError> {
+        let coordinator = self.replication.read().clone();
+        for cp in &self.partitions {
+            check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
         }
         Ok(())
     }
@@ -11724,6 +12569,104 @@ mod tests {
         assert_eq!(handle.fetch(1024, 20).unwrap().records.len(), 1);
     }
 
+    /// `fetch_up_to` cuts inside a multi-record batch: the cursor stops at the
+    /// first record not returned, so the next fetch continues exactly there.
+    #[test]
+    fn fetch_up_to_returns_at_most_max_records_and_resumes_after_them() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.bounded",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payloads: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        for chunk in payloads.chunks(4) {
+            svc.publish(
+                &ctx,
+                "orders.bounded",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: chunk.iter().map(|p| record(p)).collect(),
+                },
+            )
+            .unwrap();
+        }
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.bounded".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        for expected in [3usize, 3, 1] {
+            let batch = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+            assert_eq!(batch.records.len(), expected);
+            seen.extend(batch.records.iter().map(|r| r.offset));
+        }
+        assert_eq!(seen, (0..7).collect::<Vec<u64>>());
+        assert!(handle.fetch_up_to(1024 * 1024, 3, 20).unwrap().records.is_empty());
+    }
+
+    /// A backlog on partition 0 must not starve partition 1: each fetch call
+    /// starts its scan one partition further along.
+    #[test]
+    fn fetch_up_to_rotates_the_starting_partition_so_a_backlog_cannot_starve_the_rest() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.fair",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (partition, count) in [(0u32, 6usize), (1, 2)] {
+            for i in 0..count {
+                svc.publish(
+                    &ctx,
+                    "orders.fair",
+                    PublishBatch {
+                        partition: Some(partition),
+                        producer: None,
+                        records: vec![record(&format!("p{partition}-{i}"))],
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.fair".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let first = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+        let second = handle.fetch_up_to(1024 * 1024, 3, 20).unwrap();
+        let from_p1 = |b: &FetchedBatch| b.records.iter().filter(|r| r.partition == 1).count();
+        assert_eq!(first.records.len(), 3);
+        assert_eq!(from_p1(&first), 0, "the first call starts on partition 0");
+        assert!(
+            from_p1(&second) > 0,
+            "the second call must reach partition 1 despite the backlog on 0"
+        );
+    }
+
     // ---- OffsetOutOfRange after retention + deliberate recovery ----
 
     #[test]
@@ -13598,6 +14541,418 @@ mod tests {
             "the caller-supplied 'tf.actor' copy must be stripped, not just appended alongside"
         );
         assert_eq!(actor_headers[0].1, Bytes::from_static(b"tester"));
+    }
+
+    // ---- correlation id stamping (TB-02) ----------------------------
+
+    /// Publishes `record` on a fresh one-partition topic under `ctx` and
+    /// returns the `tf.correlation_id` values the stored record carries.
+    fn stamped_correlation_ids(ctx: &BusCallContext, mut record: PublishRecord) -> Vec<Bytes> {
+        let (_tmp, svc) = test_service();
+        svc.create_topic(
+            ctx,
+            "events.corr",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        record.timestamp_ms = 1;
+        svc.publish(
+            ctx,
+            "events.corr",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record],
+            },
+        )
+        .unwrap();
+        let handle = svc
+            .open_consumer(
+                ctx,
+                "g1",
+                &["events.corr".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let fetched = handle.fetch(1024, 20).unwrap();
+        assert_eq!(fetched.records.len(), 1);
+        fetched.records[0]
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "tf.correlation_id")
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    fn with_header(mut r: PublishRecord, name: &str, value: &str) -> PublishRecord {
+        r.headers
+            .push((name.to_string(), Bytes::from(value.to_string())));
+        r
+    }
+
+    #[test]
+    fn a_valid_record_header_wins_over_the_context_correlation_id() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        let r = with_header(record("p"), "correlation-id", "from-header");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"from-header")]
+        );
+    }
+
+    #[test]
+    fn an_invalid_record_header_falls_back_to_the_context_id() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        let r = with_header(record("p"), "correlation-id", "not valid!");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"from-ctx")]
+        );
+    }
+
+    #[test]
+    fn the_context_id_is_stamped_when_the_record_has_no_header() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("from-ctx".to_string());
+        assert_eq!(
+            stamped_correlation_ids(&ctx, record("p")),
+            vec![Bytes::from_static(b"from-ctx")]
+        );
+    }
+
+    #[test]
+    fn an_invalid_context_id_is_not_stamped() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("has space".to_string());
+        assert!(stamped_correlation_ids(&ctx, record("p")).is_empty());
+    }
+
+    #[test]
+    fn no_correlation_id_means_no_stamp() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        assert!(stamped_correlation_ids(&ctx, record("p")).is_empty());
+    }
+
+    #[test]
+    fn a_forged_tf_correlation_id_is_still_stripped() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        let r = with_header(record("p"), "tf.correlation_id", "forged");
+        assert!(stamped_correlation_ids(&ctx, r).is_empty());
+
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = Some("real".to_string());
+        let r = with_header(record("p"), "tf.correlation_id", "forged");
+        assert_eq!(
+            stamped_correlation_ids(&ctx, r),
+            vec![Bytes::from_static(b"real")],
+            "exactly the broker's own value, never the forged copy beside it"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_correlation_id_header_is_an_input() {
+        let mut ctx = test_ctx("org-1");
+        ctx.correlation_id = None;
+        for name in ["x-correlation-id", "traceparent", "Correlation-Id"] {
+            let r = with_header(record("p"), name, "abc-1");
+            assert!(
+                stamped_correlation_ids(&ctx, r).is_empty(),
+                "{name} must not be promoted"
+            );
+        }
+    }
+
+    // ---- correlation-filtered peek (TB-02) --------------------------
+
+    fn publish_correlated(
+        svc: &BusService,
+        ctx: &BusCallContext,
+        topic: &str,
+        payload: &str,
+        id: Option<&str>,
+    ) {
+        let r = match id {
+            Some(id) => with_header(record(payload), "correlation-id", id),
+            None => record(payload),
+        };
+        svc.publish(
+            ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![r],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn peek_filtered_returns_only_matching_records_and_how_far_it_scanned() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peekc",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (payload, id) in [
+            ("a0", Some("chain-a")),
+            ("b0", Some("chain-b")),
+            ("n0", None),
+            ("a1", Some("chain-a")),
+            ("b1", Some("chain-b")),
+        ] {
+            publish_correlated(&svc, &ctx, "events.peekc", payload, id);
+        }
+
+        let hit = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        let payloads: Vec<_> = hit.records.iter().map(|r| r.payload.clone()).collect();
+        assert_eq!(
+            payloads,
+            vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
+        );
+        assert_eq!(hit.next_offset, Some(5), "the whole partition was examined");
+
+        // A page that fills up resumes right after its last match.
+        let page = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                1,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.next_offset, Some(1));
+        let rest = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                page.next_offset.unwrap(),
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap();
+        assert_eq!(rest.records.len(), 1);
+        assert_eq!(rest.records[0].payload, Bytes::from_static(b"a1"));
+
+        let miss = svc
+            .peek_filtered(
+                &ctx,
+                "events.peekc",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("nobody"),
+            )
+            .unwrap();
+        assert!(miss.records.is_empty());
+        assert_eq!(miss.next_offset, Some(5));
+
+        // `None` is the plain peek.
+        let plain = svc
+            .peek_filtered(&ctx, "events.peekc", 0, 0, 10, PEEK_MAX_BYTES, None)
+            .unwrap();
+        assert_eq!(plain.records.len(), 5);
+        assert_eq!(plain.next_offset, None);
+    }
+
+    #[test]
+    fn a_shared_scan_budget_is_spent_across_calls_and_a_spent_one_scans_nothing() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peekb",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (payload, id) in [
+            ("n0", None),
+            ("n1", None),
+            ("n2", None),
+            ("a0", Some("chain-a")),
+        ] {
+            publish_correlated(&svc, &ctx, "events.peekb", payload, id);
+        }
+        let mut budget = ScanBudget {
+            records: 3,
+            bytes: usize::MAX,
+        };
+        let first = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut budget,
+            )
+            .unwrap();
+        assert!(first.records.is_empty(), "the match lies past the budget");
+        assert_eq!(first.next_offset, Some(3));
+        assert!(budget.is_spent());
+        assert!(first.next_offset.unwrap() < first.high_watermark);
+
+        // A spent budget examines nothing and reports where it stood.
+        let second = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                3,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut budget,
+            )
+            .unwrap();
+        assert!(second.records.is_empty());
+        assert_eq!(second.next_offset, Some(3));
+
+        let mut fresh = ScanBudget::default();
+        let resumed = svc
+            .peek_filtered_within(
+                &ctx,
+                "events.peekb",
+                0,
+                3,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+                &mut fresh,
+            )
+            .unwrap();
+        assert_eq!(resumed.records.len(), 1);
+        assert_eq!(resumed.next_offset, Some(4));
+    }
+
+    #[test]
+    fn peek_filtered_audits_only_a_read_that_returns_records() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "events.peeka",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        publish_correlated(&svc, &ctx, "events.peeka", "a0", Some("chain-a"));
+        let browse_rows = |svc: &BusService| {
+            crate::db::repository::list_audit_logs(
+                &svc.db,
+                &crate::db::models::AuditLogFilters {
+                    action: Some("bus.messages.browse".to_string()),
+                    ..Default::default()
+                },
+                0,
+                1000,
+            )
+            .unwrap()
+            .len()
+        };
+        let before = browse_rows(&svc);
+        svc.peek_filtered(
+            &ctx,
+            "events.peeka",
+            0,
+            0,
+            10,
+            PEEK_MAX_BYTES,
+            Some("nobody"),
+        )
+        .unwrap();
+        assert_eq!(
+            browse_rows(&svc),
+            before,
+            "an empty filtered read is not audited"
+        );
+        svc.peek_filtered(
+            &ctx,
+            "events.peeka",
+            0,
+            0,
+            10,
+            PEEK_MAX_BYTES,
+            Some("chain-a"),
+        )
+        .unwrap();
+        assert_eq!(browse_rows(&svc), before + 1);
+    }
+
+    #[test]
+    fn peek_filtered_is_refused_without_read_permission() {
+        let (_tmp, bus_dir) = test_bus_dir();
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir,
+            db,
+            authorizer: Arc::new(DenyAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+        })
+        .expect("bus service");
+        let ctx = test_ctx("org-1");
+        let err = svc
+            .peek_filtered(
+                &ctx,
+                "events.denied",
+                0,
+                0,
+                10,
+                PEEK_MAX_BYTES,
+                Some("chain-a"),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::PermissionDenied { .. }),
+            "{err:?}"
+        );
     }
 
     // ---- topic config cache -----------------------------------------
@@ -18056,6 +19411,85 @@ mod tests {
     }
 
     #[test]
+    fn a_json_write_rule_is_not_bypassed_by_publishing_to_the_dead_letter_topic() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "patients.updated",
+            topics::TopicOptions {
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let record = |payload: &str| PublishRecord {
+            key: None,
+            headers: vec![],
+            payload: Bytes::from(payload.to_string()),
+            timestamp_ms: now_ms(),
+            schema_id: 0,
+        };
+        svc.publish(
+            &ctx,
+            "patients.updated",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"patient_id":1}"#)],
+            },
+        )
+        .unwrap();
+        let seen = svc
+            .peek(&ctx, "patients.updated", 0, 0, 1, 4096)
+            .unwrap()
+            .records
+            .remove(0);
+        assert!(matches!(
+            svc.note_delivery_failure(
+                &ctx,
+                "g",
+                "patients.updated",
+                0,
+                0,
+                &seen,
+                dlq::DlqReason::ConsumerError,
+                "boom",
+            )
+            .unwrap(),
+            dlq::DlqOutcome::SentToDlq { .. }
+        ));
+        let direct = svc.publish(
+            &ctx,
+            "__dlq.patients.updated",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"patient_id":1,"ssn":"x"}"#)],
+            },
+        );
+        assert!(
+            matches!(direct, Err(BusServiceError::PermissionDenied { .. })),
+            "{direct:?}"
+        );
+    }
+
+    #[test]
     fn publish_rejects_batch_with_field_not_in_write_policy() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
@@ -19759,6 +21193,162 @@ mod tests {
         let batch = handle.fetch(1024, 10).unwrap();
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.records[0].payload.as_ref(), br#"{"id":"ok-1"}"#);
+    }
+
+    /// A fresh `validation = dlq` topic: `__dlq.<topic>` is created by the
+    /// first violation and its partitions get their assignment applied a
+    /// moment later. The first invalid record must wait for that, not be
+    /// dropped with `NotLeader (leader_node_id=None)`.
+    fn fresh_dlq_topic_with_unplaced_dlq(
+        svc: &BusService,
+        ctx: &BusCallContext,
+    ) -> (Arc<FakeCoordinator>, String) {
+        register_schema(svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source_cfg = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.events")
+            .unwrap()
+            .unwrap();
+        let dlq_topic = dlq::dlq_topic_name("orders.events");
+        svc.ensure_dlq_topic(ctx, "orders.events", &source_cfg)
+            .unwrap();
+        let system_ctx = BusCallContext {
+            actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
+            ..ctx.clone()
+        };
+        open_leader_writes(svc, &system_ctx, &dlq_topic, 0);
+        let coord = FakeCoordinator::leader(1);
+        coord.topic_roles.lock().insert(
+            dlq_topic.clone(),
+            PartitionRole::Unavailable {
+                reason: UnavailableReason::NoAssignment,
+            },
+        );
+        svc.set_replication(coord.clone());
+        open_leader_writes(svc, ctx, "orders.events", 0);
+        (coord, dlq_topic)
+    }
+
+    #[test]
+    fn the_first_invalid_record_of_a_fresh_topic_waits_for_the_dlq_leader_and_is_quarantined() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let placed = Arc::clone(&coord);
+        let dlq_for_thread = dlq_topic.clone();
+        let placer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            placed.topic_roles.lock().insert(
+                dlq_for_thread,
+                PartitionRole::Leader { epoch: 1 },
+            );
+        });
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"status":"missing-required-id"}"#)],
+                },
+            )
+            .unwrap();
+        placer.join().unwrap();
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(result.schema_dropped, 0);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 0);
+        assert_eq!(
+            svc.partition_stats(&ctx, &dlq_topic, 0)
+                .unwrap()
+                .high_watermark,
+            1,
+            "the record is in the DLQ"
+        );
+    }
+
+    #[test]
+    fn an_invalid_record_whose_dlq_never_gets_a_leader_fails_the_publish_instead_of_being_dropped() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (_coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let started = Instant::now();
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the wait is bounded");
+        assert_eq!(svc.schema_dlq_write_failures_total(), 1);
+        assert_eq!(
+            svc.partition_stats(&ctx, &dlq_topic, 0)
+                .unwrap()
+                .high_watermark,
+            0
+        );
+        assert_eq!(
+            svc.partition_stats(&ctx, "orders.events", 0)
+                .unwrap()
+                .high_watermark,
+            0,
+            "the valid record is not published either: the caller retries the whole batch"
+        );
+    }
+
+    #[test]
+    fn a_dlq_led_by_another_node_still_drops_the_violation_without_failing_the_publish() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        let led_by_b = PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 1,
+        };
+        for partition in 0..8 {
+            coord
+                .topic_partition_roles
+                .lock()
+                .insert((dlq_topic.clone(), partition), led_by_b.clone());
+        }
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.schema_rejected, 0);
+        assert_eq!(result.schema_dropped, 1);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 1);
     }
 
     #[test]
@@ -23039,5 +24629,985 @@ mod tests {
         schema_registry::registry::delete(&svc.db, svc.instance_id(), "org-1", "orders", Some(1), true)
             .unwrap();
         assert_eq!(publish_note().accepted, 1, "every version withdrawn: the latest validates");
+    }
+
+    // ---- F4 B6: field policies on topics of Avro / Protobuf / Thrift messages ----
+
+    mod binary_policy {
+        use super::*;
+        use crate::bus::schema_registry::{registry, Compatibility, SchemaType};
+
+        fn names(of: &[&str]) -> std::collections::BTreeSet<String> {
+            of.iter().map(|n| n.to_string()).collect()
+        }
+
+        fn varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    return out;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        fn zz(n: i64) -> Vec<u8> {
+            varint(((n << 1) ^ (n >> 63)) as u64)
+        }
+
+        /// One format: its pattern (`a: int`, `b`, `c`: strings), the version
+        /// that adds `d: int`, and how a record with those values is written.
+        struct Case {
+            kind: SchemaType,
+            subject: &'static str,
+            v1: &'static str,
+            v2: &'static str,
+            /// The bytes of a record with a = 5, b = "bee", c = "sea" (and, from
+            /// version 2 on, d = 9), the fields in schema order.
+            write: fn(d: Option<i32>, fields: &[&str]) -> Vec<u8>,
+        }
+
+        fn proto_field(name: &str, d: Option<i32>) -> Vec<u8> {
+            match name {
+                "a" => [vec![0x08], varint(5)].concat(),
+                "b" => [vec![0x12, 3], b"bee".to_vec()].concat(),
+                "c" => [vec![0x1a, 3], b"sea".to_vec()].concat(),
+                "d" => d.map(|d| [vec![0x20], varint(d as u64)].concat()).unwrap_or_default(),
+                _ => unreachable!(),
+            }
+        }
+
+        fn thrift_field(name: &str, d: Option<i32>) -> Vec<u8> {
+            match name {
+                "a" => [vec![8, 0, 1], 5i32.to_be_bytes().to_vec()].concat(),
+                "b" => [vec![11, 0, 2], 3i32.to_be_bytes().to_vec(), b"bee".to_vec()].concat(),
+                "c" => [vec![11, 0, 3], 3i32.to_be_bytes().to_vec(), b"sea".to_vec()].concat(),
+                "d" => d
+                    .map(|d| [vec![8, 0, 4], d.to_be_bytes().to_vec()].concat())
+                    .unwrap_or_default(),
+                _ => unreachable!(),
+            }
+        }
+
+        fn avro_field(name: &str, d: Option<i32>) -> Vec<u8> {
+            match name {
+                "a" => zz(5),
+                "b" => [zz(3), b"bee".to_vec()].concat(),
+                "c" => [zz(3), b"sea".to_vec()].concat(),
+                "d" => zz(i64::from(d.unwrap_or(0))),
+                _ => unreachable!(),
+            }
+        }
+
+        const CASES: [Case; 3] = [
+            Case {
+                kind: SchemaType::Protobuf,
+                subject: "rec.proto",
+                v1: "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; }",
+                v2: "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; int32 d = 4; }",
+                write: |d, fields| {
+                    fields
+                        .iter()
+                        .flat_map(|f| proto_field(f, d))
+                        .collect()
+                },
+            },
+            Case {
+                kind: SchemaType::Thrift,
+                subject: "rec.thrift",
+                v1: "struct X { 1: required i32 a, 2: string b, 3: string c }",
+                v2: "struct X { 1: required i32 a, 2: string b, 3: string c, 4: i32 d }",
+                write: |d, fields| {
+                    let mut out: Vec<u8> = fields.iter().flat_map(|f| thrift_field(f, d)).collect();
+                    out.push(0);
+                    out
+                },
+            },
+            Case {
+                kind: SchemaType::Avro,
+                subject: "rec.avro",
+                v1: r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"string"}]}"#,
+                v2: r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"string"},{"name":"d","type":"int","default":0}]}"#,
+                write: |d, fields| fields.iter().flat_map(|f| avro_field(f, d)).collect(),
+            },
+        ];
+
+        fn setup(svc: &BusService, case: &Case, validation: topics::ValidationMode) -> BusCallContext {
+            let ctx = test_ctx("org-1");
+            registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                case.subject,
+                case.kind,
+                case.v1,
+                Some(Compatibility::None),
+                None,
+            )
+            .unwrap();
+            svc.create_topic(
+                &ctx,
+                "bytes.topic",
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    max_delivery_attempts: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some(case.subject.to_string()),
+                    validation: Some(validation),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            ctx
+        }
+
+        fn publish_bytes(svc: &BusService, ctx: &BusCallContext, payload: Vec<u8>) -> Result<PublishResult, BusServiceError> {
+            svc.publish(
+                ctx,
+                "bytes.topic",
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(payload),
+                        timestamp_ms: now_ms(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+        }
+
+        fn rule(svc: &BusService, direction: field_policies::Direction, fields: &[&str], required: &[&str]) {
+            field_policies::set_policy(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "bytes.topic",
+                "any",
+                field_policies::SUBJECT_ANY,
+                direction,
+                &names(fields),
+                &names(required),
+                &names(&[]),
+                &names(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
+            )
+            .unwrap();
+        }
+
+        fn drop_rule(svc: &BusService, direction: field_policies::Direction) {
+            field_policies::delete_policy(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "bytes.topic",
+                "any",
+                field_policies::SUBJECT_ANY,
+                direction,
+                None,
+            )
+            .unwrap();
+        }
+
+        fn peek_one(svc: &BusService, ctx: &BusCallContext, topic: &str, offset: u64) -> FetchedRecordMeta {
+            svc.peek(ctx, topic, 0, offset, 1, 4096)
+                .unwrap()
+                .records
+                .remove(0)
+        }
+
+        fn valid_under(kind: SchemaType, schema_text: &str, payload: &[u8]) {
+            let compiled = kind.ops().compile(schema_text).unwrap();
+            kind.ops()
+                .validate(&compiled, payload)
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}\n{schema_text}"));
+        }
+
+        #[test]
+        fn a_reader_sees_only_the_fields_of_its_rule_re_encoded_under_a_sub_schema() {
+            for validation in [topics::ValidationMode::Dlq, topics::ValidationMode::Warn] {
+                for case in &CASES {
+                    let (_tmp, svc) = test_service();
+                    let ctx = setup(&svc, case, validation);
+                    let full = (case.write)(None, &["a", "b", "c"]);
+                    publish_bytes(&svc, &ctx, full.clone()).unwrap();
+                    let stamp = svc
+                        .raw_record("org-1", "bytes.topic", 0, 0, &svc.topic_config("org-1", "bytes.topic").unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .schema_id;
+                    assert_ne!(stamp, 0, "a record that passed the check carries the version");
+                    let handle = svc
+                        .open_consumer(
+                            &ctx,
+                            "g1",
+                            &["bytes.topic".to_string()],
+                            ConsumerConfig { commit_mode: groups::CommitMode::Explicit },
+                        )
+                        .unwrap();
+
+                    // No rule: the record as published, under the version's own id.
+                    let open = peek_one(&svc, &ctx, "bytes.topic", 0);
+                    assert_eq!((open.payload.to_vec(), open.schema_id), (full.clone(), stamp));
+
+                    rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
+                    let expected = (case.write)(None, &["a", "c"]);
+                    let peeked = peek_one(&svc, &ctx, "bytes.topic", 0);
+                    assert_eq!(peeked.payload.to_vec(), expected, "{:?}", case.kind);
+                    assert_ne!(peeked.schema_id, 0);
+                    assert_ne!(peeked.schema_id, stamp, "the sub-schema has an id of its own");
+                    let fetched = handle.fetch(4096, 50).unwrap().records.remove(0);
+                    assert_eq!(
+                        (fetched.payload.to_vec(), fetched.schema_id),
+                        (expected.clone(), peeked.schema_id)
+                    );
+                    let listed = svc
+                        .peek_runs(&ctx, "bytes.topic", 0, &[0..1], 4096)
+                        .unwrap()
+                        .records
+                        .remove(0);
+                    assert_eq!(
+                        (listed.payload.to_vec(), listed.schema_id),
+                        (expected.clone(), peeked.schema_id)
+                    );
+
+                    // The reader gets the sub-schema under that id, and it
+                    // describes exactly the projection.
+                    let served = svc
+                        .schema_for_reader(&ctx, "bytes.topic", peeked.schema_id)
+                        .unwrap();
+                    assert!(served.derived);
+                    assert_eq!(served.version, 1);
+                    assert_eq!(served.schema_ref_id, peeked.schema_id);
+                    valid_under(case.kind, &served.schema_text, &peeked.payload);
+                    // Never the full pattern: not by its own id, not by a guess.
+                    for id in [stamp, 0, peeked.schema_id.wrapping_add(1)] {
+                        assert!(
+                            matches!(
+                                svc.schema_for_reader(&ctx, "bytes.topic", id),
+                                Err(BusServiceError::SchemaNotFound { .. })
+                            ),
+                            "{:?} id {id}",
+                            case.kind
+                        );
+                    }
+
+                    // A narrower rule: the id it was served before answers nothing.
+                    rule(&svc, field_policies::Direction::Read, &["a"], &[]);
+                    assert!(matches!(
+                        svc.schema_for_reader(&ctx, "bytes.topic", peeked.schema_id),
+                        Err(BusServiceError::SchemaNotFound { .. })
+                    ));
+                    let narrower = peek_one(&svc, &ctx, "bytes.topic", 0);
+                    assert_eq!(narrower.payload.to_vec(), (case.write)(None, &["a"]));
+
+                    // The rule goes: the registered version is served by its own id.
+                    drop_rule(&svc, field_policies::Direction::Read);
+                    let whole = svc.schema_for_reader(&ctx, "bytes.topic", stamp).unwrap();
+                    assert!(!whole.derived);
+                    assert_eq!(whole.schema_text, case.v1);
+                }
+            }
+        }
+
+        #[test]
+        fn every_record_is_read_under_the_version_it_was_written_with() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    case.subject,
+                    case.kind,
+                    case.v2,
+                    Some(Compatibility::None),
+                    None,
+                )
+                .unwrap();
+                publish_bytes(&svc, &ctx, (case.write)(Some(9), &["a", "b", "c", "d"])).unwrap();
+                rule(&svc, field_policies::Direction::Read, &["a", "d"], &[]);
+
+                let old = peek_one(&svc, &ctx, "bytes.topic", 0);
+                let new = peek_one(&svc, &ctx, "bytes.topic", 1);
+                assert_eq!(old.payload.to_vec(), (case.write)(None, &["a"]), "{:?}", case.kind);
+                assert_eq!(new.payload.to_vec(), (case.write)(Some(9), &["a", "d"]));
+                assert_ne!(old.schema_id, new.schema_id);
+                let old_schema = svc.schema_for_reader(&ctx, "bytes.topic", old.schema_id).unwrap();
+                let new_schema = svc.schema_for_reader(&ctx, "bytes.topic", new.schema_id).unwrap();
+                assert_eq!((old_schema.version, new_schema.version), (1, 2));
+                valid_under(case.kind, &old_schema.schema_text, &old.payload);
+                valid_under(case.kind, &new_schema.schema_text, &new.payload);
+                // A record of an older version is not decoded with the newer one.
+                assert!(!old_schema.schema_text.contains('d') || case.kind == SchemaType::Thrift
+                    || !old_schema.schema_text.contains("\"d\""));
+            }
+        }
+
+        #[test]
+        fn a_record_that_is_not_valid_under_the_pattern_is_withheld_not_shown() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                // `warn` lets the invalid record in, unstamped.
+                let ctx = setup(&svc, case, topics::ValidationMode::Warn);
+                let good = (case.write)(None, &["a", "b", "c"]);
+                publish_bytes(&svc, &ctx, good[..good.len() - 1].to_vec()).unwrap();
+                rule(&svc, field_policies::Direction::Read, &["a"], &[]);
+                let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert!(seen.payload.is_empty(), "{:?}", case.kind);
+                assert_eq!(seen.schema_id, 0);
+            }
+        }
+
+        #[test]
+        fn a_dlq_reader_inherits_the_rule_of_the_source_topic() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                let full = (case.write)(None, &["a", "b", "c"]);
+                publish_bytes(&svc, &ctx, full.clone()).unwrap();
+                // The record that fails validation is quarantined.
+                publish_bytes(&svc, &ctx, vec![0xff, 0xff, 0xff]).unwrap();
+                rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
+                let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert!(matches!(
+                    svc.note_delivery_failure(
+                        &ctx, "g", "bytes.topic", 0, 0, &seen,
+                        dlq::DlqReason::ConsumerError, "boom",
+                    )
+                    .unwrap(),
+                    dlq::DlqOutcome::SentToDlq { .. }
+                ));
+                let dlq = svc.peek(&ctx, "__dlq.bytes.topic", 0, 0, 10, 4096).unwrap();
+                assert_eq!(dlq.records.len(), 2);
+                let by_error: Vec<&FetchedRecordMeta> = dlq.records.iter().collect();
+                // The delivery failure keeps the published record: projected for
+                // the reader like the source topic, with its sub-schema id.
+                let projected = by_error
+                    .iter()
+                    .find(|r| !r.payload.is_empty())
+                    .expect("the valid record's projection");
+                assert_eq!(projected.payload.to_vec(), (case.write)(None, &["a", "c"]), "{:?}", case.kind);
+                assert_ne!(projected.schema_id, 0);
+                let served = svc
+                    .schema_for_reader(&ctx, "__dlq.bytes.topic", projected.schema_id)
+                    .unwrap();
+                assert!(served.derived);
+                // The quarantined garbage is not valid under any version: withheld.
+                let garbage = by_error.iter().find(|r| r.payload.is_empty()).expect("withheld");
+                assert_eq!(garbage.schema_id, 0);
+                // The DLQ error text stays hidden, like on any restricted read.
+                let hidden = |r: &FetchedRecordMeta| {
+                    r.headers
+                        .iter()
+                        .find(|(k, _)| k.as_ref() == b"dlq.error_message")
+                        .map(|(_, v)| v.is_empty())
+                };
+                assert_eq!(hidden(projected), Some(true));
+            }
+        }
+
+        #[test]
+        fn a_write_rule_checks_the_fields_a_record_sets() {
+            for case in CASES.iter().filter(|c| c.kind != SchemaType::Avro) {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Off);
+                rule(&svc, field_policies::Direction::Write, &["a", "b"], &["a"]);
+                // c is set but not allowed.
+                match publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap_err() {
+                    BusServiceError::FieldNotAllowed { fields, .. } => {
+                        assert_eq!(fields, vec!["c".to_string()], "{:?}", case.kind)
+                    }
+                    other => panic!("{:?}: {other:?}", case.kind),
+                }
+                // a is required by the rule and missing. A Thrift pattern that
+                // itself marks `a` required refuses the record as invalid first.
+                match publish_bytes(&svc, &ctx, (case.write)(None, &["b"])).unwrap_err() {
+                    BusServiceError::RequiredFieldMissing { fields, .. } => {
+                        assert_eq!(fields, vec!["a".to_string()])
+                    }
+                    BusServiceError::FieldPolicyPayloadMalformed { .. }
+                        if case.kind == SchemaType::Thrift => {}
+                    other => panic!("{:?}: {other:?}", case.kind),
+                }
+                // Not valid under the pattern at all: malformed, never unchecked.
+                let broken = (case.write)(None, &["a", "b"]);
+                assert!(matches!(
+                    publish_bytes(&svc, &ctx, broken[..broken.len() - 1].to_vec()).unwrap_err(),
+                    BusServiceError::FieldPolicyPayloadMalformed { .. }
+                ));
+                assert_eq!(
+                    publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b"])).unwrap().accepted,
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn an_avro_field_is_set_when_it_is_not_at_its_default_or_null() {
+            let (_tmp, svc) = test_service();
+            let ctx = test_ctx("org-1");
+            let schema = r#"{"type":"record","name":"X","fields":[
+                {"name":"a","type":"int"},
+                {"name":"ssn","type":["null","string"],"default":null},
+                {"name":"note","type":"string","default":"-"}]}"#;
+            registry::register(
+                &svc.db, svc.instance_id(), "org-1", "x.avro", SchemaType::Avro, schema,
+                Some(Compatibility::None), None,
+            )
+            .unwrap();
+            svc.create_topic(
+                &ctx,
+                "bytes.topic",
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some("x.avro".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // `a` has no default and is not nullable: always set, so it must be allowed.
+            rule(&svc, field_policies::Direction::Write, &["a", "note"], &["a"]);
+            let record = |ssn: Option<&str>, note: &str| {
+                [
+                    zz(5),
+                    match ssn {
+                        Some(s) => [zz(1), zz(s.len() as i64), s.as_bytes().to_vec()].concat(),
+                        None => zz(0),
+                    },
+                    [zz(note.len() as i64), note.as_bytes().to_vec()].concat(),
+                ]
+                .concat()
+            };
+            assert_eq!(publish_bytes(&svc, &ctx, record(None, "-")).unwrap().accepted, 1);
+            assert_eq!(publish_bytes(&svc, &ctx, record(None, "changed")).unwrap().accepted, 1);
+            match publish_bytes(&svc, &ctx, record(Some("90010112345"), "-")).unwrap_err() {
+                BusServiceError::FieldNotAllowed { fields, .. } => {
+                    assert_eq!(fields, vec!["ssn".to_string()])
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_preview_of_a_binary_record_is_what_the_subject_and_the_caller_both_see() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                let subject = names(&["a", "b"]);
+                let caller = names(&["a", "c"]);
+                let preview = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&subject), Some(&caller))
+                    .unwrap();
+                assert_eq!(preview.payload.to_vec(), (case.write)(None, &["a"]), "{:?}", case.kind);
+                assert_ne!(preview.schema_id, 0);
+                // `b` is shown by the subject's rule but not to the caller: the
+                // caller is not told the record sets it.
+                let shown: Vec<(String, bool)> = ["a", "c"]
+                    .iter()
+                    .map(|n| (n.to_string(), *n == "a"))
+                    .collect();
+                let mut fields = preview.fields.clone();
+                fields.sort();
+                assert_eq!(fields, shown);
+                assert!(preview.caller_withheld, "the caller does not see `b`");
+                // Subject and caller see the same fields: nothing differs
+                // between them, yet the caller's own rule still withholds `b`.
+                let same = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&caller), Some(&caller))
+                    .unwrap();
+                assert!(same.caller_withheld, "{:?}", case.kind);
+                let open_caller = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&subject), None)
+                    .unwrap();
+                assert!(!open_caller.caller_withheld, "{:?}", case.kind);
+                // No rule at all: the record as it is.
+                let open = svc
+                    .preview_binary_record(&ctx, "bytes.topic", 0, 0, None, None)
+                    .unwrap();
+                assert_eq!(open.payload.to_vec(), (case.write)(None, &["a", "b", "c"]));
+            }
+        }
+
+        fn update_validation(
+            svc: &BusService,
+            ctx: &BusCallContext,
+            mode: topics::ValidationMode,
+        ) -> Result<topics::TopicConfig, BusServiceError> {
+            svc.update_topic(
+                ctx,
+                "bytes.topic",
+                topics::TopicOptions {
+                    validation: Some(mode),
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn try_rule(
+            svc: &BusService,
+            direction: field_policies::Direction,
+            fields: &[&str],
+        ) -> Result<(), BusServiceError> {
+            field_policies::set_policy(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "bytes.topic",
+                "any",
+                field_policies::SUBJECT_ANY,
+                direction,
+                &names(fields),
+                &names(&[]),
+                &names(&[]),
+                &names(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
+            )
+        }
+
+        #[test]
+        fn a_rule_cannot_show_a_field_that_reaches_the_message_itself_and_such_a_version_withholds_its_records(
+        ) {
+            for case in &CASES {
+                // The version in which `c` holds a whole `X`, `b` included.
+                let recursive = match case.kind {
+                    SchemaType::Protobuf => {
+                        "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; X c = 3; }"
+                    }
+                    SchemaType::Thrift => {
+                        "struct X { 1: required i32 a, 2: string b, 3: optional X c }"
+                    }
+                    _ => {
+                        r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":["null","X"],"default":null}]}"#
+                    }
+                };
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                // Fine while `c` is a string.
+                rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
+                registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    case.subject,
+                    case.kind,
+                    recursive,
+                    Some(Compatibility::None),
+                    None,
+                )
+                .unwrap();
+                let mut nested = (case.write)(None, &["a", "b"]);
+                if case.kind == SchemaType::Avro {
+                    nested.extend(zz(0));
+                }
+                publish_bytes(&svc, &ctx, nested.clone()).unwrap();
+
+                // The rule is not accepted again, in either direction.
+                for direction in [
+                    field_policies::Direction::Read,
+                    field_policies::Direction::Write,
+                ] {
+                    match try_rule(&svc, direction, &["a", "c"]).unwrap_err() {
+                        BusServiceError::InvalidArgument(reason) => {
+                            assert!(
+                                reason.contains("field 'c' refers back"),
+                                "{:?}: {reason}",
+                                case.kind
+                            )
+                        }
+                        other => panic!("{:?}: {other:?}", case.kind),
+                    }
+                }
+                // The stored rule still reads the record written before: its
+                // version has no such field. The record of the new version,
+                // whose `c` holds a whole `X`, is withheld, not passed on with
+                // the bytes of the fields the rule hides.
+                let old = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert_eq!(
+                    old.payload.to_vec(),
+                    (case.write)(None, &["a", "c"]),
+                    "{:?}",
+                    case.kind
+                );
+                let new = peek_one(&svc, &ctx, "bytes.topic", 1);
+                assert!(new.payload.is_empty(), "{:?}", case.kind);
+                assert_eq!(new.schema_id, 0);
+                // A rule that shows everything is fine where a record holds
+                // declared fields only (Avro); where it may carry a field a
+                // newer version added (Protobuf, Thrift) it still leaves that
+                // out of the nested copy of the message. Leaving `c` out is
+                // fine everywhere.
+                if case.kind == SchemaType::Avro {
+                    rule(&svc, field_policies::Direction::Read, &["a", "b", "c"], &[]);
+                    assert_eq!(
+                        peek_one(&svc, &ctx, "bytes.topic", 1).payload.to_vec(),
+                        nested
+                    );
+                } else {
+                    assert!(
+                        try_rule(&svc, field_policies::Direction::Read, &["a", "b", "c"]).is_err(),
+                        "{:?}",
+                        case.kind
+                    );
+                }
+                rule(&svc, field_policies::Direction::Read, &["a", "b"], &[]);
+                assert_eq!(
+                    peek_one(&svc, &ctx, "bytes.topic", 1).payload.to_vec(),
+                    (case.write)(None, &["a", "b"])
+                );
+            }
+        }
+
+        #[test]
+        fn a_refused_derivation_is_remembered_and_the_record_stays_withheld() {
+            for case in &CASES {
+                let recursive = match case.kind {
+                    SchemaType::Protobuf => {
+                        "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; X c = 3; }"
+                    }
+                    SchemaType::Thrift => {
+                        "struct X { 1: required i32 a, 2: string b, 3: optional X c }"
+                    }
+                    _ => {
+                        r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":["null","X"],"default":null}]}"#
+                    }
+                };
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
+                registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    case.subject,
+                    case.kind,
+                    recursive,
+                    Some(Compatibility::None),
+                    None,
+                )
+                .unwrap();
+                let mut nested = (case.write)(None, &["a", "b"]);
+                if case.kind == SchemaType::Avro {
+                    nested.extend(zz(0));
+                }
+                publish_bytes(&svc, &ctx, nested).unwrap();
+                assert_eq!(svc.binary_projector.derivation_refusals_cached(), 0);
+                for _ in 0..3 {
+                    let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                    assert!(seen.payload.is_empty(), "{:?}", case.kind);
+                }
+                assert_eq!(
+                    svc.binary_projector.derivation_refusals_cached(),
+                    1,
+                    "{:?}: one refusal, however many reads",
+                    case.kind
+                );
+            }
+        }
+
+        #[test]
+        fn a_record_without_a_version_stamp_is_withheld_not_read_with_the_current_version() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Off);
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                update_validation(&svc, &ctx, topics::ValidationMode::Dlq).unwrap();
+                rule(&svc, field_policies::Direction::Read, &["a"], &[]);
+                let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert!(seen.payload.is_empty(), "{:?}", case.kind);
+                assert_eq!(seen.schema_id, 0);
+            }
+        }
+
+        #[test]
+        fn a_pattern_that_reorders_its_fields_does_not_make_an_unstamped_record_read_as_another_field(
+        ) {
+            let v1 = r#"{"type":"record","name":"X","fields":[{"name":"ssn","type":"string"},{"name":"note","type":"string"}]}"#;
+            let v2 = r#"{"type":"record","name":"X","fields":[{"name":"note","type":"string"},{"name":"ssn","type":"string"}]}"#;
+            let (_tmp, svc) = test_service();
+            let ctx = test_ctx("org-1");
+            let register = |text: &str| {
+                registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    "ssn.avro",
+                    SchemaType::Avro,
+                    text,
+                    Some(Compatibility::Backward),
+                    None,
+                )
+                .unwrap()
+            };
+            register(v1);
+            svc.create_topic(
+                &ctx,
+                "bytes.topic",
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some("ssn.avro".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Written while the topic checked nothing: no version stamp.
+            let record = [
+                [zz(11), b"90010112345".to_vec()].concat(),
+                [zz(4), b"note".to_vec()].concat(),
+            ]
+            .concat();
+            publish_bytes(&svc, &ctx, record).unwrap();
+            update_validation(&svc, &ctx, topics::ValidationMode::Dlq).unwrap();
+            // The reordered version is compatible and the old record is valid
+            // under it, with `note` made of the bytes of `ssn`.
+            register(v2);
+            rule(&svc, field_policies::Direction::Read, &["note"], &[]);
+            let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+            assert!(seen.payload.is_empty(), "{:?}", seen.payload);
+        }
+
+        #[test]
+        fn a_read_rule_needs_the_topic_to_validate_and_a_topic_with_one_cannot_stop_validating() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Off);
+                match try_rule(&svc, field_policies::Direction::Read, &["a"]).unwrap_err() {
+                    BusServiceError::InvalidArgument(reason) => assert!(
+                        reason.contains(field_policies::BINARY_TOPIC_READ_NEEDS_VALIDATION),
+                        "{:?}: {reason}",
+                        case.kind
+                    ),
+                    other => panic!("{:?}: {other:?}", case.kind),
+                }
+                // A write rule judges the record on the way in: no stamp needed.
+                try_rule(&svc, field_policies::Direction::Write, &["a", "b", "c"]).unwrap();
+                update_validation(&svc, &ctx, topics::ValidationMode::Warn).unwrap();
+                try_rule(&svc, field_policies::Direction::Read, &["a"]).unwrap();
+                match update_validation(&svc, &ctx, topics::ValidationMode::Off).unwrap_err() {
+                    BusServiceError::InvalidTopicConfig { reason } => assert!(
+                        reason.contains(field_policies::BINARY_TOPIC_READ_NEEDS_VALIDATION),
+                        "{:?}: {reason}",
+                        case.kind
+                    ),
+                    other => panic!("{:?}: {other:?}", case.kind),
+                }
+                drop_rule(&svc, field_policies::Direction::Read);
+                update_validation(&svc, &ctx, topics::ValidationMode::Off).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_topic_already_off_with_a_read_rule_accepts_an_update_that_leaves_validation_alone() {
+            let (_tmp, svc) = test_service();
+            let case = &CASES[0];
+            let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+            rule(&svc, field_policies::Direction::Read, &["a"], &[]);
+            // A topic as it was before the refusal existed: validation off
+            // under a read rule.
+            svc.db
+                .write()
+                .unwrap()
+                .execute(
+                    "UPDATE bus_topics SET validation='off' WHERE name='bytes.topic'",
+                    [],
+                )
+                .unwrap();
+            svc.invalidate_topic_config_cache("org-1", "bytes.topic");
+            let updated = svc
+                .update_topic(
+                    &ctx,
+                    "bytes.topic",
+                    topics::TopicOptions {
+                        retention_ms: Some(3_600_000),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(updated.retention_ms, 3_600_000);
+            assert_eq!(updated.validation, topics::ValidationMode::Off);
+            // Touching validation itself is still refused.
+            assert!(update_validation(&svc, &ctx, topics::ValidationMode::Off).is_err());
+        }
+
+        #[test]
+        fn a_write_rule_that_no_record_can_satisfy_is_refused() {
+            let (_tmp, svc) = test_service();
+            let case = &CASES[2];
+            setup(&svc, case, topics::ValidationMode::Dlq);
+            // `a`, `b` and `c` have no default and are not nullable: every
+            // record sets them.
+            match try_rule(&svc, field_policies::Direction::Write, &["a"]).unwrap_err() {
+                BusServiceError::InvalidArgument(reason) => {
+                    assert!(reason.contains("field 'b'"), "{reason}")
+                }
+                other => panic!("{other:?}"),
+            }
+            try_rule(&svc, field_policies::Direction::Write, &["a", "b", "c"]).unwrap();
+        }
+
+        #[test]
+        fn a_write_rule_does_not_stop_the_dead_letter_of_a_failed_delivery() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                rule(
+                    &svc,
+                    field_policies::Direction::Write,
+                    &["a", "b", "c"],
+                    &[],
+                );
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert!(
+                    matches!(
+                        svc.note_delivery_failure(
+                            &ctx,
+                            "g",
+                            "bytes.topic",
+                            0,
+                            0,
+                            &seen,
+                            dlq::DlqReason::ConsumerError,
+                            "boom",
+                        )
+                        .unwrap_or_else(|e| panic!("{:?}: {e}", case.kind)),
+                        dlq::DlqOutcome::SentToDlq { .. }
+                    ),
+                    "{:?}",
+                    case.kind
+                );
+                let dead = svc.peek(&ctx, "__dlq.bytes.topic", 0, 0, 10, 4096).unwrap();
+                assert_eq!(dead.records.len(), 1);
+            }
+        }
+
+        #[test]
+        fn a_write_rule_is_not_bypassed_by_publishing_to_the_dead_letter_topic() {
+            for case in &CASES {
+                let (_tmp, svc) = test_service();
+                let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+                rule(
+                    &svc,
+                    field_policies::Direction::Write,
+                    &["a", "b", "c"],
+                    &[],
+                );
+                // The broker's own dead letter lands (and creates the topic).
+                publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+                let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
+                assert!(
+                    matches!(
+                        svc.note_delivery_failure(
+                            &ctx,
+                            "g",
+                            "bytes.topic",
+                            0,
+                            0,
+                            &seen,
+                            dlq::DlqReason::ConsumerError,
+                            "boom",
+                        )
+                        .unwrap_or_else(|e| panic!("{:?}: {e}", case.kind)),
+                        dlq::DlqOutcome::SentToDlq { .. }
+                    ),
+                    "{:?}",
+                    case.kind
+                );
+                // Version 2 adds `d`, which the rule does not allow.
+                registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    case.subject,
+                    case.kind,
+                    case.v2,
+                    Some(Compatibility::None),
+                    None,
+                )
+                .unwrap();
+                let forbidden = (case.write)(Some(9), &["a", "b", "c", "d"]);
+                assert!(
+                    matches!(
+                        publish_bytes(&svc, &ctx, forbidden.clone()),
+                        Err(BusServiceError::FieldNotAllowed { .. })
+                    ),
+                    "{:?}: the rule refuses the record on its own topic",
+                    case.kind
+                );
+                let direct = svc.publish(
+                    &ctx,
+                    "__dlq.bytes.topic",
+                    PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![PublishRecord {
+                            key: None,
+                            headers: vec![],
+                            payload: Bytes::from(forbidden),
+                            timestamp_ms: now_ms(),
+                            schema_id: 0,
+                        }],
+                    },
+                );
+                assert!(
+                    matches!(direct, Err(BusServiceError::PermissionDenied { .. })),
+                    "{:?}: {direct:?}",
+                    case.kind
+                );
+            }
+        }
+
+        #[test]
+        fn guessing_sub_schema_ids_costs_one_scan_of_the_versions_not_one_per_guess() {
+            let (_tmp, svc) = test_service();
+            let case = &CASES[2];
+            let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+            publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+            rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
+            let id = peek_one(&svc, &ctx, "bytes.topic", 0).schema_id;
+            // As after a restart: nothing remembers where the id came from.
+            svc.binary_projector.forget_sources();
+            assert!(
+                svc.schema_for_reader(&ctx, "bytes.topic", id)
+                    .unwrap()
+                    .derived
+            );
+            let before = svc.binary_projector.scans_run();
+            for guess in 1..=40u32 {
+                assert!(matches!(
+                    svc.schema_for_reader(&ctx, "bytes.topic", id ^ (guess << 8)),
+                    Err(BusServiceError::SchemaNotFound { .. })
+                ));
+            }
+            // A registry change elsewhere may add a scan, never one per guess.
+            let spent = svc.binary_projector.scans_run() - before;
+            assert!(spent <= 3, "{spent} scans for 40 guesses");
+            assert!(
+                svc.schema_for_reader(&ctx, "bytes.topic", id)
+                    .unwrap()
+                    .derived
+            );
+        }
+
+        #[test]
+        fn a_topic_without_a_rule_costs_no_projection_state() {
+            let (_tmp, svc) = test_service();
+            let case = &CASES[0];
+            let ctx = setup(&svc, case, topics::ValidationMode::Dlq);
+            publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b", "c"])).unwrap();
+            let _ = peek_one(&svc, &ctx, "bytes.topic", 0);
+            assert!(svc.binary_projector.is_untouched());
+        }
     }
 }

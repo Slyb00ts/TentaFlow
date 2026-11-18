@@ -28,15 +28,17 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import { T, fmtCount } from '/js/modules/tentabus/format.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
+import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import {
   SUBJECT_KINDS, DIRECTIONS, ANY_ID, whoTitle, whoSub, fieldPhrase, ruleFacts, actionOptions, blankForm, formFromRule, serializeForm,
-  parseForm, formProblem, typedProblems, readActionList, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
+  parseForm, formProblem, typedProblems, readActionList, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys, binaryWarnings, staleFields,
 } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-tag-input.js';
+import '/js/components/tf-alert.js';
 
 /** A list longer than this gets a search box over its rows. */
 const SEARCH_FROM = 12;
@@ -48,6 +50,7 @@ const typedHint = { hl7v2: 'hiding.extra.hint_hl7', xml: 'hiding.extra.hint_xml'
 // ---------------------------------------------------------------------------
 
 function sourceNote(source) {
+  if (source.mode === 'binary') return T('hiding.source.binary', { name: source.subject, version: source.version ?? '', format: schemaFormatLabel(source.binaryFormat) });
   if (source.xsd && source.mode === 'manual') return T('hiding.source.xsd');
   if (source.complex) return T('hiding.source.complex');
   if (source.mode === 'schema') return T('hiding.source.schema', { name: source.subject, version: source.version });
@@ -74,6 +77,8 @@ function fieldsHtml(source) {
     </div>
     <div class="muted" data-role="source-note">${escapeHtml(sourceNote(source))}</div>
     <div class="tb-explain-box" data-role="actions-note" hidden></div>
+    <tf-alert tone="warning" data-role="binary-warn" title="${escapeAttr(T('hiding.binary.warn_title'))}" message="" hidden></tf-alert>
+    <div class="muted" data-role="stale-note" hidden></div>
     <div data-role="extras"></div>
     <div class="muted" data-role="unlisted-note"></div>`;
 }
@@ -92,22 +97,36 @@ function extraHtml(role, label, hint) {
  * Draws the rows and the typed-in lists of `direction` with the values of
  * `form`; `sync` is called on every change.
  */
-function paintFields(win, { direction, form, source, format, fieldActions, sync }) {
+function paintFields(win, { direction, form, source, format, fieldActions, stale = [], sync }) {
+  const binary = source.mode === 'binary';
   const rows = win.querySelector('[data-role="rows"]');
   rows.innerHTML = source.fields.map(rowHtml).join('');
+  const warn = win.querySelector('[data-role="binary-warn"]');
+  const paintWarn = () => {
+    const actions = Object.create(null);
+    for (const seg of rows.querySelectorAll('tf-segmented[data-field]')) actions[seg.getAttribute('data-field')] = seg.value || '';
+    const lines = binaryWarnings({ direction, form: { actions }, source });
+    warn.setAttribute('message', lines.join(' '));
+    warn.hidden = lines.length === 0;
+  };
   for (const seg of rows.querySelectorAll('tf-segmented[data-field]')) {
-    seg.setOptions(actionOptions(direction, fieldActions), form.actions[seg.getAttribute('data-field')]);
-    seg.addEventListener('change', sync);
+    seg.setOptions(actionOptions(direction, fieldActions, binary), form.actions[seg.getAttribute('data-field')]);
+    seg.addEventListener('change', () => { paintWarn(); sync(); });
   }
+  paintWarn();
+  const staleNote = win.querySelector('[data-role="stale-note"]');
+  staleNote.textContent = stale.length ? T('hiding.binary.stale', { fields: stale.map(showHidden).join(', '), n: stale.length }) : '';
+  staleNote.hidden = stale.length === 0;
   filterRows(win);
   const listed = source.fields.length > 0;
   const read = direction === 'read';
-  const offered = read ? readActionList(fieldActions) : [];
+  const offered = read && !binary ? readActionList(fieldActions) : [];
   const hint = T(typedHint[format]);
-  const extras = [extraHtml('extra-shown', T(`hiding.extra.${read ? 'shown' : 'allowed'}${listed ? '' : '_typed'}`), hint)];
+  // Every field a rule on a binary topic may name is in the list: nothing is typed in.
+  const extras = binary ? [] : [extraHtml('extra-shown', T(`hiding.extra.${read ? 'shown' : 'allowed'}${listed ? '' : '_typed'}`), hint)];
   if (offered.includes('mask')) extras.push(extraHtml('extra-masked', T(`hiding.extra.masked${listed ? '' : '_typed'}`), hint));
   if (offered.includes('hash')) extras.push(extraHtml('extra-hashed', T(`hiding.extra.hashed${listed ? '' : '_typed'}`), hint));
-  if (!read) extras.push(extraHtml('extra-required', T('hiding.extra.required'), hint));
+  if (!read && !binary) extras.push(extraHtml('extra-required', T('hiding.extra.required'), hint));
   const host = win.querySelector('[data-role="extras"]');
   host.innerHTML = extras.join('');
   for (const [role, tags] of [['extra-shown', form.extraShown], ['extra-masked', form.extraMasked], ['extra-hashed', form.extraHashed], ['extra-required', form.extraRequired]]) {
@@ -115,7 +134,7 @@ function paintFields(win, { direction, form, source, format, fieldActions, sync 
     if (input) input.tags = tags;
   }
   const note = win.querySelector('[data-role="actions-note"]');
-  note.innerHTML = actionsNoteHtml(offered, format);
+  note.innerHTML = binary ? binaryNoteHtml(direction, source) : actionsNoteHtml(offered, format);
   note.hidden = !note.innerHTML;
   const typedChanged = () => {
     markTyped(win, format);
@@ -126,7 +145,24 @@ function paintFields(win, { direction, form, source, format, fieldActions, sync 
   // A HL7 writing rule also accepts the unnamed positions of the listed segments.
   const unlisted = direction === 'write' && source.implicit.length ? 'write_hl7' : direction;
   // A pattern that closes itself has no fields outside the list to warn about.
-  win.querySelector('[data-role="unlisted-note"]').textContent = listed && !source.complete ? T(`hiding.unlisted.${unlisted}`) : '';
+  win.querySelector('[data-role="unlisted-note"]').textContent = listed && !source.complete ? T(`hiding.unlisted.${binary ? `${direction}_binary` : unlisted}`) : '';
+}
+
+/**
+ * What a rule means on a binary topic, said once above the fields: reading
+ * removes a field from the message (it cannot be masked or hashed), and a
+ * reader with a rule gets the message encoded under a sub-schema; writing
+ * counts a field as set the way the format does (Avro: not the default or null).
+ */
+export function binaryNoteHtml(direction, source) {
+  const lines = direction === 'read'
+    ? [
+      `<div><b>${escapeHtml(T('hiding.action.hide'))}</b> — ${escapeHtml(T('hiding.binary.hide_means'))}</div>`,
+      `<div class="muted">${escapeHtml(T('hiding.binary.mask_hash_off'))}</div>`,
+      `<div class="muted">${escapeHtml(T('hiding.binary.read_subschema'))}</div>`,
+    ]
+    : [`<div>${escapeHtml(T(`hiding.binary.write_${source.binaryFormat}`))}</div>`];
+  return lines.join('');
 }
 
 /**
@@ -387,7 +423,7 @@ export function openHidingChange(row, ctx) {
       </div>
       ${fieldsHtml(source)}`,
     wire: (w, sync) => {
-      paintFields(w, { direction: row.direction, form: stored, source, format, fieldActions: ctx.fieldActions, sync });
+      paintFields(w, { direction: row.direction, form: stored, source, format, fieldActions: ctx.fieldActions, stale: staleFields(row, source), sync });
       w.querySelector('[data-role="field-search"]')?.addEventListener('search', () => filterRows(w));
     },
     draft: (w) => ({ form: readSerialized(w, source, stored.hiddenImplicit) }),

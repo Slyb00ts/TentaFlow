@@ -265,10 +265,18 @@ pub async fn run_flow_turn(
         Some(owner) => FlowActor::user(owner),
         None => FlowActor::system_component(meeting_id.clone()),
     };
-    let mut req_meta = FlowRequestMeta::new(request_id.clone(), FlowOrigin::Meeting, actor);
+    // The run is keyed by an id the server mints. The sidecar's `request_id`
+    // names the reverse stream the chunks go back on and nothing else: it is a
+    // peer's value, and two meetings could send the same one.
+    let mut req_meta = FlowRequestMeta::new(
+        format!("meeting-{}", uuid::Uuid::new_v4()),
+        FlowOrigin::Meeting,
+        actor,
+    );
     req_meta.user_id = session.owner_user_id.clone();
     req_meta.session_id = Some(meeting_id.clone());
     req_meta.deadline = Some(Instant::now() + TURN_DEADLINE);
+    crate::routing::start_recording(&mut req_meta, Some(&db), None);
     let cancel = req_meta.cancel_token.clone();
     // Armed for the whole turn: if the reverse stream breaks, the listener
     // aborts this task and the guard's Drop cancels the flow. Without it a
@@ -801,6 +809,11 @@ pub(crate) fn dispatch_error_chunk(e: &DispatchError) -> StreamChunkType {
         DispatchError::Denied { .. } => error_chunk(ErrorType::InvalidRequest, &e.to_string()),
         DispatchError::CompileFailed { .. } => {
             error_chunk(ErrorType::InvalidRequest, &e.to_string())
+        }
+        // The message starts with the stable `sla.overloaded` code and carries
+        // the retry delay, so the bot can wait instead of retrying blindly.
+        DispatchError::Overloaded { .. } | DispatchError::BackendBusy { .. } => {
+            error_chunk(ErrorType::RateLimitExceeded, &e.to_string())
         }
         other => error_chunk(ErrorType::InternalError, &other.to_string()),
     }

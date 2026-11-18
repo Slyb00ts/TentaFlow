@@ -94,6 +94,7 @@ pub(crate) fn agent_model(implementation: ServiceImplementation) -> ProcessModel
         .find(|node| node.id == "Service")
         .unwrap();
     node.kind = ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: String::new(),
         input_mapping: BTreeMap::new(),
         output_mapping: BTreeMap::new(),

@@ -35,6 +35,7 @@ pub mod routing;
 pub mod scheduler;
 pub mod services;
 pub mod services_repo;
+pub mod sla;
 pub mod skills;
 pub mod skills_hub;
 pub mod stt;
@@ -81,6 +82,7 @@ pub mod tentanas;
 pub mod tentavm;
 pub mod system_check;
 pub mod tentaquant;
+pub mod bootstrap;
 
 #[cfg(target_os = "windows")]
 pub mod firewall_check;

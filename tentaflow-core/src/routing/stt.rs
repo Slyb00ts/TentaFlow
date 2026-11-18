@@ -318,6 +318,14 @@ impl Router {
                             Err(ExecutorError::SttServiceUnavailable) => {
                                 Err(crate::error::CoreError::SttServiceUnavailable.into())
                             }
+                            Err(ExecutorError::Busy {
+                                backend,
+                                retry_after_ms,
+                            }) => Err(crate::error::CoreError::BackendBusy {
+                                backend,
+                                retry_after_ms,
+                            }
+                            .into()),
                             Err(e) => Err(crate::error::CoreError::InternalError {
                                 message: format!("executor.execute_stt: {}", e),
                                 source: None,

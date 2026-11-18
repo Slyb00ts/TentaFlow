@@ -13,6 +13,8 @@ void tentaflow_mobile_start(void);
 void tentaflow_on_pause(void);
 void tentaflow_on_resume(void);
 void tentaflow_on_memory_warning(void);
+// Graceful shutdown before the process exits; blocks for at most ~4 s.
+void tentaflow_on_terminate(void);
 
 // =============================================================================
 // LAN discovery — Swift NWBrowser -> Rust iroh mesh

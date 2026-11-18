@@ -53,6 +53,10 @@ pub struct StampedProgressEvent {
     /// Epoch milliseconds — the unit `run_events.at_ms` stores.
     pub at_ms: i64,
     pub event: ProgressEvent,
+    /// The run scope an event was mirrored from, set only on copies delivered to
+    /// a session key. A subscriber of a session key sees many runs one after
+    /// another; this is what tells it which one an event belongs to.
+    pub run_scope: Option<String>,
 }
 
 /// Capacity of each per-scope broadcast ring. A slow subscriber that lags past
@@ -70,8 +74,9 @@ const SCOPE_CHANNEL_CAPACITY: usize = 256;
 /// authorization — and the log copies the binding instead of deriving anything
 /// from the event (invariant 1).
 ///
-/// This is NOT an authorization token and must never be used as one: the ACL
-/// that decides who may subscribe stays `session_owners`. A rebinding is still
+/// This is NOT an authorization token and must never be used as one: who may
+/// subscribe is decided by the scope key itself (see [`session_scope_key`]),
+/// never by this binding. A rebinding is still
 /// allowed — one session scope carries many runs one after another, each with
 /// its own `request_id` — but only WITHIN ONE PRINCIPAL, see
 /// [`ProgressBroker::bind_run_provenance`].
@@ -86,6 +91,8 @@ pub struct RunProvenance {
     pub org_id: Option<String>,
     pub correlation_id: Option<String>,
     pub session_id: Option<String>,
+    /// The bus record that triggered the run, for a `FlowOrigin::Bus` run.
+    pub bus_source: Option<crate::events::store::BusRecordRef>,
     /// WHAT the run executes, the other half of the accountability question
     /// (§2.8: "which actor, from which origin, against which model"). Minted by
     /// the dispatcher at the same instant as this binding — see
@@ -162,6 +169,7 @@ impl RunProvenance {
             org_id: meta.org_id.clone(),
             correlation_id: meta.correlation_id.clone(),
             session_id: meta.session_id.clone(),
+            bus_source: meta.bus_source.clone(),
             descriptor,
         }
     }
@@ -179,9 +187,10 @@ impl RunProvenance {
 
 /// What a scope's provenance slot holds.
 ///
-/// The extra state is not bookkeeping: a broadcast scope is keyed by the
-/// session id, which on the foreground path is a value the CLIENT supplies
-/// (`stream_handlers`: `meta.session_id = invoke.session_id`). Two principals
+/// The extra state is not bookkeeping: a broadcast scope can be keyed by the
+/// session id, which on a foreground path that does not mint its own scope is
+/// a value the CLIENT supplies (chat runs mint one, see
+/// `FlowRequestMeta::record_to_event_log`). Two principals
 /// can therefore end up publishing into one ring, and a `ProgressEvent` carries
 /// nothing that says which run it came from — so once that has happened, no
 /// stamp the log could apply to the events still in flight is known to be the
@@ -221,6 +230,12 @@ pub fn begin_run(meta: &FlowRequestMeta, descriptor: RunDescriptor) {
     }
     let scope = meta.progress_scope();
     let broker = global_broker();
+    if let (Some(session_id), Some(user_id)) = (
+        meta.session_id.as_deref(),
+        meta.user_id.as_deref().or(meta.actor_user_id.as_deref()),
+    ) {
+        broker.mirror_run_to_session(&scope, &session_scope_key(user_id, session_id));
+    }
     broker.bind_run_provenance(&scope, RunProvenance::from_meta(meta, descriptor));
     if !crate::events::progress_log::attach_scope(&scope) {
         // Nothing is watching this scope and nothing will: a headless build
@@ -233,22 +248,26 @@ pub fn begin_run(meta: &FlowRequestMeta, descriptor: RunDescriptor) {
     }
 }
 
+/// The broadcast key of a conversation's live view for ONE principal. The
+/// conversation id is chosen by the client (low entropy, shared by nothing the
+/// server can vouch for), so it never addresses a scope by itself: the key is
+/// derived from the authenticated principal and the id, which makes another
+/// user's view of the same id a different key rather than a binding to defend.
+pub fn session_scope_key(principal: &str, session_id: &str) -> String {
+    format!("session:{principal}:{session_id}")
+}
+
 /// Per-scope broadcast registry. A scope is a session id or a run id. Senders
 /// are created lazily on first publish/subscribe and dropped when the last
 /// subscriber goes away AND no fresh event arrives — see `prune_if_idle`.
 pub struct ProgressBroker {
     scopes: DashMap<String, broadcast::Sender<StampedProgressEvent>>,
-    /// §3.3 ACL — server-side binding of a session-scope key to the principal
-    /// that started the flow under it. A `Session` event scope is the
-    /// client-minted conversation id (low entropy, time-correlated); it MUST
-    /// NOT double as an authorization token. The dispatch layer records the
-    /// owner here when a foreground flow starts, and `authorize_scope` rejects a
-    /// `Session` subscription whose key is unbound or owned by a different
-    /// principal (admin bypass). Without this, any authenticated user could
-    /// guess/observe another user's session id and read their harness activity
-    /// (UserQuestion / PermissionRequest / RouterDecision) — cross-principal
-    /// leak (OWASP A01).
-    session_owners: DashMap<String, String>,
+    /// Run scope -> the session-scope key its events are also delivered to,
+    /// set by [`begin_run`] for a run whose conversation has a live view and
+    /// dropped when the run's `RunFinished` is published. The run records under
+    /// its own server-minted scope; this is how the chat's activity view, which
+    /// subscribes by session, still sees it.
+    session_mirrors: DashMap<String, String>,
     /// §2.5 — server-minted provenance of the run executing under each scope,
     /// bound by [`begin_run`] and read by the event-log subscriber. Bounded by
     /// the number of live subscribers: `begin_run` gives the entry back when no
@@ -260,7 +279,7 @@ impl ProgressBroker {
     pub fn new() -> Self {
         Self {
             scopes: DashMap::new(),
-            session_owners: DashMap::new(),
+            session_mirrors: DashMap::new(),
             run_provenance: DashMap::new(),
         }
     }
@@ -316,26 +335,16 @@ impl ProgressBroker {
         self.run_provenance.remove(scope);
     }
 
-    /// Binds a session-scope key to the principal that started a flow under it.
-    /// Called from the foreground dispatch path with the authenticated
-    /// `user_id`. Idempotent re-binding to the same owner is a no-op; a session
-    /// id is owned by the first principal to claim it, so a second principal
-    /// cannot hijack an in-flight session scope by re-dispatching under the same
-    /// id (the binding is only cleared by `release_session_owner`).
-    pub fn bind_session_owner(&self, session_id: &str, user_id: &str) {
-        if session_id.is_empty() || user_id.is_empty() {
+    /// Delivers everything published on `run_scope` to `session_key` as well,
+    /// until the run's `RunFinished`. `session_key` comes from
+    /// [`session_scope_key`], so it already belongs to the principal who started
+    /// the run.
+    pub fn mirror_run_to_session(&self, run_scope: &str, session_key: &str) {
+        if run_scope.is_empty() || session_key.is_empty() || run_scope == session_key {
             return;
         }
-        self.session_owners
-            .entry(session_id.to_string())
-            .or_insert_with(|| user_id.to_string());
-    }
-
-    /// Returns the principal that owns a session-scope key, if bound.
-    pub fn session_owner(&self, session_id: &str) -> Option<String> {
-        self.session_owners
-            .get(session_id)
-            .map(|o| o.value().clone())
+        self.session_mirrors
+            .insert(run_scope.to_string(), session_key.to_string());
     }
 
     /// Subscribe to a scope's progress stream. Creates the channel if absent so
@@ -358,15 +367,40 @@ impl ProgressBroker {
     /// live receivers, `send` returns `Err` (no receivers); we drop the entry
     /// so the map does not grow unbounded across runs.
     pub fn publish(&self, scope: &str, event: ProgressEvent) {
-        let Some(tx) = self.scopes.get(scope) else {
-            return;
-        };
         // The stamp is taken HERE, still inside the emitter's own call, and
         // never by whoever pulls the event out of the ring — see
         // [`StampedProgressEvent`].
         let stamped = StampedProgressEvent {
             at_ms: now_ms(),
             event,
+            run_scope: None,
+        };
+        let mirror = self.session_mirrors.get(scope).map(|m| m.value().clone());
+        if let Some(session_key) = mirror {
+            // The live view has no use for a step's content (the wire drops it),
+            // so the bodies are never copied for it, and nothing is copied at
+            // all while nobody watches the conversation.
+            let wanted = !matches!(stamped.event, ProgressEvent::NodeIo { .. })
+                && self.subscriber_count(&session_key) > 0;
+            if wanted {
+                self.deliver(
+                    &session_key,
+                    StampedProgressEvent {
+                        run_scope: Some(scope.to_string()),
+                        ..stamped.clone()
+                    },
+                );
+            }
+            if matches!(stamped.event, ProgressEvent::RunFinished { .. }) {
+                self.session_mirrors.remove(scope);
+            }
+        }
+        self.deliver(scope, stamped);
+    }
+
+    fn deliver(&self, scope: &str, stamped: StampedProgressEvent) {
+        let Some(tx) = self.scopes.get(scope) else {
+            return;
         };
         if tx.send(stamped).is_err() {
             // No live receivers — drop the sender lock before removing to avoid
@@ -563,19 +597,37 @@ mod tests {
         assert_eq!(broker.subscriber_count("session-2"), 0);
     }
 
-    #[test]
-    fn session_owner_binds_first_principal_and_rejects_hijack() {
-        let broker = ProgressBroker::new();
-        assert_eq!(broker.session_owner("s1"), None);
-        broker.bind_session_owner("s1", "user-a");
-        assert_eq!(broker.session_owner("s1").as_deref(), Some("user-a"));
-        // A second principal cannot steal an in-flight session scope.
-        broker.bind_session_owner("s1", "user-b");
-        assert_eq!(broker.session_owner("s1").as_deref(), Some("user-a"));
-        // Empty inputs never create a binding.
-        broker.bind_session_owner("", "user-c");
-        broker.bind_session_owner("s2", "");
-        assert_eq!(broker.session_owner("s2"), None);
+    #[tokio::test]
+    async fn a_run_is_mirrored_to_its_session_until_it_finishes() {
+        let broker = Arc::new(ProgressBroker::new());
+        let key = session_scope_key("user-a", "conv");
+        let mut session_rx = broker.subscribe(&key);
+        let mut other_rx = broker.subscribe(&session_scope_key("user-b", "conv"));
+        broker.mirror_run_to_session("run-1", &key);
+        let question = ProgressEvent::UserQuestion {
+            run_id: "run-1".into(),
+            interaction_id: "i".into(),
+            question: "q".into(),
+            choices: vec![],
+        };
+        broker.publish("run-1", question.clone());
+        assert_eq!(session_rx.recv().await.expect("mirrored").event, question);
+        // The same conversation id under another principal is another key.
+        assert!(other_rx.try_recv().is_err());
+        broker.publish(
+            "run-1",
+            ProgressEvent::RunFinished {
+                run_id: "run-1".into(),
+                status: "completed".into(),
+            },
+        );
+        assert!(matches!(
+            session_rx.recv().await.expect("end mirrored").event,
+            ProgressEvent::RunFinished { .. }
+        ));
+        // The mirror is gone with the run: the next run on this scope is not delivered.
+        broker.publish("run-1", question);
+        assert!(session_rx.try_recv().is_err());
     }
 
     #[tokio::test]

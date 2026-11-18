@@ -10,7 +10,7 @@ engine = "qwen3-rerank-mlx"
 description = "Qwen3 Reranker via mlx-lm + FastAPI /v1/rerank (Apple Silicon)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "mlx-lm"
+pypi_package = "mlx-lm==0.32.2"
 
 [launch]
 command = "uvicorn"

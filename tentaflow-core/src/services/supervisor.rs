@@ -111,13 +111,19 @@ pub struct ServiceEntry {
     pub runtime_port: Option<u16>,
     pub sidecar_quic_port: Option<u16>,
     pub models: Vec<ModelEntry>,
-    /// Backend timeout for this service (defaults to 30000 if `config_json`
-    /// does not specify it). Materialised from `services.config_json` at
-    /// snapshot build time so the routing path never re-parses TOML.
+    /// `timeout_ms` of `services.config_json` (default 30000), materialised at
+    /// snapshot build time so the routing path never re-parses it. For a live
+    /// handle this is how long a request waits for a free slot of
+    /// `max_concurrent` before it fails with `CoreError::BackendBusy`; the
+    /// request timeout itself is separate (`INFERENCE_TIMEOUT_MS` of the handle).
+    /// Only a client built straight from the entry
+    /// (`transport_client::entry_to_backend_client`) uses it as a request timeout.
     pub timeout_ms: u64,
-    /// Maximum concurrent requests the load balancer will dispatch to this
-    /// service. Default 16.
-    pub max_concurrent: u32,
+    /// `max_concurrent` of `services.config_json`: the most requests in flight
+    /// to this service on this node, enforced by `services::limiter`. `None`
+    /// (key absent, or 0) means no limit. It also sizes the idle connection
+    /// pool of the HTTP client, where the absent value reads as 16.
+    pub max_concurrent: Option<u32>,
     /// Weight for weighted random load balancing across replicas. Default 100.
     pub weight: u32,
     /// Optional alias the engine prefers for this model (e.g. ollama maps
@@ -902,6 +908,25 @@ impl Supervisor {
     }
 
     async fn build_snapshot(&self) -> Result<ServicesSnapshot, SupervisorError> {
+        let snapshot = self.read_snapshot().await?;
+        // Applied on every rebuild, so a changed `max_concurrent` resizes the
+        // limiter in place (and a removed key lifts the limit); handles are not
+        // rebuilt for it.
+        for svc in &snapshot.services {
+            crate::services::limiter::configure(
+                &self.local_node_id,
+                svc.id,
+                svc.max_concurrent,
+                Duration::from_millis(svc.timeout_ms),
+            );
+        }
+        crate::services::limiter::prune(&self.local_node_id, |id| {
+            snapshot.services_by_id.contains_key(&id)
+        });
+        Ok(snapshot)
+    }
+
+    async fn read_snapshot(&self) -> Result<ServicesSnapshot, SupervisorError> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> Result<ServicesSnapshot, SupervisorError> {
             let conn = db
@@ -1106,6 +1131,11 @@ impl Supervisor {
                     svc.engine_id
                 );
             }
+            // The limit is in force before the handle can serve a request, not
+            // from the next snapshot rebuild on.
+            if node_id == self.local_node_id {
+                self.configure_limiter_from_row(service_id);
+            }
             let handle = match build_handle(&svc, creds) {
                 Ok(h) => h,
                 Err(e) => {
@@ -1166,6 +1196,27 @@ impl Supervisor {
                 tracing::warn!("supervisor: catalog rebuild failed: {}", e);
             }
         }
+    }
+
+    /// Reads `max_concurrent` / `timeout_ms` of one local service from its row
+    /// and applies them to its limiter.
+    fn configure_limiter_from_row(&self, service_id: i64) {
+        let config_json = self
+            .db
+            .read()
+            .ok()
+            .and_then(|conn| services_repo::get(&conn, service_id).ok().flatten())
+            .map(|row| row.config_json);
+        let Some(config_json) = config_json else {
+            return;
+        };
+        let meta = parse_backend_meta(&config_json);
+        crate::services::limiter::configure(
+            &self.local_node_id,
+            service_id,
+            meta.max_concurrent,
+            Duration::from_millis(meta.timeout_ms),
+        );
     }
 
     /// Drain every live handle and abort every reconnect task. Called on
@@ -1760,7 +1811,7 @@ async fn http_probe_external(url: &str, timeout: Duration) -> HealthStatus {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BackendMeta {
     pub timeout_ms: u64,
-    pub max_concurrent: u32,
+    pub max_concurrent: Option<u32>,
     pub weight: u32,
     pub model_name_override: Option<String>,
     pub extra_config: HashMap<String, String>,
@@ -1783,8 +1834,8 @@ fn parse_backend_meta(config_json: &str) -> BackendMeta {
     let max_concurrent = obj
         .and_then(|m| m.get("max_concurrent"))
         .and_then(|v| v.as_u64())
-        .map(|v| v.min(u32::MAX as u64) as u32)
-        .unwrap_or(16);
+        .filter(|v| *v > 0)
+        .map(|v| v.min(u32::MAX as u64) as u32);
     let weight = obj
         .and_then(|m| m.get("weight"))
         .and_then(|v| v.as_u64())
@@ -2185,6 +2236,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_rebuild_applies_max_concurrent_to_the_limiter() {
+        let db = open_db();
+        let conf = cfg(1_000, 5, 60_000);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports_for_test(50_620, 50_630),
+            cipher_for_test(),
+            "limiter-snapshot-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
+        let id = {
+            let conn = db.write().unwrap();
+            let mut svc =
+                NewService::minimal("limited", DeployMethod::NativeEmbedded, Transport::Embedded);
+            svc.status = ServiceStatus::Running;
+            svc.config_json = r#"{"max_concurrent":3,"timeout_ms":1500}"#.into();
+            services_repo::insert(&conn, &svc).unwrap()
+        };
+
+        sup.build_snapshot().await.unwrap();
+        let limiter = crate::services::limiter::limiter_for("limiter-snapshot-node", id);
+        assert_eq!(limiter.limit(), Some(3));
+
+        // A changed config resizes the same limiter in place.
+        {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE services SET config_json = ?1 WHERE id = ?2",
+                rusqlite::params![r#"{"max_concurrent":5}"#, id],
+            )
+            .unwrap();
+        }
+        sup.build_snapshot().await.unwrap();
+        assert_eq!(limiter.limit(), Some(5));
+
+        // Removing the key lifts the limit: a missing `max_concurrent` means
+        // no limit, as it did before the limit existed.
+        {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE services SET config_json = '{}' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        sup.build_snapshot().await.unwrap();
+        assert_eq!(limiter.limit(), None);
+    }
+
+    #[test]
+    fn a_zero_max_concurrent_reads_as_not_set() {
+        assert_eq!(
+            parse_backend_meta(r#"{"max_concurrent":0}"#).max_concurrent,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn clear_restart_state_on_recovery() {
         let db = open_db();
         let ports = ports_for_test(50_700, 50_710);
@@ -2246,7 +2357,7 @@ mod tests {
     fn parse_backend_meta_returns_defaults_for_empty_object() {
         let meta = parse_backend_meta("{}");
         assert_eq!(meta.timeout_ms, 30_000);
-        assert_eq!(meta.max_concurrent, 16);
+        assert_eq!(meta.max_concurrent, None, "a missing key means no limit");
         assert_eq!(meta.weight, 100);
         assert!(meta.model_name_override.is_none());
         assert!(meta.extra_config.is_empty());
@@ -2257,7 +2368,7 @@ mod tests {
         let json = r#"{"timeout_ms":60000,"max_concurrent":4,"weight":50,"model_name_override":"alias-x"}"#;
         let meta = parse_backend_meta(json);
         assert_eq!(meta.timeout_ms, 60_000);
-        assert_eq!(meta.max_concurrent, 4);
+        assert_eq!(meta.max_concurrent, Some(4));
         assert_eq!(meta.weight, 50);
         assert_eq!(meta.model_name_override.as_deref(), Some("alias-x"));
         // model_name_override is consumed into the typed field; it must not
@@ -2269,7 +2380,7 @@ mod tests {
     fn parse_backend_meta_tolerates_invalid_json() {
         let meta = parse_backend_meta("not-json");
         assert_eq!(meta.timeout_ms, 30_000);
-        assert_eq!(meta.max_concurrent, 16);
+        assert_eq!(meta.max_concurrent, None, "a missing key means no limit");
         assert_eq!(meta.weight, 100);
         assert!(meta.model_name_override.is_none());
         assert!(meta.extra_config.is_empty());
@@ -2286,7 +2397,7 @@ mod tests {
         }"#;
         let meta = parse_backend_meta(json);
         assert_eq!(meta.timeout_ms, 5_000);
-        assert_eq!(meta.max_concurrent, 8);
+        assert_eq!(meta.max_concurrent, Some(8));
         assert_eq!(
             meta.extra_config.get("api_key").map(String::as_str),
             Some("sk-xxx")
@@ -2367,7 +2478,7 @@ mod tests {
         assert_eq!(entry.id, svc_id);
         assert_eq!(entry.timeout_ms, 45_000);
         assert_eq!(entry.weight, 75);
-        assert_eq!(entry.max_concurrent, 16);
+        assert_eq!(entry.max_concurrent, None);
         assert!(snap.find_service_for_model("nope").is_none());
     }
 
@@ -2615,6 +2726,29 @@ mod tests {
         // Handle was built and inserted under the local node id.
         assert_eq!(cache.len(), 1);
         assert!(cache.get("local-node", svc_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_new_handle_is_limited_before_the_first_snapshot_rebuild() {
+        let db = open_db();
+        let (sup, _registry, cache) = build_supervisor_with_registry(db.clone());
+        let svc_id = {
+            let conn = db.write().unwrap();
+            let mut svc = NewService::minimal(
+                "llama-cpp",
+                DeployMethod::NativeEmbedded,
+                Transport::Embedded,
+            );
+            svc.status = ServiceStatus::Running;
+            svc.config_json = r#"{"max_concurrent":2,"timeout_ms":4000}"#.into();
+            services_repo::insert(&conn, &svc).unwrap()
+        };
+
+        sup.reconcile_handles().await;
+
+        assert!(cache.get("local-node", svc_id).is_some());
+        let limiter = crate::services::limiter::limiter_for("local-node", svc_id);
+        assert_eq!(limiter.limit(), Some(2), "no snapshot was built yet");
     }
 
     #[tokio::test]

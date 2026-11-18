@@ -68,45 +68,6 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
     Ok(())
 }
 
-/// Native core applications registered into the same package catalog as WASM
-/// addons (app-platform). Each entry is `(package name, manifest.toml)` — the
-/// code lives in core, so the "bundle" is the manifest alone. The list grows
-/// as Studios are retrofitted (plan-01 P2) and new native apps land.
-const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
-    (
-        "Benchmark Studio",
-        include_str!("../benchmark/app-manifest.toml"),
-    ),
-    ("ML Studio", include_str!("../ml_studio/app-manifest.toml")),
-    (
-        "Projekty",
-        include_str!("../project_studio/app-manifest.toml"),
-    ),
-    (
-        "Code Studio",
-        include_str!("../code_studio/app-manifest.toml"),
-    ),
-    ("Meeting Bot", include_str!("../meeting/app-manifest.toml")),
-    ("TentaNas", include_str!("../tentanas/app-manifest.toml")),
-    (
-        "TentaQuant",
-        include_str!("../tentaquant/app-manifest.toml"),
-    ),
-    ("TentaBus", include_str!("../bus/app-manifest.toml")),
-];
-
-/// Manifest of a bundled native package by its `[addon].id`. Test fixtures
-/// persist it on instance rows the way `lifecycle::install_instance` does, so
-/// instance-manifest readers (`app_db::open`) meet the real `native.db_file`.
-#[cfg(test)]
-pub(crate) fn native_manifest(package_id: &str) -> Option<&'static str> {
-    NATIVE_APP_PACKAGES.iter().map(|(_, m)| *m).find(|m| {
-        crate::addon::lifecycle::parse_manifest_toml(m)
-            .map(|parsed| parsed.addon_id == package_id)
-            .unwrap_or(false)
-    })
-}
-
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the
 /// exact mirror of [`install_bundled_addons`]: materializes `manifest.toml`
 /// under `packages/{id}/{version}/` and upserts the `addon_packages` row with
@@ -115,8 +76,14 @@ pub fn install_native_packages(db: &DbPool) -> Result<()> {
     std::fs::create_dir_all(packages_root())
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}"))?;
 
-    for (name, manifest_toml) in NATIVE_APP_PACKAGES {
-        if let Err(e) = install_single_native_package(db, name, manifest_toml) {
+    // Native core applications share the package catalog with WASM addons
+    // (app-platform); the code lives in core, so the "bundle" is the manifest
+    // alone.
+    for hooks in crate::addon::native_apps::REGISTRY {
+        let Some(name) = hooks.catalog_name else {
+            continue;
+        };
+        if let Err(e) = install_single_native_package(db, name, hooks.manifest) {
             error!("Blad reconcile natywnego pakietu '{}': {}", name, e);
             // Continue with the next package — one broken manifest must not
             // hide the rest of the native catalog.
@@ -427,8 +394,8 @@ pub fn package_dir(package_id: &str, version: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A shipped package's install steps must be runnable and readable: a hook
-    /// exists for the package, and every i18n key the wizard will look up is
+    /// A shipped package's install steps must be runnable and readable: its
+    /// hooks carry `install_step`, and every i18n key the wizard will look up is
     /// present in all five locales (a missing one would render the raw key).
     #[test]
     fn every_native_package_with_install_steps_has_a_hook_and_translations() {
@@ -447,14 +414,13 @@ mod tests {
                 .try_fold(root, |node, part| node.get(part))
                 .is_some_and(|v| v.is_string())
         };
-        for (name, manifest_toml) in NATIVE_APP_PACKAGES {
+        for hooks in crate::addon::native_apps::REGISTRY {
+            let name = hooks.package_id;
             let manifest =
-                crate::addon::lifecycle::parse_manifest_toml(manifest_toml).expect("manifest");
+                crate::addon::lifecycle::parse_manifest_toml(hooks.manifest).expect("manifest");
             if manifest.install_steps.is_empty() {
                 continue;
             }
-            let hooks = crate::addon::native_apps::hooks_for(&manifest.addon_id)
-                .unwrap_or_else(|| panic!("'{name}' declares install steps but has no hooks"));
             assert!(hooks.install_step.is_some(), "'{name}' declares install steps without a hook");
             for step in &manifest.install_steps {
                 let keys = std::iter::once(&step.title_key)

@@ -95,6 +95,31 @@ impl UsageSink {
     }
 }
 
+/// What a run shares with the code that bounds it from outside (the SLA
+/// admission): the id of the audit row the executor created for it.
+#[derive(Debug, Default)]
+pub struct RunSettle {
+    execution_id: std::sync::atomic::AtomicI64,
+}
+
+impl RunSettle {
+    /// Recorded once, by the first run that creates a row: a child run that
+    /// shares the handle must not replace its parent's id.
+    pub(crate) fn publish(&self, id: i64) {
+        let _ = self.execution_id.compare_exchange(
+            0,
+            id,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    /// The row id, `0` while none was created.
+    pub fn execution_id(&self) -> i64 {
+        self.execution_id.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Pełny zestaw zależności dostępny adapterom podczas execute(). Wszystkie pola
 /// to Arc<dyn Trait> z dispatchers/ — zero ServiceManager, zero god-objectu.
 ///
@@ -106,6 +131,8 @@ impl UsageSink {
 pub struct ExecutionContext {
     pub request_id: String,
     pub execution_id: i64,
+    /// Shared with whoever bounds the run from outside; see [`RunSettle`].
+    pub settle: Arc<RunSettle>,
     /// §3.5 — id of the run that spawned this one, recorded as
     /// `flow_executions.parent_execution_id` so the execution tree (parent →
     /// subflow / loop body / map element) is reconstructable. `SubflowRunner`
@@ -304,7 +331,9 @@ impl ExecutionContext {
     /// `envelope.meta` — a node that rewrote meta must not be able to change
     /// where its own calls are reported from.
     pub fn provenance(&self) -> CallProvenance {
-        let provenance = CallProvenance::new(self.origin, self.actor());
+        // A node adapter only ever runs inside a run, so what it dispatches is
+        // nested in that run.
+        let provenance = CallProvenance::new(self.origin, self.actor()).nested_in_run();
         if self.origin == FlowOrigin::Process {
             provenance.with_org(self.org_id.clone())
         } else {
@@ -883,6 +912,7 @@ pub mod test_support {
         ExecutionContext {
             request_id: "test".into(),
             execution_id: 0,
+            settle: Arc::default(),
             parent_execution_id: None,
             light: false,
             session_id: None,

@@ -27,6 +27,7 @@ import '/js/components/tf-tabs.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-menu.js';
+import { explainServiceAccountError } from '/js/modules/flows-builder/bus-consumer.js';
 
 // Delete and undo must keep working after a click on Save or a palette Enter
 // leaves focus on a button, so only elements that consume these keys
@@ -212,6 +213,7 @@ const FlowBuilderScreen = {
         if (!this._current(state)) return;
         state.flow = { id: detail.id, name: detail.name, description: detail.description ?? null,
           flow_json: detail.graphJson ?? '{"nodes":[],"edges":[]}', status: detail.status ?? (detail.enabled ? 'active' : 'draft') };
+        state.busConsumer = detail.busConsumer ?? null;
         state.readOnly = !!detail.isSystem;
       }
     } catch (err) {
@@ -304,6 +306,7 @@ const FlowBuilderScreen = {
     state.canvas.setTemplates(state.palette.getTemplates());
     if (state.mode === 'bpmn') state.canvas.setData(parsed);
     else state.canvas.setData(parsed.nodes || [], parsed.edges || []);
+    if (state.mode !== 'bpmn') state.canvas.setBusConsumer(state.busConsumer ?? null);
     if (state.mode === 'bpmn') {
       this._syncProcessBodySelect();
       this._syncStartCatalog();
@@ -334,6 +337,17 @@ const FlowBuilderScreen = {
       // Lets the config panel ask the live graph for a node's loop-region role
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
+      getBusConsumer: () => state.busConsumer ?? null,
+      // A node's config in the last loaded or saved flow: what the running
+      // flow reads under, as opposed to the edit in progress.
+      getSavedNodeConfig: (id) => {
+        try {
+          const graph = JSON.parse(state.flow?.flow_json || '{}');
+          return (graph.nodes || []).find((n) => n.id === id)?.config ?? null;
+        } catch {
+          return null;
+        }
+      },
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : [])
         .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: processDiagnosticDetail(diagnostic) })),
@@ -1538,7 +1552,7 @@ const FlowBuilderScreen = {
   // Messages from the server and the codec cite elements by internal id; the
   // author sees their names.
   _explain(state, message) {
-    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData(), state.processOptions) : message;
+    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData(), state.processOptions) : explainServiceAccountError(message);
   },
 
   // A save that cannot go through says so where the author looks: the status

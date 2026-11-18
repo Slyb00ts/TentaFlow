@@ -549,7 +549,7 @@ fn default_engines() -> Vec<EngineItem> {
 fn default_models_for(engine_id: &str) -> Vec<ModelItem> {
     match engine_id {
         "sglang" | "vllm" => vec![
-            ModelItem { model_id: "speakleash/Bielik-11B-v3.0-Instruct-FP8-Dynamic".into(), author: "speakleash".into(), downloads: 0, likes: 0 },
+            ModelItem { model_id: "speakleash/Bielik-11B-v3.1-Instruct-FP8-Dynamic".into(), author: "speakleash".into(), downloads: 0, likes: 0 },
             ModelItem { model_id: "meta-llama/Llama-3.1-8B-Instruct".into(), author: "meta-llama".into(), downloads: 0, likes: 0 },
             ModelItem { model_id: "Qwen/Qwen2.5-7B-Instruct".into(), author: "Qwen".into(), downloads: 0, likes: 0 },
             ModelItem { model_id: "mistralai/Mistral-7B-Instruct-v0.3".into(), author: "mistralai".into(), downloads: 0, likes: 0 },

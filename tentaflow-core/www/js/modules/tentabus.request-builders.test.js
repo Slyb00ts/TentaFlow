@@ -488,11 +488,12 @@ test('no control in tentabus.js is gated on isSiteAdmin', () => {
 function makeHidingLoader(world) {
   // eslint-disable-next-line no-new-func
   return new Function('world', `
-    const { state, ApiBinary, requireInstanceId, describeBusError, renderPanel, topicFormat } = world;
+    const { state, ApiBinary, requireInstanceId, describeBusError, renderPanel, topicFormat, schemaKind, binaryFieldTypes } = world;
     const canAdmin = () => world.canAdmin();
     let hidingTurn = 0;
     async ${cut(source, 'busCall')}
     ${cut(source, 'freshHiding')}
+    async ${cut(source, 'fetchBinaryFieldSchema')}
     async ${cut(source, 'fetchFieldSchema')}
     async ${cut(source, 'loadTopicHiding')}
     return { load: loadTopicHiding, leave: () => { hidingTurn += 1; } };`)(world);
@@ -507,6 +508,8 @@ function hidingWorld(answers) {
     describeBusError: (e) => `błąd: ${e.message}`,
     renderPanel: () => painted.push(world.state.hiding),
     topicFormat: () => 'json',
+    schemaKind: (type) => (['avro', 'protobuf', 'thrift'].includes(type) ? 'binary' : ''),
+    binaryFieldTypes: () => [],
     canAdmin: () => false,
   };
   return { world, painted };
@@ -526,6 +529,38 @@ test('loadTopicHiding: only the newest answer for the open topic lands', async (
   await first;
   assert.deepEqual(world.state.hiding.policies, [{ subjectId: 'new' }], 'the slow, earlier answer did not overwrite the newer one');
   assert.equal(painted.length, 1);
+});
+
+test('loadTopicHiding: a binary pattern is read fresh, its field list comes from the server and the types from its text; a withdrawn one is not asked for fields', async () => {
+  const asked = [];
+  const subjects = [{ subject: 'zamowienie', schemaType: 'avro', deprecatedAtMs: null }];
+  const { world } = hidingWorld({
+    busFieldPolicyListRequest: () => ({ payload: { FieldPolicyListResponse: { policies: [] } } }),
+    busSchemaSubjectListRequest: () => { asked.push('subjects'); return { payload: { SchemaSubjectListResponse: { subjects } } }; },
+    busSchemaFieldsGetRequest: (req) => { asked.push(['fields', req.subject]); return { payload: { SchemaFieldsGetResponse: { subject: 'zamowienie', schemaType: 'avro', version: 3, fields: ['numer', 'uwagi'] } } }; },
+    busSchemaGetRequest: (req) => { asked.push(['text', req.version]); return { payload: { SchemaGetResponse: { schema: { version: 3 }, schemaText: '{}' } } }; },
+  });
+  world.state.detail.topic = { schemaId: 'zamowienie', contentType: 'application/octet-stream' };
+  world.state.shell = { subjects: [{ subject: 'zamowienie', schemaType: 'avro' }] };
+  world.state.capabilities = { binaryFieldActions: ['hide'] };
+  world.binaryFieldTypes = undefined;
+  const { load } = makeHidingLoader({ ...world, binaryFieldTypes: () => [{ name: 'numer', type: 'string', alwaysSet: true }] });
+  await load('wizyty');
+  assert.deepEqual(asked, ['subjects', ['fields', 'zamowienie'], ['text', 3]]);
+  assert.deepEqual(world.state.hiding.schema, {
+    subject: 'zamowienie', schemaType: 'avro', version: 3, fields: ['numer', 'uwagi'], types: [{ name: 'numer', type: 'string', alwaysSet: true }],
+  });
+  asked.length = 0;
+  subjects[0].deprecatedAtMs = 5;
+  await load('wizyty');
+  assert.deepEqual(asked, ['subjects'], 'a withdrawn pattern takes no new rule, so its fields are not asked for');
+  assert.deepEqual(world.state.hiding.schema, { subject: 'zamowienie', schemaType: 'avro', withdrawn: true });
+  subjects[0].deprecatedAtMs = null;
+  world.state.capabilities = {};
+  asked.length = 0;
+  await load('wizyty');
+  assert.deepEqual(asked, ['subjects'], 'a server that does not list the binary actions is not asked for fields');
+  assert.deepEqual(world.state.hiding.schema, { subject: 'zamowienie', schemaType: 'avro' });
 });
 
 test('loadTopicHiding: an answer for a topic that was left, or after the topic was closed, lands nowhere', async () => {

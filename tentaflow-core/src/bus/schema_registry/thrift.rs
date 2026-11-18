@@ -110,8 +110,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use super::{
-    shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    leaking_field, leaking_field_refusal, shorten_path, Budget, Compatibility, CompiledSchema,
+    LimitExceeded, SchemaAwareFieldFormat, SchemaError, SchemaKindOps, Screened, TextRules,
+    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod idl;
@@ -801,8 +802,11 @@ impl SchemaKindOps for ThriftOps {
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
         let schema_text = schema_text.as_str();
-        let compiled = parse_text(schema_text)?;
-        let derived = derive(&compiled, allowed);
+        let compiled = CompiledSchema::Thrift(parse_text(schema_text)?);
+        if let Some(field) = leaking_field(self, &compiled, allowed)? {
+            return Err(invalid(leaking_field_refusal(&field)));
+        }
+        let derived = derive(thrift_compiled(&compiled)?, allowed);
         // The projection must itself compile. Enum values grow when
         // written out, so the check allows twice the source limit, not more:
         // the caps on names, fields and values bound the text built here.
@@ -866,3 +870,177 @@ impl SchemaKindOps for ThriftOps {
 }
 
 pub(super) static THRIFT_OPS: ThriftOps = ThriftOps;
+
+// =============================================================================
+// Field policies on Thrift structs (F4 B3 + B6)
+// =============================================================================
+// A struct is a run of fields, each with its own header (type, id) and a stop
+// byte, so a read projection leaves the dropped fields out. The strict walk
+// finds the bytes of every top-level field (a field the schema does not declare
+// is walked for its framing and is never kept: the sub-schema cannot name it).
+//   - TBinaryProtocol: a field is its header and value, copied as it is.
+//   - TCompactProtocol: a header holds the DELTA from the previous field id, so
+//     dropping a field changes the delta of the next kept one. Every kept
+//     header is written again against the previous KEPT id (short form for a
+//     delta of 1-15, otherwise the type byte and the id as a zig-zag varint);
+//     the type nibble — which also carries an inline `true`/`false` — and the
+//     value bytes are copied.
+// A `required` field the projection keeps is still `required` in the derived
+// schema and still on the wire; a dropped one is not listed, so the projection
+// satisfies the derived schema's walk (checked in the tests).
+
+fn thrift_compiled(compiled: &CompiledSchema) -> Result<&Compiled, SchemaError> {
+    match compiled {
+        CompiledSchema::Thrift(c) => Ok(c),
+        _ => Err(invalid("called with a non-thrift compiled schema")),
+    }
+}
+
+/// `value` as a zig-zag varint (a compact field id is an i16 in one).
+fn put_zigzag_id(out: &mut Vec<u8>, id: i32) {
+    let mut n = ((id << 1) ^ (id >> 31)) as u32;
+    while n >= 0x80 {
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+impl SchemaAwareFieldFormat for ThriftOps {
+    fn carries_unknown_fields(&self) -> bool {
+        true
+    }
+
+    fn declared_fields(&self, compiled: &CompiledSchema) -> Result<Vec<String>, SchemaError> {
+        let c = thrift_compiled(compiled)?;
+        Ok(c.structs[c.root]
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect())
+    }
+
+    fn list_fields(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        shared: &mut ValidationBudget,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = thrift_compiled(compiled)?;
+        let root = &c.structs[c.root];
+        let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_UNITS));
+        let spans = walker::top_spans(c, payload, &mut budget);
+        shared.spend(budget.used);
+        Ok(spans?
+            .iter()
+            .map(|span| match root.field_by_id(span.id) {
+                Some(index) => root.fields[index].name.clone(),
+                None => format!("#{}", span.id),
+            })
+            .collect())
+    }
+
+    fn project(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        shared: &mut ValidationBudget,
+    ) -> Result<Vec<u8>, SchemaError> {
+        let c = thrift_compiled(compiled)?;
+        let root = &c.structs[c.root];
+        let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_UNITS));
+        let spans = walker::top_spans(c, payload, &mut budget);
+        shared.spend(budget.used);
+        let mut out = Vec::new();
+        let mut previous = 0i32;
+        for span in spans? {
+            let kept = root
+                .field_by_id(span.id)
+                .is_some_and(|index| visible.contains(&root.fields[index].name));
+            if !kept {
+                continue;
+            }
+            match c.protocol {
+                Protocol::Binary => out.extend_from_slice(&payload[span.start..span.end]),
+                Protocol::Compact => {
+                    let code = payload[span.start] & 0x0f;
+                    let delta = span.id - previous;
+                    if (1..=15).contains(&delta) {
+                        out.push(((delta as u8) << 4) | code);
+                    } else {
+                        out.push(code);
+                        put_zigzag_id(&mut out, span.id);
+                    }
+                    out.extend_from_slice(&payload[span.header_end..span.end]);
+                }
+            }
+            previous = span.id;
+        }
+        out.push(0);
+        Ok(out)
+    }
+
+    fn self_referencing_fields(
+        &self,
+        compiled: &CompiledSchema,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = thrift_compiled(compiled)?;
+        // Structs a type holds (through containers and typedefs), and from
+        // those the structs that reach the root, walked from the root along
+        // the "holds" edges backwards.
+        let holds: Vec<Vec<usize>> = (0..c.structs.len())
+            .map(|s| {
+                c.structs[s]
+                    .fields
+                    .iter()
+                    .flat_map(|f| structs_in(c, f.ty))
+                    .collect()
+            })
+            .collect();
+        let mut holders: Vec<Vec<usize>> = vec![Vec::new(); c.structs.len()];
+        for (holder, held) in holds.iter().enumerate() {
+            for &target in held {
+                holders[target].push(holder);
+            }
+        }
+        let mut reaches = vec![false; c.structs.len()];
+        reaches[c.root] = true;
+        let mut work = vec![c.root];
+        while let Some(id) = work.pop() {
+            for &holder in &holders[id] {
+                if !reaches[holder] {
+                    reaches[holder] = true;
+                    work.push(holder);
+                }
+            }
+        }
+        Ok(c.structs[c.root]
+            .fields
+            .iter()
+            .filter(|f| structs_in(c, f.ty).into_iter().any(|s| reaches[s]))
+            .map(|f| f.name.clone())
+            .collect())
+    }
+}
+
+/// The structs a type is made of, without looking inside them: through
+/// typedefs and containers only.
+fn structs_in(c: &Compiled, ty: ExprId) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut work = vec![ty];
+    while let Some(e) = work.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        match &c.exprs[e] {
+            Expr::Base(_) | Expr::Ref(_) | Expr::Enum(_) => {}
+            Expr::Struct(s) => found.push(*s),
+            Expr::Typedef(t) => work.push(c.typedefs[*t].target),
+            Expr::List(child) | Expr::Set(child) => work.push(*child),
+            Expr::Map(k, v) => work.extend([*k, *v]),
+        }
+    }
+    found
+}

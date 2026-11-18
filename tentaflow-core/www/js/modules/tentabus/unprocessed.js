@@ -76,6 +76,7 @@ export function unprocessedRecord(topic, r) {
     payload: r.payloadPreview,
     isBlobRef: Boolean(r.isBlobRef),
     truncated: Boolean(r.truncated),
+    schemaRefId: r.schemaRefId,
   };
 }
 

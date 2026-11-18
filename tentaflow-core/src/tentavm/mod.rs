@@ -34,11 +34,12 @@ use crate::db::DbPool;
 
 pub const PACKAGE_ID: &str = "tentavm";
 
-/// The package manifest, compiled in. The catalog registration
-/// (`addon::bundled::NATIVE_APP_PACKAGES`) is deliberately NOT here yet: an
-/// installable package needs its i18n keys and its Router screen, which come
-/// with the UI shell. Until then the manifest is what the hooks and their
-/// tests are checked against.
+/// The package manifest, compiled in and carried by the app's hooks. The
+/// catalog registration (`NativeAppHooks::catalog_name`) is deliberately NOT
+/// there yet: an installable package needs its i18n keys and its Router
+/// screen, which come with the UI shell. Until then the manifest decides the
+/// platforms an instance runs on, and the hooks and their tests are checked
+/// against it.
 pub const APP_MANIFEST: &str = include_str!("app-manifest.toml");
 
 /// Status a freshly published node host carries until the environment probe
@@ -166,6 +167,17 @@ fn ensure_local_host(main_db: &DbPool, org_id: &str, node_id: &str) -> Result<()
 /// is the `warn!` below.
 pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
+    if crate::addon::native_apps::console_only_node() {
+        // An app-sandboxed core cannot run a hypervisor and cannot even install
+        // one, so it is not a host in `needs_install` either: a host row would
+        // put it on every node's host list as a target that never comes ready.
+        tracing::info!(
+            "native app '{}': TentaVM initialized as a console at {:?} (no host row)",
+            ctx.addon_id,
+            ctx.data_dir
+        );
+        return Ok(());
+    }
     match publish_local_host(ctx.db, ctx.org_id, crate::sync::runtime::local_node_id())? {
         Some(node_id) => {
             // §17.5 step 2 is "init: probe → host row". The row is above; the
@@ -432,11 +444,13 @@ mod tests {
     /// its route would not exist.
     #[test]
     fn the_package_is_not_in_the_catalog_yet() {
+        let hooks = crate::addon::native_apps::hooks_for(PACKAGE_ID).expect("compiled app");
         assert!(
-            crate::addon::bundled::native_manifest(PACKAGE_ID).is_none(),
-            "TentaVM must stay out of NATIVE_APP_PACKAGES until the UI shell \
+            hooks.catalog_name.is_none(),
+            "TentaVM must stay out of the catalog until the UI shell \
              brings its i18n keys and its Router screen"
         );
+        assert_eq!(hooks.manifest, APP_MANIFEST);
     }
 
     /// The plan lists what is actually there and, above all, what STAYS: the

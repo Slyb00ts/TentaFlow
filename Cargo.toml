@@ -194,6 +194,7 @@ llama-cpp-sys-2 = "0.1.146"
 log = "0.4"
 lru = "0.18.0"
 lz4_flex = {version = "0.13.1", default-features = false}
+mach2 = "0.6.0"
 md-5 = "0.11.0"
 memchr = "2"
 memmap2 = "0.9.11"

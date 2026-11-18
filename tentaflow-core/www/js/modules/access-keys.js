@@ -17,6 +17,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { revokeConfirmMessage } from '/js/lib/service-account-usage.js';
 import { modelBundleScopeResources } from '/js/modules/catalog/camera-cv-bundles.js';
 import {
   BUS_SCHEMA_REGISTRY,
@@ -271,8 +272,29 @@ function renderKeysTab(body) {
   body.querySelectorAll('[data-scope]').forEach((b) => b.addEventListener('click', () => openScopeEditor(b.getAttribute('data-scope'))));
 }
 
+// Keys whose service-account lookup is in flight: a second click on the same
+// button must not stack a second question on the first.
+const revokeLookups = new Set();
+
 async function revokeKey(keyId, body) {
-  if (!window.confirm(t('access_keys.revoke_confirm', 'Zrewokować ten klucz? Przestanie działać natychmiast.'))) return;
+  if (revokeLookups.has(keyId)) return;
+  revokeLookups.add(keyId);
+  const button = [...body.querySelectorAll('[data-revoke]')].find((b) => b.getAttribute('data-revoke') === keyId);
+  button?.setAttribute('disabled', '');
+  let message;
+  try {
+    // A general key can be the service account of bus_consume flows; the
+    // question names them first, because revoking silently stops their reading.
+    message = await revokeConfirmMessage(keyId, {
+      baseMessage: t('access_keys.revoke_confirm', 'Zrewokować ten klucz? Przestanie działać natychmiast.'),
+      loadUsage: (keyUid) => ApiBinary.list('serviceAccountUsageRequest', { payload: { keyUid }, arrayKey: 'flows' }),
+      t: (key, vars) => t(key, null, vars),
+    });
+  } finally {
+    revokeLookups.delete(keyId);
+    button?.removeAttribute('disabled');
+  }
+  if (!window.confirm(message)) return;
   try {
     await ApiBinary.action('apiKeyRevokeRequest', { keyId });
     toast(t('access_keys.revoked_ok', 'Klucz zrewokowany'), 'success');

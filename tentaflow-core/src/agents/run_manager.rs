@@ -576,6 +576,11 @@ impl AgentRunManager {
     /// be exceeded fail the call (the model sees a recoverable tool error), they
     /// do not silently drop tasks.
     pub async fn handle_agent_spawn(&self, caller: &CallerRun, args: &Value) -> Result<Value> {
+        if caller.principal.is_bus_service_account() {
+            return Err(anyhow!(
+                "agent_spawn: a flow running as a service account may not start sub-agents"
+            ));
+        }
         let tasks = parse_spawn_tasks(args)?;
         if tasks.is_empty() {
             return Err(anyhow!("agent_spawn: no tasks provided"));
@@ -1933,6 +1938,14 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             cancel_token: cancel,
             progress_sink: Some(progress),
             flow_depth: 0,
+            nested_in_run: false,
+            // An agent run started under a bus run continues work that was
+            // admitted already, as before the SLA gate existed.
+            slot_held_by_caller: principal.origin
+                == crate::flow_engine::dispatcher::FlowOrigin::Bus,
+            settle: Default::default(),
+            bus_source: None,
+            progress_scope_override: None,
         };
 
         let outcome = dispatcher

@@ -137,6 +137,7 @@ fn manual_model() -> tentaflow_protocol::processes::ProcessModel {
 
 fn service_model() -> tentaflow_protocol::processes::ProcessModel {
     linear_activity_model(ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: "flow-simulation-service".into(),
         input_mapping: BTreeMap::new(),
         output_mapping: BTreeMap::new(),
@@ -1921,6 +1922,7 @@ fn simulation_source_pin_is_immutable_after_capture() {
 #[test]
 fn simulation_refuses_an_unbound_service_step_with_its_stable_code() {
     let model = linear_activity_model(ProcessNodeKind::ServiceTask {
+        retry: None,
         flow_id: String::new(),
         input_mapping: BTreeMap::new(),
         output_mapping: BTreeMap::new(),

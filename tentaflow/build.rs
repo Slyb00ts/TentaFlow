@@ -358,6 +358,7 @@ fn build_mlx_bridge() {
             // wtedy dylib NIE powstaje -> backend mlx niedostepny. Flaga
             // pomija ten gate dla buildow z linii polecen.
             "-skipMacroValidation",
+            "-skipPackagePluginValidation",
             "-derivedDataPath",
         ])
         .arg(&xcode_build_dir)
@@ -436,10 +437,13 @@ fn build_mlx_bridge() {
 
 // ----- Kokoro Swift bridge (macOS only) --------------------------------------
 //
-// Buduje libKokoroBridge.dylib (Kokoro 82M MLX TTS — niezalezny od MLXBridge
-// bo wymaga nowszego mlx-swift). Identyczny przeplyw co MLXBridge: xcodebuild
-// → kopia dylib + Cmlx bundle → install_name_tool. Bundle Cmlx jest WSPOLNY
-// (ten sam mlx-swift), wiec nie nadpisujemy go jezeli juz istnieje.
+// Builds libKokoroBridge.dylib (Kokoro 82M MLX TTS). Same flow as MLXBridge:
+// xcodebuild → copy dylib + frameworks + resource bundles → install_name_tool.
+// Both packages pin the same PrismML mlx-swift revision, and both dylibs read
+// the ONE `mlx-swift_Cmlx.bundle` beside the binary. MLXBridge's copy is the
+// authoritative one (it must carry the fork's 1-bit/g128 kernels Bonsai needs);
+// replacing it with Kokoro's build would make the shipped metallib depend on
+// whichever bridge was built last.
 fn build_kokoro_bridge() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "macos" {
@@ -490,6 +494,7 @@ fn build_kokoro_bridge() {
             "-configuration",
             "Release",
             "-skipMacroValidation",
+            "-skipPackagePluginValidation",
             "-derivedDataPath",
         ])
         .arg(&xcode_build_dir)
@@ -537,7 +542,7 @@ fn build_kokoro_bridge() {
     // Cmlx, MLXNN, MisakiSwift, MLXUtilsLibrary, Numerics (bo MisakiSwift/
     // MLXUtilsLibrary deklaruja `type: .dynamic`). Bez dostarczenia tych
     // frameworkow + resource bundli (KokoroBridge_KokoroSwiftLocal, MisakiSwift,
-    // Cmlx-metallib, ZIPFoundation) obok dylib, dlopen pada
+    // ZIPFoundation; Cmlx metallib comes from MLXBridge) obok dylib, dlopen pada
     // ("Library not loaded: @rpath/MLX.framework") i deploy konczy sie
     // generycznym "load kokoro". rpath @loader_path + target_dir ustawia
     // build_mlx_bridge. Walidacja: dlopen+loadModel+synthesize OK po skopiowaniu.
@@ -562,11 +567,15 @@ fn build_kokoro_bridge() {
         }
     }
     // Resource bundle (Bundle.module): KokoroSwiftLocal (espeak/lexicon),
-    // MisakiSwift (G2P), Cmlx (default.metallib), ZIPFoundation.
+    // MisakiSwift (G2P), ZIPFoundation. `mlx-swift_Cmlx.bundle` is skipped:
+    // build_mlx_bridge already installed the authoritative metallib.
     if let Ok(entries) = std::fs::read_dir(&products) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if entry.path().extension().and_then(|s| s.to_str()) != Some("bundle") {
+                continue;
+            }
+            if name.to_str() == Some("mlx-swift_Cmlx.bundle") {
                 continue;
             }
             let dest = target_dir.join(&name);

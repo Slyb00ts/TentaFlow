@@ -131,7 +131,7 @@ pub fn default_models(engine_id: &str) -> Vec<HfModelResult> {
     match engine_id {
         "sglang" | "vllm" => vec![
             hf_model(
-                "speakleash/Bielik-11B-v3.0-Instruct-FP8-Dynamic",
+                "speakleash/Bielik-11B-v3.1-Instruct-FP8-Dynamic",
                 "speakleash",
                 "text-generation",
             ),

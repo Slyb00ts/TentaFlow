@@ -5222,6 +5222,10 @@ pub async fn ml_studio_ft_chat(
                 &model_name,
                 &payload.message,
                 max_tokens,
+                Some(
+                    &crate::auth::acl::UserContext::new(org.user_id.as_str(), "user")
+                        .with_org(org.org_id.as_str()),
+                ),
             )
             .await
             {

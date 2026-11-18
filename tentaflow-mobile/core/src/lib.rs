@@ -172,23 +172,21 @@ fn start_app(data_dir_override: Option<std::path::PathBuf>) -> Result<()> {
             }
         };
 
-        runtime.block_on(async {
-            info!("Uruchamianie serwisow Core...");
-            match runtime::start_services(config).await {
-                Ok(_handles) => {
-                    info!("Serwisy Core uruchomione — HTTPS na porcie 8090");
-                    // Nie upuszczaj handles — serwisy dzialaja w tle
-                    std::mem::forget(_handles);
-                }
-                Err(e) => {
-                    error!("Blad uruchamiania serwisow: {:#}", e);
-                }
+        info!("Uruchamianie serwisow Core...");
+        match runtime.block_on(runtime::start_services(config)) {
+            Ok(handles) => {
+                info!("Serwisy Core uruchomione — HTTPS na porcie 8090");
+                // The node runs on the runtime's workers until the host app's
+                // terminate callback stops it.
+                runtime::keep(runtime, handles);
             }
-        });
-
-        // Runtime zyje wiecznie — serwisy dzialaja w tle
+            Err(e) => {
+                error!("Blad uruchamiania serwisow: {:#}", e);
+                // What a partial start already spawned keeps running.
+                std::mem::forget(runtime);
+            }
+        }
         info!("Runtime dziala w tle");
-        std::mem::forget(runtime);
     });
 
     info!("start_app() zakonczony — serwisy startuja w tle");

@@ -413,11 +413,16 @@ pub fn llm_generate(
         };
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(
+            tokio::runtime::Handle::current().block_on(router.route_embeddings_in_context(
                 request,
                 None,
                 call_provenance.origin,
                 call_provenance.actor_for(&addon_id),
+                Some(crate::compliance::ai_gateway::AiGatewayContext {
+                    parent_run: call_provenance.parent.clone(),
+                    org_id: caller.data().org_id.clone(),
+                    ..Default::default()
+                }),
             ))
         });
 
@@ -527,6 +532,7 @@ pub fn llm_generate(
     let flow_meta = build_flow_meta(_options_json.as_ref());
 
     let compliance_context = crate::compliance::ai_gateway::AiGatewayContext {
+        parent_run: call_provenance.parent.clone(),
         org_id: caller.data().org_id.clone(),
         addon_id: Some(addon_id.clone()),
         instance_id: Some(caller.data().instance_id.clone()),
@@ -1032,6 +1038,7 @@ pub fn llm_generate_stream_start(
     // domykane przez ComplianceAuditStream po skonsumowaniu / porzuceniu
     // strumienia — identycznie jak dla klienta SSE.
     let compliance_context = crate::compliance::ai_gateway::AiGatewayContext {
+        parent_run: call_provenance.parent.clone(),
         org_id: caller.data().org_id.clone(),
         addon_id: Some(addon_id.clone()),
         instance_id: Some(caller.data().instance_id.clone()),

@@ -3,6 +3,8 @@
 // `#/tentabus?instance=…&tab=…&topic=…&section=…&group=…&gtopic=…&subject=…` is written with the router's
 // own `replaceParams` (no history entry per click, no second router) and read
 // back by `mount(params)`, so a reload or a pasted link reopens the same view.
+// `&corr=…&partition=…&offset=…` under a topic is a one-way link from the Events
+// screen: it opens that topic's message preview on a record, and is not written back.
 // Pure functions: the screen owns the state, this file only translates it.
 
 export const MAIN_TABS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'replication'];
@@ -29,6 +31,7 @@ export function parseRoute(params = {}) {
   else if (group) tab = 'groups';
   else if (subject) tab = 'schemas';
   return {
+    ...previewOf(topic, params),
     instance: params.instance ? String(params.instance) : null,
     tab,
     topic,
@@ -37,6 +40,37 @@ export function parseRoute(params = {}) {
     groupTopic: !topic && group && params.gtopic ? String(params.gtopic) : null,
     subject,
   };
+}
+
+/**
+ * The deep link into a topic's message preview (`corr`, `partition`, `offset`),
+ * as the Events screen writes it: only the parts that are well formed, and only
+ * under a topic. A malformed number is dropped rather than guessed, so a
+ * hand-edited link opens the preview without it. Absent parts leave their key
+ * out, so an ordinary address parses exactly as before.
+ */
+function previewOf(topic, params) {
+  const out = {};
+  if (!topic) return out;
+  if (typeof params.corr === 'string' && params.corr.trim() !== '') out.corr = params.corr.trim();
+  for (const key of ['partition', 'offset']) {
+    const raw = params[key];
+    if ((typeof raw === 'string' || typeof raw === 'number') && /^\d{1,15}$/.test(String(raw))) out[key] = Number(raw);
+  }
+  return out;
+}
+
+/**
+ * The params of a parsed route that must survive choosing an instance: the
+ * topic and the preview deep link. Without them the instance picker would
+ * drop a link from Events that carries no instance.
+ */
+export function carriedParams(route) {
+  const out = {};
+  if (!route.topic) return out;
+  out.topic = route.topic;
+  for (const key of ['corr', 'partition', 'offset']) if (route[key] != null) out[key] = route[key];
+  return out;
 }
 
 function sectionOf(sections, asked) {

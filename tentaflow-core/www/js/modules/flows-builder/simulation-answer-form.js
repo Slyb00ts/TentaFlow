@@ -42,6 +42,7 @@ export function answerFormHtml(step, draft) {
       <tf-alert data-answer-error="outputs" tone="danger" hidden></tf-alert>
     </section>
     ${verdict}
+    ${step.hasRetryPolicy ? `<tf-alert tone="info" data-answer-retry-skipped message="${escapeAttr(text('simulation_retry_skipped'))}"></tf-alert>` : ''}
   </div>`;
 }
 

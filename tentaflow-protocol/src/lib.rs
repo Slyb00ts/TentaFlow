@@ -41,6 +41,7 @@ pub mod project_studio;
 pub mod provider_account;
 pub mod map;
 pub mod robot_cloud;
+pub mod sla;
 pub mod storage;
 pub mod stream;
 pub mod tentanas;
@@ -65,10 +66,10 @@ pub use bus::{
     BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire,
     BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire,
     BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire,
-    BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
-    BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire, BusTopicAccessWire,
-    BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
-    BusTopicSummaryWire,
+    BusPayload, BusQuotaWire, BusRecordSchemaWire, BusReplicaLagWire, BusReplicaNodeWire,
+    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire,
+    BusTopicAccessWire, BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire,
+    BusTopicStatsWire, BusTopicSummaryWire,
 };
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,
@@ -277,6 +278,9 @@ pub use message_body::{
     ApiKeyCreateResponse,
     ApiKeySummary,
     AppEntryWire,
+    BusConsumerStatus,
+    ServiceAccountFlowUsage,
+    ServiceAccountOption,
     AuditEvent,
     AuditLogCleanupRequest,
     AuditLogCleanupResponse,

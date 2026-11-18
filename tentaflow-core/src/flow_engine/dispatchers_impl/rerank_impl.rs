@@ -56,6 +56,7 @@ impl RerankDispatcher for RerankDispatcherImpl {
             provenance.origin,
             provenance.actor,
         );
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()
@@ -65,7 +66,7 @@ impl RerankDispatcher for RerankDispatcherImpl {
         let response = runtime
             .execute_rerank(api_req, &mut rctx)
             .await
-            .map_err(|e| anyhow!("RerankDispatcher: {e}"))?;
+            .map_err(|e| super::dispatcher_failure("RerankDispatcher", e.into_anyhow()))?;
 
         // Guard: backend nie może zwrócić indeksu spoza zakresu dokumentów —
         // inaczej adapter zmapowałby score na zły kandydat.

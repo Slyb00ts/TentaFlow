@@ -55,3 +55,21 @@ test('setOptions carries `disabled`, and a whole-control disabled still disables
   assert.deepEqual(state(el), [['a', false], ['b', true]], 'the per-option state survives the control being re-enabled');
   el.remove();
 });
+
+test('a label attribute is shown above the control and names the radiogroup; without it nothing is added', () => {
+  const el = mount('<option value="a">A</option><option value="b">B</option>', 'a');
+  const caption = el.querySelector('.tf-segmented-label');
+  assert.equal(caption.hidden, true);
+  assert.equal(el.querySelector('.tf-segmented').hasAttribute('aria-labelledby'), false);
+  el.setAttribute('label', 'Waits between retries');
+  assert.equal(caption.hidden, false);
+  assert.equal(caption.textContent, 'Waits between retries');
+  assert.equal(el.querySelector('.tf-segmented').getAttribute('aria-labelledby'), caption.id);
+  el.setOptions([{ value: 'x', label: 'X' }], 'x');
+  const rebuilt = el.querySelector('.tf-segmented-label');
+  assert.equal(rebuilt.textContent, 'Waits between retries');
+  assert.equal(el.querySelector('.tf-segmented').getAttribute('aria-labelledby'), rebuilt.id);
+  el.removeAttribute('label');
+  assert.equal(el.querySelector('.tf-segmented-label').hidden, true);
+  el.remove();
+});

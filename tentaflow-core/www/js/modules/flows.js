@@ -11,8 +11,10 @@ import {
 import { TfWindow } from '/js/components/tf-window.js';
 import { openFlowBuilder } from '/js/modules/flows-builder.js';
 import { I18n } from '/js/i18n.js';
+import { executionsTableHtml } from '/js/lib/flow-executions.js';
 import { emptyProcessModel, processCommand } from './flows-builder/bpmn.js';
 import { openProcessInstances } from './flows-builder/process-monitor.js';
+import { busConsumerText, busConsumerChipStatus } from './flows-builder/bus-consumer.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
@@ -147,7 +149,13 @@ function renderRow(f) {
   const factoryChip = isFactory
     ? ` <tf-chip status="neutral" data-flow-factory="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.factory_chip'))}</tf-chip>`
     : '';
-  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
+  // A flow that reads the bus says so when it does not: the chip names the state, the title adds the reason and the node.
+  const consumer = busConsumerText(f.busConsumer);
+  const consumerChip = consumer && consumer.state !== 'running'
+    ? ` <tf-chip status="${busConsumerChipStatus(consumer.state)}" title="${escapeAttr(consumer.detail)}" data-flow-consumer="${escapeAttr(f.id)}">${escapeHtml(consumer.text)}</tf-chip>`
+      + (consumer.reason ? `<div class="flows-consumer-reason" data-flow-consumer-reason="${escapeAttr(f.id)}">${escapeHtml(consumer.reason)}</div>` : '')
+    : '';
+  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
 }
 
 function bindRowActions() {
@@ -242,6 +250,10 @@ async function deleteFlow(flowId, flowName) {
       toast(I18n.t('flows.delete_not_found'), 'warning');
     }
   } catch (err) {
+    if (String(err.message).includes('[flow:has_history]')) {
+      toast(I18n.t('flows.delete_has_history'), 'error');
+      return;
+    }
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
 }
@@ -260,36 +272,12 @@ async function showExecs(flowId) {
         </div>
         ${execs.length === 0 ? `
           <div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('flows.exec_empty'))}</div></div>
-        ` : `
-          <table class="data-table">
-            <thead><tr>
-              <th>${escapeHtml(I18n.t('flows.col_exec_id'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_status'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_exec_start'))}</th>
-              <th>${escapeHtml(I18n.t('flows.col_exec_end'))}</th>
-            </tr></thead>
-            <tbody>
-              ${execs.map((e) => `
-                <tr>
-                  <td><code style="font-size:11px;">${escapeHtml(e.id)}</code></td>
-                  <td><tf-chip status="${execStatus(e.status)}">${escapeHtml(e.status)}</tf-chip></td>
-                  <td style="font-size:12px;color:var(--text-3);">${formatDate(e.startedAtEpoch)}</td>
-                  <td style="font-size:12px;color:var(--text-3);">${e.completedAtEpoch ? formatDate(e.completedAtEpoch) : '—'}</td>
-                </tr>`).join('')}
-            </tbody>
-          </table>`}
+        ` : executionsTableHtml(execs)}
       </div>`;
     byId('execs-close')?.addEventListener('click', () => { host.innerHTML = ''; });
   } catch (err) {
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
-}
-
-function execStatus(s) {
-  const v = (s || '').toLowerCase();
-  if (v === 'completed' || v === 'success' || v === 'ok') return 'ok';
-  if (v === 'running' || v === 'pending') return 'info';
-  return 'warn';
 }
 
 export default FlowsScreen;

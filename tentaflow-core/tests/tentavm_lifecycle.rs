@@ -56,7 +56,7 @@ fn booted_node() -> (db::DbPool, String) {
     .clone()
 }
 
-/// TentaVM is deliberately NOT in `NATIVE_APP_PACKAGES` yet (the tile needs the
+/// TentaVM's hooks deliberately carry no `catalog_name` yet (the tile needs the
 /// UI shell), so the catalog row is written here the way `install_native_packages`
 /// writes it: manifest on disk plus the `addon_packages` row.
 fn register_package(db: &db::DbPool) {

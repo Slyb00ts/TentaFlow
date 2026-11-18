@@ -708,6 +708,13 @@
   text-overflow: ellipsis;
 }
 .fb-node-row .fb-val.missing { color: var(--tf-danger, #ef4444); }
+/* Consumer state of a bus_consume flow: only a state that needs attention is coloured. */
+.fb-node-consumer .fb-key { font-weight: 600; }
+.fb-node-consumer[data-state="refused"] .fb-key,
+.fb-consumer-banner[data-state="refused"] { color: var(--tf-warning, #d9a300); }
+.fb-node-consumer[data-state="halted"] .fb-key,
+.fb-consumer-banner[data-state="halted"] { color: var(--tf-danger, #ef4444); }
+.fb-consumer-banner { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
 
 /* Porty */
 .fb-port {
@@ -1783,3 +1790,6 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
   .fb-canvas.fb-runtime .fb-node--token-active { animation: fb-token-pulse 2s ease-in-out infinite; }
   .fb-canvas.fb-runtime .fb-node--token-incident { animation: fb-incident-pulse 2s ease-in-out infinite; }
 }
+
+/* Why a bus consumer is not running, under its chip in the flow list: a phone has no hover, so the reason is not left to the chip's title. */
+.flows-consumer-reason { font-size: 12px; font-weight: 400; color: var(--text-3, #8a8f98); overflow-wrap: anywhere; white-space: normal; margin-top: 2px; }

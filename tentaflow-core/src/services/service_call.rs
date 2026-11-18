@@ -39,6 +39,28 @@ pub struct CallerContext {
     /// F2 P1.b — owning organization of the call. `None` means "use the
     /// default tenant" and is recorded as `org-default` in audit rows.
     pub org_id: Option<String>,
+    /// What made this call: an addon acting by itself, a scheduler job, a
+    /// process step, or an `addon.*` block inside a flow run (`parent`). `None`
+    /// is a plain addon call. A model call made on behalf of a run belongs to
+    /// that run and is recorded as its child step, or not at all for a bus run.
+    pub provenance: Option<crate::addon::AddonCallProvenance>,
+}
+
+impl CallerContext {
+    /// The origin a model call made by this caller is stamped with.
+    pub fn origin(&self) -> crate::flow_engine::dispatcher::FlowOrigin {
+        self.provenance
+            .as_ref()
+            .map_or(crate::flow_engine::dispatcher::FlowOrigin::Addon, |p| p.origin)
+    }
+
+    /// The actor a model call made by this caller is stamped with.
+    pub fn actor(&self) -> crate::flow_engine::dispatcher::FlowActor {
+        match &self.provenance {
+            Some(provenance) => provenance.actor_for(&self.addon_id),
+            None => crate::flow_engine::dispatcher::FlowActor::addon(self.addon_id.clone()),
+        }
+    }
 }
 
 /// Request shape for `dispatch`. `payload_json` is forwarded verbatim to the
@@ -242,13 +264,26 @@ pub async fn dispatch(
         // §2.5 — addon-as-model: the caller IS the addon instance.
         let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
             None,
-            crate::flow_engine::dispatcher::FlowOrigin::Addon,
-            crate::flow_engine::dispatcher::FlowActor::addon(req.caller.addon_id.clone()),
+            req.caller.origin(),
+            req.caller.actor(),
         )
         .with_addon_identity(Some(req.caller.addon_id.clone()), req.caller.org_id.clone());
-        let routed =
-            route_alias_via_executor(executor, &service_name, &req.payload_json, &mut exec_ctx)
-                .await;
+        // An addon block lent to a running flow makes its model calls on behalf
+        // of that run; an addon acting on its own behalf enters from outside.
+        exec_ctx.nested_in_run = req
+            .caller
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.parent.is_some());
+        let routed = route_alias_via_executor(
+            executor,
+            &service_name,
+            &req.payload_json,
+            &mut exec_ctx,
+            db,
+            &req.caller,
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis() as i64;
         let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -378,6 +413,8 @@ pub async fn dispatch(
     } else {
         Duration::from_millis(req.timeout_ms as u64)
     };
+    // The addon's own payload, not the one with the pickup token injected.
+    let mut run = open_service_run(&service_name, &req.payload_json, db, &req.caller);
     let started = Instant::now();
     let dispatch_outcome = tokio::time::timeout(
         timeout,
@@ -394,6 +431,7 @@ pub async fn dispatch(
     let result = match dispatch_outcome {
         Ok(inner) => inner,
         Err(_) => {
+            fail_call_run(&mut run);
             if let Some(ref wire) = minted_token_wire {
                 crate::services::pickup_token_issuer().revoke(wire);
             }
@@ -425,6 +463,13 @@ pub async fn dispatch(
             });
         }
     };
+
+    if let Some(run) = run.take() {
+        match &result {
+            Ok(response_json) => run.finish_output(response_json.clone()),
+            Err(_) => run.finish_failed(),
+        }
+    }
 
     match result {
         Ok(response_json) => {
@@ -755,6 +800,8 @@ async fn route_alias_via_executor(
     alias: &str,
     payload_json: &str,
     exec_ctx: &mut crate::services::runtime::context::ExecutionContext,
+    db: &DbPool,
+    caller: &CallerContext,
 ) -> Result<AliasRouteResult, AliasRouteError> {
     use crate::api::openai::types::{ChatCompletionRequest, EmbeddingRequest, MessageContent};
     use crate::services::runtime::executor::ExecutorError;
@@ -768,8 +815,17 @@ async fn route_alias_via_executor(
     }))
     .map_err(|e| AliasRouteError::Dispatch(format!("build chat request: {e}")))?;
 
-    match executor.execute_chat(chat_req, exec_ctx).await {
+    // One run per `service_request`: the chat attempt and, when the alias serves
+    // embeddings instead, the embeddings call that follows it. Not opened for a
+    // call made inside a run (it belongs to that run, and a bus run keeps no
+    // bodies anywhere).
+    let mut run = open_call_run(&chat_req, db, caller);
+    let chat = executor.execute_chat(chat_req, exec_ctx).await;
+    match chat {
         Ok(resp) => {
+            if let Some(run) = run.take() {
+                run.finish_response(&resp);
+            }
             let text = resp
                 .choices
                 .first()
@@ -801,14 +857,19 @@ async fn route_alias_via_executor(
             | ResolveError::UnknownModel(_)
             | ResolveError::CrossEnvironmentDenied(_),
         )) => {
+            fail_call_run(&mut run);
             return Err(AliasRouteError::NoTarget(
                 "alias_no_target_available".to_string(),
             ));
         }
         Err(ExecutorError::AllCandidatesFailed { last_error, .. }) => {
+            fail_call_run(&mut run);
             return Err(AliasRouteError::Dispatch(last_error));
         }
-        Err(e) => return Err(AliasRouteError::Dispatch(e.to_string())),
+        Err(e) => {
+            fail_call_run(&mut run);
+            return Err(AliasRouteError::Dispatch(e.to_string()));
+        }
     }
 
     // Embeddings: input z pola `input` payloadu (string lub lista) — gdy brak,
@@ -822,8 +883,18 @@ async fn route_alias_via_executor(
         user: None,
         extra: serde_json::Map::new(),
     };
-    match executor.execute_embeddings(emb_req, exec_ctx).await {
+    if let Some(run) = run.as_mut() {
+        run.set_embeddings_input(&emb_req);
+    }
+    let embedded = executor.execute_embeddings(emb_req, exec_ctx).await;
+    if embedded.is_err() {
+        fail_call_run(&mut run);
+    }
+    match embedded {
         Ok(resp) => {
+            if let Some(run) = run.take() {
+                run.finish_embeddings(&resp);
+            }
             let embeddings: Vec<&Vec<f32>> = resp.data.iter().map(|d| &d.embedding).collect();
             let body = serde_json::json!({
                 "status": "ok",
@@ -849,6 +920,56 @@ async fn route_alias_via_executor(
             Err(AliasRouteError::Dispatch(last_error))
         }
         Err(e) => Err(AliasRouteError::Dispatch(e.to_string())),
+    }
+}
+
+/// Opens the Events run of an addon `service_request` (alias or concrete
+/// service). Made inside a flow run the call is a child step of it instead, and
+/// nothing for a bus run.
+fn open_call_run(
+    request: &crate::api::openai::types::ChatCompletionRequest,
+    db: &DbPool,
+    caller: &CallerContext,
+) -> Option<crate::routing::direct_run::DirectRun> {
+    let context = crate::compliance::ai_gateway::AiGatewayContext {
+        org_id: caller.org_id.clone(),
+        parent_run: caller
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.parent.clone()),
+        ..Default::default()
+    };
+    crate::routing::direct_run::DirectRun::begin(
+        request,
+        caller.origin(),
+        &caller.actor(),
+        None,
+        Some(db),
+        Some(&context),
+        None,
+    )
+}
+
+/// Opens the Events run of an addon `service_request` to a concrete service: the
+/// payload the addon sent, as the one user message it is delivered as.
+fn open_service_run(
+    service_name: &str,
+    payload_json: &str,
+    db: &DbPool,
+    caller: &CallerContext,
+) -> Option<crate::routing::direct_run::DirectRun> {
+    let request: crate::api::openai::types::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": service_name,
+            "messages": [{"role": "user", "content": payload_json}],
+        }))
+        .ok()?;
+    open_call_run(&request, db, caller)
+}
+
+fn fail_call_run(run: &mut Option<crate::routing::direct_run::DirectRun>) {
+    if let Some(run) = run.take() {
+        run.finish_failed();
     }
 }
 
@@ -1131,7 +1252,62 @@ mod tests {
             instance_id: None,
             is_system_call: true,
             org_id: None,
+            provenance: None,
         }
+    }
+
+    fn alias_chat_request() -> crate::api::openai::types::ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "alias",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("request")
+    }
+
+    /// An addon calling an alias by itself is a top-level run stamped with the
+    /// caller's own origin and actor. Made by an `addon.*` block inside a run it
+    /// is a child step of that run when the run records content, and nothing for
+    /// a bus run.
+    #[test]
+    fn an_alias_call_is_a_run_a_child_step_or_nothing() {
+        use crate::flow_engine::dispatcher::FlowOrigin;
+        use crate::flow_engine::dispatchers::{ParentRun, ProgressEvent, ProgressSink};
+
+        struct Recording(parking_lot::Mutex<Vec<ProgressEvent>>);
+        impl ProgressSink for Recording {
+            fn emit(&self, _scope: &str, event: ProgressEvent) {
+                self.0.lock().push(event);
+            }
+            fn wants_io(&self) -> bool {
+                true
+            }
+        }
+
+        let db = make_db();
+        let mut caller = system_caller("notes");
+        let run = open_call_run(&alias_chat_request(), &db, &caller);
+        assert!(run.is_some(), "a standalone addon call is recorded");
+        drop(run);
+
+        let sink = std::sync::Arc::new(Recording(Default::default()));
+        let chat = ParentRun::new(FlowOrigin::Chat, sink.clone(), "run-1".to_string());
+        caller.provenance = Some(crate::addon::AddonCallProvenance::nested(chat));
+        let child = open_call_run(&alias_chat_request(), &db, &caller);
+        assert!(child.is_some(), "a call inside a chat run is a child step");
+        drop(child);
+        let events = sink.0.lock();
+        assert!(matches!(events.first(), Some(ProgressEvent::NodeStarted { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::RunFinished { .. })),
+            "a child step does not end the parent run"
+        );
+        drop(events);
+
+        let bus = ParentRun::new(FlowOrigin::Bus, sink, "run-2".to_string());
+        caller.provenance = Some(crate::addon::AddonCallProvenance::nested(bus));
+        assert!(open_call_run(&alias_chat_request(), &db, &caller).is_none());
     }
 
     #[test]

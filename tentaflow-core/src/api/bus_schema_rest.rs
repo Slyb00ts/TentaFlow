@@ -410,8 +410,8 @@ where
     // Registry rows live in the platform DB, but they are only this node's to
     // serve while it runs the instance — the same availability rule, and the
     // same 404/503 answers, as the records REST.
-    let instance_id = match resolve_engine(db, Some(instance)) {
-        Ok((id, _svc)) => id.as_str().to_string(),
+    let (instance_id, svc) = match resolve_engine(db, Some(instance)) {
+        Ok((id, svc)) => (id, svc),
         Err(resp) => {
             facts.reason = Some("instance_unavailable".to_string());
             return resp;
@@ -447,7 +447,16 @@ where
 
     let ctx = RegistryCall {
         db: db.clone(),
-        instance_id,
+        bus_ctx: crate::bus::BusCallContext {
+            instance_id: instance_id.clone(),
+            org_id: org_id.clone(),
+            actor: Some(key_uid.clone()),
+            actor_kind: crate::auth::actor::ActorKind::ApiKey,
+            correlation_id: None,
+            origin: "v1.bus.schema.rest".to_string(),
+        },
+        svc,
+        instance_id: instance_id.as_str().to_string(),
         org_id,
         created_by: format!("api_key:{key_uid}"),
     };
@@ -505,6 +514,8 @@ where
 
 struct RegistryCall {
     db: DbPool,
+    svc: Arc<crate::bus::BusService>,
+    bus_ctx: crate::bus::BusCallContext,
     instance_id: String,
     org_id: String,
     created_by: String,
@@ -607,6 +618,8 @@ async fn run_route(
 
     let RegistryCall {
         db,
+        svc,
+        bus_ctx,
         instance_id,
         org_id,
         created_by,
@@ -655,6 +668,23 @@ async fn run_route(
                 )
             }
             Op::Get(subject, version, id_only) => {
+                // A key whose read rule restricts a topic checked with this
+                // Avro/Protobuf/Thrift pattern gets the pattern through the
+                // records it reads, not whole: the text names the fields the
+                // rule hides. A key has no topic-admin exemption.
+                if !id_only {
+                    if let Some(topic) = svc
+                        .topics_hiding_pattern_from(&bus_ctx, &subject)?
+                        .into_iter()
+                        .next()
+                    {
+                        return Err(BusServiceError::PermissionDenied {
+                            action: "read_schema",
+                            topic,
+                        }
+                        .into());
+                    }
+                }
                 let (info, schema_text) = registry::get(db, inst, org, &subject, version)?;
                 let json = if id_only {
                     serde_json::json!({
@@ -1615,6 +1645,91 @@ mod tests {
             .unwrap()
             .is_empty(),
             "nothing may be registered from a refused text"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_read_rule_hides_fields_is_not_served_the_whole_binary_pattern() {
+        let fx = fixture("cc00000d");
+        let uid = fx.key(ORG, &["read", "write"]);
+        let q = format!("?org_id={ORG}");
+        let avro = r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"ssn","type":"string"}]}"#;
+        let body = serde_json::json!({ "schema_type": "avro", "schema_text": avro }).to_string();
+        let registered = send(
+            &fx,
+            "POST",
+            &format!("{}{q}", fx.path("/people/versions")),
+            api_key(&uid),
+            &body,
+        );
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let ctx = BusCallContext {
+            instance_id: fx.instance.clone(),
+            org_id: ORG.to_string(),
+            actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        fx.svc
+            .create_topic(
+                &ctx,
+                "people",
+                TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some("people".to_string()),
+                    validation: Some(crate::bus::topics::ValidationMode::Dlq),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let get = |tail: &str| {
+            send(
+                &fx,
+                "GET",
+                &format!("{}{q}", fx.path(tail)),
+                api_key(&uid),
+                "",
+            )
+        };
+        let whole = get("/people/versions/latest");
+        assert_eq!(
+            whole.status(),
+            StatusCode::OK,
+            "no rule: the pattern is served"
+        );
+        assert!(body_json(whole)["schema_text"]
+            .as_str()
+            .is_some_and(|t| t.contains("ssn")));
+
+        crate::bus::field_policies::set_policy(
+            &fx.state.db,
+            fx.instance.as_str(),
+            ORG,
+            "people",
+            "any",
+            crate::bus::field_policies::SUBJECT_ANY,
+            crate::bus::field_policies::Direction::Read,
+            &["a".to_string()].into_iter().collect(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            crate::bus::field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let hidden = get("/people/versions/latest");
+        assert_eq!(hidden.status(), StatusCode::FORBIDDEN);
+        assert!(!body_json(hidden).to_string().contains("ssn"));
+        assert_eq!(
+            get("/people/versions/1").status(),
+            StatusCode::FORBIDDEN,
+            "a numbered version is no different"
+        );
+        assert_eq!(
+            get("/people/versions/1/id").status(),
+            StatusCode::OK,
+            "the reference id names no field"
         );
     }
 

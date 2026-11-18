@@ -207,6 +207,20 @@ pub fn instance_should_run(main_db: &DbPool, db: &DbPool) -> bool {
 /// Idempotent — reconcile calls it again on every boot and enable.
 pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     let pool = open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
+    if crate::addon::native_apps::console_only_node() {
+        // No disks, no helper and no mounts in an app sandbox: the loops would
+        // act on nothing. The summary says this node is a console, so no
+        // fleet list offers it; the blockers are still published, because an
+        // uninstall is refused while any ready node has published none.
+        fleet::publish_console_summary(ctx.db, ctx.addon_id);
+        publish_teardown_blocks(ctx.db, ctx.addon_id, &pool);
+        tracing::info!(
+            "native app '{}': TentaNas initialized as a console at {:?}",
+            ctx.addon_id,
+            ctx.data_dir
+        );
+        return Ok(());
+    }
     let orphaned = db::fail_orphaned_jobs(&pool)?;
     // A sharing stop or resume that died with the process (wave 10): its
     // record is `stopped` again, and resumed once TentaNas is enabled.
@@ -342,6 +356,11 @@ fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry>
 /// the Environment tab collects through `ElevationRemoveRequest`. Pure: the
 /// uninstall dialog calls it on every open.
 pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    // A console imports no pool, shares nothing and writes no backup
+    // (`native_teardown`); its instance is the data directory alone.
+    if crate::addon::native_apps::console_only_node() {
+        return Ok(vec![data_dir_entry(ctx)]);
+    }
     // The two block rows are keyed on the app HAVING targets, not on the
     // configfs tree existing: a node with LIO loaded for something else and no
     // target of ours must not be promised the removal of something that is not
@@ -395,13 +414,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
         removed: false,
         ..Default::default()
     });
-    entries.push(TeardownEntry {
-        path: ctx.data_dir.clone(),
-        kind: "tentanas_data_dir",
-        description: "instance data directory (tentanas.db: disk history, alerts, jobs, shares)".into(),
-        removed: true,
-        ..Default::default()
-    });
+    entries.push(data_dir_entry(ctx));
     // The keystore lives outside the data dir precisely so this wipe cannot
     // reach it: the encrypted datasets stay on the pools, so their keys must
     // stay too, and deleting them is a separate deliberate act.
@@ -471,12 +484,26 @@ pub fn publish_teardown_blocks(main_db: &DbPool, addon_id: &str, db: &DbPool) {
     crate::addon::native_apps::record_teardown_blocks(main_db, addon_id, &blocks);
 }
 
+fn data_dir_entry(ctx: &NativeAppContext) -> TeardownEntry {
+    TeardownEntry {
+        path: ctx.data_dir.clone(),
+        kind: "tentanas_data_dir",
+        description: "instance data directory (tentanas.db: disk history, alerts, jobs, shares)".into(),
+        removed: true,
+        ..Default::default()
+    }
+}
+
 /// n18a's mode chip and backup column: mode A (the helper) tears down
 /// unattended; anything else needs the admin's sudo password on that node
 /// first (`native_arm_teardown`), or its pools stay imported. The backup is
 /// the configuration export `config_io::write_backup` writes, named after
 /// the host (`config_io::filename`).
 pub fn native_teardown_node_info(ctx: &NativeAppContext) -> TeardownNodeInfo {
+    // A console's teardown needs no root and writes no backup.
+    if crate::addon::native_apps::console_only_node() {
+        return TeardownNodeInfo::default();
+    }
     let helper = open_db(ctx.db, ctx.org_id, ctx.addon_id)
         .map(|db| elevation::mode(&db) == elevation::Mode::Helper)
         .unwrap_or(false);
@@ -614,6 +641,12 @@ pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
     // an unreadable database, the end — drops the password with `hold`
     // (wave-9b critic, round 2, MAJOR B).
     let hold = teardown_hold::take(ctx.addon_id);
+    // A console started no loop, mounted nothing and holds no pool or share,
+    // so there is nothing to stop, export or back up — and no helper to ask.
+    if crate::addon::native_apps::console_only_node() {
+        crate::addon::app_db::close(ctx.addon_id);
+        return Ok(());
+    }
     let pool=open_db(ctx.db,ctx.org_id,ctx.addon_id)?;
     teardown_status::phase(ctx.addon_id, "tentanas_elastic_check");
     db::block_elastic_teardown(&pool)?;

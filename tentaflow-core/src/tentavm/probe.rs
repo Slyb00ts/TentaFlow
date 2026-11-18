@@ -1723,15 +1723,18 @@ pub async fn refresh_local_probe(
 /// restart nothing would re-run it — the dashboard read is the anchor that
 /// survives that, and it is also the moment the answer is actually needed.
 ///
-/// Returns None only where this node never initialized the environment. Never
-/// creates anything to find that out.
+/// Returns None only where this node never initialized the environment or is
+/// a console-only node (`native_apps::console_only_node`). Never creates
+/// anything to find that out.
 pub async fn ensure_local_probe(
     main_db: &DbPool,
     org_id: &str,
     instance_id: &str,
     node_id: &str,
 ) -> Option<CachedProbe> {
-    if !instance_db_exists(org_id, instance_id) {
+    // Without a host row (`native_init`) every measurement is refused after the
+    // fact; the dashboard read would pay for one on every render to learn it.
+    if crate::addon::native_apps::console_only_node() || !instance_db_exists(org_id, instance_id) {
         return None;
     }
     if let Some(fresh) = cached_local(main_db, org_id, instance_id, node_id) {

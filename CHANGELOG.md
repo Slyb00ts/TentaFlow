@@ -6,6 +6,114 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Limity i SLA usług (TB-03)
+
+- Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,
+  replikowane przez Sync Ledger w zakresie organizacji: polityka jest wspólna
+  dla całego klastra, a limity /v1 liczy każdy węzeł osobno. 212 dodaje lokalne
+  tabele węzła `sla_breaches` i `sla_samples`.
+- Nowy moduł `sla` z rejestrem polityk i bramką usługi. Bramka pilnuje limitu
+  równoczesnych wywołań, krótkiej kolejki z limitem czasu oraz limitu wywołań
+  w oknie zegarowym, a także zbiera p95 opóźnień. Zmiana polityki działa
+  w miejscu i nie ucina trwających wywołań. Bramek nic jeszcze nie wywołuje,
+  więc zachowanie aplikacji się nie zmienia.
+- Jeśli dwa węzły nadadzą polityce tę samą nazwę, na każdym węźle wygrywa ta
+  sama, starsza polityka, a druga dostaje przyrostek z identyfikatora.
+- Polityka SLA działa przy uruchamianiu przepływu. Slot zajmuje tylko
+  wywołanie najwyższego poziomu; wywołania z wnętrza przebiegu (bloki,
+  addony, model opublikowany jako ten sam flow) slotu nie zajmują.
+- Gdy limit jest wyczerpany:
+  - `/v1` (OpenAI i Anthropic) zwraca 429 z `Retry-After` w sekundach;
+  - WebSocket zwraca błąd z kodem `sla.overloaded`;
+  - zadanie BPMN jest odkładane z kodem `FLOW_OVERLOADED` i ponawiane po
+    oknie.
+- Timeout z polityki anuluje przebieg i daje mu 2 s na zakończenie. Wiersz
+  wykonania kończy się wtedy jako `error`. `/v1` zwraca 504, a WebSocket
+  błąd `sla.timeout`. Klienci SDK OpenAI ponawiają 504 dwa razy, więc
+  kosztowny przepływ może się wykonać do trzech razy.
+- Reaktor TentaBus konsumuje flow zgodnie z jego polityką SLA. Przy
+  `max_concurrency` = N przetwarza naraz do N paczek: przy `ordering =
+  partition` partycja idzie po kolei, a różne partycje równolegle; przy
+  `ordering = none` wszystkie paczki idą równolegle. Bez polityki albo przy
+  N = 1 reaktor działa jak dotąd.
+- Commit obejmuje tylko ciągły prefiks obsłużonych paczek w każdej partycji.
+  Rekordy po porażce zostaną dostarczone ponownie; `on_error` (dlq, skip,
+  halt) działa dla każdej paczki osobno.
+- Wyczerpany limit tylko opóźnia przetwarzanie: nic nie trafia do DLQ i nic
+  nie ginie, rośnie lag. Spowalnianie widać w lagu i jego alertach oraz w
+  polu `throttled_until`, a nie w licznikach odmów.
+- W trybie `at_most_once` reaktor najpierw rezerwuje sloty i pobiera najwyżej
+  tyle paczek, ile zarezerwował. Czekanie na nowe rekordy jest wtedy skracane
+  do połowy `queue_timeout` polityki.
+- Status konsumenta pokazuje `in_flight`, `max_concurrency` i
+  `throttled_until`. Starsze węzły odczytują go bez tych pól.
+- Każdy węzeł co 30 s ocenia ostatnie 5 minut usług objętych polityką
+  i otwiera naruszenia: p95 czasu odpowiedzi, odsetek błędów, timeouty,
+  ostrzeżenie o wykorzystaniu limitu wywołań, osiągnięcie limitu oraz
+  nasycenie wątków trwające co najmniej 60 s. Naruszenie otwiera się raz,
+  aktualizuje, dopóki trwa, i zamyka przy pierwszej ocenie, w której warunek
+  już nie zachodzi albo polityka zniknęła. Flow busa, który tylko zwalnia,
+  też je otwiera, bo liczy się zapełnienie okna, a nie odmowy.
+- Węzeł zapisuje próbki minutowe usług (7 dni) i historię naruszeń (90 dni
+  po zamknięciu). Audyt `sla.calls.rejected`, `sla.concurrency.rejected`,
+  `sla.breach.raised` i `sla.breach.resolved` jest zbierany w oknach 60 s
+  ze stemplem organizacji polityki.
+- Eksport Zabbix ma cztery nowe metryki bez etykiet:
+  `tentaflow_sla_breaches_open`, `tentaflow_sla_rejected_total`,
+  `tentaflow_sla_timeouts_total` i `tentaflow_sla_inflight`; szablon Zabbix
+  zawiera pasujące pozycje.
+- `max_concurrent` usługi AI jest teraz prawdziwym limitem równoczesnych
+  wywołań na węźle. Obejmuje usługi HTTP, QUIC i silniki wbudowane
+  (llama.cpp, MLX, sherpa) oraz endpointy `/v1/infer`, `/v1/rerank`,
+  `/v1/ranking` i generowanie obrazów. Strumień trzyma slot do końca.
+  Brak klucza oznacza brak limitu, jak dotąd; dozwolone wartości to 0–1024,
+  gdzie 0 też znaczy brak limitu.
+- Zajęte wywołanie czeka najwyżej `timeout_ms` usługi. Potem `/v1` zwraca 503
+  z `Retry-After`, a WebSocket błąd `backend.busy`. Komunikat nie zawiera
+  identyfikatorów usługi ani węzła.
+- Przy kilku replikach zajęta replika nie blokuje wolnej: żądanie bez
+  czekania przechodzi do następnej i czeka tylko na ostatniej. Odmowa z
+  powodu zajętości nie liczy się jako awaria w circuit breakerze.
+- Protokół ma nową rodzinę komunikatów `SlaBody`: lista, odczyt, zapis
+  i usunięcie polityki, przypisanie i zdjęcie polityki z flow, stan SLA oraz
+  stronicowana lista naruszeń. Starsze klienty ignorują nowe pola.
+- Migracja 213 dodaje uprawnienie `sla.manage`, nadawane tylko roli
+  `org_admin`. Zapis polityk wymaga `sla.manage`, a przypisanie do flow
+  dodatkowo roli `power_user` lub `admin`, tak jak edycja flow. Odczyty
+  dotyczą własnej organizacji; inną organizację może wskazać tylko
+  super-admin.
+- Odmowy, na które admin może zareagować, mają kody: `invalid_value`
+  (z nazwą pola), `name_taken`, `policy_in_use` (z liczbą przypisań),
+  `system_flow` i `governed_elsewhere`. Zmiany polityk i przypisań trafiają
+  do audytu `sla.policy.*` ze stanem przed i po.
+- Lista flow pokazuje przypisaną politykę i skrót stanu (ok, ostrzeżenie,
+  naruszenie, zajęcie, wykorzystanie okna). Flow objęty polityką innej
+  organizacji ma w skrócie znacznik `governed_elsewhere` z bieżącym stanem,
+  bez nazwy i identyfikatora polityki.
+
+### Zdarzenia i konta usługowe (TB-02)
+
+- Przebiegi AI w dzienniku zdarzeń zawsze zapisują pełne wejście i wyjście
+  (prompt, odpowiedź, argumenty i wyniki narzędzi, żądanie do modelu w każdej
+  iteracji agenta) — bez zgody organizacji. Ustawienie
+  `events.store_assistant_body:<org>` nie istnieje: wiersz `assistant_message`
+  niesie treść odpowiedzi dla każdego przebiegu, a starsze wiersze z
+  `not_enabled` i `no_organisation` nadal się odczytują. Przebiegi z magistrali
+  (TentaBus, dane medyczne) nie zapisują żadnej treści — tylko oś czasu — i tego
+  nie zmienia żadna ścieżka. Przebieg czatu bez modelu kończy się teraz jako
+  `failed` (błąd dociera do strumienia zamiast pustej odpowiedzi), a przycisk
+  „Anuluj” nie pojawia się przy przebiegach, których nie da się anulować.
+- Każdy przebieg przepływu kończy się teraz jednym wierszem `request_finished`
+  w dzienniku zdarzeń (status `completed`/`failed`/`cancelled` i czas, bez
+  treści), także przebiegi z magistrali i przepływy bez wywołania LLM; widok
+  Zdarzeń zamyka żądanie tym wierszem, a dla starszych przebiegów zostaje
+  dotychczasowa reguła (odpowiedź albo błąd). Wiersz nie wymaga migracji, ale
+  starsza wersja programu po obniżeniu wersji odrzuca strony zdarzeń zawierające
+  `request_finished` (nieznany rodzaj zdarzenia).
+- Odwołanie klucza API, który jest kontem usługi aktywnych przepływów
+  `bus_consume`, ostrzega przed potwierdzeniem i wymienia te przepływy
+  (`ServiceAccountUsageRequest`, tylko Admin, w obrębie organizacji wywołującego).
+
 ### Struktura organizacyjna
 
 - Nieobecność nie ma już powodu: pole zniknęło z formularza, bazy (migracja 200
@@ -645,6 +753,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (32 zakresy, 32 grupy powtórzeń, 128 wystąpień, 8 instancji w drzewie
   wywołań) kończą się zrozumiałym komunikatem w pięciu językach. Przebieg
   z kodem wykonawczym `RealExecution` nadal jest odrzucany.
+- Polityka ponowień per krok BPMN (B4.6): zadanie usługi może mieć `retry`
+  (1–10 ponowień, odstęp od 1 s do 24 h, stały albo rosnący z mnożnikiem i
+  limitem). Krok bez polityki serializuje się bajt w bajt jak dotąd, więc
+  opublikowane modele zachowują swoje sumy SHA-256. Silnik sam ponawia tylko
+  awarię, która dowodnie nic nie zrobiła na zewnątrz; niepewny wynik, przekroczony
+  czas po wysłaniu i nieudane mapowanie wyniku nigdy nie są ponawiane
+  automatycznie, a ręczne ponowienie liczy się do limitu. Jedna awaria to jeden
+  incydent: migracja 210 dodaje do `bpmn_incidents` liczbę prób, limit i termin
+  kolejnej próby, więc restart w trakcie oczekiwania nie gubi ani nie podwaja
+  ponowienia, a osoba dostaje powiadomienie raz, dopiero gdy silnik rezygnuje.
+  Historia ma zdarzenia `job_retry_scheduled`, `job_retries_exhausted` i
+  `job_retry_stopped`, a incydent pokazuje `attempts` (wykonane, limit, termin).
+  Import `failedJobRetryTimeCycle` (`R<n>/PT…`) mapuje się na politykę, cykle
+  nieregularne na najbliższą z ostrzeżeniem. Symulacja uruchamia krok raz i mówi o
+  tym w formularzu. Inspektor ma sekcję ponowień w zakładce „Czas”
+  (pięć języków); przy kroku agenta ostrzega, że każde ponowienie uruchamia agenta
+  od nowa i zużywa jego model, czas i budżet.
+  Poprawki po przeglądzie B4.6: ponowienie odłożone, bo źródło lub aktywacja są
+  chwilowo niedostępne, nie zużywa limitu (zdarzenie `job_retry_deferred`, termin
+  przesuwa się o opóźnienie polityki, po 20 odłożeniach albo 24 h silnik rezygnuje
+  z powodem `deferral_limit`); przejściowy błąd bazy (zajęta, zablokowana, I/O)
+  nie rozbraja ponowienia, a nieudane rozbrojenie nie blokuje reszty strony;
+  `job_retries_exhausted` zapisuje się raz, przy przejściu z uzbrojenia, a zatrzymanie
+  przez kod (np. niepewny wynik) zapisuje `job_retry_stopped` z powodem; rozwiązany
+  incydent traci termin; opóźnienie wykładnicze zaokrągla w górę, więc 1 s rośnie;
+  import Camundy czyta też listę `PT10M,PT17M,PT20M` (jeden interwał to jedno
+  ponowienie), oznacza przycięte i nieregularne cykle jako przybliżone i ostrzega
+  (`CAMUNDA_RETRY_CYCLE_NO_JOB`), gdy cykl leży na zadaniu bez joba; UI pokazuje
+  bezwzględny termin zamiast „za 30 s”; poprawiono podpowiedź o ponowieniach
+  w pięciu językach.
 - Bramka AI i limity tokenów. Wyczerpany limit tokenów zatrzymuje teraz wywołanie
   modelu w każdym przepływie (zwykłym, systemowym i strumieniowym), a nie tylko w
   kroku procesu; wcześniej zwykły przepływ tylko logował odmowę i działał dalej bez
@@ -710,6 +848,179 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   pliku reguł audytu NFS zmienia się na angielski przy następnym zapisie.
 
 ### TentaBus
+
+- PowerUser może edytować flow: `FlowUpdateRequest`, `FlowVersionRestoreRequest`
+  i `FlowFactoryRestoreRequest` wymagają teraz roli PowerUser lub Admin (wcześniej
+  tylko Admin). Pozostałe ograniczenia bez zmian: flow systemowe są tylko do
+  odczytu, domyślny flow czatu musi być aktywny, kolizje nazwy publikacji są
+  odrzucane, a każde sprawdzenie konta usługowego nadal wymaga, by zapisujący
+  osobiście miał prawa do tematu. User i Viewer nadal są odrzucani.
+- Odbiór z magistrali: gdy kolejka błędów (DLQ) nie przyjmuje jeszcze zapisu,
+  odbiór czeka 2 s i wraca ze stanem „oczekuje” (powód `dlq_unavailable`) zamiast
+  w pętli uruchamiać flow od nowa; odmowy zapisu flow z kontem usługowym niosą
+  nazwę węzła i klucza (nie identyfikator) i są tłumaczone w interfejsie na pięć
+  języków; import środowiska zwraca nazwy flow zapisanych jako szkice, a interfejs
+  je pokazuje.
+- Flow z historią uruchomień nie da się usunąć: `FlowDeleteRequest` odmawia przed
+  jakimkolwiek zapisem (zamiast kończyć się błędem klucza obcego w bazie) i
+  proponuje dezaktywację; historia wykonań zostaje nietknięta, migracji brak.
+  Flow bez historii usuwa się jak dotąd i nadal zapisuje audyt odpięcia konta.
+- Naprawa: flow z węzłem `bus_consume` nigdy niczego nie czytał, bo reaktor
+  konsumował bez tożsamości, a autoryzator odmawia wołającemu bez aktora. Teraz
+  węzeł wskazuje konto usługowe (`service_account`: uid aktywnego klucza ogólnego,
+  nigdy klucza użytkownika ani grupy) i flow czyta, publikuje (`bus_publish`) i
+  zapisuje do DLQ jako ten klucz, z jego prawami do tematów i regułami ukrywania
+  pól; w audycie występuje jako `api_key:<uid>`. Konsumuje w grupie klucza
+  `k:<uid>.<grupa>` (autor wpisuje samą grupę). Nowo przypisane konto czyta temat
+  od najstarszego zachowanego rekordu. Zapis flow z takim węzłem (tworzenie,
+  edycja aktywnego flow, przywracanie wersji i fabryczne) sprawdza przy każdym
+  zapisie, że zapisujący (PowerUser lub Admin) sam ma odczyt tematu i zapis na
+  każdy temat `bus_publish`, w swojej organizacji, że klucz istnieje, jest aktywny i
+  ogólny, ma te same prawa, i odmawia `create_if_missing` (klucz nie tworzy
+  tematów); powiązanie trafia do audytu jako `flow.service_account.bind`. Flow bez
+  konta usługowego (zapisane przed zmianą) pozostaje bez odbioru z widocznym
+  powodem; nic nie jest uzupełniane automatycznie. Broker zapisuje list martwy
+  (`on_error = dlq`) dla klucza własnym kontekstem wewnętrznym, tak jak kwarantannę
+  schematu, dopiero po sprawdzeniu odczytu klucza na temacie źródłowym; klucz nadal
+  nie ma dostępu do tematów `__`. Stan odbioru per węzeł (działa, oczekuje,
+  wstrzymany z powodem, zatrzymany) jest w `FlowSummary`/`FlowDetail`
+  (`bus_consumer`, dopisane na końcu z `#[serde(default)]`, `SCHEMA_VERSION`
+  bez zmian), na liście flow, na węźle i w inspektorze; wstrzymany odbiór wznawia
+  się sam w ciągu 5 s po naprawie przyczyny, a zatrzymany (`halt`) po ponownym
+  zapisie flow. Nowe żądanie `ServiceAccountListRequest` (PowerUser) zwraca do
+  listy wyboru tylko uid i nazwę aktywnych kluczy ogólnych. Flow działający jako
+  konto usługowe nie może mieć `bus_publish` w podflow, pętli ani mapie (ani
+  węzła `agent`): klucz działa jedną tożsamością w całym przebiegu, więc zapis
+  odmawia, a `SubflowRunner` odmawia w czasie wykonania ciała edytowanego po
+  powiązaniu. Import środowiska sprawdza flow tak jak zapis; flow, który nie
+  przejdzie, trafia jako szkic (audyt `flow.service_account.import_demoted`),
+  a zreplikowany zapis niesie ten status, nazwę, opis i typ usługi. Sprawdzenie
+  idzie szerzej niż węzły najwyższego poziomu: przeszukiwanie podflow, pętli i map
+  jest wszerz (płytsza ścieżka wygrywa), a brakujący lub nieczytelny podflow to
+  odmowa (przy imporcie dzieci bierze się najpierw z paczki). Węzły uruchamiające
+  agentów (`agent`, `agent_context`, `spawn`, `await_subagents`) są odrzucane, a
+  `core.agent_spawn` odmawia w czasie wykonania dla przebiegu konta usługowego;
+  model będący opublikowanym flow też nie jest dla niego dostępny. Flow dostarczony
+  przez addon nie może wskazać konta usługowego. Zapis sprawdza też regułę
+  ukrywania pól po stronie zapisu dla celów `bus_publish`, a błąd odczytu reguły
+  jest błędem zapisu. Audyt zna `flow.service_account.unbind` (usunięcie
+  powiązania, dezaktywacja, usunięcie flow) i porównuje węzeł, klucz, temat,
+  instancję i organizację. Ostrzeżenie o nowej grupie porównuje z ostatnio
+  zapisanym flow, nie z edytowanym węzłem. Znane ograniczenia: lista kluczy
+  nie jest zawężona do organizacji (klucze nie mają organizacji), a stan
+  „wstrzymany” jest tylko w pamięci procesu (po restarcie reaktor ustala go od
+  nowa). Bez migracji.
+- Korelacja end to end (TB-02, backend): jeden `correlation_id` przechodzi przez
+  łańcuch temat → przepływ → temat. Nagłówek rekordu `correlation-id` (ASCII
+  `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) broker waliduje i zapisuje jako
+  `tf.correlation_id`; nagłówki `tf.*` od wołającego nadal są usuwane, a
+  `x-correlation-id` i `traceparent` nie są wejściem. Reaktor przenosi id rekordu do
+  przebiegu (partia z mieszanymi id dostaje nowe id partii i `bus_correlation_ids` w
+  meta), przebiegi z magistrali trafiają teraz zawsze do osi czasu zdarzeń, a ponowienie
+  z DLQ zachowuje oryginalne id. REST przyjmuje i zwraca nagłówek `X-Correlation-Id`
+  (nieprawidłowy daje 400; bez niego każdy rekord dostaje własne id, a odpowiedź
+  publikacji niesie `correlation_id` i `correlation_ids`); wynika z tego, że wyrażenie
+  `idempotency_key` czytające nagłówek `correlation-id` nie rozpozna ponowionego
+  żądania REST bez `X-Correlation-Id`, bo każde ponowienie dostaje nowe id. Wartości
+  nagłówków w NDJSON są kodowane base64. Dashboard nadaje UUID na operację zamiast
+  numeru ramki WS. Sub-agenty uruchamiane reaktorem zapisują teraz oś czasu zdarzeń.
+  `MessagesBrowseRequest` ma opcjonalny `correlation_id` (ograniczony skan: jeden
+  budżet 10 000 rekordów albo 8 MiB na całe żądanie, wspólny dla partycji;
+  `next_offset` partycji mówi, dokąd doszedł, a partycja, do której budżet nie
+  dotarł, zgłasza swój początek), a `FlowExecutionSummary` — `request_id`,
+  `correlation_id` i `origin`. Widoczność zdarzeń: przeglądarka jest zawsze
+  ograniczona do organizacji wołającego (także odczyt osi czasu i treści kroku
+  pojedynczego przebiegu); poza nią czyta tylko administrator platformy (wcześniej
+  `events.read_all` pozwalało czytać cudzą organizację przez `org_id` w żądaniu).
+  Zwykłe `events.read` nadal widzi własne przebiegi, także bez organizacji. Przebiegi
+  z magistrali nie zapisują treści kroków (`step_io`) ani lustra audytu w outboxie;
+  zostają oś czasu i czasy kroków.
+- Korelacja w interfejsie (TB-02.4): Zdarzenia mają widoczne pole „Korelacja” (to samo
+  filtrowanie co `?correlation=`) i sekcję korelacji w szczegółach przebiegu (kopiowanie,
+  współrzędne wiadomości z magistrali z linkiem „Otwórz w TentaBus”, „Pokaż wszystko z tą
+  korelacją”). Podgląd wiadomości TentaBus ma kolumnę „Korelacja”, filtr szukający od
+  numeru „Od numeru”, link do Zdarzeń w szczegółach wiadomości, a gdy budżet przeszukania
+  się wyczerpie — „Przeszukano do numeru N” i „Szukaj dalej od N+1” zamiast „brak wyników”.
+  Adres `#/tentabus?topic=…&corr=…&partition=…&offset=…` otwiera podgląd na rekordzie.
+  Historia wykonań przepływu ma kolumnę „Korelacja” i link „Oś czasu →”. Zdarzenie
+  rozpoczynające przebieg z magistrali zapisuje `bus_source` (instancja, topik, partycja i numer
+  rekordu, bez treści).
+- Dashboard: ukrywanie danych na tematach z wzorem **Avro, Protobuf albo Thrift**
+  (F4 B6 UI). Blokada „treść binarna” zostaje tylko dla tematu bez wzoru, z wycofanym
+  wzorem, z nieczytelną listą pól albo na starszym serwerze (`binaryFieldActions`
+  w możliwościach); każdy powód ma własny tekst. Okno zasady listuje pola
+  najwyższego poziomu z `SchemaFieldsGet` (z typami z tekstu wzoru), odczyt to
+  „Pokaż / Ukryj” („Zamaskuj” i „Zahaszuj” są widoczne, ale zablokowane z wyjaśnieniem),
+  zapis „Dozwolone / Wymagane / Niedozwolone” z objaśnieniem, co znaczy „ustawione”
+  w danym formacie, i ostrzeżeniem, gdy pole Avro bez wartości domyślnej i bez null
+  jest „Niedozwolone”. Podgląd „jak widzi…”, przeglądarka wiadomości i okno
+  nieprzetworzonej wiadomości pokazują treść binarną jako bajty, numer wzoru
+  (`schemaRefId`) i „Pokaż wzór” (`SchemaForRecordGet`); rekord wstrzymany jest
+  nazwany. Nowe odmowy (maska/hasz, wzór wycofany lub niepodpięty, pole spoza wzoru,
+  zmiana lub odpięcie wzoru pod zasadami, nowa wersja bez pola wymaganego przez
+  zasadę zapisu) są opisane po polsku i w czterech pozostałych językach.
+- Zasady ukrywania danych działają na tematach z wzorem **Avro, Protobuf albo
+  Thrift** (F4 B6). Odczyt (`peek`, `fetch`, REST rekordów, funkcje hosta addonów,
+  reaktor/bloki flow, lista „nieprzetworzonych wiadomości”, podgląd „jak widzi X”)
+  dekoduje rekord wersją wzoru, którą go zapisano (id wpisane przy publikacji;
+  rekord bez id nie wskazuje żadnej wersji i jest wstrzymany), pomija pola, których
+  zasada nie pokazuje, i zwraca rekord w tym samym formacie i protokole, taki jak
+  napisany pod **pod-schematem** wyprowadzonym dla widocznych pól: Protobuf —
+  bez tagów ukrytych pól, Thrift — bez ich nagłówków (w TCompact delty id kolejnych
+  pól są liczone od nowa), Avro — bez bajtów ukrytych pól (kolejność pól i gałęzie
+  unii bez zmian). Dotyczy pól najwyższego poziomu. Rekord niepoprawny według
+  wzoru zapisu, z nieznaną wersją albo z wzorem, który się już nie kompiluje, jest
+  **wstrzymany** (pusty ładunek, id 0), nigdy pokazany. Maska i hasz nadal są
+  odmawiane na tematach binarnych (`masking and hashing do not apply to a topic
+  whose messages are binary`). Temat bez zasad nie płaci niczego; skompilowane
+  wersje i teksty pod-schematów są w pamięci podręcznej.
+- Rekord niesie id schematu, pod którym jest zapisany: `schema_id` w JSON REST
+  rekordów, `schema_ref_id` w podglądach wiadomości i nieprzetworzonych
+  wiadomości (`#[serde(default)]`), `schema_id` w rekordzie funkcji hosta
+  (`BusRecordOut`, opcjonalne). Dla czytelnika z zasadą to id jego pod-schematu;
+  tekst pobiera przez `SchemaForRecordGetRequest` (WS) albo
+  `GET /v1/bus/instances/{instance}/topics/{topic}/schemas/{schema_id}?org_id=`
+  (to samo prawo co odczyt tematu). Czytelnik z zasadą dostaje wyłącznie swój
+  pod-schemat, nigdy pełny wzór; id po zmianie zasady nie jest już obsługiwane
+  (`bus.schema_not_found`). `SchemaFieldsGetRequest` zwraca nazwy pól najwyższego
+  poziomu wzoru binarnego.
+- Zapis: zasada zapisu na temacie binarnym sprawdza pola, które rekord **ustawia**:
+  Protobuf — tagi na drucie, Thrift — id pól, Avro (gdzie każde pole jest zawsze
+  na drucie) — pola, których wartość jest inna niż domyślna albo `null` w
+  nullowalnej unii (pole bez domyślnej i bez `null` jest zawsze ustawione, więc
+  musi być dozwolone). Rekord niepoprawny według wzoru to `FieldPolicyPayloadMalformed`.
+- Nowe odmowy: zasada na temacie z wzorem wycofanym albo z typem treści
+  Avro/Protobuf/Thrift bez powiązanego wzoru (`field policies on a topic whose
+  messages are binary need a linked message pattern that is not withdrawn`),
+  nazwa pola spoza wzoru, zmiana albo odpięcie wzoru tematu, który ma zasady,
+  oraz nowa wersja wzoru bez pola, które zasada zapisu wymaga
+  (`registry::VERSION_DROPS_REQUIRED_FIELD`). Zasady już zapisane działają dalej
+  po wycofaniu wzoru. Bez migracji i bez podbicia `SCHEMA_VERSION`.
+- Poprawki po przeglądzie F4 B6 (R1): zasada nie może pokazać pola, którego typ
+  sięga z powrotem do wzoru (rekurencja przez korzeń, np. `next`), gdy ukrywa
+  jakiekolwiek inne pole — zagnieżdżona kopia korzenia niesie ukryte pola; taki
+  rekord (zasada sprzed nowej wersji wzoru) jest wstrzymany. Zasada odczytu na
+  temacie binarnym wymaga, by temat sprawdzał wiadomości (`validation` inne niż
+  `off`), a temat z taką zasadą nie przechodzi na `off`: rekord bez id wersji nie
+  jest czytany wersją bieżącą. Zasada zapisu, której nie spełni żaden rekord
+  (pole Avro bez domyślnej i bez `null`, niedozwolone), jest odmawiana. Zasada
+  zapisu nie dotyczy tematu `__dlq.*` (zapis brokera). Czytelnik, któremu
+  zasada odczytu ogranicza temat z wzorem binarnym, nie dostaje pełnego wzoru z
+  `SchemaGetRequest` ani `SchemaFieldsGetRequest` (tylko administrator tematu);
+  zgadywanie id pod-schematu kosztuje jeden skan wersji na zmianę rejestru.
+- Poprawki po przeglądzie F4 B6 (R2): zasada zapisu jest pomijana tylko dla
+  zapisu brokera do `__dlq.*` (martwy list nieudanej dostawy, kwarantanna), nie
+  dla każdego publish na temat o takiej nazwie — publish użytkownika na
+  `__dlq.x`, którego wiąże zasada zapisu tematu `x`, jest odmawiany
+  (`PermissionDenied`). REST rejestru schematów (`GET .../versions/{n}`) nie
+  oddaje pełnego wzoru Avro/Protobuf/Thrift kluczowi, któremu zasada odczytu
+  ogranicza temat z tym wzorem (403, klucz nie ma wyjątku administratora).
+  Protobuf i Thrift: zasada nie może pokazać pola sięgającego do korzenia nawet
+  wtedy, gdy pokazuje wszystkie pola wersji (rekord może nieść tag nowszej
+  wersji w zagnieżdżonej kopii). Odmowa wyprowadzenia pod-schematu jest
+  pamiętana (jedno ostrzeżenie zamiast jednego na odczyt). Strażnik
+  `validation=off` pod zasadą odczytu działa tylko, gdy aktualizacja dotyka
+  `validation`.
 
 - Zasada odczytu może pokazać pole **zamaskowane** albo **zahaszowane** (F4 B7;
   tylko JSON, XML i HL7 v2 — w Avro, Protobuf i Thrift zasada nadal jest

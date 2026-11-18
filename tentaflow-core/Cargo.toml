@@ -427,6 +427,11 @@ plist = { workspace = true }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 libloading = { workspace = true }
 
+# Mach task accounting (`TASK_VM_INFO` phys_footprint) for the iOS per-app memory
+# limit in `memory/process_limit.rs`.
+[target.'cfg(target_os = "ios")'.dependencies]
+mach2 = { workspace = true }
+
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 wasmtime = { workspace = true }
@@ -642,6 +647,12 @@ required-features = ["test-support"]
 # Needs `stub_ctx` from the test-support surface.
 [[test]]
 name = "bus_flow_chain_p11_gate"
+required-features = ["test-support"]
+
+# TB-02: one correlation id across REST-style entry -> A -> F1 -> B -> F2 -> C,
+# flow_executions and run_events. Needs `stub_ctx`.
+[[test]]
+name = "bus_correlation_chain"
 required-features = ["test-support"]
 
 # ort-backed state classifier + plate OCR: load pool + run one forward on a real

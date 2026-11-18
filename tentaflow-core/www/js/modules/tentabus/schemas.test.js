@@ -131,6 +131,26 @@ test('binding a pattern to a topic of another payload kind is refused in plain w
   assert.equal(schemaKindMismatchText(undefined), '');
 });
 
+test('the B6 refusals (recursive field, read rule without validation, unwritable write rule) are put in plain words', () => {
+  const recursive = busRefusalText("bus.invalid_argument: field 'next' refers back to the message itself and cannot be shown without the fields the rule hides: topic 'wezly' is checked with the pattern 'node'");
+  assert.match(recursive, /^Pole „next” odwołuje się do całej wiadomości/);
+  assert.match(recursive, /topik wezly, wzór node/);
+  assert.match(busRefusalText("field 'next' refers back to the message itself and cannot be shown without the fields the rule hides"), /^Pole „next”/);
+  const read = busRefusalText("bus.invalid_argument: a read rule on a topic of binary messages needs the topic to validate its messages: topic 'zam-off' is checked with the avro pattern 'zam-avro' but does not validate its messages");
+  assert.match(read, /topik zam-off \(wzór zam-avro\) ma sprawdzanie wyłączone/);
+  assert.match(
+    busRefusalText("bus.invalid_topic_config: a read rule on a topic of binary messages needs the topic to validate its messages: cannot turn validation off on topic 'zam' while a read rule exists for it; delete its read rules first"),
+    /wyłączyć sprawdzania wiadomości topiku zam/,
+  );
+  const write = busRefusalText("bus.invalid_argument: field 'customer' has no default value and is not nullable, so every record sets it and a write rule has to allow it: topic 'zam' is checked with the pattern 'zam-avro'");
+  assert.match(write, /pole „customer” nie ma wartości domyślnej/);
+  assert.match(write, /topik zam, wzór zam-avro/);
+  assert.match(
+    busRefusalText("the default value of field 'big' is too large to evaluate (more than 1 bytes or 2 steps once its nested defaults are filled in), so a write rule cannot tell whether the field is set and has to allow it: topic 'zam' is checked with the pattern 'zam-avro'"),
+    /Zasada zapisu nie może ocenić pola „big”/,
+  );
+});
+
 test('the stable server sentences about a stored pattern and a rule on a binary topic are put in plain words', () => {
   assert.match(
     busRefusalText("protocol error BadRequest: bus.invalid_argument: subject 'zamowienie' v3: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema: field 'a' of struct 'X' has no explicit id (line 1)"),
@@ -138,7 +158,7 @@ test('the stable server sentences about a stored pattern and a rule on a binary 
   );
   assert.equal(
     busRefusalText("bus.invalid_argument: field policies cannot apply to a topic whose messages are binary: topic 'zamowienia' is checked with the thrift pattern 'zamowienie'"),
-    'Topik zamowienia przyjmuje wiadomości binarne (wzór zamowienie, Thrift). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc nie można ich dodać.',
+    'Zasada tekstowa nie może obowiązywać na topiku zamowienia: ma on wzór binarny zamowienie (Thrift). Odśwież stronę i dodaj zasadę jeszcze raz.',
   );
   assert.equal(busRefusalText('bus.invalid_argument: something else'), '');
   assert.equal(
@@ -160,4 +180,35 @@ test('binding a binary pattern under existing rules and the compile error behind
 test('the bind refusal without a kind (the pattern vanished meanwhile) still reads in words', () => {
   const text = busRefusalText("bus.invalid_topic_config: field policies cannot apply to a topic whose messages are binary: cannot bind the binary pattern 'z' to topic 'zamowienia' while field policies exist for it; delete its field policies first");
   assert.match(text, /\(binarny\)/);
+});
+
+test('the refusals of rules on a binary topic, of changing its pattern and of a version that drops a required field are put in plain words', () => {
+  assert.equal(
+    busRefusalText("protocol error BadRequest: bus.invalid_argument: masking and hashing do not apply to a topic whose messages are binary: topic 'zamowienia' is checked with the avro pattern 'zamowienie'"),
+    'Zamaskować ani zahaszować pola nie można: topik zamowienia ma wiadomości binarne (wzór zamowienie, Avro). Pole można tylko pokazać albo ukryć.',
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: topic 'zamowienia' declares binary messages (content_type 'application/avro') but no message pattern is linked to it"),
+    'Topik zamowienia ma wiadomości binarne, ale nie ma przypiętego wzoru. Przypnij wzór w ustawieniach topiku, a potem dodaj zasadę.',
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: the protobuf pattern 'zam' of topic 'zamowienia' is withdrawn"),
+    'Wzór zam (Protobuf) topiku zamowienia jest wycofany, więc nie można dodać ani zmienić zasady. Zasady ukrywania pól w wiadomościach binarnych wymagają wzoru, który nie jest wycofany.',
+  );
+  assert.match(
+    busRefusalText("bus.invalid_argument: field policies on a topic whose messages are binary need a linked message pattern that is not withdrawn: the message pattern of topic 'zamowienia' was changed or withdrawn while the rule was being saved; try again"),
+    /^Wzór topiku zamowienia zmienił się albo został wycofany, zanim zasada się zapisała/,
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field 'sekret' is not a field of the message pattern 'zam' of topic 'zamowienia'"),
+    'Pole „sekret” nie należy do wzoru zam topiku zamowienia. Zasada może wymieniać tylko pola najwyższego poziomu tego wzoru.',
+  );
+  assert.match(
+    busRefusalText("bus.invalid_topic_config: cannot change the message pattern of topic 'zamowienia' while field policies exist for it (they name fields of the pattern 'zam'); delete its field policies first"),
+    /^Nie można zmienić ani odpiąć wzoru zam topiku zamowienia, dopóki topik ma zasady ukrywania pól.*Usuń najpierw zasady w sekcji Ukrywanie danych\.$/,
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: the new version lacks a field that a write rule of a topic bound to this pattern requires: field 'numer' is required by a write rule of topic 'zamowienia'; change the rule first"),
+    'Nowa wersja wzoru nie ma pola „numer”, a zasada zapisu topiku zamowienia wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku zamowienia), a potem dodaj wersję.',
+  );
 });

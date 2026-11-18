@@ -1593,7 +1593,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         unrelated
             .add_incidents
-            .push(tentaflow_protocol::processes::ProcessIncident {
+            .push(tentaflow_protocol::processes::ProcessIncident { attempts: None,
                 scope_id: snapshot.instance.instance_id.clone(),
                 incident_id: id.clone(),
                 node_id: Some("Catch_1".into()),

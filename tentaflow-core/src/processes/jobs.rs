@@ -573,13 +573,47 @@ async fn execute_flow(
         .map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
         .collect();
 
-    if !begin_dispatch(job, None)? {
-        return Ok(());
+    // A flow under an SLA policy takes its slot BEFORE the dispatch boundary is
+    // committed, and without waiting for one: a job holds its lease while it
+    // waits, and the task can be put off instead. Nothing ran yet, so any
+    // refusal defers the task for at least the refusal's `retry_after` (bounded,
+    // an incident only after `DEFER_DEADLINE_MS`) like a busy addon, instead of
+    // failing a run that never started.
+    let admission = match dispatcher.admit_pinned_flow(&pinned, &mut meta).await {
+        Ok(admission) => admission,
+        Err(DispatchError::Overloaded { retry_after_ms, .. }) => {
+            repository::defer_job_for(
+                pool,
+                claimed,
+                worker_id,
+                "FLOW_OVERLOADED",
+                i64::try_from(retry_after_ms).unwrap_or(i64::MAX),
+                now_ms(),
+            )?;
+            return Ok(());
+        }
+        Err(error) => return fail_claim(pool, worker_id, claimed, "FLOW_ERROR", error, None),
+    };
+    // The admission is held from before the dispatch boundary; if the boundary
+    // is not committed the run never starts, and the slot and the window call
+    // go back.
+    match begin_dispatch(job, None) {
+        Ok(true) => {}
+        Ok(false) => {
+            admission.forgo();
+            return Ok(());
+        }
+        Err(error) => {
+            admission.forgo();
+            return Err(error);
+        }
     }
     let execution = async {
         pinned_flow_end(
             job,
-            dispatcher.dispatch_pinned_flow(&pinned, envelope, meta).await,
+            dispatcher
+                .dispatch_pinned_flow_admitted(&pinned, envelope, meta, admission)
+                .await,
         )
     };
     let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
@@ -4039,7 +4073,9 @@ mod tests {
             model.variables.insert("case_key".into(), json!("review-17"));
             let work = model.nodes.iter_mut().find(|node| node.id == "Work_Exact").unwrap();
             work.kind = match route {
-                "service" => ProcessNodeKind::ServiceTask { flow_id: flow_id.clone(),
+                "service" => ProcessNodeKind::ServiceTask {
+                    retry: None,
+                    flow_id: flow_id.clone(),
                     input_mapping: BTreeMap::from([("payload".into(), "vars.accepted_customer_id".into())]),
                     output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
                     implementation: Default::default(),

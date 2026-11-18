@@ -10,6 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
+import { busConsumerText, busGroupProblem } from '/js/modules/flows-builder/bus-consumer.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
@@ -20,8 +21,11 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { PROCESS_RETRY_LIMITS, CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processRetryMode, processRetryChange, processRetryProblems, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
+
+const RETRY_POLICY_KEYS = ['retryAttempts', 'retryDelaySeconds', 'retryBackoff', 'retryFactorPercent', 'retryMaxDelaySeconds'];
+const PROCESS_RETRY_MAX_ATTEMPTS = PROCESS_RETRY_LIMITS.attempts;
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -255,9 +259,23 @@ async function loadDynamicEnumOptions(source, category) {
         }))
         .filter((o) => o.value);
     }
+    if (source === 'bus_service_accounts') {
+      // Service-account picker of a `bus_consume` node: the active general API
+      // keys, by uid and name (`ServiceAccountListRequest`, PowerUser — the full
+      // key list is Admin-only and carries far more than a picker needs). A
+      // failed call is NOT turned into an empty list: the field then says the
+      // accounts could not be loaded instead of "no keys". A saved uid that is
+      // no longer offered falls into the "stale value" branch above.
+      const accounts = await ApiBinary.list('serviceAccountListRequest', { arrayKey: 'accounts' });
+      return (Array.isArray(accounts) ? accounts : [])
+        .map((a) => ({ value: String(a.keyId ?? ''), label: String(a.name || a.keyId || '') }))
+        .filter((o) => o.value);
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);
+  // A failed load must not stay cached for the whole session.
+  promise.catch(() => _dynamicEnumCache.delete(key));
   return promise;
 }
 
@@ -905,7 +923,8 @@ export class FlowConfig {
         ${verificationMode === 'Test' || verificationMode === 'Critic' ? '' : `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>`}
         <div data-routing-view></div>`)
         + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${processTimeoutCeiling(config)}" step="1" ${processTimeoutProblem(config) ? `error="${escapeAttr(I18n.t('bpmn.timeout_invalid', { max: processTimeoutCeiling(config) }))}"` : ''}`)}
-        <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
+        <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>
+        ${this._retryPolicyHtml(config, input, disabled, Boolean(agentTask))}`);
       serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
       fields += `${textarea('script', 'script_body', config.script, 3)}
@@ -1417,6 +1436,7 @@ export class FlowConfig {
       const key = control.dataset.process;
       if (key === 'editSequence') { canvas.selectEdge(control.value); return; }
       if (this.readOnly) return;
+      if (RETRY_POLICY_KEYS.includes(key)) { this._changeRetry(node, key, control); return; }
       if (key === 'callTargetMode' || key === 'localBodyChoice'
         || key === 'calledDefinitionChoice' || key === 'calledVersionChoice' || key === 'calledProcessChoice'
         || key === 'calledElement') return;
@@ -1675,6 +1695,56 @@ export class FlowConfig {
     this.root.querySelector('[data-process="duplicate"]')?.addEventListener('click', () => this.opts.onDuplicate(node.id));
   }
 
+  // The retry policy of a Service task, in the Timing tab: nothing is hidden, the
+  // detail fields only appear once there is a policy to describe. An agent step may
+  // have one too, with a note that every repeat runs the whole agent again.
+  _retryPolicyHtml(config, input, disabled, agentStep = false) {
+    const retry = config.retry ?? null;
+    const grown = retry?.backoff?.Exponential;
+    const problems = processRetryProblems(retry);
+    const error = (key, text) => (problems[key] ? `error="${escapeAttr(I18n.t(text, problems[key]))}"` : '');
+    return `<section class="fb-process-retry" data-retry-policy>
+      <h4>${escapeHtml(I18n.t('bpmn.retry_policy_title'))}</h4>
+      ${input('retryAttempts', 'retry_attempts', retry?.maxAttempts ?? 0, `type="number" min="0" max="${PROCESS_RETRY_MAX_ATTEMPTS}" step="1" ${error('retryAttempts', 'bpmn.retry_attempts_invalid')}`)}
+      <div data-retry-detail ${retry ? '' : 'hidden'}>
+        ${input('retryDelaySeconds', 'retry_delay', retry?.delaySeconds ?? '', `type="number" min="1" max="86400" step="1" ${error('retryDelaySeconds', 'bpmn.retry_delay_invalid')}`)}
+        <tf-segmented data-process="retryBackoff" size="sm" label="${escapeAttr(I18n.t('bpmn.retry_backoff'))}" value="${processRetryMode(retry)}" ${disabled}>
+          <option value="Fixed">${escapeHtml(I18n.t('bpmn.retry_backoff_fixed'))}</option>
+          <option value="Exponential">${escapeHtml(I18n.t('bpmn.retry_backoff_exponential'))}</option>
+        </tf-segmented>
+        <div data-retry-growing ${grown ? '' : 'hidden'}>
+          ${input('retryFactorPercent', 'retry_factor', grown?.factorPercent ?? '', `type="number" min="101" max="1000" step="1" ${error('retryFactorPercent', 'bpmn.retry_factor_invalid')}`)}
+          ${input('retryMaxDelaySeconds', 'retry_max_delay', grown?.maxDelaySeconds ?? '', `type="number" min="1" max="86400" step="1" ${error('retryMaxDelaySeconds', 'bpmn.retry_max_delay_invalid')}`)}
+        </div>
+      </div>
+      <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.retry_policy_hint'))}</p>
+      ${agentStep ? `<p class="fb-field-hint" data-retry-agent-cost>${escapeHtml(I18n.t('bpmn.retry_agent_cost_hint'))}</p>` : ''}
+    </section>`;
+  }
+
+  // Applies one field of the retry section to the node and brings the other
+  // controls in line (values the section chose, errors, which fields show).
+  _changeRetry(node, key, control) {
+    const next = processRetryChange(node.config.retry ?? null, key, control.value);
+    this.opts.onConfigChange(node.id, { retry: next });
+    const problems = processRetryProblems(next);
+    const grown = next?.backoff?.Exponential;
+    const shown = { retryAttempts: next?.maxAttempts ?? 0, retryDelaySeconds: next?.delaySeconds ?? '',
+      retryFactorPercent: grown?.factorPercent ?? '', retryMaxDelaySeconds: grown?.maxDelaySeconds ?? '' };
+    const messages = { retryAttempts: 'bpmn.retry_attempts_invalid', retryDelaySeconds: 'bpmn.retry_delay_invalid',
+      retryFactorPercent: 'bpmn.retry_factor_invalid', retryMaxDelaySeconds: 'bpmn.retry_max_delay_invalid' };
+    for (const [field, value] of Object.entries(shown)) {
+      const target = this.root.querySelector(`[data-process="${field}"]`);
+      if (!target) continue;
+      if (field !== key && String(target.value) !== String(value)) target.value = String(value);
+      if (problems[field]) target.setAttribute('error', I18n.t(messages[field], problems[field]));
+      else target.removeAttribute('error');
+    }
+    this.root.querySelector('[data-process="retryBackoff"]').value = processRetryMode(next);
+    this.root.querySelector('[data-retry-detail]').hidden = !next;
+    this.root.querySelector('[data-retry-growing]').hidden = !grown;
+  }
+
   _bindServiceTabs(node) {
     const tabs = this.root.querySelector('[data-service-tabs]');
     tabs.addEventListener('change', (event) => {
@@ -1914,7 +1984,8 @@ export class FlowConfig {
     const keys = schema.order && schema.order.length ? schema.order : Object.keys(props);
 
     const labelVal = isAutoNodeLabel(n.label, n.type, this.template?.label) ? '' : (n.label || '');
-    let html = `
+    let html = this._renderBusConsumerBanner();
+    html += `
       <div class="fb-field">
         <tf-input data-bind="label" data-type="string" label="${escapeAttr(I18n.t('flows_config.name'))}" value="${escapeAttr(labelVal)}" placeholder="${escapeAttr(getNodeName(n.type, this.template?.label))}"></tf-input>
       </div>
@@ -1932,6 +2003,7 @@ export class FlowConfig {
       if (!def) continue;
       const value = n.config?.[key];
       html += this._renderField(key, def, value, required.includes(key));
+      html += this._renderBusConsumeNote(key);
     }
 
     for (const f of harness) {
@@ -1975,6 +2047,45 @@ export class FlowConfig {
     return html;
   }
 
+  // `bus_consume` runs as a service account: its consumer group is that key's
+  // own `k:<uid>.<group>`, and the group a flow reads from is new whenever the
+  // account is. The author types the plain group; both facts are shown here
+  // instead of left to be discovered in TentaBus.
+  _busEffectiveGroupText() {
+    const cfg = this.node?.config || {};
+    const uid = String(cfg.service_account || '').trim();
+    const group = String(cfg.group || '').trim();
+    if (group && busGroupProblem(group)) return I18n.t('flows_config.group_invalid');
+    if (!uid || !group) return I18n.t('flows_config.effective_group_pending');
+    return I18n.t('flows_config.effective_group', { group: `k:${uid}.${group}` });
+  }
+
+  _renderBusConsumeNote(key) {
+    if (this.node?.type !== 'bus_consume') return '';
+    if (key === 'group') {
+      const bad = busGroupProblem(this.node?.config?.group) ? ' fb-map-warn' : '';
+      return `<div class="fb-field-hint${bad}" data-role="bus-effective-group" aria-live="polite">${escapeHtml(this._busEffectiveGroupText())}</div>`;
+    }
+    if (key === 'service_account') {
+      // Shown while the account differs from the one in the last loaded or
+      // saved flow (not from the live node, which already holds the edit): a
+      // flow reading under an unchanged account keeps its group and position.
+      const live = String(this.node?.config?.service_account || '').trim();
+      const savedConfig = this.opts?.getSavedNodeConfig?.(this.node?.id);
+      const saved = String((savedConfig ? savedConfig.service_account : live) || '').trim();
+      const hidden = live === saved ? ' hidden' : '';
+      return `<div class="fb-field-hint fb-map-warn" data-role="bus-new-group-warning" aria-live="polite" data-saved-account="${escapeAttr(saved)}"${hidden}>${escapeHtml(I18n.t('flows_config.service_account_new_group_warning'))}</div>`;
+    }
+    return '';
+  }
+
+  _renderBusConsumerBanner() {
+    if (this.node?.type !== 'bus_consume') return '';
+    const info = busConsumerText(this.opts.getBusConsumer?.());
+    if (!info) return '';
+    return `<div class="fb-field fb-consumer-banner" data-state="${escapeAttr(info.state)}" role="status">${escapeHtml(info.detail)}</div>`;
+  }
+
   _renderField(key, def, value, isRequired) {
     const type = def.type || 'string';
     const title = def.title_key ? I18n.t(def.title_key) : (def.title || key);
@@ -1998,7 +2109,7 @@ export class FlowConfig {
     if (Array.isArray(def.enum)) {
       const opts = def.enum.map((opt) => {
         const v = typeof opt === 'object' ? opt.value : opt;
-        const l = typeof opt === 'object' ? opt.label : opt;
+        const l = typeof opt === 'object' ? (opt.label_key ? I18n.t(opt.label_key) : opt.label) : opt;
         const sel = String(curVal) === String(v) ? 'selected' : '';
         return `<option value="${escapeAttr(v)}" ${sel}>${escapeHtml(l)}</option>`;
       }).join('');
@@ -2154,11 +2265,36 @@ export class FlowConfig {
       }
       const type = el.dataset.type;
       // tf-input/tf-textarea/tf-select all expose `.value` and emit `change`.
+      // The group line and its check follow the typing, not only the blur.
+      if (node.type === 'bus_consume' && key === 'group') {
+        el.addEventListener('input', () => {
+          const line = body.querySelector('[data-role="bus-effective-group"]');
+          if (!line) return;
+          const group = String(el.value || '').trim();
+          const cfg = this.node?.config || {};
+          const uid = String(cfg.service_account || '').trim();
+          line.textContent = busGroupProblem(group)
+            ? I18n.t('flows_config.group_invalid')
+            : (uid && group ? I18n.t('flows_config.effective_group', { group: `k:${uid}.${group}` }) : I18n.t('flows_config.effective_group_pending'));
+          line.classList.toggle('fb-map-warn', !!busGroupProblem(group));
+        });
+      }
       el.addEventListener('change', () => {
         let v = el.value;
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
         this.opts.onConfigChange?.(node.id, { [key]: v });
         this._refreshPreview();
+        if (node.type === 'bus_consume' && (key === 'group' || key === 'service_account')) {
+          const line = body.querySelector('[data-role="bus-effective-group"]');
+          if (line) {
+            line.textContent = this._busEffectiveGroupText();
+            line.classList.toggle('fb-map-warn', !!busGroupProblem(this.node?.config?.group));
+          }
+          const warning = body.querySelector('[data-role="bus-new-group-warning"]');
+          if (warning && key === 'service_account') {
+            warning.hidden = String(v || '').trim() === warning.dataset.savedAccount;
+          }
+        }
       });
     });
 
@@ -2173,7 +2309,14 @@ export class FlowConfig {
       try {
         const opts = await loadDynamicEnumOptions(source, category);
         if (!opts.length) {
-          sel.setOptions([{ value: '', label: I18n.t('flows_config.dynamic_empty', { source, category }), disabled: true }], '');
+          const label = source === 'bus_service_accounts'
+            ? I18n.t('flows_config.service_account_none')
+            : I18n.t('flows_config.dynamic_empty', { source, category });
+          const rows = [{ value: '', label, disabled: true }];
+          // The bound key stays visible and selected even when the list is
+          // empty, so a hidden picker never reads as "no account".
+          if (currentValue) rows.push({ value: currentValue, label: I18n.t('flows_config.dynamic_stale', { value: currentValue }) });
+          sel.setOptions(rows, currentValue || '');
           return;
         }
         const list = [{ value: '', label: I18n.t('flows_config.select_placeholder') }, ...opts];
@@ -2186,6 +2329,11 @@ export class FlowConfig {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(`[fb-config] dynamic_enum load failed for ${source}:${category}:`, err);
+        if (source === 'bus_service_accounts') {
+          const rows = [{ value: '', label: I18n.t('flows_config.service_account_load_failed'), disabled: true }];
+          if (currentValue) rows.push({ value: currentValue, label: I18n.t('flows_config.dynamic_stale', { value: currentValue }) });
+          sel.setOptions(rows, currentValue || '');
+        }
       }
     });
   }

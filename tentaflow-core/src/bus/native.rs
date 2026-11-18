@@ -835,8 +835,8 @@ mod tests {
 
     /// Installs a bare `addons` row for `addon_id` so `app_db::open`
     /// (`open_db`/`native_init`/`native_on_enable`) can resolve a
-    /// `native.db_file` to open. Deliberately NOT `bundled::native_manifest`
-    /// ("tentabus"): that reads the compiled-in manifest catalog, which is
+    /// `native.db_file` to open. Deliberately NOT the compiled manifest of
+    /// `native_apps::hooks_for("tentabus")`: that reads the compiled-in manifest catalog, which is
     /// EMPTY under `TENTAFLOW_FAST_BUILD=1` (`build.rs` skips addon
     /// bundling) — these are `bus::` tests, gated under the fast build, so
     /// they must not depend on it. `native_apps::test_support::

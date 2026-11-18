@@ -1,18 +1,18 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM jako PyPI pinned (0.28.0). Dla macOS Apple
+# Opis: vLLM jako PyPI pinned (0.34.0). Dla macOS Apple
 #       Silicon uzywamy osobnego silnika `vllm-metal` (bundle
 #       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
 engine = "vllm"
-description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.28.0)"
+description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.34.0)"
 python_version = "3.12"
-# Pinned na 0.28.0. Switch z git HEAD na PyPI dla
+# Pinned na 0.34.0. Switch z git HEAD na PyPI dla
 # reproducibility — git main moze rozjechac sie z innymi deps.
 source = "pypi"
-pypi_package = "vllm==0.28.0"
+pypi_package = "vllm==0.34.0"
 
 [launch]
 command = "python"
@@ -61,7 +61,9 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = []
+# vLLM 0.34.0 pins exactly this triple; cu130 wheels exist for x86_64 and
+# aarch64 (DGX Spark / Grace Blackwell).
+extras = ["torch==2.14.0", "torchvision==0.29.0", "torchaudio==2.11.0"]
 
 [[install_variants]]
 backend = "rocm"

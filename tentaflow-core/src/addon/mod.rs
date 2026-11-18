@@ -698,16 +698,43 @@ pub struct ToolDefinition {
 pub struct AddonCallProvenance {
     pub origin: crate::flow_engine::dispatcher::FlowOrigin,
     pub actor: Option<crate::flow_engine::dispatcher::FlowActor>,
+    /// Correlation id of the run the call belongs to (TB-02). `bus_publish_v1`
+    /// stamps it on records that carry no `correlation-id` header of their
+    /// own; `None` makes the host mint one per record.
+    pub correlation_id: Option<String>,
+    /// The flow run this call is made on behalf of (an `addon.*` block), whose
+    /// origin the call carries. A model call it makes belongs to that run: it is
+    /// recorded as a child step of it, never as a run of its own.
+    pub parent: Option<crate::flow_engine::dispatchers::ParentRun>,
 }
 
 impl AddonCallProvenance {
+    /// An addon block executing inside a flow run of `origin`: the call is that
+    /// run's, so a bus flow stays a bus call and a chat flow stays a chat call.
+    pub fn nested(parent: crate::flow_engine::dispatchers::ParentRun) -> Self {
+        Self {
+            origin: parent.origin,
+            actor: None,
+            correlation_id: None,
+            parent: Some(parent),
+        }
+    }
+
     /// An addon acting on its own behalf — the shape of every ordinary tool
     /// call and of a worker that has not been lent out yet.
     pub fn addon() -> Self {
         Self {
             origin: crate::flow_engine::dispatcher::FlowOrigin::Addon,
             actor: None,
+            correlation_id: None,
+            parent: None,
         }
+    }
+
+    /// Ties the call to the correlation chain of the run that made it.
+    pub fn with_correlation_id(mut self, correlation_id: Option<String>) -> Self {
+        self.correlation_id = correlation_id;
+        self
     }
 
     /// An Admin Scheduler tick firing an addon tool. The actor is the JOB, not
@@ -719,6 +746,8 @@ impl AddonCallProvenance {
             actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
                 job_id,
             )),
+            correlation_id: None,
+            parent: None,
         }
     }
 
@@ -731,6 +760,8 @@ impl AddonCallProvenance {
             actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
                 request_id,
             )),
+            correlation_id: None,
+            parent: None,
         }
     }
 
@@ -1463,21 +1494,12 @@ impl AddonManager {
         // reconciles; each node records its own outcome in the synced
         // `__node_status/` registry so the admin GUI shows the whole fleet.
         if manifest.is_native() {
-            if !native_apps::platform_supported(&manifest.platforms) {
+            if let Some(refusal) = native_apps::local_platform_refusal(&addon.package_id) {
                 info!(
                     "sync reconcile: native '{addon_id}' unsupported na tej platformie ({}) — pomijam init",
                     std::env::consts::OS
                 );
-                native_apps::record_node_status(
-                    &self.db,
-                    addon_id,
-                    "unsupported",
-                    &format!(
-                        "platform '{}' not in {:?}",
-                        std::env::consts::OS,
-                        manifest.platforms
-                    ),
-                );
+                native_apps::record_node_status(&self.db, addon_id, "unsupported", &refusal);
                 return;
             }
             let Some(hooks) = native_apps::hooks_for(&addon.package_id) else {
@@ -2620,22 +2642,13 @@ impl AddonManager {
             if !manifest.is_native() {
                 continue;
             }
-            if !native_apps::platform_supported(&manifest.platforms) {
+            if let Some(refusal) = native_apps::local_platform_refusal(&a.package_id) {
                 info!(
                     "start_installed_native_instances: native '{}' unsupported na tej platformie ({}) — pomijam init",
                     a.addon_id,
                     std::env::consts::OS
                 );
-                native_apps::record_node_status(
-                    &self.db,
-                    &a.addon_id,
-                    "unsupported",
-                    &format!(
-                        "platform '{}' not in {:?}",
-                        std::env::consts::OS,
-                        manifest.platforms
-                    ),
-                );
+                native_apps::record_node_status(&self.db, &a.addon_id, "unsupported", &refusal);
                 continue;
             }
             let Some(hooks) = native_apps::hooks_for(&a.package_id) else {
@@ -3223,6 +3236,33 @@ impl AddonManager {
         )
     }
 
+    /// [`Self::call_tool`] / [`Self::call_tool_preauthorized`] for a tool an agent
+    /// run calls from inside a flow run: the call carries that run (origin, and
+    /// its progress sink for the model calls the tool makes) and the
+    /// organisation the run acts in, which the worker must belong to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_tool_in_run(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        user_id: &str,
+        preauthorized: bool,
+        parent: crate::flow_engine::dispatchers::ParentRun,
+        expected_org: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            CallIdentity::User(user_id),
+            preauthorized,
+            AddonCallProvenance::nested(parent),
+            None,
+            expected_org,
+        )
+    }
+
     /// Like `call_tool` but skips the per-addon `"llm"` permission check because
     /// the caller already adjudicated it (§3.13 B: the harness raised a grant
     /// card and the operator chose AllowOnce / AllowForRun — neither persists a
@@ -3654,6 +3694,7 @@ impl AddonManager {
     /// out_cap, out_len_ptr) -> i32`), z konwencja tool name = "block.{block_type}".
     /// `envelope_json` to serialized FlowEnvelope; response to envelope JSON
     /// po wykonaniu logiki bloku.
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke_block(
         &self,
         addon_id: &str,
@@ -3663,6 +3704,8 @@ impl AddonManager {
         org_id: Option<String>,
         fuel_budget: u64,
         deadline: Option<std::time::Instant>,
+        correlation_id: Option<String>,
+        parent: Option<crate::flow_engine::dispatchers::ParentRun>,
     ) -> Result<Vec<u8>> {
         info!(
             "Wywolanie flow blocku '{}.{}' (user_id={:?}, fuel={}, deadline={:?})",
@@ -3706,9 +3749,16 @@ impl AddonManager {
             permission_checker: self.permission_checker.clone(),
             fuel_consumed: 0,
             is_system_call: user_id.is_none(),
-            // A flow `addon.*` block runs the addon on the flow's behalf; the
-            // flow's own §2.5 stamp travels with the flow, not through here.
-            call_provenance: AddonCallProvenance::addon(),
+            // A flow `addon.*` block runs the addon on the flow's behalf. The
+            // run's origin travels with the call, so a model call the block
+            // makes stays that run's (a bus flow stays a bus call, and no second
+            // run is opened for it); its correlation id keeps a
+            // `bus_publish_v1` from the block in the run's chain.
+            call_provenance: match parent {
+                Some(parent) => AddonCallProvenance::nested(parent),
+                None => AddonCallProvenance::addon(),
+            }
+            .with_correlation_id(correlation_id),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),
@@ -4482,6 +4532,66 @@ mod tests {
         });
     }
 
+    /// An instance replicated from a build that did not list this node's
+    /// platform carries that build's `platforms` on its row. This node runs
+    /// the package anyway, because its OWN compiled manifest lists it, and an
+    /// `unsupported` recorded by an earlier boot is replaced by `ready`.
+    #[tokio::test]
+    async fn a_stale_instance_manifest_does_not_keep_a_supported_node_unsupported() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::db::migrations::run(&conn).unwrap();
+            let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+            let package = "benchmark-studio";
+            let addon_id = "benchmark-studio-0000beef";
+            let compiled = native_apps::hooks_for(package).expect("compiled app").manifest;
+            let compiled_platforms = lifecycle::parse_manifest_toml(compiled).unwrap().platforms;
+            let line = format!("platforms = {compiled_platforms:?}");
+            assert!(
+                compiled.contains(&line),
+                "manifest spells platforms as {line}"
+            );
+            let stale = lifecycle::rewrite_manifest_for_instance(
+                &compiled.replace(&line, "platforms = [\"solaris\"]"),
+                addon_id,
+                "Benchmark",
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            db.write()
+                .unwrap()
+                .execute(
+                    "INSERT INTO addons (addon_id, name, version, package_id, package_version, \
+                     runtime, manifest_json, is_enabled) \
+                     VALUES (?1, 'Benchmark', '1.0.0', ?2, '1.0.0', 'native', ?3, 1)",
+                    rusqlite::params![addon_id, package, stale],
+                )
+                .unwrap();
+            native_apps::record_node_status(
+                &db,
+                addon_id,
+                "unsupported",
+                "platform not in [\"solaris\"]",
+            );
+            let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+            let manager = AddonManager::new(db.clone(), cipher).expect("addon manager");
+
+            manager.start_installed_native_instances();
+
+            let status = crate::db::repository::list_addon_config_prefixed(
+                &db,
+                addon_id,
+                native_apps::NODE_STATUS_KEY_PREFIX,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, value, _)| serde_json::from_str::<serde_json::Value>(&value).unwrap())
+            .next()
+            .expect("node status recorded");
+            assert_eq!(status["status"], "ready", "{status}");
+        });
+    }
+
     #[test]
     fn test_activate_skips_gated_aliases() {
         // Two aliases owned by the addon; only one is gated. The pure
@@ -4698,5 +4808,23 @@ mod tests {
         assert_eq!(actor.kind(), ActorKind::Addon);
         assert_eq!(actor.id(), Some("notes-inst-1"));
         assert_eq!(actor.user_id(), None);
+    }
+
+    /// An `addon.*` block inside a flow run reports the run's origin and marks
+    /// the call as nested, so a model call it makes is the run's own: a bus flow
+    /// stays a bus call (no bodies anywhere), a chat flow opens no second run.
+    #[test]
+    fn a_block_inside_a_run_carries_the_runs_origin_and_is_nested() {
+        use crate::flow_engine::dispatcher::FlowOrigin;
+
+        for origin in [FlowOrigin::Bus, FlowOrigin::Chat] {
+            let provenance =
+                AddonCallProvenance::nested(crate::flow_engine::dispatchers::ParentRun::unrecorded(origin));
+            assert_eq!(provenance.origin, origin);
+            assert!(provenance.parent.is_some());
+        }
+        assert!(AddonCallProvenance::addon().parent.is_none());
+        assert!(AddonCallProvenance::scheduler("job").parent.is_none());
+        assert!(AddonCallProvenance::process("req").parent.is_none());
     }
 }

@@ -127,6 +127,27 @@ pub fn parse_bus_records_path(path: &str) -> Option<(Option<&str>, &str)> {
     }
 }
 
+/// Matches `GET /v1/bus/instances/{instance_id}/topics/{topic}/schemas/{schema_id}`
+/// (F4 B6): the schema a reader decodes a record of a binary topic with —
+/// `schema_id` is the id the record carried (the `schema_id` of the records
+/// JSON). Returns `(instance, topic, schema_id)`. No legacy instance-less form:
+/// the route is new.
+pub fn parse_bus_record_schema_path(path: &str) -> Option<(&str, &str, u32)> {
+    let rest = path.strip_prefix("/v1/bus/instances/")?;
+    let (instance, after_instance) = rest.split_once("/topics/")?;
+    let (topic, id) = after_instance.split_once("/schemas/")?;
+    if instance.is_empty()
+        || instance.contains('/')
+        || topic.is_empty()
+        || topic.contains('/')
+        || id.is_empty()
+        || !id.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((instance, topic, id.parse().ok()?))
+}
+
 #[derive(Debug, Default)]
 struct BusRecordsQuery {
     org_id: Option<String>,
@@ -331,7 +352,11 @@ struct RestActor {
 }
 
 impl RestActor {
-    fn call_context(&self, instance_id: BusInstanceId) -> BusCallContext {
+    fn call_context(
+        &self,
+        instance_id: BusInstanceId,
+        correlation_id: Option<String>,
+    ) -> BusCallContext {
         let (actor, actor_kind) = match &self.caller {
             RestCaller::User { user_id } => (user_id.clone(), ActorKind::User),
             RestCaller::ApiKey { uid } => (uid.clone(), ActorKind::ApiKey),
@@ -341,7 +366,7 @@ impl RestActor {
             org_id: self.org_id.clone(),
             actor: Some(actor),
             actor_kind,
-            correlation_id: None,
+            correlation_id,
             origin: "v1.bus.rest".to_string(),
         }
     }
@@ -717,6 +742,22 @@ struct NdjsonRecord {
     payload_b64: String,
 }
 
+/// HTTP request/response header carrying a correlation id (TB-02). Distinct
+/// from the record-level `correlation-id` header.
+const CORRELATION_ID_HTTP_HEADER: &str = "x-correlation-id";
+
+/// The validated `X-Correlation-Id` request header: `Ok(None)` when absent,
+/// `Err` when present but not a valid id.
+fn request_correlation_id(headers: &hyper::HeaderMap) -> std::result::Result<Option<String>, ()> {
+    let Some(raw) = headers.get(CORRELATION_ID_HTTP_HEADER) else {
+        return Ok(None);
+    };
+    match raw.to_str() {
+        Ok(id) if bus::correlation::validate(id) => Ok(Some(id.to_string())),
+        _ => Err(()),
+    }
+}
+
 fn decode_b64(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
@@ -814,7 +855,13 @@ where
 {
     let (peer_ip, user_agent) = request_origin(&req);
     let mut facts = KeyAuditFacts::default();
-    let response = serve_publish(req, db, instance, topic, &mut facts).await;
+    let echoed = request_correlation_id(req.headers()).ok().flatten();
+    let mut response = serve_publish(req, db, instance, topic, &mut facts).await;
+    if let Some(id) = echoed.and_then(|id| hyper::header::HeaderValue::from_str(&id).ok()) {
+        response
+            .headers_mut()
+            .insert(CORRELATION_ID_HTTP_HEADER, id);
+    }
     audit_key_request(
         db,
         "bus.rest.publish",
@@ -864,6 +911,18 @@ where
     if let Err(resp) = precheck_api_key(db, &actor, instance, topic, BusAction::Produce, facts) {
         return resp;
     }
+    let header_correlation_id = match request_correlation_id(req.headers()) {
+        Ok(id) => id,
+        Err(()) => {
+            facts.reason = Some("invalid_correlation_id".to_string());
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid X-Correlation-Id header: expected 1-128 ASCII characters \
+                 [A-Za-z0-9._:-] starting with a letter or digit",
+            );
+        }
+    };
     // Resolved (and the running engine looked up) before touching the
     // request body — §3.2: a request addressed to instance B must never
     // fall back to A, and a malformed/unavailable instance should fail as
@@ -888,7 +947,7 @@ where
         }
     };
 
-    let (records, create_if_missing) = if is_cbor {
+    let (mut records, create_if_missing) = if is_cbor {
         let input: BusPublishInput = match minicbor::decode(&body_bytes) {
             Ok(v) => v,
             Err(e) => {
@@ -935,8 +994,10 @@ where
         );
     }
     facts.records = Some(records.len());
+    let record_correlation_ids =
+        bus::correlation::settle_records(&mut records, header_correlation_id.as_deref());
 
-    let ctx = actor.call_context(instance_id);
+    let ctx = actor.call_context(instance_id, header_correlation_id.clone());
     let batch = PublishBatch {
         partition: None,
         producer: None,
@@ -971,7 +1032,9 @@ where
             // DLQ under `validation = dlq`; `schema_dropped`: records that
             // failed validation and whose quarantine copy could not be
             // written — lost. Both additive, always present.
-            let body = publish_response_json(&r);
+            let mut body = publish_response_json(&r);
+            body["correlation_id"] = serde_json::json!(header_correlation_id);
+            body["correlation_ids"] = serde_json::json!(record_correlation_ids);
             json_response(
                 StatusCode::OK,
                 serde_json::to_vec(&body).unwrap_or_default(),
@@ -1022,7 +1085,115 @@ fn record_to_json(r: FetchedRecordMeta) -> serde_json::Value {
             ))
             .collect::<HashMap<String, String>>(),
         "payload": base64::engine::general_purpose::STANDARD.encode(r.payload),
+        // The id of the schema the payload is written under (`0` = none). For
+        // a binary topic read through a rule that hides fields it is the id of
+        // the reader's sub-schema (`.../schemas/{schema_id}`); `0` with an
+        // empty payload = the record was withheld.
+        "schema_id": r.schema_id,
     })
+}
+
+pub async fn handle_record_schema(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+    instance: String,
+    topic: String,
+    schema_id: u32,
+) -> std::result::Result<Response<OpenAIBody>, hyper::Error> {
+    let Some(db) = router.db.clone() else {
+        return Ok(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal_error",
+            "database unavailable".to_string(),
+        ));
+    };
+    Ok(record_schema(req, &db, &instance, &topic, schema_id).await)
+}
+
+/// Serves one record-schema request and, for a general key, writes its audit row.
+pub(crate) async fn record_schema<B>(
+    req: Request<B>,
+    db: &crate::db::DbPool,
+    instance: &str,
+    topic: &str,
+    schema_id: u32,
+) -> Response<OpenAIBody> {
+    let (peer_ip, user_agent) = request_origin(&req);
+    let mut facts = KeyAuditFacts::default();
+    let response = serve_record_schema(&req, db, instance, topic, schema_id, &mut facts);
+    audit_key_request(
+        db,
+        "bus.rest.consume",
+        Some(instance),
+        topic,
+        response.status(),
+        facts,
+        peer_ip,
+        user_agent,
+    );
+    response
+}
+
+/// The caller's schema for `schema_id` of `topic`: the sub-schema of what the
+/// caller's rule shows when it hides fields, else the registered version. The
+/// right is the right to consume the topic (`BusAction::Consume`), for a key
+/// checked before the instance is looked up.
+fn serve_record_schema<B>(
+    req: &Request<B>,
+    db: &crate::db::DbPool,
+    instance: &str,
+    topic: &str,
+    schema_id: u32,
+    facts: &mut KeyAuditFacts,
+) -> Response<OpenAIBody> {
+    let principal = req.extensions().get::<Principal>().cloned();
+    let query = match parse_query(req.uri().query().unwrap_or("")) {
+        Ok(q) => q,
+        Err(e) => {
+            facts.reason = Some(e.to_string());
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            );
+        }
+    };
+    let actor = match resolve_actor(db, principal.as_ref(), &query, facts) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = precheck_api_key(db, &actor, Some(instance), topic, BusAction::Consume, facts)
+    {
+        return resp;
+    }
+    let (instance_id, svc) = match resolve_engine(db, Some(instance)) {
+        Ok(v) => v,
+        Err(resp) => {
+            facts.reason = Some("instance_unavailable".to_string());
+            return resp;
+        }
+    };
+    let ctx = actor.call_context(instance_id, None);
+    let schema = match tokio::task::block_in_place(|| svc.schema_for_reader(&ctx, topic, schema_id))
+    {
+        Ok(schema) => schema,
+        Err(e) => {
+            facts.reason = Some(bus_error_reason(&e));
+            return map_bus_error(&e);
+        }
+    };
+    let body = serde_json::json!({
+        "subject": schema.subject,
+        "schema_type": schema.schema_type.as_str(),
+        "version": schema.version,
+        "schema_id": schema.schema_ref_id,
+        "derived": schema.derived,
+        "schema": schema.schema_text,
+    });
+    json_response(
+        StatusCode::OK,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 pub async fn handle_consume(
@@ -1132,7 +1303,7 @@ fn serve_consume<B>(
         .saturating_mul(CONSUME_RECORD_BYTE_ESTIMATE)
         .max(64 * 1024);
 
-    let ctx = actor.call_context(instance_id);
+    let ctx = actor.call_context(instance_id, None);
     // Blocking too, though not through the `blocking_recv` that `bus::mod`'s
     // BLOCKING note names for `publish`/`fetch`: `open_consumer` opens a full
     // `Partition` — writer thread and directory flock included — for every
@@ -1859,9 +2030,27 @@ mod tests {
             query: &str,
             body: &str,
         ) -> Reply {
+            self.send_with_headers(instance, topic, method, principal, query, body, &[])
+        }
+
+        /// `send_to` with extra request headers.
+        #[allow(clippy::too_many_arguments)]
+        fn send_with_headers(
+            &self,
+            instance: &str,
+            topic: &str,
+            method: &str,
+            principal: Option<Principal>,
+            query: &str,
+            body: &str,
+            headers: &[(&str, &str)],
+        ) -> Reply {
             let mut builder = Request::builder().method(method).uri(format!(
                 "/v1/bus/instances/{instance}/topics/{topic}/records?{query}"
             ));
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
             if let Some(p) = principal {
                 builder = builder.extension(p);
             }
@@ -1887,6 +2076,11 @@ mod tests {
                 .await
                 .expect("request task");
                 let status = resp.status();
+                let correlation_header = resp
+                    .headers()
+                    .get("x-correlation-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let bytes = resp
                     .into_body()
                     .collect()
@@ -1896,6 +2090,7 @@ mod tests {
                 Reply {
                     status,
                     json: serde_json::from_slice(&bytes).expect("json body"),
+                    correlation_header,
                 }
             })
         }
@@ -1917,6 +2112,8 @@ mod tests {
     struct Reply {
         status: StatusCode,
         json: serde_json::Value,
+        /// The `X-Correlation-Id` response header.
+        correlation_header: Option<String>,
     }
 
     fn key_principal(uid: &str) -> Option<Principal> {
@@ -2067,6 +2264,135 @@ mod tests {
         );
         assert_eq!(own.status, StatusCode::OK, "{}", own.json);
         assert_eq!(payloads(&own), vec![serde_json::json!({"id": 1})]);
+    }
+
+    /// The `tf.correlation_id` each consumed record carries, in order.
+    fn stamped_ids(reply: &Reply) -> Vec<Option<String>> {
+        reply.json["records"]
+            .as_array()
+            .expect("records array")
+            .iter()
+            .map(|r| {
+                r["headers"]["tf.correlation_id"].as_str().map(|b64| {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap();
+                    String::from_utf8(raw).unwrap()
+                })
+            })
+            .collect()
+    }
+
+    fn two_records() -> String {
+        format!("{}\n{}", ndjson(r#"{"id":1}"#), ndjson(r#"{"id":2}"#))
+    }
+
+    /// Without `X-Correlation-Id` each record gets its own id (owner decision
+    /// 2), and the response lists them.
+    #[test]
+    fn rest_publish_mints_a_correlation_id_per_record() {
+        let fx = key_fixture("cccc3a10");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &two_records());
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert!(published.json["correlation_id"].is_null());
+        assert!(published.correlation_header.is_none());
+        let reported: Vec<String> = published.json["correlation_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reported.len(), 2);
+        assert_ne!(reported[0], reported[1]);
+
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert_eq!(
+            stamped_ids(&own),
+            vec![Some(reported[0].clone()), Some(reported[1].clone())],
+            "the stored records carry exactly the reported ids"
+        );
+    }
+
+    /// A valid `X-Correlation-Id` becomes the id of every record without one of
+    /// its own, and is echoed; a record's own valid header still wins.
+    #[test]
+    fn rest_publish_applies_and_echoes_the_request_correlation_id() {
+        let fx = key_fixture("cccc3a11");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        let own_header = base64::engine::general_purpose::STANDARD.encode("rec-own");
+        let body = format!(
+            "{}\n{}",
+            ndjson(r#"{"id":1}"#),
+            format!(
+                r#"{{"payload_b64":"{}","headers":{{"correlation-id":"{own_header}"}}}}"#,
+                base64::engine::general_purpose::STANDARD.encode(r#"{"id":2}"#)
+            )
+        );
+        let published = fx.send_with_headers(
+            fx.instance.as_str(),
+            TOPIC,
+            "POST",
+            key_principal(&writer),
+            &org_query(),
+            &body,
+            &[("X-Correlation-Id", "req-42")],
+        );
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert_eq!(published.json["correlation_id"], "req-42");
+        assert_eq!(published.correlation_header.as_deref(), Some("req-42"));
+        assert_eq!(
+            published.json["correlation_ids"],
+            serde_json::json!(["req-42", "rec-own"])
+        );
+
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert_eq!(
+            stamped_ids(&own),
+            vec![Some("req-42".to_string()), Some("rec-own".to_string())]
+        );
+    }
+
+    /// An invalid `X-Correlation-Id` is a 400, and nothing is published.
+    #[test]
+    fn rest_publish_refuses_an_invalid_correlation_header() {
+        let fx = key_fixture("cccc3a12");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        for bad in ["has space", "-lead", &"a".repeat(129)] {
+            let reply = fx.send_with_headers(
+                fx.instance.as_str(),
+                TOPIC,
+                "POST",
+                key_principal(&writer),
+                &org_query(),
+                &ndjson(r#"{"id":1}"#),
+                &[("X-Correlation-Id", bad)],
+            );
+            assert_eq!(
+                reply.status,
+                StatusCode::BAD_REQUEST,
+                "{bad}: {}",
+                reply.json
+            );
+            assert_eq!(reply.json["error"]["code"], "invalid_request_error");
+        }
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("k:{reader}.lis")),
+        );
+        assert!(
+            payloads(&own).is_empty(),
+            "a refused publish stores nothing"
+        );
     }
 
     /// A grant belongs to one organisation; the call must name one.
@@ -2235,6 +2561,146 @@ mod tests {
             payloads(&wildcard),
             vec![serde_json::json!({"id": 1, "name": "Jan"})]
         );
+    }
+
+    #[test]
+    fn parse_bus_record_schema_path_matches_only_the_instance_scoped_shape() {
+        assert_eq!(
+            parse_bus_record_schema_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/42"),
+            Some(("tentabus-0000abcd", "orders", 42))
+        );
+        for bad in [
+            "/v1/bus/topics/orders/schemas/42",
+            "/v1/bus/instances//topics/orders/schemas/42",
+            "/v1/bus/instances/tentabus-0000abcd/topics//schemas/42",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/-1",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/4294967296",
+            "/v1/bus/instances/tentabus-0000abcd/topics/a/b/schemas/1",
+            "/v1/bus/instances/tentabus-0000abcd/topics/orders/records",
+        ] {
+            assert_eq!(parse_bus_record_schema_path(bad), None, "{bad}");
+        }
+        assert_eq!(parse_bus_records_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/1"), None);
+    }
+
+    /// F4 B6: a key reads a Protobuf topic through a rule; the record carries
+    /// the id of its sub-schema and the schema route serves that sub-schema —
+    /// and nothing else (never the full pattern).
+    #[test]
+    fn key_reads_of_a_binary_topic_carry_the_sub_schema_id_and_the_route_serves_it() {
+        use crate::bus::schema_registry::{registry, Compatibility, SchemaType};
+        let fx = key_fixture("cccc3b06");
+        let key = fx.key(&["read"]);
+        let text = "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; }";
+        registry::register(
+            &fx.state.db, fx.instance.as_str(), ORG, "x.proto", SchemaType::Protobuf, text,
+            Some(Compatibility::None), None,
+        )
+        .unwrap();
+        fx.svc
+            .create_topic(
+                &fx.user_ctx("u-admin"),
+                "bytes",
+                TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some("x.proto".to_string()),
+                    validation: Some(crate::bus::topics::ValidationMode::Dlq),
+                    ..TopicOptions::default()
+                },
+            )
+            .unwrap();
+        let resource_id = topic_acl_resource_id(fx.instance.as_str(), ORG, "bytes");
+        assert!(crate::db::repository::resource_permissions::set_topic_rule(
+            &fx.state.db, &resource_id, "api_key", &key, "read", "allow",
+        )
+        .unwrap());
+        let names = |n: &[&str]| -> std::collections::BTreeSet<String> {
+            n.iter().map(|s| s.to_string()).collect()
+        };
+        field_policies::set_policy(
+            &fx.state.db, fx.instance.as_str(), ORG, "bytes", "any", field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read, &names(&["a", "c"]), &names(&[]), &names(&[]), &names(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let full = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
+        fx.svc
+            .publish(
+                &fx.user_ctx("u-admin"),
+                "bytes",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(full),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+        let consumed = fx.send_to(
+            fx.instance.as_str(), "bytes", "GET", key_principal(&key), &own_group_query(&key), "",
+        );
+        assert_eq!(consumed.status, StatusCode::OK, "{}", consumed.json);
+        let record = &consumed.json["records"][0];
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(record["payload"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(payload, [vec![0x08, 5], vec![0x1a, 3], b"sea".to_vec()].concat());
+        let schema_id = record["schema_id"].as_u64().expect("the id of the sub-schema") as u32;
+        assert_ne!(schema_id, 0);
+
+        let fetch_schema = |id: u32, principal: Option<Principal>| {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/bus/instances/{}/topics/bytes/schemas/{id}?org_id={ORG}",
+                    fx.instance.as_str()
+                ))
+                .extension(principal.unwrap())
+                .extension(V1PeerIp("203.0.113.9".to_string()))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let (db, instance) = (fx.db(), fx.instance.as_str().to_string());
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let resp = tokio::spawn(async move {
+                    record_schema(req, &db, &instance, "bytes", id).await
+                })
+                .await
+                .unwrap();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                Reply {
+                    status,
+                    json: serde_json::from_slice(&bytes).expect("json body"),
+                    correlation_header: None,
+                }
+            })
+        };
+        let served = fetch_schema(schema_id, key_principal(&key));
+        assert_eq!(served.status, StatusCode::OK, "{}", served.json);
+        assert_eq!(served.json["derived"], true);
+        assert_eq!(served.json["schema_id"], schema_id);
+        assert_eq!(served.json["schema_type"], "protobuf");
+        let sub = served.json["schema"].as_str().unwrap();
+        assert!(sub.contains("int32 a = 1") && sub.contains("string c = 3"), "{sub}");
+        assert!(!sub.contains("string b"), "the hidden field is not in the sub-schema: {sub}");
+        let missing = fetch_schema(schema_id.wrapping_add(1), key_principal(&key));
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.json);
+        // A key with no right on the topic learns nothing.
+        let stranger = fx.key(&[]);
+        let denied = fetch_schema(schema_id, key_principal(&stranger));
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.json);
     }
 
     /// F4 B7: the records REST reads through the same projection — a key's

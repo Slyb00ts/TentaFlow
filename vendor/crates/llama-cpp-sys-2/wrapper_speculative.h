@@ -9,11 +9,13 @@
 //  (a) Walidacja seq_id: shim odrzuca seq_id spoza [0, n_seq) wczesnym no-op,
 //      więc błędny indeks NIE spowoduje aborta przez GGML_ASSERT w bibliotece.
 //      Jednak biblioteka używa GGML_ASSERT również w innych miejscach (np.
-//      common_speculative_accept robi GGML_ASSERT(impl_last[seq_id])).
+//      common_speculative_accept robi GGML_ASSERT(n_accepted == 0), gdy
+//      impl_last[seq_id] jest pusty).
 //      GGML_ASSERT woła abort() i NIE jest łapane przez wewnętrzny try/catch —
 //      catch (std::exception) nie przechwytuje aborta. Strona wywołująca MUSI:
 //        - wołać accept() tylko dla sekwencji, dla której draft() faktycznie
-//          wygenerował draft (inaczej impl_last[seq_id] == nullptr → abort),
+//          wygenerował draft (inaczej impl_last[seq_id] == nullptr i każde
+//          n_accepted > 0 → abort),
 //        - nie wołać draft() dla tej samej sekwencji po raz drugi bez odczytania
 //          (draft_result) i akceptacji (accept) poprzedniego draftu.
 //
@@ -103,6 +105,9 @@ void llama_rs_speculative_begin(
 
 // Przetwarza batch i aktualizuje wewnętrzny stan speculative.
 // Zwraca true, jeśli batch został przetworzony.
+// `batch` is the llama_batch just decoded on ctx_tgt; it must carry token ids
+// and positions (false otherwise), because the shim rebuilds the library's
+// common_batch from it after the decode.
 bool llama_rs_speculative_process(
     llama_rs_speculative * spec,
     const struct llama_batch * batch);
@@ -139,7 +144,7 @@ size_t llama_rs_speculative_draft_result(
 // Informuje kontekst speculative o liczbie tokenów zaakceptowanych przez model
 // docelowy dla danej sekwencji. seq_id spoza [0, n_seq) jest ignorowane (no-op).
 // UWAGA: wolno wołać wyłącznie dla sekwencji, dla której draft() wygenerował
-// draft — inaczej biblioteka robi GGML_ASSERT(impl_last[seq_id]) → abort
+// draft — inaczej biblioteka przy n_accepted > 0 robi GGML_ASSERT → abort
 // (patrz kontrakt bezpieczeństwa na górze pliku).
 void llama_rs_speculative_accept(
     llama_rs_speculative * spec,

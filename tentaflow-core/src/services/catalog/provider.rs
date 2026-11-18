@@ -78,6 +78,16 @@ impl CatalogProvider {
         }
     }
 
+    /// Publishes a hand-built snapshot, so a test can resolve against entries
+    /// without a registry and a database.
+    #[cfg(test)]
+    pub(crate) fn install_for_test(&self, entries: Vec<CatalogEntry>) {
+        self.current.store(Arc::new(CatalogSnapshot {
+            entries: Arc::from(entries.into_boxed_slice()),
+            version: 1,
+        }));
+    }
+
     /// Lock-free load. Cheap (one Arc clone) — call it on every request.
     pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
         self.current.load_full()

@@ -1,8 +1,8 @@
 # =============================================================================
 # Plik: Dockerfile (vllm-spark-ray)
 # Opis: CIENKA warstwa nad JUZ ZBUDOWANYM obrazem from-source `vllm-spark`
-#       (vLLM 0.28 + torch sm_121a). Dodaje TYLKO rdma-core/libibverbs (RoCE dla
-#       NCCL) i Ray 2.55.1 — wymagane do multi-node tensor-parallel (head+worker,
+#       (vLLM 0.34 + torch sm_121a). Dodaje TYLKO rdma-core/libibverbs (RoCE dla
+#       NCCL) i Ray 2.60.0 — wymagane do multi-node tensor-parallel (head+worker,
 #       --distributed-executor-backend ray). Buduje sie w ~1-2 min (potem cache),
 #       zamiast 20-40 min rebuildu vLLM ze zrodel. Uzywany WYLACZNIE przez deploy
 #       rozproszony (D3); single-node vllm-spark dalej idzie na czystej bazie.
@@ -11,7 +11,7 @@
 # bazy obecny na nodzie); jej brak = czytelny blad w preflight (NIE rebuild).
 # =============================================================================
 
-ARG BASE_IMAGE=tentaflow/vllm-spark:0.28.0
+ARG BASE_IMAGE=tentaflow/vllm-spark:0.34.0
 FROM ${BASE_IMAGE}
 
 # rdma-core/libibverbs: userspace IB verbs — bez nich NCCL nie otworzy
@@ -20,9 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libibverbs1 librdmacm1 ibverbs-providers rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
-# Ray w TYM SAMYM venv co vLLM (`/opt/vllm-venv`). 2.55.1 ma kola aarch64 i jest
-# kompatybilny z vllm 0.28 / torch 2.13.
-RUN /opt/vllm-venv/bin/pip install --no-cache-dir ray==2.55.1
+# Ray w TYM SAMYM venv co vLLM (`/opt/vllm-venv`). 2.60.0 ma kola aarch64 i jest
+# kompatybilny z vllm 0.34 / torch 2.14.
+RUN /opt/vllm-venv/bin/pip install --no-cache-dir ray==2.60.0
 
 # ENTRYPOINT / ENV / HEALTHCHECK dziedziczone z bazy (entrypoint.sh obsluguje
 # ENGINE_LAUNCH_CMD, ktorego uzywa deploy rozproszony do `ray start && vllm serve`).

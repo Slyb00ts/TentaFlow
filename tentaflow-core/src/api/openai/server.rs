@@ -99,6 +99,18 @@ fn html_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
     asset_response(status, "text/html; charset=utf-8", body)
 }
 
+/// Adds `Retry-After` (whole seconds) to a refusal the caller may retry.
+pub(crate) fn with_retry_after(
+    mut response: Response<OpenAIBody>,
+    secs: u64,
+) -> Response<OpenAIBody> {
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from(secs),
+    );
+    response
+}
+
 /// Mapuje dowolny anyhow::Error (potencjalnie CoreError) na error response z odpowiednim HTTP status.
 /// The full error goes to the log here; the client receives `client_message`.
 fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
@@ -109,14 +121,19 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
         let error_type = match err {
             CoreError::ModelNotFound { .. } => "model_not_found",
             CoreError::InvalidRequest { .. } => "invalid_request_error",
-            CoreError::AllBackendsUnavailable { .. } | CoreError::SttServiceUnavailable => {
-                "service_unavailable"
-            }
+            CoreError::AllBackendsUnavailable { .. }
+            | CoreError::SttServiceUnavailable
+            | CoreError::BackendBusy { .. } => "service_unavailable",
             CoreError::Timeout { .. } => "timeout_error",
+            CoreError::Overloaded { .. } => "rate_limit_exceeded",
             _ => "internal_error",
         };
         let client_msg = err.client_message();
-        error_response(status, error_type, client_msg)
+        let response = error_response(status, error_type, client_msg);
+        match err.retry_after_secs() {
+            Some(secs) => with_retry_after(response, secs),
+            None => response,
+        }
     } else {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -524,6 +541,14 @@ pub async fn handle_request(
             crate::api::bus_rest::handle_consume(req, router, instance, topic).await
         }
 
+        ("GET", p) if crate::api::bus_rest::parse_bus_record_schema_path(p).is_some() => {
+            let (instance, topic, schema_id) =
+                crate::api::bus_rest::parse_bus_record_schema_path(p).unwrap();
+            let (instance, topic) = (instance.to_string(), topic.to_string());
+            crate::api::bus_rest::handle_record_schema(req, router, instance, topic, schema_id)
+                .await
+        }
+
         // TentaBus schema registry REST (F3-REST) — same dynamic-segment
         // reason as the records routes above; the method is part of the route
         // (`GET`/`POST` on `.../versions` are list vs register).
@@ -840,6 +865,11 @@ async fn handle_image_generation(
             ),
         ));
     }
+
+    let _slot = match local_service_slot(&target).await {
+        Ok(slot) => slot,
+        Err(e) => return Ok(core_error_to_response(&e)),
+    };
 
     // Bazowy URL ComfyUI (golе `endpoint_url`, BEZ `/v1`).
     let base = match resolve_http_base_from_target(&target, &request.model, context_label) {
@@ -1435,10 +1465,22 @@ async fn handle_audio_speech_flow_stream(
                 crate::error::CoreError::ModelNotFound { .. } => {
                     (StatusCode::NOT_FOUND, "model_not_found")
                 }
+                crate::error::CoreError::Overloaded { .. } => {
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
+                }
+                crate::error::CoreError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "backend_error"),
             };
+            // The log keeps the raw dispatch error. The client gets
+            // `client_message()`, which is generic for the SLA, timeout and
+            // model-not-found statuses above; the 500 branch falls back to the
+            // error's own text and is not sanitized.
             error!("audio flow-stream init: {}", msg);
-            return Ok(error_response(status, code, msg));
+            let response = error_response(status, code, core_err.client_message());
+            return Ok(match core_err.retry_after_secs() {
+                Some(secs) => with_retry_after(response, secs),
+                None => response,
+            });
         }
     };
 
@@ -1932,6 +1974,11 @@ async fn handle_passthrough(
         Err(resp) => return Ok(resp),
     };
 
+    let _slot = match local_service_slot(&target).await {
+        Ok(slot) => slot,
+        Err(e) => return Ok(core_error_to_response(&e)),
+    };
+
     // Embedded vision (`/v1/infer`): silniki wkompilowane w binarkę (detekcja
     // twarzy/pozy/emocji + OCR) nie wystawiają HTTP — uruchamiamy je in-process
     // przez `crate::vision`, zamiast forwardować po sieci. Reszta (`/v1/rerank`,
@@ -2074,6 +2121,41 @@ fn resolve_local_v1_target(
                 format!("model '{}' niedostępny: {}", model, e),
             ))
         }
+    }
+}
+
+/// Takes the in-flight slot of the local service behind `target`. These
+/// endpoints send their own HTTP request or run the engine in-process instead
+/// of going through the executor, so the slot is taken here and held by the
+/// caller until the call ends. `Ok(None)` for unlimited or non-local targets.
+async fn local_service_slot(
+    target: &crate::services::runtime::target::ResolvedExecutionTarget,
+) -> crate::error::Result<Option<crate::services::limiter::ServicePermit>> {
+    use crate::services::handles_cache::BackendHandle;
+    use crate::services::runtime::target::ResolvedExecutionTarget;
+    match target {
+        ResolvedExecutionTarget::Local {
+            service_id,
+            handle: BackendHandle::Embedded { node_id, .. },
+            ..
+        } => crate::services::limiter::limiter_for(node_id, *service_id)
+            .acquire()
+            .await
+            .map(Some)
+            .map_err(Into::into),
+        ResolvedExecutionTarget::Local {
+            handle: BackendHandle::Http(client),
+            ..
+        } => client.acquire_slot().await,
+        _ => Ok(None),
+    }
+}
+
+/// Client-safe text of a refused slot for paths whose errors are plain strings.
+fn slot_refusal_message(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<CoreError>() {
+        Some(err) => err.client_message(),
+        None => "service unavailable".to_string(),
     }
 }
 
@@ -2337,14 +2419,17 @@ fn vision_infer_to_json(out: crate::vision::InferOutput, w: f32, h: f32) -> serd
 /// `ProtocolError`) jak i inni callerzy, którzy sami decydują jak opakować błąd.
 /// Współdzielona, jedyna implementacja resolve dla obu tierów — bez duplikacji
 /// logiki katalogu/ACL.
-pub fn resolve_local_v1_base_url(
+///
+/// Alongside the base URL it returns the service's in-flight slot; the caller
+/// holds it until its forward ends.
+pub async fn resolve_local_v1_base_url(
     router: &Router,
     model: &str,
     surface: crate::services::catalog::ServiceSurface,
     input_modalities: &[crate::services::catalog::InputModality],
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<(String, Option<crate::services::limiter::ServicePermit>), String> {
     let executor = match router.executor() {
         Some(e) => e,
         None => return Err("Executor niedostępny".to_string()),
@@ -2377,7 +2462,17 @@ pub fn resolve_local_v1_base_url(
                 handle,
                 context_label,
             ) {
-                Ok(resolved) => Ok(resolved.client.url().trim_end_matches('/').to_string()),
+                Ok(resolved) => {
+                    let slot = resolved
+                        .client
+                        .acquire_slot()
+                        .await
+                        .map_err(|e| slot_refusal_message(&e))?;
+                    Ok((
+                        resolved.client.url().trim_end_matches('/').to_string(),
+                        slot,
+                    ))
+                }
                 Err(e) => Err(format!(
                     "model '{}' nie jest lokalnym serwisem HTTP: {}",
                     model, e
@@ -2434,6 +2529,10 @@ async fn try_embedded_rerank(
             ..
         } => engine_id.clone(),
         _ => return None,
+    };
+    let _slot = match local_service_slot(&target).await {
+        Ok(slot) => slot,
+        Err(e) => return Some(Err(slot_refusal_message(&e))),
     };
     let request = crate::api::openai::types::RerankRequest {
         model: model.to_string(),
@@ -2498,14 +2597,15 @@ pub async fn rerank_forward(
         return result;
     }
 
-    let base = resolve_local_v1_base_url(
+    let (base, _slot) = resolve_local_v1_base_url(
         router,
         model,
         crate::services::catalog::ServiceSurface::Rerank,
         &[crate::services::catalog::InputModality::Text],
         user_ctx,
         context_label,
-    )?;
+    )
+    .await?;
 
     // Forward leci ZAWSZE na Cohere-style `/v1/rerank` (kontener vLLM nie zna
     // `/v1/ranking`). `endpoint_url` zwykle kończy się na `/v1`.
@@ -2983,6 +3083,40 @@ fn emit_trailer_headers(
 mod error_mapping_tests {
     use super::*;
 
+    /// The side endpoints (`/v1/infer`, `/v1/rerank`, ComfyUI) that bypass the
+    /// executor still respect the service's in-flight limit: a saturated
+    /// embedded engine refuses with 503 + `Retry-After`, and the slot taken for
+    /// a call is returned when that call ends.
+    #[tokio::test]
+    async fn a_side_endpoint_takes_the_service_slot() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "side-endpoint-limit-node";
+        configure(node, 11, Some(1), std::time::Duration::from_millis(50));
+        let target = crate::services::runtime::target::ResolvedExecutionTarget::Local {
+            service_id: 11,
+            model_name: "rerank".into(),
+            handle: crate::services::handles_cache::BackendHandle::Embedded {
+                model_name: "rerank".into(),
+                node_id: node.into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+
+        let held = local_service_slot(&target).await.unwrap();
+        assert!(held.is_some());
+        assert_eq!(limiter_for(node, 11).in_flight(), 1);
+
+        let refused = local_service_slot(&target).await.expect_err("saturated");
+        let resp = core_error_to_response(&refused);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_some());
+        assert!(!slot_refusal_message(&refused).contains(node));
+
+        drop(held);
+        assert_eq!(limiter_for(node, 11).in_flight(), 0);
+        assert!(local_service_slot(&target).await.unwrap().is_some());
+    }
+
     /// A missing STT service must reach external clients as 503
     /// `service_unavailable`, not a generic 500.
     #[test]
@@ -3001,6 +3135,51 @@ mod error_mapping_tests {
         let core = crate::routing::dispatch_error_to_core(dispatch, "whisper-1");
         assert!(matches!(core, CoreError::SttServiceUnavailable));
         assert_eq!(core.status_code(), 503);
+    }
+
+    /// A refusal by an SLA policy crosses the same two steps a real `/v1` call
+    /// takes (dispatch error -> core error -> HTTP answer) and comes out as a
+    /// 429 that tells the client how long to wait, in whole seconds rounded up.
+    #[test]
+    fn an_sla_refusal_is_a_429_with_retry_after() {
+        use crate::flow_engine::dispatcher::DispatchError;
+        use crate::sla::RefusalReason;
+
+        for (retry_after_ms, header) in [(1_000, "1"), (1_001, "2"), (2_500, "3"), (1, "1")] {
+            let dispatch = DispatchError::Overloaded {
+                reason: RefusalReason::QueueFull,
+                retry_after_ms,
+            };
+            let core = crate::routing::dispatch_error_to_core(dispatch, "any-model");
+            let err: anyhow::Error = core.into();
+            let resp = core_error_to_response(&err);
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                resp.headers().get(hyper::header::RETRY_AFTER).unwrap(),
+                header,
+                "{retry_after_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn other_failures_carry_no_retry_after() {
+        let err: anyhow::Error = CoreError::SttServiceUnavailable.into();
+        let resp = core_error_to_response(&err);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn a_policy_timeout_is_a_504() {
+        use crate::flow_engine::dispatcher::DispatchError;
+
+        let dispatch = DispatchError::TimedOut {
+            flow_id: "f1".into(),
+            timeout_ms: 100,
+        };
+        let core = crate::routing::dispatch_error_to_core(dispatch, "any-model");
+        let resp = core_error_to_response(&core.into());
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }
 

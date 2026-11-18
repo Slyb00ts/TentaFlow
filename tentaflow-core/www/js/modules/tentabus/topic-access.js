@@ -34,6 +34,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { usageWarning } from '/js/lib/service-account-usage.js';
 import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime } from '/js/modules/tentabus/format.js';
 import { busSchemaScopeId, topicScopeId, BUS_SCHEMA_REGISTRY } from '/js/modules/access-keys-scopes.js';
@@ -486,7 +487,7 @@ function rowButtons(pairs) {
     b.setAttribute('size', 'sm');
     b.dataset.act = act;
     b.textContent = label;
-    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(b); });
     wrap.appendChild(b);
   }
   return wrap;
@@ -571,7 +572,7 @@ export function paintAccessSection(host, view, ctx) {
       if (!row._known) return null;
       return rowButtons([
         ['key-rights', T('access.change.button'), () => ctx.go({ kind: 'key-rights', keyId: live()._key })],
-        ['key-revoke', T('access.keys.revoke.button'), () => ctx.go({ kind: 'key-revoke', keyId: live()._key })],
+        ['key-revoke', T('access.keys.revoke.button'), (button) => ctx.go({ kind: 'key-revoke', keyId: live()._key }, button)],
       ]);
     } : null;
   }
@@ -955,6 +956,11 @@ export function openKeyRevoke(row, ctx) {
   const rights = listFormat(keyRightNames(row.rights).map((r) => r.toLocaleLowerCase(I18n.getLanguage())));
   const lines = [T('access.keys.revoke.impact', { name, rights })];
   if (row.otherScopes > 0) lines.push(T('access.keys.revoke.impact_other', { count: fmtCount(row.otherScopes), n: row.otherScopes }));
+  // Flows that read the bus as this key stop reading; when the lookup failed
+  // the window says the check did not happen instead of staying silent.
+  const flowsWarning = usageWarning(ctx.serviceFlows, (key, vars) => I18n.t(key, vars));
+  if (flowsWarning) lines.push(flowsWarning);
+  else if (ctx.serviceFlowsUnknown) lines.push(I18n.t('access_keys.revoke_usage_unknown'));
   return openConfirmWindow({
     title: T('access.keys.revoke.window_title', { name }),
     icon: 'key',

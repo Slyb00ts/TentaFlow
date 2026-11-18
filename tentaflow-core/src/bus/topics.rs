@@ -1531,6 +1531,31 @@ pub fn update_topic(
             }
         }
     }
+    // F4 B6: a field policy on a topic of Avro, Protobuf or Thrift messages is
+    // written against the fields of THE pattern the topic is bound to. Moving
+    // the topic to another pattern, or unbinding it, would leave the rules
+    // naming fields of a pattern that no longer applies (or, unbound, reading
+    // binary records as text), so it is refused until the rules are removed.
+    // (A new VERSION of the same subject is not a change of binding.)
+    let old_subject = old_schema_id.as_deref().filter(|s| !s.is_empty());
+    let new_subject = cfg.schema_id.as_deref().filter(|s| !s.is_empty());
+    if let Some(old_subject) = old_subject.filter(|old| Some(*old) != new_subject) {
+        let was_binary = repository::bus_schema_subject_get(db, instance_id, org_id, old_subject)?
+            .and_then(|row| SchemaType::parse(&row.schema_type))
+            .is_some_and(|kind| kind.is_binary());
+        if was_binary
+            && !repository::bus_field_policy_list_for_topic(db, instance_id, org_id, name)?
+                .is_empty()
+        {
+            return Err(BusServiceError::InvalidTopicConfig {
+                reason: format!(
+                    "cannot change the message pattern of topic '{name}' while field policies \
+                     exist for it (they name fields of the pattern '{old_subject}'); delete its \
+                     field policies first"
+                ),
+            });
+        }
+    }
     apply_schema_binding_guard(
         db,
         org_id,
@@ -1539,6 +1564,30 @@ pub fn update_topic(
         validation_touched,
         old_schema_id.as_deref(),
     )?;
+    // A read rule on a topic of binary messages is enforced on the records that
+    // carry the id of the pattern version they were validated under; a topic
+    // that stops validating would publish records nothing can read through
+    // the rule (`field_policies::BINARY_TOPIC_READ_NEEDS_VALIDATION`).
+    if validation_touched && cfg.validation == ValidationMode::Off {
+        if let Some(subject) = cfg.schema_id.as_deref().filter(|s| !s.is_empty()) {
+            let is_binary = repository::bus_schema_subject_get(db, instance_id, org_id, subject)?
+                .and_then(|row| SchemaType::parse(&row.schema_type))
+                .is_some_and(|kind| kind.is_binary());
+            if is_binary
+                && repository::bus_field_policy_list_for_topic(db, instance_id, org_id, name)?
+                    .iter()
+                    .any(|rule| rule.direction == super::field_policies::Direction::Read.as_str())
+            {
+                return Err(BusServiceError::InvalidTopicConfig {
+                    reason: format!(
+                        "{}: cannot turn validation off on topic '{name}' while a read rule \
+                         exists for it; delete its read rules first",
+                        super::field_policies::BINARY_TOPIC_READ_NEEDS_VALIDATION,
+                    ),
+                });
+            }
+        }
+    }
     cfg.updated_at_ms = now_ms;
     // The binary-pattern-under-rules refusal is made again inside the UPDATE
     // when the pattern changes, so a rule written since the check above

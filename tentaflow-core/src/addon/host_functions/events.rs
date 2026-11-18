@@ -166,6 +166,7 @@ pub fn event_publish(
         instance_id: Some(state.instance_id.clone()),
         is_system_call: state.is_system_call,
         org_id: state.org_id.clone(),
+        provenance: None,
     };
     let bus = state.event_bus.clone();
     let db = state.db.clone();

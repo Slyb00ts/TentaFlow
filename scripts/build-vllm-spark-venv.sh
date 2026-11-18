@@ -1,13 +1,18 @@
 #!/bin/bash
 # ===== File: scripts/build-vllm-spark-venv.sh — native vLLM bundle for DGX Spark =====
-# Builds vLLM 0.26 from source into a self-contained venv for GB10 (sm_121a),
-# then applies the one patch upstream still lacks (nvfp4_ds_mla).
+# Builds vLLM 0.28 from source into a self-contained venv for GB10 (sm_121a),
+# then applies the one patch upstream still lacks (nvfp4_ds_mla). The version
+# follows the patch, not the newest vLLM: it is the one `vllm-dspark-src` pins.
 #
-# This is the artifact, not a convenience wrapper: the native deploy consumes
-# the same recipe via `llm/python/vllm-spark/bundle.toml`, and our own clean
-# image is a thin COPY over it. Building on a third-party runtime image is what
+# What it is for: the DSpark cluster venv that `scripts/dspark-cluster.sh` and
+# `scripts/bench-openai-api.py` run directly, to tune and measure the 2-node
+# DeepSeek setup outside the app. It is NOT what the app deploys: the native
+# `vllm-spark` engine installs its own venv from
+# `llm/python/vllm-spark/bundle.toml` (a newer vLLM, no nvfp4_ds_mla patch), and
+# the `vllm-dspark-src` image builds 0.28 + the patch itself. Only the 12.0
+# arch rule is shared with the bundle. Building on a third-party runtime image is what
 # produced the flashinfer-cubin deadlock -- that base ships cubin/jit-cache
-# pinned to ITS vLLM (0.19), vLLM 0.26 wants flashinfer-python 0.26-era, and no
+# pinned to ITS vLLM (0.19), vLLM 0.28 wants a newer flashinfer-python, and no
 # matching cubin exists on PyPI. A clean venv never installs those packages at
 # all, so flashinfer falls back to its own cache dir and the conflict cannot
 # arise.
@@ -23,13 +28,13 @@
 set -uo pipefail
 
 PREFIX="${PREFIX:-/opt/TentaFlow/.runtime/bundles/vllm-spark}"
-VLLM_REF="${VLLM_REF:-v0.26.0}"
-TORCH_SPEC="${TORCH_SPEC:-torch==2.11.0+cu130}"
+VLLM_REF="${VLLM_REF:-v0.28.0}"
+TORCH_SPEC="${TORCH_SPEC:-torch==2.13.0+cu130}"
 # DeepSeek V4 imports torchvision (multimodal preprocessing), so it is not
 # optional: without it the worker dies at init with ModuleNotFoundError long
 # after the weights have loaded. It must come from the SAME cu130 index and be
-# the release paired with this torch -- 0.26.0 goes with torch 2.11.
-TORCHVISION_SPEC="${TORCHVISION_SPEC:-torchvision==0.26.0+cu130}"
+# the release paired with this torch -- 0.28.0 goes with torch 2.13.
+TORCHVISION_SPEC="${TORCHVISION_SPEC:-torchvision==0.28.0+cu130}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 JOBS="${MAX_JOBS:-8}"
@@ -120,7 +125,7 @@ if ! done_step build; then
 fi
 
 log "naklada latke nvfp4_ds_mla"
-"$PY" "$REPO_ROOT/tentaflow-containers/llm/patches/dspark/patch_nvfp4_026.py" || die "latka"
+"$PY" "$REPO_ROOT/tentaflow-containers/llm/patches/dspark/patch_nvfp4_ds_mla.py" || die "latka"
 
 log "weryfikacja"
 SITE=$("$PY" -c "import vllm,os;print(os.path.dirname(vllm.__file__))") || die "import vllm"

@@ -3024,6 +3024,11 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
     let generated_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap())
         .join("browser-bindgen")
         .join(binding.out_name);
+    // Everything in this directory is copied into `www/js`, so it holds this
+    // run's wasm-bindgen output and nothing an earlier build left there.
+    if generated_dir.exists() {
+        std::fs::remove_dir_all(&generated_dir).unwrap();
+    }
     std::fs::create_dir_all(&generated_dir).unwrap();
     let status = Command::new("wasm-bindgen")
         .args(["--target", "web", "--out-dir"])
@@ -3075,7 +3080,8 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
 fn emit_js_twin(binding: &BrowserWasmBinding, label: &str, generated_dir: &Path, out_js_dir: &Path) {
     let twin = out_js_dir.join(format!("{}_asm.js", binding.out_name));
     let wasm = generated_dir.join(format!("{}_bg.wasm", binding.out_name));
-    let raw = generated_dir.join(format!("{}_asm.raw.js", binding.out_name));
+    // Beside the bindgen directory, not in it: that one is copied into `www/js`.
+    let raw = generated_dir.with_file_name(format!("{}_asm.raw.js", binding.out_name));
 
     let status = Command::new("wasm2js")
         .arg(&wasm)

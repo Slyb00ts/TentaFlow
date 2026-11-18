@@ -165,6 +165,14 @@ pub enum CoreSyncResourceKind {
     /// Deputies and absences (migration 181).
     OrgDeputy,
     OrgAbsence,
+    /// A service SLA policy (migration 211, TB-03): limits and thresholds an
+    /// administrator edits from any node. Replicated so every node enforces the
+    /// same policy; the counters and breaches it produces stay node-local.
+    SlaPolicy,
+    /// Which policy governs which service. Revocation-bearing (unassigning
+    /// lifts a limit), composite PK, so the Delete tombstone has to win over an
+    /// older assignment that arrived the long way round.
+    SlaAssignment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1293,6 +1301,34 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "org-structure",
     },
+    // ---------------------------------------------------------------------
+    // Service SLA policies (docs: SUM/tentabus/PLAN-TB03-LIMITY-SLA.md §3.1).
+    // One partition, so an assignment is ordered after the policy it names.
+    //
+    // NEVER add here, and each omission is a decision:
+    //   * `sla_breaches` — what THIS node measured against a policy; limits are
+    //     counted per node, so a replicated breach would describe traffic the
+    //     receiver never saw;
+    //   * `sla_samples` — per-minute node-local measurements, like
+    //     `bus_lag_samples`.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::SlaPolicy,
+        table_name: "service_sla_policies",
+        resource_type: "core.sla_policy",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "sla",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::SlaAssignment,
+        table_name: "service_sla_assignments",
+        resource_type: "core.sla_assignment",
+        primary_key_column: "target_kind,target_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "sla",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -1641,6 +1677,37 @@ mod tests {
             );
         }
         for table in ["map_chunks", "map_device_sessions"] {
+            assert!(!is_core_sync_table(table), "{table} must stay node-local");
+        }
+    }
+
+    /// Service SLA: the policy and its assignments replicate in one partition;
+    /// the breaches and samples a node produced stay on it.
+    #[test]
+    fn registry_contains_the_sla_policy_tables_but_not_the_evidence() {
+        for (table, resource_type, primary_key) in [
+            ("service_sla_policies", "core.sla_policy", "id"),
+            (
+                "service_sla_assignments",
+                "core.sla_assignment",
+                "target_kind,target_id",
+            ),
+        ] {
+            let descriptor =
+                descriptor_for_table(table).unwrap_or_else(|| panic!("missing descriptor {table}"));
+            assert_eq!(descriptor.resource_type, resource_type);
+            assert_eq!(descriptor.primary_key_column, primary_key);
+            assert_eq!(descriptor.scope, CoreSyncScope::Organization);
+            assert_eq!(descriptor.retention, CoreSyncRetention::Durable);
+            assert_eq!(
+                descriptor
+                    .partition_id("org-default", None, NodeEnvironment::Prod)
+                    .unwrap()
+                    .as_str(),
+                "core/env/prod/org/org-default/sla"
+            );
+        }
+        for table in ["sla_breaches", "sla_samples"] {
             assert!(!is_core_sync_table(table), "{table} must stay node-local");
         }
     }

@@ -284,6 +284,17 @@ test('the start window offers each runnable Service step a result source and a d
   assert.equal(noServices.querySelector('.fb-simulation-fixtures'), null);
 });
 
+test('the start window says, once, that a step with a retry policy runs once in a simulation', async () => {
+  const model = { ...RUNNABLE, nodes: RUNNABLE.nodes.map((node) => (node.id === 'Plain'
+    ? { ...node, kind: { ServiceTask: { ...node.kind.ServiceTask, retry: { maxAttempts: 2, delaySeconds: 5, backoff: 'Fixed' } } } } : node)) };
+  const form = await startWindow(model);
+  const rows = [...form.querySelectorAll('[data-fixture-step]')];
+  assert.match(rows[0].querySelector('[data-fixture-retry-skipped]').getAttribute('message'), /retry/i);
+  assert.equal(rows[0].querySelectorAll('[data-answer-retry-skipped]').length, 0, 'the form does not repeat it');
+  assert.equal(rows[1].querySelector('[data-fixture-retry-skipped]'), null);
+  form.remove();
+});
+
 test('start sends no fixture for a step left to the operator and the prepared result for a step set to one', async () => {
   responder = () => ({ view: baseView() });
   const form = await startWindow(RUNNABLE);

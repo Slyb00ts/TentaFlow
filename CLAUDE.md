@@ -140,7 +140,21 @@ Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model retur
 (wrong GPU logits) with no build error. `setup.sh` installs it; `tentaflow/build.rs` fails
 loudly if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
 metallib (`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBridge builds via
-`xcodebuild -skipMacroValidation` (SwiftPM CLI can't compile Metal shaders).
+`xcodebuild -skipMacroValidation -skipPackagePluginValidation` (SwiftPM CLI can't compile Metal
+shaders; mlx-swift's `CudaBuild` plugin is refused unless trusted).
+
+**iOS memory ceiling.** iOS kills the app (jetsam) at a per-app limit far below physical RAM.
+Every iOS memory budget comes from ONE helper, `memory::process_memory()` (`TASK_VM_INFO`
+`phys_footprint` + `os_proc_available_memory()`). Models may use the limit less
+`JETSAM_RESERVE_BYTES` (`model_ceiling_bytes`), because core, SQLite, TLS and the Metal driver
+share the same footprint: the single "Apple GPU" that `enrich_ios_live` reports carries that
+ceiling as `vram_total_mb` and the whole footprint as `vram_used_mb`, so free = what a model
+may still add (MemoryGuard and the deploy wizard's MLX default size from it). `mlx_swift_bridge`
+caps `memory_budget_mb` at MLX's own share — the footprint its model load added — plus that
+headroom, never at the whole limit. `ram_total_mb` stays physical RAM — device info, never a
+budget. The
+app target signs with `TentaFlowAI.entitlements` (increased-memory-limit +
+extended-virtual-addressing); the App ID needs both capabilities.
 
 `tentaflow-core` features — default = `inference-whisper` + `camera` (GStreamer is mandatory
 for the video pipeline). Key opt-ins:
@@ -420,6 +434,23 @@ cancels LLM + TTS instead of running to the 120 s turn deadline. Independently,
 flow grinding. Transcripts and answers are personal data: logs on these paths carry lengths,
 latencies and ids only, never the text.
 
+## Node startup
+
+`tentaflow-core/src/bootstrap.rs` is the ONE startup sequence, called by both
+`tentaflow/src/main.rs` and `tentaflow-mobile/core/src/runtime.rs`, in phases:
+`open_database` → `init_core_state` → `build_router` → `CoreNode::start_router_and_addons` →
+`start_mesh` → `start_background_services` → `start_server`. A host puts only the steps its
+platform cannot share between phases (desktop: storage path overrides, cluster health, Ollama
+detection, Meeting Bot cleanup, deployment resume, vision workers, cameras; mobile: sandbox
+data root, model residency, diagnostics heartbeat, Bonjour FFI). Never re-add a startup step
+at one call site only: mobile was a hand copy that drifted until no addon or native app worked
+on iOS/Android (no `AddonManager` reached the server). Shutdown is shared the same way:
+`CoreNode::stop_process_runtime` then `CoreNode::shutdown` (desktop stops its vision workers in
+between). Mobile keeps the started node in `runtime::RUNNING`; iOS runs the shutdown from
+`tentaflow_on_terminate` (`willTerminate`, ~4 s budget), and every pause flushes the addons'
+durable state, because a suspended app is killed without a callback. Android has no terminate
+hook: an Activity's `onDestroy` does not end the process, and core state cannot start twice.
+
 ## Addons
 
 `tentaflow-core/build.rs` embeds bundled addons from `tentaflow-core/addons/` (addon.wasm +
@@ -444,6 +475,13 @@ stay as the DB left them; instances start via auto-start) — a restart must not
 addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
 (`ABI_OUTPUT_BUFFER_TOO_SMALL`: required length on `out_len_ptr`) by reallocating the
 `on_request` output buffer and retrying, up to 8 MB; code 2 and other errors still fail.
+
+Native apps compiled into core are listed ONCE, in `addon/native_apps.rs::REGISTRY`: each
+`NativeAppHooks` carries the package's compiled `manifest` and an optional `catalog_name`. The
+catalog registers the entries that have a name (TentaVM ships hooks with `None` until its tile
+has a route), and a node decides from its OWN compiled manifest's `platforms` whether it runs an
+instance (`local_platform_refusal`), never from the replicated instance row, which says what
+the installing build supported.
 
 Native packages may declare `[[install_step]]` (`addon/install_steps.rs`): the Addons install UI
 (`www/js/modules/addons/install-steps.js`) renders each step's field schema (`select`,
@@ -492,12 +530,20 @@ native (`python-bundle`) deployment.
   private/local subresource requests inside Playwright routing.
 - `test-runner` — see Project Studio below.
 
-LLM engine versions live in the container manifests: vLLM 0.28.0 on PyTorch 2.13.0 +
-torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
-official ROCm wheel index. DGX Spark builds vLLM 0.28.0 from source and the DeepSeek DSpark
-variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
-`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.28.0 needs
-`vllm-dspark-src`, because the old overlay no longer applies to current sources.
+LLM engine versions live in the container manifests: vLLM 0.34.0 on PyTorch 2.14.0 +
+torchvision 0.29.0 (cu130), SGLang 0.5.23 on PyTorch 2.14.1 + torchvision 0.29.1 (cu130 only —
+no CUDA 12 wheels since 0.5.20; ROCm torch from `whl/rocm7.2`). ROCm vLLM variants install from
+the official ROCm wheel index, whose vLLM wheel pins its own torch build — so the shared vLLM
+`requirements.lock` pins no torch and only the cuda variant carries the torch triple. vLLM
+0.34 has no `--task`: pooling engines (embeddings, rerankers) launch with `--runner pooling`.
+DGX Spark builds vLLM 0.34.0 from source (`vllm-spark`). The DeepSeek DSpark variant
+(`vllm-dspark-src`, and `scripts/build-vllm-spark-venv.sh` for the native cluster) stays on vLLM
+0.28.0, because its local `nvfp4_ds_mla` patch targets that tree: from 0.34 upstream defines
+`nvfp4_ds_mla` itself as a different, SM100-only NVFP4 format, while DeepSeek V4 still rejects it.
+Profile `vllm-dspark` is legacy (external vLLM 0.24 image + old overlay). vllm-metal is pinned as
+a PAIR in its bundle (`vllm_version` + `vllm_release_tag` + `vllm_metal_version`, never
+`releases/latest`): a plugin release X.Y requires vLLM core X.Y, installed from vLLM's prebuilt
+macOS arm64 wheel.
 
 vLLM recipes (`tentaflow-core/src/deploy/vllm_recipes.rs`) resolve in a cascade: exact HF id →
 normalized id (quantization/packaging suffixes stripped, same org then canonical orgs) →
@@ -1072,6 +1118,11 @@ contract and the `native-libs` artifact mapping, so we can use upstream features
   to the new free position after acceptance — without them M-RoPE rejects the batch. MTP only
   pays off when the GPU is not saturated (a single or rare stream); with several parallel
   sequences the draft overhead outweighs the gain.
+- MTP traps: the model must be loaded with `LlamaLoadConfig.load_mtp` (llama.cpp skips the NextN
+  tensors otherwise and the MTP graph aborts on `nextn.eh_proj`); the engine sets it only for
+  `Mtp`. Since llama.cpp 1.0 the MTP drafter's destructor calls into `ctx_tgt`, so the
+  speculative handle is dropped BEFORE the target context. `common_speculative_process` takes a
+  `common_batch`; the C shim rebuilds it from the `llama_batch` just decoded on `ctx_tgt`.
 - Anti-hang contract: `submit_with_sink` takes a `Box<dyn EngineSink>` and the scheduler calls
   `sink.try_send` from its own thread (no thread per request). A `Full` token is deferred to the
   slot's `pending`, including the terminal token, and `release_slot` only frees the slot after

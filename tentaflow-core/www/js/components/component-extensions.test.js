@@ -947,6 +947,27 @@ test('tf-agent-activity: cancel and open-run still emit their events', () => {
   assert.ok(w.querySelector('.tf-aa-timeline'), 'the timeline renders at level 2');
 });
 
+test('tf-agent-activity: a flow run with no agent run behind it offers no cancel', () => {
+  const w = activity({ level: 'tree' });
+  w.applyEvent({ kind: 'node_started', scope: 'chat-run-1', nodeId: 'm1', unmanaged: true });
+  assert.ok(w.querySelector('[data-action="open-run"]'));
+  assert.equal(w.querySelector('[data-action="cancel-run"]'), null);
+});
+
+test('tf-agent-activity: the end of a run settles it, and a new conversation starts empty', () => {
+  const w = activity({ level: 'tree' });
+  w.applyEvent({ kind: 'node_started', scope: 'chat-run-2', nodeId: 'm1', unmanaged: true });
+  assert.ok(w._driver(), 'the run is going');
+  const stepsBefore = w._runs.get('chat-run-2').steps.length;
+  w.applyEvent({ kind: 'run_finished', runId: 'chat-run-2', status: 'completed', unmanaged: true });
+  assert.equal(w._driver(), null, 'a finished run is no longer the one working');
+  assert.equal(w._runs.get('chat-run-2').status, 'completed');
+  assert.equal(w._runs.get('chat-run-2').steps.length, stepsBefore, 'the end adds no step');
+  assert.doesNotMatch(w.textContent, /0 tok/, 'a flow run reports no token count, so none is shown');
+  w.clearRuns();
+  assert.equal(w._runs.size, 0);
+});
+
 // ---------------------------------------------------------------------------
 // 7. tf-select / tf-button — light DOM written AFTER the upgrade
 // ---------------------------------------------------------------------------

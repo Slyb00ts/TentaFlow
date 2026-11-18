@@ -2122,6 +2122,15 @@ name = "content-type"
 value = "application/json"
 ```
 
+Korelacja (TB-02): naglowek rekordu `correlation-id` (ASCII
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) broker waliduje i zapisuje jako
+`tf.correlation_id`. Rekord bez waznego naglowka dostaje id przebiegu flow,
+w ktorym dziala blok addonu (`invoke_block` przekazuje je z kontekstu flow);
+poza przebiegiem host nadaje kazdemu rekordowi wlasne id (UUID v7).
+Konsument, ktory publikuje dalej rekord przeczytany z tematu, musi odeslac
+wartosc `tf.correlation_id` jako `correlation-id` — broker usuwa kazdy
+naglowek `tf.*` przysłany przez wolajacego.
+
 Audytowane KAZDE wywolanie (`ok`/`denied`/`error`) — to jest granica
 "open"-owa dla publish (nie ma osobnego `bus_publish_open`), nie
 per-rekord w srodku batcha. Bledy: `NotFound` (2, temat nie istnieje i

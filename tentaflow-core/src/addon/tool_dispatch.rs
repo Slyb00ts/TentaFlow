@@ -141,6 +141,30 @@ impl ToolDispatcher {
         )
     }
 
+    /// [`Self::dispatch_tool_call`] (or the pre-authorized variant) for a call
+    /// made from a flow run: see `AddonManager::call_tool_in_run`.
+    pub fn dispatch_tool_call_in_run(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        user_id: &str,
+        preauthorized: bool,
+        parent: crate::flow_engine::dispatchers::ParentRun,
+        expected_org: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let tools = self.addon_manager.list_tools();
+        let tool = resolve_tool(&tools, tool_name)?;
+        self.addon_manager.call_tool_in_run(
+            &tool.addon_id,
+            &tool.tool_name,
+            arguments,
+            user_id,
+            preauthorized,
+            parent,
+            expected_org,
+        )
+    }
+
     /// Executes every call requested by one assistant turn, in order
     /// (sequential by design — simpler to audit, addon instances pool
     /// anyway). A failed call becomes an error result, never an aborted

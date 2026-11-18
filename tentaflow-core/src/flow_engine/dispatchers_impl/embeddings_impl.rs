@@ -72,6 +72,7 @@ impl EmbeddingsDispatcherImpl {
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
+            org_id: None,
         });
         let context = AiGatewayContext {
             org_id: req.provenance.org_id.clone(),
@@ -123,6 +124,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             provenance.origin,
             provenance.actor,
         );
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = match self.runtime.read().as_ref().cloned() {
             Some(runtime) => runtime,
             None => {
@@ -140,7 +142,10 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
                 if let Some(event) = audit_event.as_ref() {
                     let _ = event.finish_failed(&message);
                 }
-                return Err(anyhow!(message));
+                return Err(super::dispatcher_failure(
+                    "EmbeddingsDispatcher",
+                    e.into_anyhow(),
+                ));
             }
         };
         if let Some(event) = audit_event.as_ref() {

@@ -637,6 +637,8 @@ pub enum ProcessNodeKind {
         result_expression: Option<String>,
         #[serde(default, skip_serializing_if = "ServiceImplementation::is_flow")]
         implementation: ServiceImplementation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<ProcessRetryPolicy>,
     },
     ExclusiveGateway {
         default_flow_id: Option<String>,
@@ -922,6 +924,32 @@ pub fn tool_source_ref(addon_id: &str, tool_name: &str) -> String {
 /// Splits a `tool:<addon>/<tool>` reference; `None` for a Flow id.
 pub fn parse_tool_source_ref(source_ref: &str) -> Option<(&str, &str)> {
     source_ref.strip_prefix("tool:")?.split_once('/')
+}
+
+/// How many times, and how long after, the engine repeats a Service task on
+/// its own once it failed with proof that nothing happened outside. Absent on a
+/// task means no automatic retry, which is what every model published before
+/// this field existed does. `max_attempts` counts the repeats after the first
+/// run, so 3 is up to four runs in all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRetryPolicy {
+    pub max_attempts: u8,
+    pub delay_seconds: u32,
+    pub backoff: ProcessRetryBackoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessRetryBackoff {
+    /// Every repeat waits `delay_seconds`.
+    Fixed,
+    /// The wait before repeat `n` is `delay_seconds * (factor_percent / 100)^(n-1)`,
+    /// never more than `max_delay_seconds`.
+    Exponential {
+        factor_percent: u32,
+        max_delay_seconds: u32,
+    },
 }
 
 /// Persisted discriminator of [`ServiceImplementation`] (pins and invocation
@@ -1381,6 +1409,22 @@ pub struct ProcessIncident {
     pub scope_id: String,
     #[serde(default)]
     pub retry: ProcessIncidentRetry,
+    /// Present when the step has a retry policy: what the one incident of this
+    /// failure has been through, instead of a row per attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<ProcessIncidentAttempts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIncidentAttempts {
+    /// Repeats already made of this failure, by the engine or by a person.
+    pub made: u32,
+    /// What the step's policy allows the engine to make.
+    pub limit: u32,
+    /// When the engine repeats it next; absent once it will not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3623,6 +3667,7 @@ mod tests {
                 verification: ActivityVerification::Condition { expression: "true".into() },
                 timeout_seconds: 30,
                 result_expression: result_expression.map(str::to_owned),
+                retry: None,
                 implementation: ServiceImplementation::Flow,
             },
             LegacyNodeKind::ServiceTask {
@@ -3669,6 +3714,7 @@ mod tests {
             verification,
             timeout_seconds,
             result_expression: None,
+            retry: None,
             implementation: ServiceImplementation::AddonTool {
                 addon_id: "notes-1a2b3c4d".into(),
                 tool_name: "search".into(),
@@ -3705,6 +3751,7 @@ mod tests {
             verification: ActivityVerification::Human,
             timeout_seconds: 30,
             result_expression: None,
+            retry: None,
             implementation: ServiceImplementation::Block {
                 node_type: "llm".into(),
                 config,
@@ -3720,6 +3767,7 @@ mod tests {
             verification,
             timeout_seconds: 30,
             result_expression: None,
+            retry: None,
             implementation: ServiceImplementation::Flow,
         }
     }
@@ -3808,6 +3856,7 @@ mod tests {
             verification: ActivityVerification::Human,
             timeout_seconds: 30,
             result_expression: None,
+            retry: None,
             implementation: ServiceImplementation::AddonTool {
                 addon_id: "notes-1".into(),
                 tool_name: "search".into(),

@@ -209,8 +209,15 @@ pub struct EventsStepIoResponse {
     /// Size of each side before any cut, in bytes.
     pub input_bytes: u64,
     pub output_bytes: u64,
-    /// True when a side was cut to the storage cap.
+    /// True when a side was cut to the storage cap, or to what one reply
+    /// carries.
     pub truncated: bool,
+    /// Bytes of each side that this reply leaves out because one frame cannot
+    /// carry them; the log still holds them. Zero when the side is whole.
+    #[serde(default)]
+    pub input_omitted_bytes: u64,
+    #[serde(default)]
+    pub output_omitted_bytes: u64,
 }
 
 /// The whole Events-browser surface behind one `MessageBody::EventsBody`.

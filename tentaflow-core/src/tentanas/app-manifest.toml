@@ -17,7 +17,8 @@ icon = "cylinder"
 runtime = "native"
 # Full functionality is Linux; macOS/Windows get a limited mode (inventory and
 # health where available) decided by the environment probe, not by the catalog.
-platforms = ["linux", "macos", "windows"]
+# iOS is a console for the other nodes' storage (`native_apps::console_only_node`).
+platforms = ["linux", "macos", "windows", "ios"]
 
 [application]
 entry_panel = "main"

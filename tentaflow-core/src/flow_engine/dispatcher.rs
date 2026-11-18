@@ -65,11 +65,13 @@ use crate::flow_engine::node_adapters::{
 };
 use crate::flow_engine::progress_broker::RunDescriptor;
 use crate::flow_engine::resolver;
+use crate::flow_engine::sla_admission::{Bounded, SlaAdmission};
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
 use crate::flow_engine::types::{FlowDefinition, FlowNode};
 use crate::flow_engine::validation::{self, FlowValidationError};
 use crate::processes::blocks::BlockAccessError;
 use crate::services::runtime::quic_handle::ServiceManager;
+use crate::sla::{AdmitOrigin, RefusalReason, SlaRefusal, SlaRegistry};
 
 /// Globalny cap na CAŁY flow to już TYLKO backstop anty-zawieszeniowy (nie
 /// limit „budżetu czasu"): per-node 600 s + `max_iterations` ograniczają normalne
@@ -101,6 +103,33 @@ pub enum DispatchError {
     /// the edge answers 429 instead of a generic 500. Carries the gateway's text.
     #[error("{0}")]
     QuotaExceeded(String),
+    /// An SLA policy refused the run: the flow is at its call limit, or every
+    /// slot is taken and the waiting queue is full or its wait ran out. Typed so
+    /// the edge answers 429 with `Retry-After` (or defers, for a BPMN task)
+    /// instead of a generic 500. The text starts with the stable code
+    /// `sla.overloaded`, so every edge that only prints the error still carries it.
+    #[error("sla.overloaded: {}, retry after {retry_after_ms} ms", reason.code())]
+    Overloaded {
+        reason: RefusalReason,
+        retry_after_ms: u64,
+    },
+    /// A model service a node called is at its `max_concurrent` and no slot
+    /// freed in time. Typed so the edge answers 503 with `Retry-After`. The text
+    /// starts with the stable code `backend.busy` and names no service.
+    #[error("backend.busy: retry after {retry_after_ms} ms")]
+    BackendBusy { retry_after_ms: u64 },
+    /// The policy's execution timeout elapsed before the run finished.
+    #[error("sla.timeout: flow {flow_id} exceeded its {timeout_ms} ms timeout")]
+    TimedOut { flow_id: String, timeout_ms: u64 },
+}
+
+impl From<SlaRefusal> for DispatchError {
+    fn from(refusal: SlaRefusal) -> Self {
+        DispatchError::Overloaded {
+            reason: refusal.reason,
+            retry_after_ms: refusal.retry_after_ms,
+        }
+    }
 }
 
 impl From<anyhow::Error> for DispatchError {
@@ -111,6 +140,11 @@ impl From<anyhow::Error> for DispatchError {
             }
             Some(crate::error::CoreError::RateLimitExceeded { message }) => {
                 DispatchError::QuotaExceeded(message.clone())
+            }
+            Some(crate::error::CoreError::BackendBusy { retry_after_ms, .. }) => {
+                DispatchError::BackendBusy {
+                    retry_after_ms: *retry_after_ms,
+                }
             }
             _ => DispatchError::Internal(format!("{e:#}")),
         }
@@ -229,9 +263,10 @@ pub enum FlowOrigin {
     System,
     /// TentaBus reactor (`bus::reactor`) — a flow whose entry is `bus_consume`,
     /// dispatched in the background when new records land on its subscribed
-    /// topic/group. The message carries no human/service identity, so the run
-    /// acts under `FlowActor::system()`; this origin is what distinguishes it
-    /// in the event log from `System`'s other internal-work callers.
+    /// topic/group. The message carries no identity, so the run acts as the
+    /// flow's bound service account (`FlowActor::api_key`, no user); this
+    /// origin is what distinguishes it in the event log from `System`'s other
+    /// internal-work callers.
     Bus,
     /// BPMN process engine — a Service task running an addon tool (and later
     /// other implementations) as the instance initiator. The actor names the
@@ -386,6 +421,11 @@ pub struct CallProvenance {
     /// `FlowOrigin::Process`; every other origin leaves the audit to resolve the
     /// organization from the caller's membership, as before.
     pub org_id: Option<String>,
+    /// The call is made by a node of a flow run that is executing right now, so
+    /// whatever it dispatches onto another flow is part of that run and takes
+    /// no SLA slot of its own. Everything that enters from outside (a request,
+    /// a mesh peer, a bus record, a BPMN job, an addon call) leaves it false.
+    pub nested_in_run: bool,
 }
 
 impl CallProvenance {
@@ -394,7 +434,13 @@ impl CallProvenance {
             origin,
             actor,
             org_id: None,
+            nested_in_run: false,
         }
+    }
+
+    pub fn nested_in_run(mut self) -> Self {
+        self.nested_in_run = true;
+        self
     }
 
     pub fn with_org(mut self, org_id: Option<String>) -> Self {
@@ -412,6 +458,7 @@ impl CallProvenance {
             origin: FlowOrigin::System,
             actor: FlowActor::system(),
             org_id: None,
+            nested_in_run: false,
         }
     }
 }
@@ -491,7 +538,8 @@ pub struct FlowRequestMeta {
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
     /// AppState's `ProgressBroker`) injects the production sink; `None` →
-    /// no-op (headless / tests). Scope = session_id, falling back to
+    /// no-op (headless / tests). Scope = `progress_scope()`: a server-minted
+    /// scope when the entry point set one, else session_id, falling back to
     /// request_id so a broadcast key always exists.
     pub progress_sink: Option<Arc<dyn ProgressSink>>,
     /// RAG C2 (recursion guard) — głębokość zagnieżdżenia flow odziedziczona
@@ -502,6 +550,33 @@ pub struct FlowRequestMeta {
     /// by nie narósł (nieograniczona rekurencja). `make_context` seeduje z tego
     /// pola `subflow_depth`.
     pub flow_depth: u8,
+    /// The call is made from inside a running flow run (a node of that run
+    /// resolved a model onto this flow), as opposed to entering the system from
+    /// outside. Taken from the run's provenance, never from `flow_depth`. A
+    /// nested call takes no SLA slot: it would wait for the one its caller
+    /// holds.
+    pub nested_in_run: bool,
+    /// The run needs no slot of its own: its caller holds the permit for the
+    /// run's whole duration (the bus reactor counts the call, owns the window
+    /// and pauses a refused unit itself), or it continues work of a bus run
+    /// that was admitted already (a sub-agent completion reaction, an agent run
+    /// the flow started). The dispatcher takes no second slot, so a call is
+    /// counted once and never refused here, but still applies the policy's
+    /// timeout to the run as a backstop.
+    pub slot_held_by_caller: bool,
+    /// Shared with the SLA admission of this run: the audit row the executor
+    /// creates is published here.
+    pub settle: Arc<crate::flow_engine::node_adapter::RunSettle>,
+    /// The bus record that triggered this run (coordinates only), stamped by the
+    /// reactor dispatch for `FlowOrigin::Bus` runs and written on the run-start
+    /// event. A separate field for the same reason as `origin`.
+    pub bus_source: Option<crate::events::store::BusRecordRef>,
+    /// Server-minted broadcast scope that replaces the session id for this run.
+    /// A client-chosen session id is low-entropy and shared by every run of a
+    /// conversation, so using it as the scope would let another user's run
+    /// collide with it (and its events and audit rows be suppressed) and would
+    /// file one run's trailing rows under the next.
+    pub(crate) progress_scope_override: Option<String>,
 }
 
 /// Maps a refused block access to the dispatch error a caller already handles:
@@ -542,15 +617,37 @@ impl FlowRequestMeta {
             cancel_token: CancellationToken::new(),
             progress_sink: None,
             flow_depth: 0,
+            nested_in_run: false,
+            slot_held_by_caller: false,
+            settle: Arc::default(),
+            bus_source: None,
+            progress_scope_override: None,
         }
     }
 
-    /// Effective broadcast scope for progress events — session id when present,
-    /// else the request id.
-    pub(crate) fn progress_scope(&self) -> String {
-        self.session_id
+    /// Effective broadcast scope for progress events — the server-minted scope
+    /// when one was set, else the session id when present, else the request id.
+    pub fn progress_scope(&self) -> String {
+        self.progress_scope_override
             .clone()
+            .or_else(|| self.session_id.clone())
             .unwrap_or_else(|| self.request_id.clone())
+    }
+
+    /// Puts this run on the Events log under a scope of its own. Called by the
+    /// AI entry points only: a run without a sink publishes nothing, and a
+    /// nested flow (reached through a model alias) must not call it, or the
+    /// inner run would be recorded as a second top-level run. The scope is the
+    /// request id, minted by the server per run, so no other principal can
+    /// observe or contest it and the conversation's `session_id` stays what it
+    /// is for memory.
+    pub fn record_to_event_log(&mut self) {
+        self.progress_scope_override = Some(self.request_id.clone());
+        self.progress_sink = Some(Arc::new(
+            crate::flow_engine::progress_broker::BrokerProgressSink::new(
+                crate::flow_engine::progress_broker::global_broker(),
+            ),
+        ));
     }
 }
 
@@ -610,6 +707,10 @@ pub struct FlowDispatcher {
     /// Mesh node id for the AI gateway, resolved per call (the registry is
     /// filled after construction).
     local_node_id: crate::services::runtime::resolver::LocalNodeIdProvider,
+    /// The registry of SLA gates the top-level runs are admitted through; the
+    /// node's global one outside tests, where a test that must not share the
+    /// global gates swaps it (`use_sla_registry`).
+    sla: parking_lot::RwLock<&'static SlaRegistry>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -649,6 +750,7 @@ impl ContextFactory {
         ExecutionContext {
             request_id: meta.request_id.clone(),
             execution_id: 0,
+            settle: meta.settle.clone(),
             parent_execution_id: None,
             light: false,
             session_id: meta.session_id.clone(),
@@ -831,6 +933,7 @@ impl FlowDispatcher {
             frame_blobs,
             process_runtime: parking_lot::Mutex::new(None),
             local_node_id,
+            sla: parking_lot::RwLock::new(crate::sla::global()),
         }
     }
 
@@ -1204,6 +1307,9 @@ impl FlowDispatcher {
         meta.user_id = Some(account.id);
         meta.user_role = Some(account.role);
         meta.org_id = Some(org_id.to_owned());
+        // A process step is an AI run like any other: it goes on the Events log
+        // under its own run id and the process's organisation.
+        crate::routing::start_recording(&mut meta, Some(&self.db), Some(org_id));
         Ok(meta)
     }
 
@@ -1229,6 +1335,7 @@ impl FlowDispatcher {
         let user = crate::auth::acl::UserContext {
             user_id: user_id.to_owned(),
             role: String::new(),
+            org_id: None,
         };
         let context = crate::compliance::ai_gateway::AiGatewayContext {
             org_id: Some(org_id.to_owned()),
@@ -1329,9 +1436,8 @@ impl FlowDispatcher {
             )?,
         );
         let outcome = self
-            .run_blocking(compiled, initial, meta, RunDescriptor::default())
-            .await
-            .map_err(DispatchError::from)?;
+            .run_blocking(compiled, initial, meta, RunDescriptor::default(), None)
+            .await?;
         // Only a definite loss of access discards a result that already exists.
         definite(self.authorize_process_block(&node_type, &config, &user_id, &org_id))?;
         Ok(outcome)
@@ -1426,9 +1532,9 @@ impl FlowDispatcher {
                     initial,
                     meta,
                     RunDescriptor::resolved(model_name, service_type, modality),
+                    None,
                 )
                 .await
-                .map_err(DispatchError::from)
             }
             ResolvedFlow::NotFound => {
                 // Brak jawnego flow — model wykonywany BEZPOŚREDNIO na
@@ -1511,9 +1617,9 @@ impl FlowDispatcher {
             initial,
             meta,
             RunDescriptor::default(),
+            None,
         )
         .await
-        .map_err(DispatchError::from)
     }
 
     /// The stored status of a flow (`None` when no such flow exists), so a
@@ -1565,6 +1671,9 @@ impl FlowDispatcher {
         meta.user_id = Some(account.id);
         meta.user_role = Some(account.role);
         meta.org_id = Some(org_id.to_owned());
+        // A process step is an AI run like any other: it goes on the Events log
+        // under its own run id and the process's organisation.
+        crate::routing::start_recording(&mut meta, Some(&self.db), Some(org_id));
         Ok(meta)
     }
 
@@ -1638,38 +1747,90 @@ impl FlowDispatcher {
         &self,
         snapshot: &PinnedFlowSnapshot,
         initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        self.dispatch_pinned_flow_with(snapshot, initial, meta, None)
+            .await
+    }
+
+    pub async fn dispatch_pinned_flow_admitted(
+        &self,
+        snapshot: &PinnedFlowSnapshot,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+        admission: SlaAdmission,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        self.dispatch_pinned_flow_with(snapshot, initial, meta, Some(admission))
+            .await
+    }
+
+    /// `admission` is the permit of a caller that took it already; `None` takes
+    /// one in `run_blocking`. An admission taken for another flow is given back
+    /// and refused.
+    async fn dispatch_pinned_flow_with(
+        &self,
+        snapshot: &PinnedFlowSnapshot,
+        initial: FlowEnvelope,
         mut meta: FlowRequestMeta,
+        admission: Option<SlaAdmission>,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         use sha2::{Digest, Sha256};
 
-        let (Some(user_id), Some(org_id)) = (&meta.user_id, &meta.org_id) else {
-            return Err(DispatchError::Denied {
-                flow_id: snapshot.flow_id.clone(),
-            });
-        };
-        let user_id = user_id.clone();
-        let org_id = org_id.clone();
-        let current = self.authorize_process_flow(&snapshot.flow_id, &user_id, &org_id)?;
-        if meta.actor_user_id.as_deref() != Some(user_id.as_str())
-            || hex::encode(Sha256::digest(snapshot.graph_json.as_bytes())) != snapshot.graph_sha256
-        {
-            return Err(DispatchError::Denied {
-                flow_id: snapshot.flow_id.clone(),
-            });
+        if let Some(held) = &admission {
+            if held.flow_id() != snapshot.flow_id {
+                let message = format!(
+                    "admission taken for flow {} was used for pinned flow {}",
+                    held.flow_id(),
+                    snapshot.flow_id
+                );
+                if let Some(held) = admission {
+                    held.forgo();
+                }
+                return Err(DispatchError::Internal(message));
+            }
         }
-        meta.user_role = current.user_role;
-        self.validate_process_snapshot(&snapshot.flow_id, &snapshot.graph_json)?;
-        let compiled = Arc::new(
-            CompiledFlow::from_json(&snapshot.flow_id, &snapshot.graph_json, &self.registry)
-                .map_err(|e| DispatchError::CompileFailed {
+        // Everything up to the run itself may refuse the call; a refusal must
+        // not cost the service a slot or a call of its window.
+        let prepared = (|| {
+            let (Some(user_id), Some(org_id)) = (&meta.user_id, &meta.org_id) else {
+                return Err(DispatchError::Denied {
                     flow_id: snapshot.flow_id.clone(),
-                    msg: e.to_string(),
-                })?,
-        );
+                });
+            };
+            let user_id = user_id.clone();
+            let org_id = org_id.clone();
+            let current = self.authorize_process_flow(&snapshot.flow_id, &user_id, &org_id)?;
+            if meta.actor_user_id.as_deref() != Some(user_id.as_str())
+                || hex::encode(Sha256::digest(snapshot.graph_json.as_bytes()))
+                    != snapshot.graph_sha256
+            {
+                return Err(DispatchError::Denied {
+                    flow_id: snapshot.flow_id.clone(),
+                });
+            }
+            self.validate_process_snapshot(&snapshot.flow_id, &snapshot.graph_json)?;
+            let compiled = Arc::new(
+                CompiledFlow::from_json(&snapshot.flow_id, &snapshot.graph_json, &self.registry)
+                    .map_err(|e| DispatchError::CompileFailed {
+                        flow_id: snapshot.flow_id.clone(),
+                        msg: e.to_string(),
+                    })?,
+            );
+            Ok((user_id, org_id, current.user_role, compiled))
+        })();
+        let (user_id, org_id, user_role, compiled) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                if let Some(held) = admission {
+                    held.forgo();
+                }
+                return Err(e);
+            }
+        };
+        meta.user_role = user_role;
         let outcome = self
-            .run_blocking(compiled, initial, meta, RunDescriptor::default())
-            .await
-            .map_err(DispatchError::from)?;
+            .run_blocking(compiled, initial, meta, RunDescriptor::default(), admission)
+            .await?;
         self.authorize_process_flow(&snapshot.flow_id, &user_id, &org_id)?;
         Ok(outcome)
     }
@@ -1681,11 +1842,15 @@ impl FlowDispatcher {
     /// both already enforced between nodes by the executor. ACL is skipped: the
     /// manager already verified the spawning principal and the harness flows are
     /// resolver-unreachable system flows (no per-user ACL rows).
+    ///
+    /// A flow under an SLA policy is admitted like any top-level run, and the
+    /// policy's timeout bounds it; a run whose caller holds the permit takes no
+    /// slot of its own (see [`Self::admit_run`]).
     pub async fn dispatch_by_flow_id_background(
         &self,
         target: FlowRef,
         initial: FlowEnvelope,
-        meta: FlowRequestMeta,
+        mut meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let pool = self.db.clone();
         let lookup = target.clone();
@@ -1736,20 +1901,48 @@ impl FlowDispatcher {
                 });
             }
         };
+        let admission = self
+            .admit_run(&compiled.flow_id, &mut meta, AdmitOrigin::Background)
+            .await?;
         // A harness flow is named outright by the run manager, so the only
         // descriptor fact this run has is the flow that executes.
         let ctx = self
             .ctx_factory
             .make_context(&meta, RunDescriptor::default().with_flow(&compiled.flow_id));
-        execute_blocking(
+        let flow_id = compiled.flow_id.clone();
+        let run = execute_blocking(
             self.db.clone(),
             compiled,
             initial,
             ctx,
             self.registry.clone(),
-        )
-        .await
-        .map_err(DispatchError::from)
+        );
+        // No backstop here by design; only a policy's timeout bounds the run.
+        match admission.run_within_policy(run).await {
+            Bounded::Done(Ok(outcome)) if !admission.outcome_is_timeout(&outcome) => {
+                admission.finish_outcome(&outcome);
+                Ok(outcome)
+            }
+            // The run stopped inside the grace period: a real result only if it
+            // did not fail on the way.
+            Bounded::TimedOut(Some(Ok(outcome))) if outcome.error.is_none() => {
+                admission.finish_outcome(&outcome);
+                Ok(outcome)
+            }
+            Bounded::Done(Err(e)) if !admission.error_is_timeout(&e) => {
+                admission.finish_failed();
+                Err(DispatchError::from(e))
+            }
+            Bounded::Done(_) | Bounded::TimedOut(_) => {
+                let timeout_ms = admission.timeout_ms();
+                warn!(flow_id, timeout_ms, "Flow przekroczyl timeout polityki SLA");
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
+            }
+        }
     }
 
     /// Streaming wariant `dispatch_by_flow_id` — odpala KONKRETNY flow po ID
@@ -1791,26 +1984,14 @@ impl FlowDispatcher {
         };
         if !compiled.is_streaming {
             let outcome = self
-                .run_blocking(compiled, initial, meta, RunDescriptor::default())
-                .await
-                .map_err(DispatchError::from)?;
+                .run_blocking(compiled, initial, meta, RunDescriptor::default(), None)
+                .await?;
             return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
         }
         // Dispatched by flow id: no model routing key was resolved, so the flow
         // is the whole descriptor.
-        let ctx = self
-            .ctx_factory
-            .make_context(&meta, RunDescriptor::default().with_flow(&compiled.flow_id));
-        let stream_exec = execute_streaming(
-            self.db.clone(),
-            compiled,
-            initial,
-            ctx,
-            self.registry.clone(),
-        )
-        .await
-        .map_err(DispatchError::from)?;
-        Ok(stream_exec)
+        self.start_streaming(compiled, initial, meta, RunDescriptor::default())
+            .await
     }
 
     pub async fn try_dispatch_streaming(
@@ -1842,9 +2023,9 @@ impl FlowDispatcher {
                             initial,
                             meta,
                             RunDescriptor::resolved(model_name, service_type, modality),
+                            None,
                         )
-                        .await
-                        .map_err(DispatchError::from)?;
+                        .await?;
                     return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
                 }
                 cached.compiled.clone()
@@ -1890,30 +2071,201 @@ impl FlowDispatcher {
                 });
             }
         };
-        let ctx = self.ctx_factory.make_context(
-            &meta,
-            RunDescriptor::resolved(model_name, service_type, modality)
-                .with_flow(&compiled.flow_id),
-        );
-        let stream_exec = execute_streaming(
+        self.start_streaming(
+            compiled,
+            initial,
+            meta,
+            RunDescriptor::resolved(model_name, service_type, modality),
+        )
+        .await
+    }
+
+    /// The one admission point of a streaming flow run. The admission moves
+    /// into the returned stream (see [`SlaAdmission::attach`]), so the slot is
+    /// held until the stream ends or is dropped, not until this call returns.
+    async fn start_streaming(
+        &self,
+        compiled: Arc<CompiledFlow>,
+        initial: FlowEnvelope,
+        mut meta: FlowRequestMeta,
+        descriptor: RunDescriptor,
+    ) -> std::result::Result<StreamingExecution, DispatchError> {
+        let admission = self
+            .admit_run(&compiled.flow_id, &mut meta, AdmitOrigin::Request)
+            .await?;
+        let flow_id = compiled.flow_id.clone();
+        let ctx = self
+            .ctx_factory
+            .make_context(&meta, descriptor.with_flow(&flow_id));
+        // The pre-producer nodes run before this returns, so the policy's
+        // timeout bounds them too.
+        let started = execute_streaming(
             self.db.clone(),
             compiled,
             initial,
             ctx,
             self.registry.clone(),
-        )
-        .await
-        .map_err(DispatchError::from)?;
-        Ok(stream_exec)
+        );
+        let started = admission.run_within_policy(started).await;
+        match started {
+            Bounded::Done(Ok(exec)) => Ok(admission.attach(exec)),
+            Bounded::Done(Err(e)) if admission.error_is_timeout(&e) => {
+                let timeout_ms = admission.timeout_ms();
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
+            }
+            Bounded::Done(Err(e)) => {
+                admission.finish_failed();
+                Err(DispatchError::from(e))
+            }
+            Bounded::TimedOut(_) => {
+                let timeout_ms = admission.timeout_ms();
+                warn!(flow_id, timeout_ms, "Flow przekroczyl timeout polityki SLA");
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
+            }
+        }
     }
 
+    /// Points this dispatcher at gates of its own, so a test is not reloaded
+    /// out from under by the policies of another test's database.
+    #[cfg(test)]
+    pub(crate) fn use_sla_registry(&self, sla: &'static SlaRegistry) {
+        *self.sla.write() = sla;
+    }
+
+    /// Admits a top-level run of `flow_id` under its SLA policy and applies the
+    /// policy's timeout to `meta.deadline` (the stricter of the two wins). A
+    /// caller that is refused may wait in the policy's queue.
+    ///
+    /// Only a top-level call takes a slot. A call made from inside a running
+    /// flow (`meta.nested_in_run`: a node of that flow resolved a model onto a
+    /// flow) could otherwise wait for the slot its own caller holds. That
+    /// marker comes from the run's provenance, not from the nesting depth: the
+    /// depth the capability dispatchers keep counts how deep the recursion
+    /// guard is, which is not the same thing (a top-level embeddings call is
+    /// already one deep, a nested chat call is zero deep). A flow without a
+    /// policy gets an untracked admission and runs exactly as before.
+    ///
+    /// A run whose caller already holds the permit (`meta.slot_held_by_caller`)
+    /// takes no second slot, so the call is counted once, and still gets the
+    /// policy's timeout as a backstop. The bus reactor is that caller: it takes
+    /// the permit around each unit of records it dispatches, owns the call
+    /// window, the concurrency count and the pause after a refusal, and records
+    /// the unit's outcome (including a timeout) on its own permit.
+    pub async fn admit_run(
+        &self,
+        flow_id: &str,
+        meta: &mut FlowRequestMeta,
+        origin: AdmitOrigin,
+    ) -> std::result::Result<SlaAdmission, DispatchError> {
+        self.admit(flow_id, meta, origin, true).await
+    }
+
+    /// [`Self::admit_run`] that never waits for a slot: a full gate refuses at
+    /// once. For a caller that can put the work off instead.
+    pub async fn try_admit_run(
+        &self,
+        flow_id: &str,
+        meta: &mut FlowRequestMeta,
+        origin: AdmitOrigin,
+    ) -> std::result::Result<SlaAdmission, DispatchError> {
+        self.admit(flow_id, meta, origin, false).await
+    }
+
+    async fn admit(
+        &self,
+        flow_id: &str,
+        meta: &mut FlowRequestMeta,
+        origin: AdmitOrigin,
+        may_wait: bool,
+    ) -> std::result::Result<SlaAdmission, DispatchError> {
+        if meta.nested_in_run {
+            return Ok(SlaAdmission::untracked(flow_id));
+        }
+        // A failed load is logged and rate limited by the registry, which keeps
+        // serving the last good gates.
+        let sla = *self.sla.read();
+        let _ = sla.refresh_if_stale(&self.db);
+        let Some(gate) = sla.gate(flow_id) else {
+            return Ok(SlaAdmission::untracked(flow_id));
+        };
+        let permit = if meta.slot_held_by_caller {
+            crate::sla::SlaPermit::untracked()
+        } else if may_wait {
+            gate.admit(origin).await?
+        } else {
+            gate.try_admit(origin).await?
+        };
+        // The run gets a token of its own, a child of the caller's: the policy
+        // timeout stops the run through it without cancelling something the
+        // caller owns (a BPMN job's token, an agent run's handle), and the
+        // caller's own cancellation still reaches the run.
+        let run_cancel = meta.cancel_token.child_token();
+        meta.cancel_token = run_cancel.clone();
+        let admission = SlaAdmission::governed(
+            flow_id,
+            permit,
+            gate.config().limits.timeout,
+            &self.db,
+            meta.settle.clone(),
+            run_cancel,
+        );
+        if let Some(policy_deadline) = admission.deadline() {
+            meta.deadline = Some(
+                meta.deadline
+                    .map_or(policy_deadline, |existing| existing.min(policy_deadline)),
+            );
+        }
+        Ok(admission)
+    }
+
+    /// Admits a pinned process flow without waiting, before the caller commits
+    /// its dispatch boundary, so a refusal can still put the BPMN task off
+    /// instead of failing it. Pass the result to
+    /// [`Self::dispatch_pinned_flow_admitted`].
+    pub async fn admit_pinned_flow(
+        &self,
+        snapshot: &PinnedFlowSnapshot,
+        meta: &mut FlowRequestMeta,
+    ) -> std::result::Result<SlaAdmission, DispatchError> {
+        self.try_admit_run(&snapshot.flow_id, meta, AdmitOrigin::Request)
+            .await
+    }
+
+    /// `admission` is the permit of a caller that took it already; `None` takes
+    /// one here. An admission that was taken for another flow is refused: it
+    /// would let a run spend a slot of a gate that does not govern it.
     async fn run_blocking(
         &self,
         compiled: Arc<CompiledFlow>,
         initial: FlowEnvelope,
-        meta: FlowRequestMeta,
+        mut meta: FlowRequestMeta,
         descriptor: RunDescriptor,
-    ) -> Result<FlowExecutionOutcome> {
+        admission: Option<SlaAdmission>,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        let admission = match admission {
+            Some(admission) if admission.flow_id() != compiled.flow_id => {
+                let message = format!(
+                    "admission taken for flow {} was used for flow {}",
+                    admission.flow_id(),
+                    compiled.flow_id
+                );
+                admission.forgo();
+                return Err(DispatchError::Internal(message));
+            }
+            Some(admission) => admission,
+            None => {
+                self.admit_run(&compiled.flow_id, &mut meta, AdmitOrigin::Request)
+                    .await?
+            }
+        };
         // The flow id is taken from the flow about to execute, not from the id
         // a caller asked for: the record names what ran. The rest of the
         // descriptor is whatever the caller resolved on — empty for a dispatch
@@ -1927,7 +2279,8 @@ impl FlowDispatcher {
         // faktycznie zawieszony flow — celowo hojny (1 h), żeby nie ucinał
         // normalnego multi-hop RAG ani per-chunk extraction. `cancel_token`
         // (klient disconnect) działa niezależnie, między nodami w executorze.
-        match timeout(
+        // The policy's timeout is the stricter bound when there is one.
+        let run = timeout(
             Duration::from_secs(FLOW_BACKSTOP_SECS),
             execute_blocking(
                 self.db.clone(),
@@ -1936,22 +2289,57 @@ impl FlowDispatcher {
                 ctx,
                 self.registry.clone(),
             ),
-        )
-        .await
-        {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(e)) => {
-                warn!(flow_id, "Blad wykonania flow: {e}");
-                Err(e)
+        );
+        match admission.run_within_policy(run).await {
+            Bounded::Done(Ok(Ok(outcome))) if admission.outcome_is_timeout(&outcome) => {
+                let timeout_ms = admission.timeout_ms();
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
             }
-            Err(_) => {
+            Bounded::Done(Ok(Ok(outcome))) => {
+                admission.finish_outcome(&outcome);
+                Ok(outcome)
+            }
+            Bounded::Done(Ok(Err(e))) if admission.error_is_timeout(&e) => {
+                let timeout_ms = admission.timeout_ms();
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
+            }
+            Bounded::Done(Ok(Err(e))) => {
+                warn!(flow_id, "Blad wykonania flow: {e}");
+                admission.finish_failed();
+                Err(DispatchError::from(e))
+            }
+            Bounded::Done(Err(_)) => {
                 warn!(
                     flow_id,
                     "Backstop flow po {FLOW_BACKSTOP_SECS}s (zawieszony flow)"
                 );
-                Err(anyhow::anyhow!(
+                admission.finish_failed();
+                Err(DispatchError::Internal(format!(
                     "flow {flow_id} backstop timeout after {FLOW_BACKSTOP_SECS}s"
-                ))
+                )))
+            }
+            // The run finished inside the grace period and did not fail: the
+            // result is real, whichever side of the deadline it landed on.
+            Bounded::TimedOut(Some(Ok(Ok(outcome)))) if outcome.error.is_none() => {
+                admission.finish_outcome(&outcome);
+                Ok(outcome)
+            }
+            Bounded::TimedOut(_) => {
+                let timeout_ms = admission.timeout_ms();
+                warn!(flow_id, timeout_ms, "Flow przekroczyl timeout polityki SLA");
+                admission.finish_timed_out().await;
+                Err(DispatchError::TimedOut {
+                    flow_id,
+                    timeout_ms,
+                })
             }
         }
     }
@@ -2714,7 +3102,7 @@ mod tests {
         // `begin_run` keeps the provenance binding only while something is
         // watching the scope; without the process-wide log there is no
         // subscriber, no timeline row and therefore no audit mirror to compare.
-        crate::events::progress_log::start(events_pool.clone(), main_db.clone());
+        crate::events::progress_log::start(events_pool.clone());
 
         let run_id = format!("req-{}", uuid::Uuid::new_v4());
         let mut meta = FlowRequestMeta::new(
@@ -3190,3 +3578,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sla_tests;

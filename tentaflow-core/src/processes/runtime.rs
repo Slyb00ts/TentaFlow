@@ -1066,7 +1066,7 @@ impl<'a> Transition<'a> {
 
     fn incident(&mut self, node_id: &str, job_id: Option<String>, code: &str, message: String) {
         let node_name = self.node(node_id).ok().map(|node| node.name.clone());
-        self.plan.add_incidents.push(ProcessIncident {
+        self.plan.add_incidents.push(ProcessIncident { attempts: None,
             scope_id: self.current_scope.clone(),
             incident_id: self.next_id("runtime"),
             node_id: Some(node_id.to_owned()),
@@ -4251,7 +4251,7 @@ impl<'a> Transition<'a> {
                     let message = super::repository::bounded_failure_message(&format!("{error:#}"));
                     let waiting_token_id = self.wait(token, "waiting");
                     let incident_id = self.next_id("runtime");
-                    self.plan.add_incidents.push(ProcessIncident {
+                    self.plan.add_incidents.push(ProcessIncident { attempts: None,
                         incident_id: incident_id.clone(), scope_id: token.scope_id.clone(),
                         node_id: Some(node.id.clone()), node_name: Some(node.name.clone()), job_id: None,
                         code: "SCOPE_RETURN_ERROR".into(), message: message.clone(), at_ms: self.now_ms,
@@ -5446,7 +5446,7 @@ impl<'a> Transition<'a> {
                         .find(|candidate| candidate.scope_id == parent_scope_id)
                         .context("failed ordinary return lost its parent scope")?.revision,
                 });
-                self.plan.add_incidents.push(ProcessIncident {
+                self.plan.add_incidents.push(ProcessIncident { attempts: None,
                     incident_id: incident_id.clone(),
                     scope_id: scope.scope_id.clone(),
                     node_id: None,
@@ -5630,7 +5630,7 @@ impl<'a> Transition<'a> {
                 self.selected_process_id, &self.scopes, self.instance_id,
                 &source.scope_id, &source.node_id).ok().map(|node| node.name.clone());
             if source.phase != "uncertain" {
-                self.plan.add_incidents.push(ProcessIncident {
+                self.plan.add_incidents.push(ProcessIncident { attempts: None,
                     incident_id: incident_id.clone(), scope_id: source.scope_id.clone(),
                     node_id: Some(source.node_id.clone()), node_name,
                     job_id: Some(job_id.clone()), code: code.into(), message: message.into(),
@@ -8831,6 +8831,13 @@ impl ProcessRuntime {
             }
             let drained = super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis());
             self.handle_timer_drain(drained);
+            if let Err(error) = super::repository::drain_automatic_retries(
+                &self.db,
+                chrono::Utc::now().timestamp_millis(),
+                super::repository::AUTOMATIC_RETRY_PAGE,
+            ) {
+                tracing::error!(error_len = error.to_string().len(), "automatic retry pass failed");
+            }
             let messages =
                 super::messages::drain_pending(&self.db, chrono::Utc::now().timestamp_millis());
             self.signal_cancelled_claims(&messages.cancelled_claims);
@@ -9134,6 +9141,7 @@ pub(crate) mod test_support {
                 id: "Service".into(),
                 name: "Process evidence".into(),
                 kind: ProcessNodeKind::ServiceTask {
+                    retry: None,
                     flow_id: flow_id.into(),
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::from([(

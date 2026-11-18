@@ -12,22 +12,30 @@
 //   Filtering and paging are the SERVER's: every filter goes into the request
 //   and the next page is the keyset cursor from the previous response. Arriving
 //   with `?correlation=<id>` (the audit deep link) preselects that filter and
-//   shows it as a clearable chip — nothing else is narrowed.
+//   shows it as a clearable chip — nothing else is narrowed. The same filter is
+//   typed into the visible "Korelacja" input of the filter bar, and the
+//   inspector of a run offers its correlation section (copy, the bus record
+//   that triggered it, "show everything with this correlation").
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, fmtMs, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
 import {
-  normalizeRow, plotFrom, actorLabel, rowName, rowDetail,
+  normalizeRow, plotFrom, actorLabel, rowName, rowDetail, runOutcome, finishStatusLabel,
 } from '/js/lib/run-events.js';
+import {
+  busRecordHref, busSourceOf, normalizeCorrelation,
+} from '/js/lib/correlation.js';
 import '/js/components/tf-run-timeline.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-combobox.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-button.js';
+import '/js/components/tf-input.js';
 
 const PAGE_SIZE = 200;
 // Loading the next page this far from the bottom keeps the list ahead of the
@@ -71,6 +79,20 @@ const ROW_H = 33;
 const HEAD_H = 37;
 const ROW_H_NARROW = 52;
 const HEAD_H_NARROW = 45;
+
+// TentaBus instance names by id, for the run inspector; empty until (or unless) the roster loads.
+const busInstanceNames = new Map();
+
+async function loadBusInstanceNames() {
+  try {
+    const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
+    for (const app of Array.isArray(apps) ? apps : []) {
+      if (app.packageId !== 'tentabus' || !app.addonId) continue;
+      const name = (app.titleKey && I18n.t(app.titleKey)) || app.title;
+      if (name) busInstanceNames.set(String(app.addonId), String(name));
+    }
+  } catch { /* the inspector falls back to the instance id */ }
+}
 
 const state = {
   origins: new Set(ORIGINS),
@@ -192,12 +214,18 @@ function rowDuration(row) {
 /** A bound key names its user; an unbound one is a service key and says so. */
 function bindingTag(row) {
   if (row.actorKind !== 'api_key') return '';
+  // A bus_consume flow reads as its service account on purpose: no user behind
+  // the key is the design there, not the gap this screen looks for.
+  if (!row.actorUserId && row.origin === 'bus') {
+    return `<span class="tag bound">${escapeHtml(t('key_service_account'))}</span>`;
+  }
   return row.actorUserId
     ? `<span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
     : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span>`;
 }
 
 function bindingText(row) {
+  if (!row.actorUserId && row.origin === 'bus') return t('key_service_account_text');
   if (row.actorUserId) return t('key_bound_to', { user: row.actorUserId });
   return t('key_service_no_binding');
 }
@@ -235,6 +263,17 @@ function runTotal(runId) {
   return fmtMs(Math.max(0, last - first), lang());
 }
 
+// How the run ended when the log says so (`request_finished`); otherwise the
+// wall-clock span of what is loaded, which claims nothing about an end.
+function runSpanText(runId) {
+  const outcome = runOutcome(state.rows, runId);
+  if (!outcome) return t('run_total', { time: runTotal(runId) });
+  const status = finishStatusLabel(outcome.status);
+  return outcome.durationMs === null
+    ? status
+    : t('run_outcome', { status, time: fmtMs(outcome.durationMs, lang()) });
+}
+
 function renderHead(item) {
   const g = item.group;
   const row = g.first;
@@ -247,7 +286,7 @@ function renderHead(item) {
     actorLabel(row),
   ].filter(Boolean).map(escapeHtml).join(' · ');
   return `<div class="ev-turnhead">${escapeHtml(title)}
-    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(t('run_total', { time: runTotal(g.runId) }))}</span>
+    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(runSpanText(g.runId))}</span>
   </div>`;
 }
 
@@ -301,9 +340,12 @@ function modelKv(row) {
 
 function inspectorKeySection(row) {
   if (row.actorKind !== 'api_key') return '';
+  const serviceAccount = !row.actorUserId && row.origin === 'bus';
   const binding = row.actorUserId
     ? `${escapeHtml(row.actorUserName ?? t('actor_unresolved', { kind: t('actor_kind_user') }))} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
-    : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
+    : serviceAccount
+      ? `<span class="tag bound">${escapeHtml(t('key_service_account'))}</span> ${escapeHtml(t('key_service_account_text'))}`
+      : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
   return `<div class="ev-sec">
     <h4>${escapeHtml(t('key_section'))}</h4>
     <dl class="ev-kv">
@@ -318,7 +360,6 @@ function inspectorKeySection(row) {
 
 function inspectorLinks(row) {
   const links = [
-    [t('correlation'), row.correlationId],
     [t('link_run'), row.runId],
     [t('link_session'), row.sessionId],
     [t('link_node'), row.nodeId],
@@ -331,6 +372,48 @@ function inspectorLinks(row) {
     <h4>${escapeHtml(t('links'))}</h4>
     <div class="ev-pre">${escapeHtml(text)}</div>
   </div>`;
+}
+
+/** The run's opening row, when the loaded pages hold it. */
+function startRowOf(row) {
+  return state.rows.find((r) => r.runId === row.runId && r.kind === 'request_started') ?? null;
+}
+
+function inspectorCorrelation(row) {
+  if (!row.correlationId) return '';
+  const start = startRowOf(row);
+  const source = busSourceOf(start);
+  // Only a run that came from the bus has a triggering record to point at.
+  let coordinates = '';
+  if (row.origin === 'bus') {
+    coordinates = source
+      ? `<dl class="ev-kv">
+          ${source.instanceId ? kv(t('corr_instance'), `<span>${escapeHtml(busInstanceNames.get(source.instanceId) || source.instanceId)}</span>`) : ''}
+          ${kv(t('corr_topic'), `<span class="ev-mono">${escapeHtml(source.topic)}</span>`)}
+          ${kv(t('corr_partition_number'), `<span class="ev-mono">${escapeHtml(`${source.partition} / ${source.offset}`)}</span> <a class="ev-link" id="events-open-bus" href="${escapeAttr(busRecordHref(source, row.correlationId))}">${escapeHtml(t('corr_open_bus'))}</a>`)}
+        </dl>`
+      : `<div class="ev-corr-note muted">${escapeHtml(t(start ? 'corr_no_coordinates' : 'corr_coordinates_not_loaded'))}</div>`;
+  }
+  return `<div class="ev-sec" id="events-correlation-section">
+    <h4>${escapeHtml(t('correlation_label'))}</h4>
+    <div class="ev-corr-id">
+      <span class="ev-mono ev-corr-chip" title="${escapeAttr(row.correlationId)}">${escapeHtml(row.correlationId)}</span>
+      <tf-button variant="ghost" size="sm" icon="copy" id="events-copy-correlation">${escapeHtml(t('corr_copy'))}</tf-button>
+    </div>
+    ${coordinates}
+    <div class="ev-sec-actions">
+      <tf-button variant="secondary" size="sm" icon="filter" id="events-show-correlation">${escapeHtml(t('corr_show_all'))}</tf-button>
+    </div>
+  </div>`;
+}
+
+async function copyCorrelation(correlationId) {
+  try {
+    await navigator.clipboard.writeText(correlationId);
+    toast(t('corr_copied'), 'success');
+  } catch {
+    toast(t('corr_copy_failed'), 'error');
+  }
 }
 
 function chronometry(row) {
@@ -384,6 +467,10 @@ function renderInspector() {
     timing.push(kv(t('duration'), escapeHtml(fmtMs(row.durationMs, lang()))));
   }
 
+  if (row.kind === 'request_finished') {
+    timing.unshift(kv(t('status'), escapeHtml(finishStatusLabel(row.payload?.status))));
+  }
+
   insp.innerHTML = `
     <div class="ev-insp-head">
       <div class="ev-insp-title">${escapeHtml(heading)}</div>
@@ -396,6 +483,7 @@ function renderInspector() {
       ${timing.join('\n      ')}
     </dl>
     ${inspectorKeySection(row)}
+    ${inspectorCorrelation(row)}
     ${row.io ? '<div class="ev-sec" id="events-io"></div>' : `<div class="ev-sec">
       <h4>${escapeHtml(t('details'))}</h4>
       ${chronometry(row)}
@@ -409,6 +497,8 @@ function renderInspector() {
   byId('events-filter-actor')?.addEventListener('click', () => {
     setActor(row.actorId ?? null);
   });
+  byId('events-copy-correlation')?.addEventListener('click', () => copyCorrelation(row.correlationId));
+  byId('events-show-correlation')?.addEventListener('click', () => setCorrelation(row.correlationId));
 }
 
 /**
@@ -462,12 +552,14 @@ async function loadStepIo(row) {
     const cut = body.truncated
       ? `<div class="ev-io-note">${escapeHtml(t('io_cut'))}</div>`
       : '';
-    const section = (label, bytes, text) => `
+    // The bytes the reply could not carry arrive as a number; the words are ours.
+    const section = (label, bytes, text, omitted) => `
       <h4>${escapeHtml(label)} <span class="ev-io-size">${escapeHtml(fmtBytes(bytes))}</span></h4>
-      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>`;
+      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>
+      ${omitted > 0 ? `<div class="ev-io-note">${escapeHtml(t('io_preview_cut', { size: fmtBytes(omitted) }))}</div>` : ''}`;
     byId('events-io').innerHTML = `${cut}
-      ${section(t('io_input'), body.inputBytes, body.input)}
-      ${section(t('io_output'), body.outputBytes, body.output)}`;
+      ${section(t('io_input'), body.inputBytes, body.input, body.inputOmittedBytes ?? 0)}
+      ${section(t('io_output'), body.outputBytes, body.output, body.outputOmittedBytes ?? 0)}`;
   } catch (err) {
     if (state.selectedKey !== key) return;
     const host2 = byId('events-io');
@@ -475,11 +567,13 @@ async function loadStepIo(row) {
   }
 }
 
+// One decimal in the viewer's own separator, like every other number here.
 function fmtBytes(n) {
   if (typeof n !== 'number') return '';
   if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  const one = new Intl.NumberFormat(lang(), { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  if (n < 1024 * 1024) return `${one.format(n / 1024)} KB`;
+  return `${one.format(n / (1024 * 1024))} MB`;
 }
 
 function prettyPayload(row) {
@@ -651,7 +745,13 @@ function renderLedger() {
 
 function renderStatus() {
   const count = byId('events-count');
-  if (count) count.setAttribute('label', t('loaded_count', { count: state.rows.length }));
+  // A full window is not the whole log: older events exist until the server
+  // stops handing out a cursor, so the label says so instead of looking final.
+  if (count) {
+    count.setAttribute('label', state.hasMore
+      ? t('loaded_count_more', { count: state.rows.length })
+      : t('loaded_count', { count: state.rows.length }));
+  }
   const scope = byId('events-scope');
   if (scope) {
     scope.hidden = !state.scopedToSelf;
@@ -693,8 +793,17 @@ function renderCorrelationChip() {
   }
 }
 
+// Keeps the address in step with the filter (replace, not push) so a reload or a copied link shows what is on screen.
+function syncCorrelationHash() {
+  if (Router.current() !== 'events') return;
+  Router.replaceParams(state.correlationId ? { correlation: state.correlationId } : null);
+}
+
 function setCorrelation(correlationId) {
-  state.correlationId = correlationId || null;
+  state.correlationId = normalizeCorrelation(correlationId);
+  syncCorrelationHash();
+  const input = byId('events-correlation-input');
+  if (input && input.value !== (state.correlationId ?? '')) input.value = state.correlationId ?? '';
   renderCorrelationChip();
   loadPage({ reset: true });
 }
@@ -729,6 +838,10 @@ const EventsScreen = {
           <tf-segmented id="events-range" value="all" size="sm">
             ${rangeOptions()}
           </tf-segmented>
+          <tf-input id="events-correlation-input" class="ev-corr-input"
+            label="${escapeAttr(t('correlation_label'))}"
+            placeholder="${escapeAttr(t('correlation_placeholder'))}"
+            value="${escapeAttr(state.correlationId ?? '')}"></tf-input>
           <tf-searchbox id="events-search" debounce="350"
             placeholder="${escapeAttr(t('search_placeholder'))}"></tf-searchbox>
           <tf-chip class="ev-chip" id="events-correlation" status="accent" removable
@@ -754,7 +867,17 @@ const EventsScreen = {
   async mount() {
     timeline = byId('events-timeline');
     renderCorrelationChip();
+    loadBusInstanceNames();
     byId('events-correlation')?.addEventListener('remove', () => setCorrelation(null));
+    const correlationInput = byId('events-correlation-input');
+    // tf-input exposes its label as plain text, so the field is named on the native input.
+    correlationInput?.querySelector('input')?.setAttribute('aria-label', t('correlation_label'));
+    const applyCorrelation = () => {
+      const next = normalizeCorrelation(correlationInput.value);
+      if (next !== state.correlationId) setCorrelation(next);
+    };
+    correlationInput?.addEventListener('change', applyCorrelation);
+    correlationInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyCorrelation(); });
     narrowQuery = window.matchMedia('(max-width: 720px)');
     onNarrowChange = () => list?.refresh();
     narrowQuery.addEventListener('change', onNarrowChange);

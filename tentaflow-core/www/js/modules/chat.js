@@ -1460,10 +1460,12 @@ function stopAudioPipeline() {
 // ---- Agent activity ------------------------------------------------------
 
 // (Re)subscribe the agent-activity widget to the active conversation's session
-// scope: the conversation id is the flow `session_id` background runs publish under.
+// scope: the server mirrors the events of every run this user starts under that
+// conversation id (questions, permission requests) to the user's own session key.
 function rebindAgentActivity() {
   if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
   const widget = byId('chat-agent-activity');
+  if (widget?.clearRuns) widget.clearRuns();
   if (!widget || !activeConvId) return;
   agentActivityTeardown = attachAgentActivity(widget, activeConvId, {
     // Mirror the live step into the answer still streaming, so a slow local

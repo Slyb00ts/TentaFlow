@@ -1,7 +1,7 @@
 # Manifest serwisu vLLM-Metal — vLLM na Apple Silicon przez plugin
 # vllm-project/vllm-metal (backend MLX). Osobny silnik od vllm.toml bo upstream
-# vLLM nie ma Metal target; vllm-metal dostarcza wlasny install flow z
-# konkretna wersja vllm 0.26.0 + wheel plugin z GitHub Releases.
+# vLLM nie ma Metal target; vllm-metal dostarcza wlasny install flow:
+# prebuilt wheel rdzenia vLLM 0.33.0 + wheel pluginu v0.33.0 z GitHub Releases.
 
 [engine]
 id = "vllm-metal"
@@ -15,7 +15,7 @@ license = "Apache-2.0"
 icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
-version = "0.26.0"
+version = "0.33.0"
 
 [deploy.native]
 platforms = ["macos"]
@@ -42,8 +42,8 @@ quantization = "int4"
 # Bielik 11B Instruct (speakleash) — wymagajace ~7-8 GB VRAM po 4-bit.
 [[model_preset]]
 id = "bielik-11b-instruct-mlx-4bit"
-display_name = "Bielik 11B Instruct (MLX 4-bit)"
-repo = "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"
+display_name = "Bielik 11B v3.1 Instruct (MLX 4-bit)"
+repo = "speakleash/Bielik-11B-v3.1-Instruct-MLX-4bit"
 quantization = "int4"
 
 # Qwen 3.5 9B (MLX 4-bit) — wieksza alternatywa multijezykowa.

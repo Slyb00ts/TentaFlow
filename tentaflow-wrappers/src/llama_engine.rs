@@ -785,9 +785,11 @@ impl SpeculativeEngine {
 #[cfg(feature = "llama")]
 impl Drop for SpeculativeEngine {
     fn drop(&mut self) {
-        // Kolejność jest istotna: shim trzyma surowy wskaźnik ctx_dft i w destruktorze
-        // implementacji MTP woła na nim llama_set_sampler,
-        // więc ctx_dft musi żyć aż do zakończenia free. Dopiero potem zwalniamy ctx_dft.
+        // Kolejność jest istotna: shim trzyma surowe wskaźniki ctx_tgt i ctx_dft, a
+        // destruktor implementacji MTP woła na nich llama_set_sampler,
+        // llama_set_ctx_state_src i llama_set_embeddings_nextn_dev, więc oba muszą
+        // żyć aż do zakończenia free. Dopiero potem zwalniamy ctx_dft; ctx_tgt
+        // zwalnia scheduler_main po dropie tego silnika.
         unsafe { sys::llama_rs_speculative_free(self.raw) };
         if !self.ctx_dft.is_null() {
             unsafe { sys::llama_free(self.ctx_dft) };
@@ -814,6 +816,7 @@ fn scheduler_main(
             flash_attn: config.flash_attn,
             main_gpu: config.main_gpu,
             tensor_split: config.tensor_split.clone(),
+            load_mtp: matches!(config.speculative, SpeculativeMode::Mtp { .. }),
         },
     ) {
         Ok(rt) => Arc::new(rt),
@@ -1181,6 +1184,9 @@ fn scheduler_main(
             );
         }
     }
+    // The MTP drafter's destructor detaches its state rows from ctx_tgt, so it
+    // must go before the target context does.
+    drop(speculative);
     drop(batch);
     drop(ctx);
     drop(runtime);

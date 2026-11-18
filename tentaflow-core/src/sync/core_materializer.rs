@@ -153,6 +153,11 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::OrgChangeSet
             | CoreSyncResourceKind::OrgDeputy
             | CoreSyncResourceKind::OrgAbsence
+            // SLA policies are edited from any node, and lifting a policy from a
+            // service is a revocation: the Delete has to beat an older assignment
+            // that arrived the long way round.
+            | CoreSyncResourceKind::SlaPolicy
+            | CoreSyncResourceKind::SlaAssignment
     )
 }
 
@@ -351,6 +356,12 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
                 rows > 0 || !org_repl::row_is_owned_elsewhere(&tx, descriptor.kind, operation)?;
             rows
         }
+        CoreSyncResourceKind::SlaPolicy | CoreSyncResourceKind::SlaAssignment => {
+            let rows = crate::sla::repository::apply(&tx, descriptor.kind, operation)?;
+            authorized = rows > 0
+                || !crate::sla::repository::row_is_owned_elsewhere(&tx, descriptor.kind, operation)?;
+            rows
+        }
     };
 
     if lww_tracked && authorized {
@@ -365,6 +376,17 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
+    // The gates of this node are built from the stored policies, so an applied
+    // change has to move the generation the registry compares against, exactly
+    // as a local edit does.
+    if rows > 0
+        && matches!(
+            descriptor.kind,
+            CoreSyncResourceKind::SlaPolicy | CoreSyncResourceKind::SlaAssignment
+        )
+    {
+        crate::sla::bump_generation();
+    }
     // A replicated alias must reach the router the way a local edit does, or
     // requests keep resolving through the cache loaded before the write. The
     // writer lock goes first: both calls read the alias table back.

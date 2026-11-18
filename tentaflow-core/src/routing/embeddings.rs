@@ -28,6 +28,24 @@ impl Router {
         origin: crate::flow_engine::dispatcher::FlowOrigin,
         actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
+        self.route_embeddings_in_context(request, user, origin, actor, None)
+            .await
+    }
+
+    /// [`Self::route_embeddings_for_user`] with the gateway context of the
+    /// caller (the organisation an addon acts in, the run it is nested in).
+    ///
+    /// The call is recorded like a chat call: a run of its own when standalone
+    /// (the text sent and a summary of what came back), a child step of the
+    /// parent run when nested, nothing for a bus run.
+    pub async fn route_embeddings_in_context(
+        &self,
+        request: EmbeddingRequest,
+        user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
+        context: Option<crate::compliance::ai_gateway::AiGatewayContext>,
+    ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::auth::acl::check_access_safe(
@@ -45,10 +63,28 @@ impl Router {
                 }
             }
         }
+        let run = crate::routing::direct_run::DirectRun::begin_embeddings(
+            &request,
+            origin,
+            &actor,
+            user.as_ref(),
+            self.db.as_ref(),
+            context.as_ref(),
+            None,
+        );
         // Usage is booked by the embeddings dispatcher through the AI gateway,
         // once per backend call; booking it here as well would count it twice.
-        self.route_embeddings_inner(request, user, origin, actor)
-            .await
+        let nested = crate::routing::made_inside_a_run(context.as_ref());
+        let routed = self
+            .route_embeddings_inner(request, user, origin, actor, nested)
+            .await;
+        if let Some(run) = run {
+            match &routed {
+                Ok(result) => run.finish_embeddings(&result.response),
+                Err(_) => run.finish_failed(),
+            }
+        }
+        routed
     }
 
     /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.
@@ -62,6 +98,7 @@ impl Router {
         user: Option<crate::auth::acl::UserContext>,
         origin: crate::flow_engine::dispatcher::FlowOrigin,
         actor: crate::flow_engine::dispatcher::FlowActor,
+        nested_in_run: bool,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         debug!("Routing embeddings dla modelu: {}", request.model);
 
@@ -71,13 +108,14 @@ impl Router {
         // skonfigurowany, inaczej model embeddingów wykonywany bezpośrednio na
         // executorze (NotFound → direct execution wewnątrz dispatchera).
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let (initial, meta) =
+            let (initial, mut meta) =
                 crate::services::runtime::executor::embeddings_request_to_initial_envelope(
                     &request,
                     user.clone(),
                     origin,
                     actor.clone(),
                 );
+            meta.nested_in_run = nested_in_run;
             match dispatcher
                 .try_dispatch(&request.model, "embeddings", initial, meta)
                 .await
@@ -320,6 +358,14 @@ pub(crate) fn executor_err_to_core(
             source: None,
         },
         ExecutorError::SttServiceUnavailable => CoreError::SttServiceUnavailable,
+        ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
+        ExecutorError::Busy {
+            backend,
+            retry_after_ms,
+        } => CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        },
         ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
             model_name: model.to_string(),
         },

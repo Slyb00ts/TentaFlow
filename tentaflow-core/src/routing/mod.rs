@@ -6,6 +6,7 @@
 
 pub mod audio_stream;
 pub mod chat;
+pub mod direct_run;
 pub mod chat_template;
 pub mod documents;
 pub mod embeddings;
@@ -24,7 +25,8 @@ pub use middleware::{ResolvedRoute, RouteMetadata, RouteResult};
 
 /// Stage 3d-0b-final: mapowanie typed `DispatchError` → `CoreError`.
 /// Plan v1.5: `Denied` → 404 (nie ujawniamy istnienia modelu klientom
-/// bez ACL); pozostałe → 500 z czytelnym message.
+/// bez ACL); `Overloaded` → 429 (`CoreError::Overloaded`, the edge adds
+/// `Retry-After`); `TimedOut` → 504; pozostałe → 500 z czytelnym message.
 pub(crate) fn dispatch_error_to_core(
     err: crate::flow_engine::dispatcher::DispatchError,
     model: &str,
@@ -55,6 +57,24 @@ pub(crate) fn dispatch_error_to_core(
         DispatchError::QuotaExceeded(message) => {
             crate::error::CoreError::RateLimitExceeded { message }
         }
+        DispatchError::Overloaded {
+            reason,
+            retry_after_ms,
+        } => crate::error::CoreError::Overloaded {
+            reason: reason.code().to_string(),
+            retry_after_ms,
+        },
+        DispatchError::BackendBusy { retry_after_ms } => crate::error::CoreError::BackendBusy {
+            backend: "model service of a flow node".to_string(),
+            retry_after_ms,
+        },
+        DispatchError::TimedOut {
+            flow_id,
+            timeout_ms,
+        } => crate::error::CoreError::Timeout {
+            backend_url: format!("flow {flow_id}"),
+            timeout_ms,
+        },
     }
 }
 pub use router::{
@@ -69,6 +89,61 @@ use crate::error::Result;
 use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue};
 use sha2::{Digest, Sha256};
+
+/// Whether a model call that reaches the router is recorded on the Events log.
+/// Every AI entry point is (chat, `/v1`, addons, dashboard helpers, the curator);
+/// mesh forwards a call already recorded on the node that originated it, and a
+/// bus run records itself through the reactor.
+pub(crate) fn records_runs(origin: FlowOrigin) -> bool {
+    !matches!(origin, FlowOrigin::Mesh | FlowOrigin::Bus)
+}
+
+/// Whether the call is made from inside a flow run that is executing (an addon
+/// block lent to it): such a call takes no SLA slot of its own, for the same
+/// reason it is not recorded as a run of its own.
+pub(crate) fn made_inside_a_run(
+    context: Option<&crate::compliance::ai_gateway::AiGatewayContext>,
+) -> bool {
+    context.is_some_and(|ctx| ctx.parent_run.is_some())
+}
+
+/// [`records_runs`], and the call is not made on behalf of a run that is on the
+/// log already (an addon block inside a flow). A nested call's content belongs to
+/// the run that made it, and a call nested in a bus run is a bus call.
+pub(crate) fn records_call(
+    origin: FlowOrigin,
+    context: Option<&crate::compliance::ai_gateway::AiGatewayContext>,
+) -> bool {
+    records_runs(origin) && !made_inside_a_run(context)
+}
+
+/// Puts a run on the Events log under a server-minted scope and settles the
+/// organisation it is filed under: the caller's own, then the one the addon
+/// gateway context names, then the organisation of a user who belongs to
+/// exactly one. A user in several organisations with none named is not guessed
+/// at: the run is stored without one. Called only at the true entry points, so
+/// a flow nested inside a recorded run is never recorded a second time.
+pub(crate) fn start_recording(
+    meta: &mut FlowRequestMeta,
+    db: Option<&crate::db::DbPool>,
+    org_hint: Option<&str>,
+) {
+    meta.record_to_event_log();
+    if meta.org_id.is_none() {
+        meta.org_id = org_hint.map(str::to_string);
+    }
+    if meta.org_id.is_none() {
+        let user_id = meta.user_id.as_deref().or(meta.actor_user_id.as_deref());
+        if let (Some(db), Some(user_id)) = (db, user_id) {
+            if let Ok(memberships) = crate::services::org::repo::list_memberships_for_user(db, user_id)
+            {
+                if let [(org, _)] = memberships.as_slice() {
+                    meta.org_id = Some(org.org_id.clone());
+                }
+            }
+        }
+    }
+}
 
 /// Buduje seed envelope + per-request meta z `ChatCompletionRequest`. Trigger
 /// adapter konsumuje envelope (model + messages + payload), dispatcher
@@ -85,6 +160,7 @@ pub(crate) async fn build_initial_envelope_for_user(
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
+        meta.org_id = u.org_id;
     }
     if meta.origin == FlowOrigin::Api {
         let caller_session = meta.session_id.take();
@@ -694,6 +770,44 @@ mod provenance_tests {
         assert_eq!(meta.actor_user_id.as_deref(), Some("user-7"));
     }
 
+    /// Mesh forwards a call recorded on its originating node and a bus run
+    /// records itself; every other origin that reaches the router is recorded.
+    #[test]
+    fn every_ai_origin_is_recorded_except_mesh_and_bus() {
+        assert!(!records_runs(FlowOrigin::Mesh));
+        assert!(!records_runs(FlowOrigin::Bus));
+        for origin in [
+            FlowOrigin::Chat,
+            FlowOrigin::Api,
+            FlowOrigin::Addon,
+            FlowOrigin::Dashboard,
+            FlowOrigin::System,
+        ] {
+            assert!(records_runs(origin), "{origin:?}");
+        }
+    }
+
+    /// The shared builder is also reached by a nested flow (a chat turn whose
+    /// model alias resolves to a flow runs the inner flow through the runtime
+    /// executor). It must therefore attach no sink: only the true entry points
+    /// record a run, so one turn is exactly one top-level run.
+    #[tokio::test]
+    async fn the_shared_builder_attaches_no_sink_and_carries_the_callers_org() {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(InMemoryBlobStore::new());
+        let (_env, meta) = build_initial_envelope_for_user(
+            &chat_request(),
+            Some(crate::auth::acl::UserContext::new("user-7", "user").with_org("org-7")),
+            FlowOrigin::Chat,
+            FlowActor::user("user-7"),
+            &blobs,
+        )
+        .await
+        .expect("seed envelope");
+        assert!(meta.progress_sink.is_none());
+        assert_eq!(meta.org_id.as_deref(), Some("org-7"));
+    }
+
     /// A service key ("group" / "general") has no user behind it — `NULL`, not
     /// an empty string, so the UI can say so explicitly.
     #[tokio::test]
@@ -869,5 +983,93 @@ mod v1_session_key_tests {
             .await;
             assert_eq!(key.as_deref(), Some("conversation-42"));
         }
+    }
+}
+
+#[cfg(test)]
+mod recording_org_tests {
+    use super::*;
+
+    fn user_with_orgs(orgs: &[&str]) -> (std::sync::Arc<crate::dispatch::AppState>, String) {
+        let state = crate::dispatch::AppState::for_test();
+        let user = crate::db::repository::create_user_account(
+            &state.db,
+            "two-orgs",
+            "hash",
+            "Two orgs",
+            "two-orgs@example.test",
+        )
+        .expect("user");
+        for (index, org) in orgs.iter().enumerate() {
+            let org_id = if *org == "default" {
+                crate::services::org::DEFAULT_ORG_ID.to_string()
+            } else {
+                crate::services::org::repo::create_organization(
+                    &state.db,
+                    org,
+                    &format!("{org}-{index}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("org")
+                .org_id
+            };
+            crate::services::org::add_membership(&state.db, &org_id, &user, "role-org-viewer", "test")
+                .expect("membership");
+        }
+        (state, user)
+    }
+
+    fn recorded_org(
+        db: &crate::db::DbPool,
+        user: &str,
+        hint: Option<&str>,
+    ) -> Option<String> {
+        let mut meta = FlowRequestMeta::new("run", FlowOrigin::Dashboard, FlowActor::user(user));
+        meta.user_id = Some(user.to_string());
+        start_recording(&mut meta, Some(db), hint);
+        meta.org_id
+    }
+
+    /// A user in one organisation is filed under it.
+    #[test]
+    fn a_single_membership_names_the_organisation() {
+        let (state, user) = user_with_orgs(&["default"]);
+        assert_eq!(
+            recorded_org(&state.db, &user, None).as_deref(),
+            Some(crate::services::org::DEFAULT_ORG_ID)
+        );
+    }
+
+    /// With several memberships and no organisation named, the oldest one is
+    /// not a guess worth storing: the run is filed without one.
+    #[test]
+    fn several_memberships_without_a_named_organisation_store_none() {
+        let (state, user) = user_with_orgs(&["default", "second"]);
+        assert_eq!(recorded_org(&state.db, &user, None), None);
+    }
+
+    /// The organisation the session acts in wins over the user's other ones.
+    #[test]
+    fn the_named_organisation_wins_for_a_user_in_two() {
+        let (state, user) = user_with_orgs(&["default", "second"]);
+        assert_eq!(
+            recorded_org(&state.db, &user, Some("org-b")).as_deref(),
+            Some("org-b")
+        );
+    }
+
+    /// A call nested in a run already on the log, or a bus/mesh call, opens none.
+    #[test]
+    fn a_nested_call_is_not_recorded_again() {
+        let nested = crate::compliance::ai_gateway::AiGatewayContext {
+            parent_run: Some(crate::flow_engine::dispatchers::ParentRun::unrecorded(FlowOrigin::Chat)),
+            ..Default::default()
+        };
+        assert!(!records_call(FlowOrigin::Chat, Some(&nested)));
+        assert!(records_call(FlowOrigin::Chat, None));
+        assert!(!records_call(FlowOrigin::Bus, None));
     }
 }

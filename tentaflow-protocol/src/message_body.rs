@@ -959,6 +959,69 @@ pub struct FlowSummary {
     /// `FlowFactoryRestoreRequest`.
     #[serde(default)]
     pub is_factory: bool,
+    /// State of the flow's TentaBus consumer on the answering node; `None`
+    /// for a flow with no `bus_consume` entry that node's reactor knows of.
+    #[serde(default)]
+    pub bus_consumer: Option<BusConsumerStatus>,
+    /// The SLA policy governing the flow, in the caller's organization.
+    #[serde(default)]
+    pub sla_policy_id: Option<String>,
+    /// Small form of the flow's SLA state on the answering node; `None` for a
+    /// flow without a policy of the caller's organization.
+    #[serde(default)]
+    pub sla_brief: Option<crate::sla::SlaBrief>,
+}
+
+/// Where a `bus_consume` flow's consumer stands on one node (`bus::reactor`).
+/// Per node: refusals come from replicated data and read the same everywhere,
+/// only "not leader" differs, which is why the node is named.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusConsumerStatus {
+    /// "running" | "waiting" | "refused" | "halted".
+    pub state: String,
+    /// Stable machine reason, e.g. "service_account_missing", "read_denied",
+    /// "not_leader"; absent while running or halted.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Unix seconds when `state`/`reason` last changed.
+    pub since_epoch: u64,
+    /// Node the status was read on.
+    pub node_id: String,
+    /// Units of work the consumer has in flight right now (an SLA policy's
+    /// parallel consumption); `0` for a flow without a policy.
+    #[serde(default)]
+    pub in_flight: u32,
+    /// The policy's `max_concurrency` the consumer runs under; `None` without
+    /// a policy or without a concurrency limit.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// Unix milliseconds until which the consumer is held back by the policy's
+    /// call limit or a full concurrency limit; `None` when it is not.
+    #[serde(default)]
+    pub throttled_until: Option<u64>,
+}
+
+/// One entry of the Flow Builder's service-account picker: an active general
+/// API key, by uid and name only — never a token, verifier or rights.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAccountOption {
+    pub key_id: String,
+    pub name: String,
+}
+
+/// One active flow whose `bus_consume` node reads under a given API key: what
+/// the revoke warning names. No topic, instance or node detail, and never a
+/// token.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAccountFlowUsage {
+    #[serde(default)]
+    pub flow_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -980,6 +1043,9 @@ pub struct FlowDetail {
     /// `FlowFactoryRestoreRequest`.
     #[serde(default)]
     pub is_factory: bool,
+    /// See `FlowSummary::bus_consumer`.
+    #[serde(default)]
+    pub bus_consumer: Option<BusConsumerStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1003,6 +1069,16 @@ pub struct FlowExecutionSummary {
     pub status: String,
     pub started_at_epoch: u64,
     pub completed_at_epoch: Option<u64>,
+    /// The run's request id, which is also the `run_id` of its Events
+    /// timeline. `None` on a peer built before this field existed.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Correlation id of the chain the run belongs to (TB-02).
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Where the run entered the system (`bus`, `chat`, `api`, ...).
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 // =============================================================================
@@ -3683,6 +3759,11 @@ pub struct AgentRunEventsSubscribeRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AgentRunEvent {
     pub scope: String,
+    /// Set on an event mirrored from a conversation's flow run that is not a
+    /// managed agent run: `scope` then names that run, and the run cannot be
+    /// cancelled through the agent run manager.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmanaged: bool,
     /// One of: node_started | node_finished | first_token | iteration_started |
     /// iteration_finished | map_element | tool_call_started | tool_call_finished
     /// | compaction | child_spawned | child_finished | router_decision |
@@ -8731,6 +8812,32 @@ pub enum MessageBody {
     AddonRequirementInstallRequestBody(AddonRequirementInstallRequest),
     AddonRequirementInstallResponseBody(AddonRequirementInstallResponse),
     ProcessBody(crate::processes::ProcessPayload),
+    // ----- Service-account picker (Flow Builder, PowerUser) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). The
+    // full key list is Admin-only; a PowerUser binding a `bus_consume` node
+    // needs only which general keys exist.
+    ServiceAccountListRequest,
+    ServiceAccountListResponse {
+        accounts: Vec<ServiceAccountOption>,
+    },
+    // ----- Service-account usage (API key revoke warning, Admin) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). Which
+    // active flows of the caller's organisation read under `key_uid`.
+    ServiceAccountUsageRequest {
+        #[serde(default)]
+        key_uid: String,
+    },
+    ServiceAccountUsageResponse {
+        #[serde(default)]
+        flows: Vec<ServiceAccountFlowUsage>,
+    },
+    // ----- Service SLA policies (TB-03) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the family (request+response) in `SlaPayload`: policies, their
+    // assignment to flows, the live state of a governed flow and the breach
+    // history. Writes need `sla.manage`; reads are pinned to the caller's
+    // organization.
+    SlaBody(crate::sla::SlaPayload),
 }
 
 // =============================================================================
@@ -10383,6 +10490,175 @@ mod tests {
         assert!(summary.is_factory);
     }
 
+    /// `bus_consumer` was appended with `#[serde(default)]`: a peer that omits
+    /// it (an older node) decodes to `None`, and a present status survives a
+    /// CBOR round trip on both the list and the detail record.
+    #[test]
+    fn flow_records_carry_an_optional_bus_consumer_status() {
+        let summary_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+            "updated_at_epoch": 2, "enabled": true,
+        });
+        let summary: FlowSummary = serde_json::from_value(summary_json).expect("decode");
+        assert_eq!(summary.bus_consumer, None);
+        let detail_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "graph_json": "{}",
+            "enabled": true, "status": "active",
+        });
+        let detail: FlowDetail = serde_json::from_value(detail_json).expect("decode");
+        assert_eq!(detail.bus_consumer, None);
+
+        let status = BusConsumerStatus {
+            state: "refused".to_string(),
+            reason: Some("service_account_missing".to_string()),
+            detail: None,
+            since_epoch: 1_700_000_000,
+            node_id: "node-1".to_string(),
+            in_flight: 3,
+            max_concurrency: Some(4),
+            throttled_until: Some(1_700_000_060_000),
+        };
+        let body = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                bus_consumer: Some(status.clone()),
+                ..summary
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+        let detail = MessageBody::FlowDetailResponse(FlowDetail {
+            bus_consumer: Some(status),
+            ..detail
+        });
+        let bytes = crate::cbor::encode(&detail).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, detail);
+    }
+
+    /// The SLA fields were appended with `#[serde(default)]`: a status from an
+    /// older node decodes with no concurrency limit and nothing in flight.
+    #[test]
+    fn bus_consumer_status_decodes_without_the_sla_fields() {
+        let status: BusConsumerStatus = serde_json::from_value(serde_json::json!({
+            "state": "running", "since_epoch": 1, "node_id": "node-1",
+        }))
+        .expect("decode");
+        assert_eq!(
+            (
+                status.in_flight,
+                status.max_concurrency,
+                status.throttled_until
+            ),
+            (0, None, None)
+        );
+    }
+
+    /// The SLA fields were appended with `#[serde(default)]`: a flow record from
+    /// an older node decodes without a policy, and a present brief survives a
+    /// CBOR round trip inside the list response.
+    #[test]
+    fn flow_summary_decodes_without_the_sla_fields_and_round_trips_with_them() {
+        let old_json = serde_json::json!({
+            "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+            "updated_at_epoch": 2, "enabled": true,
+        });
+        let old: FlowSummary = serde_json::from_value(old_json).expect("decode");
+        assert_eq!((old.sla_policy_id.as_deref(), old.sla_brief.as_ref()), (None, None));
+
+        let body = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                sla_policy_id: Some("p-1".to_string()),
+                sla_brief: Some(crate::sla::SlaBrief {
+                    state: "warn".to_string(),
+                    in_flight: 2,
+                    max_concurrency: Some(4),
+                    window_used: Some(57),
+                    window_limit: Some(60),
+                    governed_elsewhere: false,
+                }),
+                ..old
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+
+        // A brief from a node that predates `governed_elsewhere` reads as the
+        // flow's own policy; one that sets it round-trips with no policy id.
+        let old_brief: crate::sla::SlaBrief =
+            serde_json::from_value(serde_json::json!({ "state": "ok" })).expect("decode");
+        assert!(!old_brief.governed_elsewhere);
+        let foreign = MessageBody::FlowListResponse {
+            flows: vec![FlowSummary {
+                sla_policy_id: None,
+                sla_brief: Some(crate::sla::SlaBrief {
+                    governed_elsewhere: true,
+                    ..old_brief
+                }),
+                ..serde_json::from_value(serde_json::json!({
+                    "id": "f1", "name": "n", "description": null, "created_at_epoch": 1,
+                    "updated_at_epoch": 2, "enabled": true,
+                }))
+                .expect("decode")
+            }],
+        };
+        let bytes = crate::cbor::encode(&foreign).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, foreign);
+    }
+
+    #[test]
+    fn service_account_picker_round_trips() {
+        let body = MessageBody::ServiceAccountListResponse {
+            accounts: vec![ServiceAccountOption {
+                key_id: "k-1".to_string(),
+                name: "Laboratorium LIS".to_string(),
+            }],
+        };
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+        let request = crate::cbor::encode(&MessageBody::ServiceAccountListRequest).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&request).expect("decode");
+        assert_eq!(decoded, MessageBody::ServiceAccountListRequest);
+    }
+
+    #[test]
+    fn service_account_usage_round_trips_and_decodes_without_fields() {
+        let request = MessageBody::ServiceAccountUsageRequest {
+            key_uid: "k-1".to_string(),
+        };
+        assert_eq!(round_trip(request.clone()), request);
+        let response = MessageBody::ServiceAccountUsageResponse {
+            flows: vec![ServiceAccountFlowUsage {
+                flow_id: "f-1".to_string(),
+                name: "Przyjmij zamowienia".to_string(),
+                status: "active".to_string(),
+            }],
+        };
+        assert_eq!(round_trip(response.clone()), response);
+
+        // A peer that sends the bare variant (no fields) still decodes.
+        #[derive(SerdeSerialize)]
+        enum Bare {
+            ServiceAccountUsageRequest {},
+            ServiceAccountUsageResponse {},
+        }
+        let bytes = crate::cbor::encode(&Bare::ServiceAccountUsageRequest {}).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            MessageBody::ServiceAccountUsageRequest {
+                key_uid: String::new()
+            }
+        );
+        let bytes = crate::cbor::encode(&Bare::ServiceAccountUsageResponse {}).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            MessageBody::ServiceAccountUsageResponse { flows: Vec::new() }
+        );
+    }
+
     #[test]
     fn body_nests_inside_envelope() {
         use crate::envelope::{message_kind, Envelope};
@@ -10441,5 +10717,33 @@ mod tests {
             "zakodowany rozmiar {} B sugeruje array-of-ints zamiast byte-string",
             buf.len()
         );
+    }
+
+    /// `FlowExecutionSummary` gained `request_id`, `correlation_id` and
+    /// `origin` at the END (TB-02): a peer built before them still decodes.
+    #[test]
+    fn flow_execution_summary_decodes_without_the_correlation_fields() {
+        #[derive(serde::Serialize)]
+        struct LegacySummary {
+            id: String,
+            flow_id: String,
+            status: String,
+            started_at_epoch: u64,
+            completed_at_epoch: Option<u64>,
+        }
+        let legacy = LegacySummary {
+            id: "1".into(),
+            flow_id: "f".into(),
+            status: "completed".into(),
+            started_at_epoch: 5,
+            completed_at_epoch: Some(6),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).expect("encode");
+        let decoded: FlowExecutionSummary = ciborium::de::from_reader(&buf[..]).expect("decode");
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.correlation_id, None);
+        assert_eq!(decoded.origin, None);
+        assert_eq!(decoded.completed_at_epoch, Some(6));
     }
 }

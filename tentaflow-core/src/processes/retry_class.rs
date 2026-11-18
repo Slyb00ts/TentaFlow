@@ -32,6 +32,7 @@ pub(super) fn classify_code(code: &str) -> Option<RetryClass> {
         | "AGENT_UNAVAILABLE"
         | "BLOCK_UNAVAILABLE"
         | "FLOW_ERROR"
+        | "FLOW_OVERLOADED"
         | "FLOW_UNAVAILABLE"
         | "INTERRUPTED"
         | "INVALID_SERVICE_JOB"

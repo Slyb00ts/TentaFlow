@@ -47,12 +47,17 @@ common_speculative_type map_type(llama_rs_speculative_type type) {
 // nie rosną (zero push_back/insert/erase), więc realokacja nie nastąpi i adresy
 // nie zostaną unieważnione. Same wektory żyją wewnątrz wrapper_state, który jest
 // alokowany na stercie i stabilny aż do free.
+//
+// `batch` is the common_batch handed to common_speculative_process: the engine
+// decodes ctx_tgt with a plain llama_batch, the library takes common_batch, so
+// every process() refills this one instance instead of allocating a new one.
 struct wrapper_state {
     common_speculative *      spec  = nullptr;
     common_params_speculative cfg;
     uint32_t                  n_seq = 0;
     std::vector<llama_tokens> prompt_per_seq;
     std::vector<llama_tokens> draft_per_seq;
+    common_batch              batch;
 };
 
 // Sprawdza, czy seq_id mieści się w [0, n_seq). Biblioteka woła GGML_ASSERT
@@ -109,6 +114,9 @@ extern "C" llama_rs_speculative * llama_rs_speculative_init(
         }
         state->cfg   = cfg;
         state->n_seq = n_seq;
+        if (ctx_tgt) {
+            state->batch = common_batch(ctx_tgt);
+        }
 
         state->spec = common_speculative_init(state->cfg, n_seq);
         if (!state->spec) {
@@ -190,9 +198,33 @@ extern "C" bool llama_rs_speculative_process(
     if (!spec || !batch) {
         return false;
     }
+    // The entries are rebuilt from the batch ctx_tgt has just decoded, so its
+    // positions cannot be derived from memory any more: an id-less or
+    // position-less batch is refused instead of guessed.
+    if (batch->n_tokens > 0 && (!batch->token || !batch->pos)) {
+        return false;
+    }
     auto * state = reinterpret_cast<wrapper_state *>(spec);
     try {
-        return common_speculative_process(state->spec, *batch);
+        common_batch & dst = state->batch;
+        dst.clear();
+        std::vector<llama_seq_id> seq_ids;
+        for (int32_t i = 0; i < batch->n_tokens; ++i) {
+            const int32_t n_sid = batch->n_seq_id ? batch->n_seq_id[i] : 1;
+            seq_ids.clear();
+            if (batch->seq_id) {
+                seq_ids.assign(batch->seq_id[i], batch->seq_id[i] + n_sid);
+            } else {
+                seq_ids.push_back(0);
+            }
+            if (seq_ids.empty()) {
+                return false;
+            }
+            // llama_batch without logits outputs only its last token.
+            const bool output = batch->logits ? batch->logits[i] != 0 : i == batch->n_tokens - 1;
+            dst.add(batch->token[i], batch->pos[i], seq_ids, output);
+        }
+        return common_speculative_process(state->spec, dst);
     } catch (const std::exception &) {
         return false;
     }

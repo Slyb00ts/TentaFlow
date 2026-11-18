@@ -1,43 +1,65 @@
 // =============================================================================
-// Plik: runtime.rs
-// Opis: Runtime mobilny wzorowany na Desktop — uruchamia Router, unified HTTPS
-//       server, mesh pipeline (mDNS + QUIC), metryki, agenty. Bez egui UI —
-//       dashboard serwowany przez unified server w przegladarce.
+// File: runtime.rs
+// Purpose: Mobile runtime (iOS/Android). Runs the same node startup as the
+//          desktop binary through `tentaflow_core::bootstrap` — router,
+//          addons and native apps, mesh, unified HTTPS server — rooted in the
+//          app sandbox, plus the mobile-only pieces: the model residency
+//          memory guard, the startup diagnostics heartbeat and the Bonjour FFI
+//          handle. No egui UI: the dashboard is served to the WebView.
+//          The running node is kept here for the lifecycle entry points:
+//          `flush_durable_state` on pause, `stop` on terminate.
 // =============================================================================
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use tentaflow_core::addon::AddonManager;
+use tentaflow_core::bootstrap::{self, CoreNode};
 use tentaflow_core::config::NodeConfig;
-use tentaflow_core::db;
-use tentaflow_core::mesh::peer_store::MeshPeerStore;
-use tentaflow_core::mesh::pipeline::{
-    start_mesh_pipeline, MeshPipelineConfig, MeshPipelineHandles,
-};
-use tentaflow_core::mesh::security::MeshSecurity;
-use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
-use tentaflow_core::routing::Router;
+use tentaflow_core::mesh::pipeline::MeshPipelineHandles;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-/// Uchwyty do uruchomionych serwisow — potrzebne do graceful shutdown
+/// What a graceful shutdown needs from the started node.
 pub struct ServiceHandles {
-    /// Kanal sygnalizujacy zamkniecie
+    /// Ends the diagnostics heartbeat.
     shutdown_tx: watch::Sender<bool>,
-    /// Router — do wywolania shutdown()
-    router: Option<Arc<Router>>,
-    /// Uchwyty mesh pipeline — MUSZA zyc, bo Drop wyrejestruje mDNS
+    node: CoreNode,
+    addon_manager: Arc<AddonManager>,
+    /// Must stay alive: dropping it unregisters mDNS.
     mesh_handles: Option<MeshPipelineHandles>,
 }
 
-/// Uruchamia wszystkie serwisy Core w tle (wzor Desktop)
+/// The started node together with the runtime it runs on. The host app's
+/// lifecycle callbacks arrive on its own threads, outside that runtime.
+struct RunningNode {
+    runtime: tokio::runtime::Runtime,
+    handles: ServiceHandles,
+}
+
+static RUNNING: Mutex<Option<RunningNode>> = Mutex::new(None);
+
+/// How long a background transition may block the host app's main thread for
+/// the durable-state flush. iOS suspends the app a few seconds after
+/// `didEnterBackground`; past this the flush still finishes on the runtime
+/// unless the suspension comes first.
+const PAUSE_FLUSH_WAIT: Duration = Duration::from_secs(2);
+
+/// Whole shutdown budget on terminate: iOS kills the process about five
+/// seconds after `willTerminate`.
+const TERMINATE_BUDGET: Duration = Duration::from_secs(4);
+
+/// The mesh goes down before the WAL checkpoints, so a slow peer must not use
+/// up the terminate budget; peers notice a vanished node by timeout anyway.
+const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Starts every Core service in the background.
 pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     info!("Uruchamianie serwisow Core (tryb mobilny)...");
 
-    // Inicjalizacja bazy danych SQLite
     let data_dir = crate::platform::data_dir();
     std::fs::create_dir_all(&data_dir)?;
 
@@ -45,183 +67,33 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     // Czytamy last_alive.txt pisane przez heartbeat_task w poprzedniej instancji.
     crate::diagnostics::diagnose_startup(&data_dir);
 
-    let db_path = data_dir.join("mobile.db");
-    info!(path = %db_path.display(), "Baza danych SQLite");
-
-    let db = db::init(&db_path).map_err(|e| {
-        error!("Blad inicjalizacji bazy danych: {}", e);
-        e
-    })?;
-    info!("Baza danych zainicjalizowana");
-
-    // The dedicated stores the desktop binary opens right after the core
-    // database. The HTTPS server and dispatch handlers reach them through
-    // process-wide handles, so a missing init surfaces as "not initialised"
-    // and aborts the whole service start.
     tentaflow_core::paths::ensure_app_dirs().map_err(|e| {
         error!("ensure_app_dirs nieudany: {}", e);
         anyhow::anyhow!("ensure_app_dirs: {}", e)
     })?;
-    tentaflow_core::ml_studio::init(tentaflow_core::paths::tentaflow_home()).map_err(|e| {
-        error!("Blad inicjalizacji bazy ML Studio: {}", e);
-        e
-    })?;
-    tentaflow_core::project_studio::init(&db).map_err(|e| {
-        error!("Blad inicjalizacji bazy Project Studio: {}", e);
-        e
-    })?;
-    tentaflow_core::services::ingest_jobs::init(
-        &tentaflow_core::paths::data_dir().join("jobs.db"),
-    )
-    .map_err(|e| {
-        error!("Ingest queue initialisation failed: {}", e);
-        e
-    })?;
-    tentaflow_core::project_studio::ingest::reconcile_orphans();
-    tentaflow_core::events::init(&db).map_err(|e| {
-        error!("Event log initialisation failed: {}", e);
-        e
-    })?;
 
-    // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
-    // iroh EndpointId z MeshSecurity.public_key_hex().
-    let _ = db::repository::delete_setting(&db, "node_id");
-
-    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (deszyfruje
-    // sekrety w configach serwisow przy starcie i podczas runtime).
-    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
-        .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
-        &file_master_key,
-    ));
-    // The same cipher for the lifecycle hooks of native apps (TentaBus seals its
-    // hashing keys with it): the master key lives in this data dir, not in the
-    // default location a hook would look at.
-    tentaflow_core::addon::native_apps::set_global_settings_cipher(&settings_cipher);
-
-    // Mesh services registry — agregator widokow `services` ze wszystkich
-    // zaufanych peerow (single source of truth po N7). Pisze do niego pipeline
-    // mesh, czyta routing/forwarding i unified server.
-    let mesh_services_registry =
-        Arc::new(tentaflow_core::services::mesh_registry::MeshServicesRegistry::new());
-
-    // MeshSecurity wczesniej niz na desktopie — supervisor stempluje
-    // `local_node_id` na ServiceInfo wpychanych do mesh_services_registry,
-    // wiec musi znac Ed25519 hex zanim odpalimy `run_first_tick`.
-    let mesh_security = Arc::new(
-        MeshSecurity::new(db.clone(), settings_cipher.clone())
-            .map_err(|e| {
-                error!("MeshSecurity init: {}", e);
-                e
-            })?,
-    );
-    let node_id = mesh_security.ed25519_public_key_hex();
-    info!("Mesh identity: {}", &node_id[..16.min(node_id.len())]);
-
-    // Port allocator dla supervisor'a — alokuje porty in-process inference
-    // serwerom (MLX/llama.cpp). Mobile nie ma Dockera, ale ma deploymenty
-    // `embedded` zapisane w services_repo (auto-load po starcie aplikacji).
-    // Excluded set jak na desktopie: porty juz przypisane zywym wierszom
-    // `services` zeby allocator nie wystawil ich rownolegle.
-    let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
-        use std::collections::HashSet;
-        use tentaflow_core::services::ports::PortAllocator;
-        use tentaflow_core::services_repo::services as services_v2_repo;
-
-        let services_runtime_cfg = config.services_runtime.clone();
-
-        let mut excluded: HashSet<u16> = HashSet::new();
-        if let Ok(conn) = db.read() {
-            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
-                for row in rows {
-                    if let Some(p) = row.runtime_port {
-                        excluded.insert(p);
-                    }
-                    if let Some(p) = row.sidecar_quic_port {
-                        excluded.insert(p);
-                    }
-                }
-            }
-        }
-
-        match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
-            Ok(allocator) => Some(Arc::new(allocator)),
-            Err(e) => {
-                tracing::warn!(
-                    "Services supervisor disabled: invalid port_range {:?}: {}",
-                    services_runtime_cfg.port_range,
-                    e
-                );
-                None
-            }
-        }
-    };
-
-    // Inicjalizacja routera (non-blocking)
-    info!("Inicjalizacja routera...");
-    let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
-
-    // Supervisor — autoload natywnych deploymentow (MLX/llama.cpp embedded)
-    // z bazy po starcie. Live_handles wspoldzielony z router::service_manager
-    // zeby reconcile() pisal do tego samego cache co czyta routing.
-    // Snapshot_rx musi byc podpiety PRZED `router.start()`.
-    let services_snapshot_rx_for_router: Option<
-        tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
-    > = if let Some(port_allocator) = services_port_allocator.clone() {
-        use tentaflow_core::services::supervisor::{DefaultEmbeddedProbe, Supervisor};
-        let services_runtime_cfg = config.services_runtime.clone();
-        let live_handles = router.service_manager().live_handles.clone();
-        let (supervisor, snapshot_rx) = Supervisor::new(
-            &services_runtime_cfg,
-            db.clone(),
-            port_allocator,
-            settings_cipher.clone(),
-            node_id.clone(),
-            mesh_services_registry.clone(),
-            live_handles,
-        );
-        let supervisor = supervisor
-            .with_embedded_probe(Arc::new(DefaultEmbeddedProbe))
-            .with_catalog_provider(router.catalog_provider().clone());
-
-        if let Err(e) = supervisor.run_first_tick().await {
-            tracing::warn!("services supervisor: first_tick failed: {}", e);
-        }
-
-        let supervisor_handle = supervisor.spawn();
-        info!(
-            "Services supervisor started (interval={}ms, port_range={:?})",
-            services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
-        );
-        let _supervisor_handle = supervisor_handle;
-        Some(snapshot_rx)
-    } else {
-        None
-    };
-
-    if let Some(rx) = services_snapshot_rx_for_router {
-        router.set_services_snapshot_rx(rx);
-    }
-
-    // Wire registry przed startem — routing path resolve'uje handles cross-node.
-    router
-        .service_manager()
-        .set_mesh_services_registry(mesh_services_registry.clone());
-    router.start();
-    info!("Router uruchomiony");
+    let db_path = data_dir.join("mobile.db");
+    info!(path = %db_path.display(), "Baza danych SQLite");
+    let db = bootstrap::open_database(&config, &db_path)?;
+    // The master key lives in the sandbox data dir, not in the default
+    // location, which is not writable on iOS.
+    // Addon packages go there too: dirs::data_dir() is not a writable
+    // location on iOS/Android.
+    let identity = bootstrap::init_core_state(&db, Some(&data_dir), data_dir.clone())?;
+    let mut node = bootstrap::build_router(&config, &db, identity).await?;
 
     // Lazy-load + memory guard dla embedded modeli (unpinned = domyslne na
     // mobile). Modele laduja sie na pierwsze zadanie (executor.ensure_resident),
     // single-resident eviction trzyma max jeden naraz, idle-unload zwalnia po
     // 60s bezczynnosci. Bez tego mobile ladowalby wszystkie modele rezydentnie
     // i przekraczal limit pamieci.
-    if let Some(ports) = services_port_allocator.clone() {
+    if let Some(ports) = node.port_allocator.clone() {
         let residency = Arc::new(
             tentaflow_core::services::model_residency::ModelResidency::new(
-                db.clone(),
+                node.db.clone(),
                 ports,
-                settings_cipher.clone(),
-                std::time::Duration::from_secs(60),
+                node.settings_cipher.clone(),
+                Duration::from_secs(60),
             ),
         );
         residency.clone().spawn_idle_unloader();
@@ -231,210 +103,122 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             residency.clone(),
             tokio::runtime::Handle::current(),
         );
-        router.plant_model_residency(residency);
+        node.router.plant_model_residency(residency);
         info!("Model residency (lazy-load + memory guard) aktywny (idle 60s)");
     }
 
-    // Store pakietow addonow w sandboxie aplikacji (platform::data_dir), NIE w
-    // dirs::data_dir() ktory na iOS/Android nie wskazuje zapisywalnego sandboxa.
-    tentaflow_core::addon::bundled::set_packages_base(data_dir.clone());
-
-    // Zainstaluj wbudowane addony (WASM — wasmi interpreter na mobile)
-    if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
-        tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
-    }
-
-    // Inicjalizacja metryk
-    let metrics = RouterMetrics::new();
-    let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
-    collector.start(shutdown_tx.subscribe()).await;
+    let addon_manager = node.start_router_and_addons()?;
+    info!("Router uruchomiony");
 
     // Heartbeat diagnostyki — co 5s zapisuje timestamp do last_alive.txt,
     // zeby nastepny startup mogl rozroznic suspend od terminate.
     crate::diagnostics::spawn_heartbeat_task(data_dir.clone(), shutdown_tx.subscribe());
 
-    // Migracja istniejacych plaintextowych sekretow
-    match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
-        Ok(n) if n > 0 => info!("Zaszyfrowano {} plaintextowych sekretow w bazie", n),
-        Err(e) => error!("Blad migracji sekretow: {}", e),
-        _ => {}
-    }
-
-    // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard
-    let mut mesh_peer_store = MeshPeerStore::new();
-    // PR2: shadow registry — parallel writes to the new sharded registry.
-    let peer_registry = tentaflow_core::mesh::peer_registry::PeerRegistry::new(4096);
-    mesh_peer_store.set_registry(peer_registry.clone());
-
-    // PR5: hydrate from peer_persisted + peer_hints, then install the
-    // PersistenceWriter for batched debounced peer-state writes.
-    match peer_registry.hydrate_from_db(&db) {
-        Ok(n) => tracing::info!("PeerRegistry hydrated {} peers from peer_persisted", n),
-        Err(e) => tracing::warn!("PeerRegistry hydrate failed: {}", e),
-    }
-    {
-        use tentaflow_core::mesh::peer_registry::persistence::{
-            DbSink, PersistenceWriter, CHANNEL_CAPACITY,
-        };
-        let sink = std::sync::Arc::new(DbSink::new(db.clone()));
-        let (writer, persist_tx) = PersistenceWriter::new(sink, CHANNEL_CAPACITY);
-        peer_registry.set_persistence(persist_tx);
-        let _writer_handle = writer.spawn();
-    }
-
-    {
-        let local_node_info = tentaflow_core::mesh::node_info_collector::collect_node_info(&node_id);
-        let local_metrics = tentaflow_core::mesh::node_info_collector::collect_fast_metrics();
-        let local_os_distro = tentaflow_core::mesh::node_info_collector::collect_os_distro();
-        let local_addresses = tentaflow_core::mesh::node_info_collector::collect_local_addresses()
-            .into_iter()
-            .filter(|ip| ip.is_ipv4())
-            .collect();
-        let docker_version = tentaflow_core::mesh::node_info_collector::docker_server_version();
-        let local_heartbeat = tentaflow_core::mesh::peer_store::HeartbeatMetrics {
-            cpu_usage_percent: local_metrics.cpu_usage_percent,
-            ram_used_mb: local_metrics.ram_used_mb,
-            gpus: local_metrics.gpus,
-            containers: local_metrics.containers,
-            networks: local_metrics.networks,
-            platform: tentaflow_core::mesh::node_info_collector::detect_platform(),
-            cpu_temperature_c: local_metrics.cpu_temperature_c,
-            swap_total_mb: local_metrics.swap_total_mb,
-            swap_used_mb: local_metrics.swap_used_mb,
-            connected_peers: Vec::new(),
-            active_requests: 0,
-            tokens_per_sec: 0.0,
-            nsys_available: false,
-            nsys_version: String::new(),
-            profiling_collectors_available: Vec::new(),
-        };
-
-        mesh_peer_store.seed_local(
-            &node_id,
-            local_node_info.hostname,
-            if local_os_distro.is_empty() {
-                local_node_info.os_info
-            } else {
-                local_os_distro
-            },
-            tentaflow_core::mesh::node_info_collector::detect_platform(),
-            local_node_info.cpu_count,
-            local_node_info.ram_total_mb,
-            local_node_info.gpu_info,
-            local_addresses,
-            docker_version,
-        );
-        mesh_peer_store.update_metrics(&node_id, &local_heartbeat);
-    }
-
-    // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
-    let mesh_handles: Option<MeshPipelineHandles>;
-    let mesh_enabled =
-        config.mesh.as_ref().map_or(false, |m| m.enabled) && cfg!(not(target_os = "android"));
-
-    if mesh_enabled {
-        let pipeline_config = MeshPipelineConfig {
-            node_id: node_id.clone(),
-            role: "mobile".to_string(),
-            mesh_config: config.mesh.as_ref().unwrap().clone(),
-            token_metrics: config.token_metrics.clone(),
-        };
-
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            start_mesh_pipeline(
-                pipeline_config,
-                &mesh_peer_store,
-                Some(db.clone()),
-                settings_cipher.clone(),
-                mesh_security.clone(),
-                mesh_services_registry.clone(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(handles)) => {
-                info!("Mesh pipeline uruchomiony");
-
-                // Eksponuj IrohMeshManager + tokio runtime handle do FFI — Swift
-                // NWBrowser bedzie karmic iroh peerami znalezionymi przez Bonjour.
-                if let Some(ref quic_mesh) = handles.quic_mesh {
-                    crate::ffi_discovery::set_mesh_handle(quic_mesh.clone());
-                    crate::ffi_discovery::set_mesh_runtime(tokio::runtime::Handle::current());
-                }
-
-                mesh_handles = Some(handles);
-            }
-            Ok(Err(e)) => {
-                error!("Blad uruchomienia mesh pipeline: {}", e);
-                mesh_handles = None;
-            }
-            Err(_) => {
-                warn!("Timeout uruchamiania mesh pipeline; dashboard startuje bez mesh handle");
-                mesh_handles = None;
-            }
-        }
+    let mesh_handles = if cfg!(target_os = "android") {
+        info!("Mesh networking wylaczony na Androidzie");
+        None
     } else {
-        info!("Mesh networking wylaczony w konfiguracji");
-        mesh_handles = None;
+        // Bounded: the dashboard must come up even when the network stalls.
+        node.start_mesh(&addon_manager, "mobile", Some(Duration::from_secs(5)))
+            .await
     };
+    // Eksponuj IrohMeshManager + tokio runtime handle do FFI — Swift
+    // NWBrowser bedzie karmic iroh peerami znalezionymi przez Bonjour.
+    if let Some(quic_mesh) = mesh_handles.as_ref().and_then(|h| h.quic_mesh.as_ref()) {
+        info!("Mesh pipeline uruchomiony");
+        crate::ffi_discovery::set_mesh_handle(quic_mesh.clone());
+        crate::ffi_discovery::set_mesh_runtime(tokio::runtime::Handle::current());
+    }
 
-    // Unified HTTPS server (OpenAI API + Dashboard na jednym porcie) — z Core
-    let quic_mesh_for_server = mesh_handles.as_ref().and_then(|h| h.quic_mesh.clone());
-    let mesh_security_for_server = mesh_handles.as_ref().and_then(|h| h.security.clone());
-    let mesh_relay_health_for_server = mesh_handles.as_ref().map(|h| h.relay_health.clone());
-    let local_node_id: Arc<str> = Arc::from(node_id.as_str());
+    let metrics = node.start_background_services(mesh_handles.as_ref()).await;
 
-    // Mobile uruchamia supervisor dla deploymentow `embedded` (MLX/llama.cpp
-    // in-process). Allocator skonstruowany wyzej musi byc przekazany do dispatcher
-    // AppState, inaczej handlery deploy/start/stop rzucaja "port allocator not
-    // initialized". Brak Dockera nie przeszkadza — embedded deploymenty (np.
-    // yolo8n-pose, MLX modele) i tak nie alokuja portow zewnetrznych.
     info!("Uruchamianie unified HTTPS server...");
-    tentaflow_core::api::unified_server::start_unified_server(
-        &config,
-        &db,
-        &metrics,
-        &router,
-        &mesh_peer_store,
-        quic_mesh_for_server,
-        local_node_id,
-        mesh_security_for_server,
-        None, // addon_manager — mobile zarzadza addonami przez supervisor
-        mesh_relay_health_for_server,
-        services_port_allocator.clone(),
-        mesh_services_registry.clone(),
-    )?;
+    node.start_server(&metrics, &addon_manager, mesh_handles.as_ref())?;
     info!("Unified HTTPS server spawn zakonczony");
 
     info!("Wszystkie serwisy uruchomione (tryb mobilny)");
 
     Ok(ServiceHandles {
         shutdown_tx,
-        router: Some(router),
+        node,
+        addon_manager,
         mesh_handles,
     })
 }
 
-/// Zatrzymuje wszystkie serwisy (graceful shutdown z timeoutem)
-pub async fn shutdown(handles: ServiceHandles) {
+/// Keeps the started node and its runtime for the lifecycle entry points.
+pub fn keep(runtime: tokio::runtime::Runtime, handles: ServiceHandles) {
+    *RUNNING.lock().unwrap_or_else(|p| p.into_inner()) = Some(RunningNode { runtime, handles });
+}
+
+/// Persists the addons' write-behind durable state now. Called when the app
+/// goes to the background: a suspended app may be killed by the system without
+/// any further callback, which would lose up to one flush interval of durable
+/// writes. Idempotent — with nothing dirty it writes nothing. Committed SQLite
+/// transactions need no checkpoint to survive that kill: the WAL is already on
+/// disk, so the checkpoints stay in the shutdown.
+pub fn flush_durable_state() {
+    let (runtime, db) = {
+        let running = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(running) = running.as_ref() else {
+            return;
+        };
+        (
+            running.runtime.handle().clone(),
+            running.handles.node.db.clone(),
+        )
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    runtime.spawn_blocking(move || {
+        let store = tentaflow_core::addon::state_store::AddonStateStore::global();
+        let _ = done_tx.send(tentaflow_core::addon::state_flusher::flush_once(&db, store));
+    });
+    match done_rx.recv_timeout(PAUSE_FLUSH_WAIT) {
+        Ok(Ok(stats)) => info!(
+            "Durable addon state flushed on pause: {} addon(s), {} failed",
+            stats.addons_flushed, stats.addons_failed
+        ),
+        Ok(Err(e)) => warn!("Durable addon state flush on pause failed: {}", e),
+        Err(_) => warn!(
+            "Durable addon state flush on pause still running after {:?}",
+            PAUSE_FLUSH_WAIT
+        ),
+    }
+}
+
+/// Shuts the node down for good, within `TERMINATE_BUDGET`. Only for a
+/// process that is about to exit: the core's process-wide state cannot be
+/// started a second time.
+pub fn stop() {
+    let Some(RunningNode { runtime, handles }) =
+        RUNNING.lock().unwrap_or_else(|p| p.into_inner()).take()
+    else {
+        return;
+    };
+    if runtime
+        .block_on(tokio::time::timeout(TERMINATE_BUDGET, shutdown(handles)))
+        .is_err()
+    {
+        warn!("Graceful shutdown cut off after {:?}", TERMINATE_BUDGET);
+    }
+    // Waiting for blocking tasks would outlast the time the system grants.
+    runtime.shutdown_background();
+}
+
+/// The core's shutdown sequence, then the mobile-only heartbeat.
+async fn shutdown(mut handles: ServiceHandles) {
     info!("Rozpoczynanie graceful shutdown...");
-
-    // Zatrzymaj router
-    if let Some(ref router) = handles.router {
-        router.shutdown();
+    if let Err(e) = handles.node.stop_process_runtime().await {
+        error!("Process runtime stop failed: {:#}", e);
     }
-
-    // Wyslij sygnal zamkniecia do wszystkich taskow
+    handles
+        .node
+        .shutdown(
+            &handles.addon_manager,
+            handles.mesh_handles,
+            Some(MESH_SHUTDOWN_TIMEOUT),
+        )
+        .await;
     let _ = handles.shutdown_tx.send(true);
-
-    // Graceful shutdown mesh — zamyka QUIC endpoint i wyrejestruje mDNS
-    if let Some(mesh) = handles.mesh_handles {
-        match tokio::time::timeout(Duration::from_secs(5), mesh.shutdown()).await {
-            Ok(_) => info!("Mesh shutdown zakonczony"),
-            Err(_) => warn!("Timeout mesh shutdown (5s)"),
-        }
-    }
-
     info!("Graceful shutdown zakonczony");
 }

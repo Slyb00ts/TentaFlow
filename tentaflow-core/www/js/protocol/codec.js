@@ -362,6 +362,25 @@ function processServiceImplementation(implementation) {
 
 const PROCESS_VERIFICATION_FAILURES = ['Error', 'NeedsHuman'];
 
+// A policy absent from the model is not sent, so a step without one keeps its original bytes.
+function processRetryPolicy(retry) {
+  processKnownFields(retry, ['maxAttempts', 'delaySeconds', 'backoff'], 'retry policy');
+  if (!Number.isInteger(retry.maxAttempts) || !Number.isInteger(retry.delaySeconds)) {
+    throw new TypeError('retry policy requires whole attempts and delay');
+  }
+  let backoff = retry.backoff;
+  if (backoff !== 'Fixed') {
+    processKnownFields(backoff, ['Exponential'], 'retry backoff');
+    const grown = backoff.Exponential;
+    processKnownFields(grown, ['factorPercent', 'maxDelaySeconds'], 'exponential backoff');
+    if (!Number.isInteger(grown.factorPercent) || !Number.isInteger(grown.maxDelaySeconds)) {
+      throw new TypeError('exponential backoff requires a whole factor and delay cap');
+    }
+    backoff = { Exponential: { factor_percent: grown.factorPercent, max_delay_seconds: grown.maxDelaySeconds } };
+  }
+  return { max_attempts: retry.maxAttempts, delay_seconds: retry.delaySeconds, backoff };
+}
+
 // Human is the default and travels as the bare variant name; the machine modes
 // carry their own fields, and a rejection must say what it turns into.
 function processVerification(verification) {
@@ -762,7 +781,8 @@ function processModel(model, bodyType = 'primary') {
         verification: verified ?? 'Human',
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
         ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }),
-        ...processServiceImplementation(body.implementation) };
+        ...processServiceImplementation(body.implementation),
+        ...(body.retry == null ? {} : { retry: processRetryPolicy(body.retry) }) };
     } else if (tag === 'ScriptTask') {
       processKnownFields(body, ['script', 'outputMapping'], 'script task');
       if (typeof body.script !== 'string' || !body.outputMapping || typeof body.outputMapping !== 'object'
@@ -1283,6 +1303,20 @@ export const encode = {
     const ids = scopeResources.map((r) => r.resourceId);
     const actions = scopeResources.map((r) => r.action ?? '');
     const body = requests.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids, actions);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ServiceAccountListRequest (unit). */
+  serviceAccountListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = requests.encodeServiceAccountListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ServiceAccountUsageRequest { keyUid } (Admin): active flows that read under the key. */
+  serviceAccountUsageRequest(correlationId, { keyUid }, sequence = 1) {
+    assertReady();
+    const body = requests.encodeServiceAccountUsageRequest(keyUid);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4198,8 +4232,11 @@ export const encode = {
    * BusPayload::MessagesBrowseRequest (M08 — audited `bus.messages.browse`, <=100
    * records / <=1 MiB, redacted preview, never a real consumer; uses `BusService::peek`,
    * follow-up toru P task 1 — no ephemeral consumer group/`bus_groups` row anymore).
-   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition?, correlationId? }.
    * `fromOffsets` (per-partition) wins over the legacy scalar `fromOffset` when non-empty.
+   * `correlationId` (TB-02) keeps only the records stamped with that id: a bounded scan, so a page
+   * can be short or empty before the partition ends — each partition's `nextOffset` in the response
+   * says how far it got.
    * `partition` (R3-2 follow-up, `KRYTYK-M1-R3.md`): number = server-side filter restricting
    * the peek to that single partition; `null`/`undefined`/absent = every partition (unchanged).
    */
@@ -4207,6 +4244,7 @@ export const encode = {
     assertReady();
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const filterId = payload.correlationId ?? payload.correlation_id;
     const body = requests.encodeBusMessagesBrowseRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
@@ -4214,6 +4252,7 @@ export const encode = {
       Number(payload.limit ?? 100),
       fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
       payload.partition == null ? undefined : Number(payload.partition),
+      filterId == null || filterId === '' ? undefined : String(filterId),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -4522,6 +4561,42 @@ export const encode = {
     const body = requests.encodeBusFieldHashKeyRotateRequest(
       encode._busInstanceId(payload),
       Number(payload.expectedKeyVersion ?? payload.expected_key_version ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaForRecordGetRequest (read tier + the topic's own read right) — the schema
+   * to decode a record of a binary topic (Avro/Protobuf/Thrift) with, AS THE CALLER READS IT.
+   * payload: { instanceId, topic, schemaRefId } — `topic` is the topic read (or its `__dlq.`
+   * topic), `schemaRefId` the `schemaRefId` of the record preview. A caller whose read rule
+   * hides fields is served the sub-schema of what it sees (`derived: true`), never the full
+   * pattern; the id of a rule changed since answers bus.schema_not_found. Answers
+   * BusSchemaForRecordGetResponse { schema: { subject, schemaType, version, schemaRefId,
+   * derived, schemaText } }.
+   */
+  busSchemaForRecordGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusSchemaForRecordGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      Number(payload.schemaRefId ?? payload.schema_ref_id ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaFieldsGetRequest (read tier) — the top-level field names of a binary
+   * pattern (what a data-hiding rule on a topic checked with it may name). payload:
+   * { instanceId, subject, version? } — `version` omitted/null = the version the topic
+   * validates with. Answers BusSchemaFieldsGetResponse { subject, schemaType, version, fields }.
+   */
+  busSchemaFieldsGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusSchemaFieldsGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      payload.version == null ? undefined : Number(payload.version),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

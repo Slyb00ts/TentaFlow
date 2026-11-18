@@ -58,8 +58,33 @@ struct CircuitBreakerState {
     /// Licznik requestow w HALF_OPEN state
     half_open_calls: u32,
 
+    /// Bumped whenever `half_open_calls` is reset, so a [`CallGuard`] that
+    /// outlives its half-open phase cannot give back a probe of a later one.
+    half_open_epoch: u64,
+
     /// Timestamp ostatniego przejscia do OPEN
     opened_at: Option<Instant>,
+}
+
+/// Returned by [`CircuitBreaker::admit`]; see there.
+#[must_use = "dropping the guard gives a half-open probe back"]
+pub struct CallGuard {
+    probe: Option<(CircuitBreaker, u64)>,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        let Some((breaker, epoch)) = self.probe.take() else {
+            return;
+        };
+        let mut state = breaker.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.state == CircuitState::HalfOpen
+            && state.half_open_epoch == epoch
+            && state.half_open_calls > 0
+        {
+            state.half_open_calls -= 1;
+        }
+    }
 }
 
 /// Circuit Breaker - wzorzec odpornosci dla backendow
@@ -95,6 +120,7 @@ impl CircuitBreaker {
                 state: CircuitState::Closed,
                 error_count: 0,
                 half_open_calls: 0,
+                half_open_epoch: 0,
                 opened_at: None,
             })),
             backend_name,
@@ -112,6 +138,24 @@ impl CircuitBreaker {
     ///
     /// Zwraca: true jesli mozna wykonac request, false jesli circuit jest OPEN
     pub fn can_execute(&self) -> bool {
+        self.decide().0
+    }
+
+    /// Like [`Self::can_execute`], for a caller that is about to send a request:
+    /// the returned guard owns the half-open probe the call may have taken, and
+    /// gives it back when dropped without a result (`record_success` /
+    /// `record_failure`). A call that ends in a way that reports neither (a 4xx,
+    /// a parse error, a cancelled future, a stream) would otherwise keep the
+    /// probe forever, and half-open has no timer to get out of that.
+    pub fn admit(&self) -> Option<CallGuard> {
+        let (allowed, probe_epoch) = self.decide();
+        allowed.then(|| CallGuard {
+            probe: probe_epoch.map(|epoch| (self.clone(), epoch)),
+        })
+    }
+
+    /// `(allowed, epoch of the half-open phase whose probe this call consumed)`.
+    fn decide(&self) -> (bool, Option<u64>) {
         // Zbieramy dane i decyzje wewnatrz locka, logujemy po zwolnieniu
         enum LogAction {
             None,
@@ -122,6 +166,7 @@ impl CircuitBreaker {
             HalfOpenLimit,
         }
 
+        let mut probe_epoch = None;
         let (result, log_action) = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -135,6 +180,7 @@ impl CircuitBreaker {
                         if elapsed >= self.timeout {
                             state.state = CircuitState::HalfOpen;
                             state.half_open_calls = 0;
+                            state.half_open_epoch += 1;
                             (true, LogAction::OpenToHalfOpen)
                         } else {
                             let remaining = (self.timeout - elapsed).as_millis();
@@ -150,6 +196,7 @@ impl CircuitBreaker {
                 CircuitState::HalfOpen => {
                     if state.half_open_calls < self.config.half_open_max_calls {
                         state.half_open_calls += 1;
+                        probe_epoch = Some(state.half_open_epoch);
                         let calls = state.half_open_calls;
                         (
                             true,
@@ -196,7 +243,7 @@ impl CircuitBreaker {
             }
         }
 
-        result
+        (result, probe_epoch)
     }
 
     /// Rejestruje sukces requestu
@@ -224,6 +271,7 @@ impl CircuitBreaker {
                     state.state = CircuitState::Closed;
                     state.error_count = 0;
                     state.half_open_calls = 0;
+                    state.half_open_epoch += 1;
                     state.opened_at = None;
                     Some(("half_open_closed", 0))
                 }
@@ -290,6 +338,7 @@ impl CircuitBreaker {
                 CircuitState::HalfOpen => {
                     state.state = CircuitState::Open;
                     state.half_open_calls = 0;
+                    state.half_open_epoch += 1;
                     state.opened_at = Some(Instant::now());
                     FailLog::HalfOpenToOpen
                 }
@@ -348,6 +397,7 @@ impl CircuitBreaker {
             state.state = CircuitState::Closed;
             state.error_count = 0;
             state.half_open_calls = 0;
+            state.half_open_epoch += 1;
             state.opened_at = None;
         };
         info!(
@@ -469,5 +519,65 @@ mod tests {
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.error_count(), 0);
+    }
+
+    fn half_open_breaker() -> CircuitBreaker {
+        let cb = CircuitBreaker::new(
+            "t".to_string(),
+            CircuitBreakerConfig {
+                threshold: 1,
+                timeout_ms: 10,
+                half_open_max_calls: 1,
+            },
+        );
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(30));
+        // The first call after the timeout moves OPEN -> HALF_OPEN.
+        drop(cb.admit().expect("moves to half-open"));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb
+    }
+
+    #[test]
+    fn a_probe_dropped_without_a_result_is_given_back() {
+        let cb = half_open_breaker();
+
+        let probe = cb.admit().expect("the probe");
+        assert!(cb.admit().is_none(), "only one probe at a time");
+        drop(probe); // no record_success / record_failure
+
+        let again = cb.admit();
+        assert!(again.is_some(), "the next call may probe");
+        drop(again);
+    }
+
+    #[test]
+    fn a_probe_that_reported_stays_consumed_by_its_result() {
+        let cb = half_open_breaker();
+        let probe = cb.admit().unwrap();
+        cb.record_success();
+        drop(probe);
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.admit().is_some());
+
+        let cb = half_open_breaker();
+        let probe = cb.admit().unwrap();
+        cb.record_failure();
+        drop(probe);
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(cb.admit().is_none(), "a failed probe reopens the circuit");
+    }
+
+    #[test]
+    fn a_late_guard_cannot_free_a_probe_of_a_later_half_open_phase() {
+        let cb = half_open_breaker();
+        let stale = cb.admit().unwrap();
+        cb.record_failure(); // reopens
+        thread::sleep(Duration::from_millis(30));
+        drop(cb.admit().expect("half-open again"));
+        let current = cb.admit().expect("the new probe");
+        drop(stale);
+        assert!(cb.admit().is_none(), "the new probe is still out");
+        drop(current);
     }
 }

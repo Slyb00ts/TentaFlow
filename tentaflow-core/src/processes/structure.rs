@@ -167,6 +167,7 @@ fn project_kind(kind: &ProcessNodeKind) -> ProcessNodeKind {
             output_mapping: BTreeMap::new(),
         },
         K::ServiceTask { .. } => K::ServiceTask {
+            retry: None,
             flow_id: String::new(),
             input_mapping: BTreeMap::new(),
             output_mapping: BTreeMap::new(),
@@ -385,6 +386,7 @@ mod tests {
             node("End", K::End),
             node("User", K::UserTask { assignee_user_id: Some(secret()), output_mapping: secret_map() }),
             node("Service", K::ServiceTask {
+                retry: None,
                 flow_id: secret(), input_mapping: secret_map(), output_mapping: secret_map(),
                 verification: ActivityVerification::Critic {
                     agent_id: secret(), criteria: secret(), on_failure: Default::default(),
@@ -396,18 +398,21 @@ mod tests {
                 },
             }),
             node("Tool", K::ServiceTask {
+                retry: None,
                 flow_id: secret(), input_mapping: secret_map(), output_mapping: secret_map(),
                 verification: ActivityVerification::Condition { expression: secret() },
                 timeout_seconds: 5, result_expression: None,
                 implementation: ServiceImplementation::AddonTool { addon_id: secret(), tool_name: secret() },
             }),
             node("Block", K::ServiceTask {
+                retry: None,
                 flow_id: secret(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
                 verification: ActivityVerification::Test { flow_id: secret(), on_failure: Default::default() },
                 timeout_seconds: 5, result_expression: None,
                 implementation: ServiceImplementation::Block { node_type: secret(), config: json!({"token": secret()}) },
             }),
             node("Unbound", K::ServiceTask {
+                retry: None,
                 flow_id: secret(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
                 verification: ActivityVerification::Human, timeout_seconds: 5, result_expression: None,
                 implementation: ServiceImplementation::Unbound { origin: secret() },

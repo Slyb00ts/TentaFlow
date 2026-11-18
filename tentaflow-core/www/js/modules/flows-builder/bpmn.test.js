@@ -2394,6 +2394,23 @@ test('result routing fixture covers every route the table can show and pairs eac
   for (const [type, stimulus] of Object.entries(routingFixture.stimuli)) assert.ok(stimulus.row, `stimulus ${type} names its table row`);
 });
 
+test('only an agent step gets the cost note in its retry section', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1);
+  const config = inspector(graph);
+  const costNote = () => config.root.querySelector('[data-retry-policy] [data-retry-agent-cost]');
+  graph.updateNodeConfig(node.id, { implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } } });
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.ok(config.root.querySelector('[data-retry-policy]'));
+  assert.equal(costNote(), null, 'a tool step has no cost note');
+  graph.updateNodeConfig(node.id, { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 8, outputSchema: { type: 'object' } } } });
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.ok(config.root.querySelector('[data-retry-policy] [data-process="retryAttempts"]'), 'an agent step keeps its policy fields');
+  assert.equal(costNote()?.textContent, I18n.t('bpmn.retry_agent_cost_hint'));
+  assert.match(costNote().textContent, /runs the agent again/);
+  graph.destroy(); config.destroy();
+});
+
 test('result routing texts name both timeout codes, the caller catch, the kept task and working time', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1);
@@ -3452,6 +3469,25 @@ test('a step time limit outside its range is marked on the field and refuses Sav
   // The server's own refusal of the same limit is told in the author's words.
   const named = processExplainError('protocol error bad_request: service task Agent_1 timeout is outside 1..=3600 seconds', agentStepModel());
   assert.equal(named, I18n.t('bpmn.timeout_out_of_range', { node: 'Review case', max: 3600 }));
+});
+
+test('a retry policy outside its limits refuses Save before the server, and the server sentence is told in the inspector words', async () => {
+  const saved = [];
+  const state = await mount(definition('draft-retry', { model: agentStepModel() }), saveFixtures('draft-retry', saved));
+  state.canvas.updateNodeConfig('Agent_1', { retry: { maxAttempts: 11, delaySeconds: 30, backoff: 'Fixed' } });
+  assert.equal(await builder._save(), false);
+  assert.equal(saved.length, 0, 'nothing is sent');
+  const shown = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.equal(shown, I18n.t('bpmn.retry_out_of_range', { node: 'Review case', reason: I18n.t('bpmn.retry_attempts_invalid', { max: 10 }) }));
+  assert.ok(!/outside|\.\.=/.test(shown));
+  state.canvas.updateNodeConfig('Agent_1', { retry: { maxAttempts: 3, delaySeconds: 30, backoff: 'Fixed' } });
+  assert.equal(await builder._save(), true);
+  const model = agentStepModel();
+  const reason = (key, limits) => I18n.t('bpmn.retry_out_of_range', { node: 'Review case', reason: I18n.t(key, limits) });
+  assert.equal(processExplainError('service task Agent_1 retry attempts are outside 1..=10', model), reason('bpmn.retry_attempts_invalid', { max: 10 }));
+  assert.equal(processExplainError('service task Agent_1 retry delay is outside 1..=86400 seconds', model), reason('bpmn.retry_delay_invalid', { min: 1, max: 86400 }));
+  assert.equal(processExplainError('service task Agent_1 retry factor is outside 101..=1000 percent', model), reason('bpmn.retry_factor_invalid', { min: 101, max: 1000 }));
+  assert.equal(processExplainError('service task Agent_1 retry delay cap is outside 45..=86400 seconds', model), reason('bpmn.retry_max_delay_invalid', { min: 45, max: 86400 }));
 });
 
 test('a disabled agent is flagged on the inspector and the canvas and its publication refusal names step and agent', async () => {

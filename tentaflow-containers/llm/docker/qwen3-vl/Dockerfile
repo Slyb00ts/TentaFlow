@@ -13,11 +13,14 @@
 # zrodel — wheels z PyPI maja prebuilt extensions (vllm, xformers, flashinfer).
 ARG CUDA_IMAGE=nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
-ARG VLLM_INDEX=https://wheels.vllm.ai/nightly/cu130
-ARG TORCH_VERSION=2.13.0
-ARG TORCHVISION_VERSION=0.28.0
+# vLLM RELEASE index for VLLM_VERSION, not nightly: nightly holds only dev
+# builds, so a release pin would silently resolve from PyPI. The path embeds
+# the version: bump it with VLLM_VERSION.
+ARG VLLM_INDEX=https://wheels.vllm.ai/0.34.0/cu130
+ARG TORCH_VERSION=2.14.0
+ARG TORCHVISION_VERSION=0.29.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG VLLM_VERSION=0.28.0
+ARG VLLM_VERSION=0.34.0
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
 ARG VLLM_INDEX

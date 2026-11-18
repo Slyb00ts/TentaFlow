@@ -57,6 +57,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         let runtime = self
             .runtime
             .read()
@@ -66,7 +67,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
         let result = runtime
             .execute_tts(api_req, &mut rctx)
             .await
-            .map_err(|e| anyhow!("TtsDispatcher: {e}"))?;
+            .map_err(|e| super::dispatcher_failure("TtsDispatcher", e.into_anyhow()))?;
 
         let mime = format_to_mime(&result.format);
         let blob_ref = self.blobs.put(result.bytes, &mime).await?;

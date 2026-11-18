@@ -48,6 +48,7 @@ pub mod gstreamer_runtime;
 pub mod handles_cache;
 pub mod key_storage;
 pub mod legal;
+pub mod limiter;
 pub mod lidar_hub;
 pub mod lidar_push;
 pub mod lidar_relay;

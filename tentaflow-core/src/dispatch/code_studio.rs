@@ -513,12 +513,23 @@ fn node_info(
 /// unpaired peer never appears: without trust there is no assertion path to it,
 /// so offering it would be a promise the wizard cannot keep.
 fn node_catalog(ctx: &HandlerContext) -> Vec<WorkspaceNodeInfo> {
-    let mut nodes = vec![local_node_info(ctx)];
+    // A console-only node refuses to provision (`workspace_create_v1`), so
+    // offering it would make the wizard preselect a node that cannot be used.
+    let mut nodes = if crate::addon::native_apps::console_only_node() {
+        Vec::new()
+    } else {
+        vec![local_node_info(ctx)]
+    };
     let Some(iroh) = ctx.state.quic_mesh.as_ref() else {
         return nodes;
     };
     for peer in ctx.state.mesh_peer_store.list() {
         if peer.node_id.as_str() == &*ctx.state.local_node_id || !iroh.is_trusted(&peer.node_id) {
+            continue;
+        }
+        // The peer's own platform report: a console-only node refuses every
+        // create it would be offered for.
+        if crate::addon::native_apps::console_only_platform(&peer.platform) {
             continue;
         }
         // The peer's own report of whether it can isolate a workspace, in
@@ -1851,6 +1862,14 @@ async fn workspace_create_v1(
                 "workspaces are provisioned by their owner node; '{requested_node}' could not be \
                  reached from this one"
             ),
+        ));
+    }
+    // A workspace needs processes, terminals and git on its owner node, and an
+    // app-sandboxed core has none of them; the mesh still reaches nodes that do.
+    if crate::addon::native_apps::console_only_node() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "this node cannot host a workspace; create it on another node of the mesh",
         ));
     }
 

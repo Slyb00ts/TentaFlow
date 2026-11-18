@@ -155,8 +155,9 @@ use ::protobuf::descriptor::field_descriptor_proto::{Label, Type};
 use ::protobuf::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
 
 use super::{
-    shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    leaking_field, leaking_field_refusal, shorten_path, Budget, Compatibility, CompiledSchema,
+    LimitExceeded, SchemaAwareFieldFormat, SchemaError, SchemaKindOps, Screened, TextRules,
+    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod prescan;
@@ -340,6 +341,12 @@ struct Field {
     explicit_optional: bool,
     /// Bit in the per-message "seen" mask of a `required` field.
     required_bit: Option<u32>,
+    /// proto2 `[default = ..]` as the parser stores it (a string's text, a
+    /// bytes value C-escaped, anything else as written): a decoder fills an
+    /// absent field with it, so a sub-schema has to say the same.
+    default_value: Option<String>,
+    /// `[packed = ..]`, when written.
+    packed: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -875,6 +882,8 @@ impl<'a> Lowering<'a> {
                 oneof,
                 explicit_optional,
                 required_bit,
+                default_value: f.has_default_value().then(|| f.default_value().to_string()),
+                packed: f.options.packed,
             });
         }
         if self.msgs[id].map_entry {
@@ -1021,6 +1030,23 @@ struct Frame {
     seen: u64,
 }
 
+/// One occurrence of a field of the designated message on the wire: its tag
+/// and value, `start..end`.
+struct TopSpan {
+    number: u32,
+    start: usize,
+    end: usize,
+}
+
+/// What the walk records about the top level of the designated message for a
+/// field policy.
+#[derive(Default)]
+struct TopSpans {
+    /// The occurrence whose value is still being walked.
+    open: Option<(u32, usize)>,
+    done: Vec<TopSpan>,
+}
+
 struct Walker<'a> {
     c: &'a Compiled,
     data: &'a [u8],
@@ -1029,6 +1055,8 @@ struct Walker<'a> {
     stack: Vec<Frame>,
     /// Field of the innermost message the failure is about.
     at: Option<usize>,
+    /// Recorded only for a field policy (`top_spans`).
+    top: Option<TopSpans>,
 }
 
 impl Walker<'_> {
@@ -1130,11 +1158,25 @@ impl Walker<'_> {
         while let Some(top) = self.stack.last() {
             let (msg, end) = (top.msg, top.end);
             self.at = None;
+            if self.stack.len() == 1 {
+                // Back at the designated message: the occurrence that was
+                // open (a nested message walked in the meantime) ends here.
+                if let Some(rec) = self.top.as_mut() {
+                    if let Some((number, start)) = rec.open.take() {
+                        rec.done.push(TopSpan {
+                            number,
+                            start,
+                            end: self.pos,
+                        });
+                    }
+                }
+            }
             if self.pos == end {
                 self.close()?;
                 continue;
             }
             self.budget.charge(1)?;
+            let field_start = self.pos;
             let tag = self.varint(end)?;
             let number = tag >> 3;
             if number == 0 || number > u64::from(MAX_FIELD_NUMBER) {
@@ -1148,6 +1190,11 @@ impl Walker<'_> {
                 3 | 4 => return Err(Fail::Violation(GROUP_WIRE)),
                 6 | 7 => return Err(Fail::Violation(BAD_WIRE)),
                 _ => {}
+            }
+            if self.stack.len() == 1 {
+                if let Some(rec) = self.top.as_mut() {
+                    rec.open = Some((number as u32, field_start));
+                }
             }
             match self.c.msgs[msg].field_by_number(number as u32) {
                 None => self.skip(wire, end)?,
@@ -1275,6 +1322,16 @@ impl Walker<'_> {
 }
 
 fn validate_with(c: &Compiled, payload: &[u8], budget: &mut Budget) -> Result<(), SchemaError> {
+    walk(c, payload, budget, false).map(|_| ())
+}
+
+/// The strict walk, optionally recording every top-level occurrence.
+fn walk(
+    c: &Compiled,
+    payload: &[u8],
+    budget: &mut Budget,
+    record_top: bool,
+) -> Result<Vec<TopSpan>, SchemaError> {
     let mut walker = Walker {
         c,
         data: payload,
@@ -1282,9 +1339,10 @@ fn validate_with(c: &Compiled, payload: &[u8], budget: &mut Budget) -> Result<()
         budget,
         stack: Vec::new(),
         at: None,
+        top: record_top.then(TopSpans::default),
     };
     match walker.run() {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(walker.top.take().map(|t| t.done).unwrap_or_default()),
         Err(Fail::Violation(msg)) => Err(SchemaError::Violation(format!(
             "{}: {msg}",
             shorten_path(&walker.render_path())
@@ -1546,6 +1604,55 @@ fn collect_keep(c: &Compiled, allowed: &BTreeSet<String>) -> Keep {
     keep
 }
 
+/// A string as a proto string literal.
+fn quote_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// ` [default = .., packed = ..]` of a field, or nothing. A value that is not
+/// a plain token (a number, `inf`, `nan`, `true`, an enum name) is left out
+/// rather than written in a form the parser could read differently.
+fn field_options(field: &Field) -> String {
+    let mut parts = Vec::new();
+    if let Some(value) = &field.default_value {
+        let literal = match field.ty {
+            Ty::Scalar(Scalar::String) => Some(quote_string(value)),
+            Ty::Scalar(Scalar::Bytes) => Some(format!("\"{value}\"")),
+            _ => value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '.'))
+                .then(|| value.clone()),
+        };
+        if let Some(literal) = literal.filter(|l| !l.is_empty()) {
+            parts.push(format!("default = {literal}"));
+        }
+    }
+    if let Some(packed) = field.packed {
+        parts.push(format!("packed = {packed}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", parts.join(", "))
+    }
+}
+
 struct Printer<'a> {
     c: &'a Compiled,
     keep: &'a Keep,
@@ -1599,9 +1706,10 @@ impl Printer<'_> {
             }
             other => self.type_ref(other),
         };
+        let options = field_options(field);
         let _ = writeln!(
             self.out,
-            "{pad}{label}{ty} {} = {};",
+            "{pad}{label}{ty} {} = {}{options};",
             field.name, field.number
         );
     }
@@ -1713,8 +1821,11 @@ impl SchemaKindOps for ProtobufOps {
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
         let schema_text = schema_text.as_str();
-        let compiled = parse_text(schema_text)?;
-        let derived = derive(&compiled, allowed);
+        let compiled = CompiledSchema::Protobuf(parse_text(schema_text)?);
+        if let Some(field) = leaking_field(self, &compiled, allowed)? {
+            return Err(invalid(leaking_field_refusal(&field)));
+        }
+        let derived = derive(protobuf_compiled(&compiled)?, allowed);
         // The projection must itself compile. It writes every type with its
         // full name, so a large valid schema grows past the limit of the text
         // it came from: the check allows twice that, not more, because the
@@ -1773,6 +1884,115 @@ impl SchemaKindOps for ProtobufOps {
 }
 
 pub(super) static PROTOBUF_OPS: ProtobufOps = ProtobufOps;
+
+// =============================================================================
+// Field policies on Protobuf messages (F4 B6)
+// =============================================================================
+// A message is a run of tagged fields, so a read projection is the run of the
+// kept fields: removing a field is leaving out its tags. The strict walk above
+// finds where every top-level occurrence starts and ends (a field the schema
+// does not declare is walked for its framing and is never kept: the
+// sub-schema cannot name it), and a kept occurrence is copied byte for byte,
+// in its original order — a repeated field keeps all its occurrences, a
+// nested message is not touched. The result is what `derive_subschema`
+// describes: the designated message with only the kept fields.
+
+fn protobuf_compiled(compiled: &CompiledSchema) -> Result<&Compiled, SchemaError> {
+    match compiled {
+        CompiledSchema::Protobuf(c) => Ok(c),
+        _ => Err(invalid("called with a non-protobuf compiled schema")),
+    }
+}
+
+impl SchemaAwareFieldFormat for ProtobufOps {
+    fn carries_unknown_fields(&self) -> bool {
+        true
+    }
+
+    fn declared_fields(&self, compiled: &CompiledSchema) -> Result<Vec<String>, SchemaError> {
+        let c = protobuf_compiled(compiled)?;
+        Ok(c.msgs[c.root].fields.iter().map(|f| f.name.clone()).collect())
+    }
+
+    fn list_fields(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        shared: &mut ValidationBudget,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = protobuf_compiled(compiled)?;
+        let root = &c.msgs[c.root];
+        let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_UNITS));
+        let spans = walk(c, payload, &mut budget, true);
+        shared.spend(budget.used);
+        Ok(spans?
+            .iter()
+            .map(|span| match root.field_by_number(span.number) {
+                Some(index) => root.fields[index].name.clone(),
+                None => format!("#{}", span.number),
+            })
+            .collect())
+    }
+
+    fn project(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        shared: &mut ValidationBudget,
+    ) -> Result<Vec<u8>, SchemaError> {
+        let c = protobuf_compiled(compiled)?;
+        let root = &c.msgs[c.root];
+        let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_UNITS));
+        let spans = walk(c, payload, &mut budget, true);
+        shared.spend(budget.used);
+        let mut out = Vec::new();
+        for span in spans? {
+            let kept = root
+                .field_by_number(span.number)
+                .is_some_and(|index| visible.contains(&root.fields[index].name));
+            if kept {
+                out.extend_from_slice(&payload[span.start..span.end]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn self_referencing_fields(
+        &self,
+        compiled: &CompiledSchema,
+    ) -> Result<BTreeSet<String>, SchemaError> {
+        let c = protobuf_compiled(compiled)?;
+        // Messages that reach the root: the root and everything holding one
+        // of them in a field (a map entry is a message too), walked from the
+        // root along the field edges backwards.
+        let mut holders: Vec<Vec<usize>> = vec![Vec::new(); c.msgs.len()];
+        for (id, msg) in c.msgs.iter().enumerate() {
+            for field in &msg.fields {
+                if let Ty::Message(target) = field.ty {
+                    holders[target].push(id);
+                }
+            }
+        }
+        let mut reaches = vec![false; c.msgs.len()];
+        reaches[c.root] = true;
+        let mut work = vec![c.root];
+        while let Some(id) = work.pop() {
+            for &holder in &holders[id] {
+                if !reaches[holder] {
+                    reaches[holder] = true;
+                    work.push(holder);
+                }
+            }
+        }
+        Ok(c.msgs[c.root]
+            .fields
+            .iter()
+            .filter(|f| matches!(f.ty, Ty::Message(target) if reaches[target]))
+            .map(|f| f.name.clone())
+            .collect())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3192,6 +3412,56 @@ mod tests {
     }
 
     #[test]
+    fn a_field_that_reaches_the_root_again_cannot_be_shown_without_the_fields_left_out() {
+        // Directly: `next` holds a whole `M`, `secret` included.
+        let direct = "syntax = \"proto3\"; message M { string secret = 1; M next = 2; }";
+        assert_eq!(
+            PROTOBUF_OPS
+                .self_referencing_fields(&compile(direct))
+                .unwrap(),
+            allowed(&["next"])
+        );
+        let refusal = PROTOBUF_OPS
+            .derive_subschema(direct, &allowed(&["next"]))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("field 'next' refers back"), "{refusal}");
+        // Even every declared field: a record stamped with this version may
+        // carry a tag a newer version added (`secret2 = 3`), kept verbatim in
+        // the nested copy while the projection strips it at the root.
+        let refusal = PROTOBUF_OPS
+            .derive_subschema(direct, &allowed(&["secret", "next"]))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("field 'next' refers back"), "{refusal}");
+        // The recursive field left out: fine.
+        PROTOBUF_OPS
+            .derive_subschema(direct, &allowed(&["secret"]))
+            .unwrap();
+
+        // Through another message and a map entry (a message too).
+        let indirect = "syntax = \"proto3\"; \
+            message M { string secret = 1; N child = 2; map<string, M> by = 3; Leaf plain = 4; } \
+            message N { repeated M back = 1; } \
+            message Leaf { int32 v = 1; }";
+        assert_eq!(
+            PROTOBUF_OPS
+                .self_referencing_fields(&compile(indirect))
+                .unwrap(),
+            allowed(&["child", "by"])
+        );
+        assert!(PROTOBUF_OPS
+            .derive_subschema(indirect, &allowed(&["by", "plain"]))
+            .is_err());
+        assert!(PROTOBUF_OPS
+            .derive_subschema(indirect, &allowed(&["child"]))
+            .is_err());
+        PROTOBUF_OPS
+            .derive_subschema(indirect, &allowed(&["plain"]))
+            .unwrap();
+    }
+
+    #[test]
     fn a_projection_keeps_the_allowed_fields_and_the_types_they_reach() {
         let order = fixtures::read("protobuf", "order.proto");
         let derived = PROTOBUF_OPS
@@ -3296,7 +3566,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             derived,
-            "syntax = \"proto2\";\n\nmessage M {\n  enum E {\n    X = 1;\n    Y = 2;\n  }\n  required int32 a = 1;\n  repeated int32 c = 3;\n  optional .M.E e = 4;\n}\n"
+            "syntax = \"proto2\";\n\nmessage M {\n  enum E {\n    X = 1;\n    Y = 2;\n  }\n  required int32 a = 1;\n  repeated int32 c = 3 [packed = true];\n  optional .M.E e = 4;\n}\n"
+        );
+        // A field keeps the options a decoder reads it with.
+        let with_default = PROTOBUF_OPS
+            .derive_subschema(&text, &allowed(&["b"]))
+            .unwrap();
+        assert!(
+            with_default.contains("optional string b = 2 [default = \"d\"];"),
+            "{with_default}"
         );
         let projected = compile(&derived);
         assert_eq!(violation(&projected, &[]), "/a: required field is missing");
@@ -4439,6 +4717,196 @@ mod tests {
             assert!(
                 accepted > 100 && refused > 100,
                 "{schema}: {accepted}/{refused}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Field policies (F4 B6): the library is the oracle
+    // -------------------------------------------------------------------------
+
+    mod field_policy {
+        use super::*;
+
+        const DEMO: &str = r#"syntax = "proto3";
+            package demo;
+            message M {
+              int64 id = 1;
+              string name = 2;
+              repeated string tags = 3;
+              Inner inner = 4;
+              map<string, int32> counts = 5;
+              oneof pick { string a = 6; int32 b = 7; }
+              Color color = 8;
+              optional string ssn = 9;
+              repeated int32 packed = 10;
+              message Inner { string x = 1; int32 y = 2; }
+              enum Color { RED = 0; GREEN = 1; }
+            }"#;
+
+        const FIELDS: [&str; 10] = [
+            "id", "name", "tags", "inner", "counts", "a", "color", "ssn", "packed", "b",
+        ];
+
+        fn names(of: &[&str]) -> BTreeSet<String> {
+            of.iter().map(|n| n.to_string()).collect()
+        }
+
+        /// `(field name, its bytes)` in wire order; `tags` appears twice with
+        /// another field between them.
+        fn parts() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                ("id", vf(1, 7)),
+                ("tags", ld(3, b"a")),
+                ("name", ld(2, b"Anna")),
+                ("tags", ld(3, b"b")),
+                ("inner", ld(4, &cat(&[&ld(1, b"x"), &vf(2, 3)]))),
+                ("counts", ld(5, &cat(&[&ld(1, b"k"), &vf(2, 9)]))),
+                ("a", ld(6, b"pick")),
+                ("color", vf(8, 1)),
+                ("ssn", ld(9, b"90010112345")),
+                ("packed", ld(10, &cat(&[&varint(1), &varint(300)]))),
+            ]
+        }
+
+        fn payload_of(parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
+            parts.iter().flat_map(|(_, bytes)| bytes.clone()).collect()
+        }
+
+        fn project(payload: &[u8], visible: &BTreeSet<String>) -> Result<Vec<u8>, SchemaError> {
+            PROTOBUF_OPS.project(
+                &compile(DEMO),
+                payload,
+                visible,
+                &mut ValidationBudget::unshared(),
+            )
+        }
+
+        #[test]
+        fn a_projection_is_the_kept_fields_in_wire_order() {
+            let all = parts();
+            let payload = payload_of(&all);
+            for visible in [
+                names(&["id"]),
+                names(&["tags"]),
+                names(&["name", "tags", "ssn"]),
+                names(&["inner", "counts", "a", "color", "packed"]),
+                names(&[]),
+                names(&FIELDS),
+                names(&["id", "not-a-field"]),
+            ] {
+                let expected: Vec<(&str, Vec<u8>)> = all
+                    .iter()
+                    .filter(|(name, _)| visible.contains(*name))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    project(&payload, &visible).unwrap(),
+                    payload_of(&expected),
+                    "visible {visible:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_library_reads_a_projection_under_the_derived_schema_as_the_visible_fields_only() {
+            let payload = payload_of(&parts());
+            let original = Oracle::new(DEMO, "M");
+            for visible in [
+                names(&["id", "name"]),
+                names(&["tags", "inner", "counts"]),
+                names(&["a", "color", "ssn", "packed"]),
+                names(&[]),
+            ] {
+                let projected = project(&payload, &visible).unwrap();
+                let derived = PROTOBUF_OPS.derive_subschema(DEMO, &visible).unwrap();
+                let sub = Oracle::new(&derived, "M");
+                let got = sub.0.parse_from_bytes(&projected).expect("the library reads it");
+                let mut want = original.0.parse_from_bytes(&payload).unwrap();
+                for field in original.0.fields() {
+                    if !visible.contains(field.name()) {
+                        field.clear_field(&mut *want);
+                    }
+                }
+                assert_eq!(
+                    ::protobuf::text_format::print_to_string(&*got),
+                    ::protobuf::text_format::print_to_string(&*want),
+                    "visible {visible:?}\n{derived}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_field_the_schema_does_not_declare_is_never_kept_and_is_listed_as_unknown() {
+            let mut payload = payload_of(&parts());
+            payload.extend(ld(100, b"from a newer writer"));
+            payload.extend(vf(101, 5));
+            let kept = project(&payload, &names(&FIELDS)).unwrap();
+            assert_eq!(kept, payload_of(&parts()));
+            let present = PROTOBUF_OPS
+                .list_fields(&compile(DEMO), &payload, &mut ValidationBudget::unshared())
+                .unwrap();
+            assert!(present.contains("#100") && present.contains("#101"), "{present:?}");
+            assert!(present.contains("id") && present.contains("tags"));
+            assert!(!present.contains("b"), "an absent field is not set: {present:?}");
+        }
+
+        #[test]
+        fn a_payload_that_is_not_valid_under_the_schema_is_never_projected() {
+            let payload = payload_of(&parts());
+            let visible = names(&["id"]);
+            assert!(project(&payload[..payload.len() - 1], &visible).is_err(), "cut short");
+            // A string that is not UTF-8, a wrong wire type, a bad length.
+            assert!(project(&ld(2, &[0xff, 0xfe]), &visible).is_err());
+            assert!(project(&cat(&[&tag(1, 2), &varint(1), &[7]]), &visible).is_err());
+            assert!(project(&cat(&[&tag(2, 2), &varint(99), b"x"]), &visible).is_err());
+            // A nested message that is broken is caught although only the
+            // enclosing field is kept.
+            assert!(project(&ld(4, &[0xff]), &names(&["inner"])).is_err());
+            let message = project(&ld(2, &[0xff]), &visible).unwrap_err().to_string();
+            assert!(!message.contains("Anna"), "{message}");
+            // An empty payload is a valid, empty message.
+            assert_eq!(project(&[], &visible).unwrap(), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn the_declared_fields_are_the_designated_messages_in_declaration_order() {
+            assert_eq!(
+                PROTOBUF_OPS.declared_fields(&compile(DEMO)).unwrap(),
+                vec!["id", "name", "tags", "inner", "counts", "a", "b", "color", "ssn", "packed"]
+            );
+        }
+
+        #[test]
+        fn the_fields_a_write_sets_are_the_tags_on_the_wire() {
+            let present = PROTOBUF_OPS
+                .list_fields(
+                    &compile(DEMO),
+                    &payload_of(&parts()),
+                    &mut ValidationBudget::unshared(),
+                )
+                .unwrap();
+            assert_eq!(
+                present,
+                names(&["id", "name", "tags", "inner", "counts", "a", "color", "ssn", "packed"])
+            );
+            assert!(PROTOBUF_OPS
+                .list_fields(&compile(DEMO), &[], &mut ValidationBudget::unshared())
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn a_proto2_required_field_is_enforced_before_a_projection_is_made() {
+            let schema = r#"syntax = "proto2"; message M { required int64 id = 1; optional string n = 2; }"#;
+            let compiled = compile(schema);
+            let project = |bytes: &[u8], visible: &[&str]| {
+                PROTOBUF_OPS.project(&compiled, bytes, &names(visible), &mut ValidationBudget::unshared())
+            };
+            assert!(project(&ld(2, b"x"), &["n"]).is_err(), "required id missing");
+            assert_eq!(
+                project(&cat(&[&vf(1, 3), &ld(2, b"x")]), &["n"]).unwrap(),
+                ld(2, b"x")
             );
         }
     }

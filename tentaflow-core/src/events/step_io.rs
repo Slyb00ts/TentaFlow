@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::code_studio::redact;
 
 /// Largest input or output kept per step, in bytes of UTF-8 text.
-pub const MAX_SIDE_BYTES: usize = 256 * 1024;
+pub const MAX_SIDE_BYTES: usize = 16 * 1024 * 1024;
 
 const ZSTD_LEVEL: i32 = 6;
 
@@ -41,30 +41,44 @@ pub struct PackedStepIo {
     pub truncated: bool,
 }
 
-/// Cuts `text` to `MAX_SIDE_BYTES` on a character boundary and says how much
-/// went; returns the original byte length too.
-fn cap(text: &str) -> (String, bool) {
-    if text.len() <= MAX_SIDE_BYTES {
-        return (text.to_string(), false);
+/// What every cut text ends with, so a side cut where it was produced is still
+/// reported as cut when it reaches [`pack`].
+const CUT_TAIL: &str = "more bytes were not stored]";
+
+/// Where a producer cuts a side: far enough under [`MAX_SIDE_BYTES`] that the
+/// marker and the redaction pass cannot push it back over.
+const PRODUCER_CAP_BYTES: usize = MAX_SIDE_BYTES - 4096;
+
+/// Cuts `text` to `limit` bytes on a character boundary, in place, and appends
+/// the marker saying how much went. The bool says whether it was cut.
+fn cut_to(mut text: String, limit: usize) -> (String, bool) {
+    if text.ends_with(CUT_TAIL) {
+        return (text, true);
     }
-    let mut end = MAX_SIDE_BYTES;
+    if text.len() <= limit {
+        return (text, false);
+    }
+    let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     let dropped = text.len() - end;
-    (
-        format!(
-            "{}\n[… cut: {dropped} more bytes were not stored]",
-            &text[..end]
-        ),
-        true,
-    )
+    text.truncate(end);
+    text.push_str(&format!("\n[… cut: {dropped} {CUT_TAIL}"));
+    (text, true)
+}
+
+/// Bounds one side where it is produced, so an oversized prompt or answer is
+/// never held (and copied through the progress stream) in full only to be cut
+/// at the end. The marker survives to [`pack`], which reports the cut.
+pub fn limit_side(text: String) -> String {
+    cut_to(text, PRODUCER_CAP_BYTES).0
 }
 
 /// Redacts, caps and compresses one step's input and output.
 pub fn pack(input: &str, output: &str) -> Result<PackedStepIo> {
-    let (input_text, input_cut) = cap(&redact::redact_text(input));
-    let (output_text, output_cut) = cap(&redact::redact_text(output));
+    let (input_text, input_cut) = cut_to(redact::redact_text(input), MAX_SIDE_BYTES);
+    let (output_text, output_cut) = cut_to(redact::redact_text(output), MAX_SIDE_BYTES);
     let body = StepIoBody {
         input: input_text,
         output: output_text,

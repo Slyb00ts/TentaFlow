@@ -252,7 +252,7 @@ mod tests {
         let core_db = main_db();
         let broker = Arc::new(ProgressBroker::new());
         broker.bind_run_provenance(SCOPE, provenance(run_id));
-        let log = RunEventLog::new(events_pool.clone(), core_db.clone(), broker.clone());
+        let log = RunEventLog::new(events_pool.clone(), broker.clone());
         log.attach(SCOPE);
 
         let (tx, rx) = mpsc::channel::<LlmStreamChunk>(8);
@@ -407,30 +407,28 @@ mod tests {
         drop(dir);
     }
 
-    /// §2.7 with response bodies OFF — the default state of an unconfigured
-    /// node. Decoding is a difference between two STORED INSTANTS, so it must
-    /// survive the body being omitted: the `assistant_message` row is still
-    /// there, at its own `at_ms`, carrying an omission rather than a text.
+    /// §2.7 for a run that keeps no response body (a Bus run). Decoding is a
+    /// difference between two STORED INSTANTS, so it must survive the body being
+    /// omitted: the `assistant_message` row is still there, at its own `at_ms`,
+    /// carrying an omission rather than a text.
     ///
     /// Written through `store::append` rather than the progress stream because
     /// no engine event carries a finished response; what is under test is that
     /// the writer's omission leaves the timing intact.
     #[tokio::test]
-    async fn decode_time_still_works_with_response_bodies_off() {
+    async fn decode_time_still_works_when_the_body_is_omitted() {
         use crate::events::{BodyOmission, EventKind};
 
         let (_dir, pool) = crate::events::test_support::events_db();
-        let core_db = crate::events::test_support::main_db();
         let actor = FlowActor::user("u-1");
         let row = |at_ms: i64, payload: EventPayload| {
-            RunEvent::new("run-quiet", at_ms, FlowOrigin::Chat, &actor, payload)
+            RunEvent::new("run-quiet", at_ms, FlowOrigin::Bus, &actor, payload)
                 .with_node("llm-1")
                 .with_org("org-quiet")
         };
 
         append(
             &pool,
-            &core_db,
             RunEvent::new(
                 "run-quiet",
                 1_000,
@@ -441,6 +439,7 @@ mod tests {
                     flow_id: None,
                     service_type: None,
                     modality: None,
+                    bus_source: None,
                 },
             )
             .with_org("org-quiet"),
@@ -448,14 +447,12 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &core_db,
             row(1_000, EventPayload::StepStart { step: "llm".into() }),
         )
         .unwrap();
-        append(&pool, &core_db, row(1_150, EventPayload::FirstToken {})).unwrap();
+        append(&pool, row(1_150, EventPayload::FirstToken {})).unwrap();
         append(
             &pool,
-            &core_db,
             row(
                 1_640,
                 EventPayload::AssistantMessage {
@@ -467,7 +464,6 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &core_db,
             row(
                 1_650,
                 EventPayload::StepEnd {
@@ -497,7 +493,7 @@ mod tests {
         assert_eq!(message.at_ms, 1_640);
         match message.payload {
             EventPayload::AssistantMessage { body, tokens } => {
-                assert_eq!(body, ResponseBody::Omitted(BodyOmission::NotEnabled));
+                assert_eq!(body, ResponseBody::Omitted(BodyOmission::NotCarried));
                 assert_eq!(tokens, Some(41));
             }
             other => panic!("expected an assistant_message payload, got {other:?}"),
@@ -510,7 +506,6 @@ mod tests {
     /// an INTERLEAVING that a real run reproduces only by luck.
     fn append_at(
         pool: &DbPool,
-        core_db: &DbPool,
         run_id: &str,
         at_ms: i64,
         node_id: Option<&str>,
@@ -522,7 +517,7 @@ mod tests {
         if let Some(node_id) = node_id {
             event = event.with_node(node_id);
         }
-        append(pool, core_db, event).expect("append");
+        append(pool, event).expect("append");
     }
 
     fn request_started() -> EventPayload {
@@ -531,6 +526,7 @@ mod tests {
             flow_id: None,
             service_type: None,
             modality: None,
+            bus_source: None,
         }
     }
 
@@ -547,10 +543,9 @@ mod tests {
     #[test]
     fn a_step_belongs_to_its_own_node_not_to_the_latest_start_in_the_run() {
         let (_dir, pool) = crate::events::test_support::events_db();
-        let core_db = crate::events::test_support::main_db();
         let run = "run-interleaved";
         let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
-            append_at(&pool, &core_db, run, at_ms, node, payload)
+            append_at(&pool, run, at_ms, node, payload)
         };
 
         at(1_000, None, request_started());
@@ -611,10 +606,9 @@ mod tests {
     #[test]
     fn a_run_with_no_request_started_has_no_ttft_rather_than_zero() {
         let (_dir, pool) = crate::events::test_support::events_db();
-        let core_db = crate::events::test_support::main_db();
         let run = "run-no-open";
         let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
-            append_at(&pool, &core_db, run, at_ms, node, payload)
+            append_at(&pool, run, at_ms, node, payload)
         };
 
         // The opening event is absent: a lagging subscriber dropped it, which
@@ -661,10 +655,9 @@ mod tests {
     #[test]
     fn a_message_that_never_completed_has_no_decode_time_rather_than_zero() {
         let (_dir, pool) = crate::events::test_support::events_db();
-        let core_db = crate::events::test_support::main_db();
         let run = "run-cut-short";
         let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
-            append_at(&pool, &core_db, run, at_ms, node, payload)
+            append_at(&pool, run, at_ms, node, payload)
         };
 
         at(1_000, None, request_started());
@@ -717,11 +710,7 @@ mod tests {
             let (dir, pool) = crate::events::test_support::events_db();
             let broker = Arc::new(ProgressBroker::new());
             broker.bind_run_provenance(SCOPE, provenance(run_id));
-            let log = RunEventLog::new(
-                pool.clone(),
-                crate::events::test_support::main_db(),
-                broker.clone(),
-            );
+            let log = RunEventLog::new(pool.clone(), broker.clone());
             log.attach(SCOPE);
             Self {
                 _dir: dir,

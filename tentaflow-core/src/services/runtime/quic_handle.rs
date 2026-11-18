@@ -58,6 +58,9 @@ pub struct QuicServiceHandle {
     /// listener on every established connection. `None` = Core never accepts
     /// streams opened by this service.
     reverse: parking_lot::RwLock<Option<crate::services::runtime::reverse_listener::ReverseWiring>>,
+    /// In-flight limit of the service, handed to every client the reconnect loop
+    /// connects. `None` for a handle that belongs to no model service.
+    limiter: Option<Arc<crate::services::limiter::ServiceLimiter>>,
 }
 
 impl QuicServiceHandle {
@@ -70,7 +73,29 @@ impl QuicServiceHandle {
             shutdown_tx,
             shutdown_rx,
             reverse: parking_lot::RwLock::new(None),
+            limiter: None,
         }
+    }
+
+    /// Gives the handle the in-flight limit of its model service.
+    ///
+    /// A sidecar's reverse requests (streams it opens back to Core) never hold
+    /// a slot of this limiter, so a request cannot wait on a slot its own
+    /// sidecar occupies: the slot is taken only by `QuicClient::send_request*`,
+    /// Core's calls INTO the sidecar, and the reverse listener serves the
+    /// sidecar's calls on streams it accepts. Only the meeting bot declares
+    /// `reverse_requests`, and its handle is registered through
+    /// `register_meeting_bot` without a limiter; a handle built by
+    /// `handles_cache::build_handle` (the ones that have one) never has reverse
+    /// wiring. What a reverse request calls goes through the router and takes
+    /// the slots of THOSE services, one at a time.
+    pub fn with_limiter(mut self, limiter: Arc<crate::services::limiter::ServiceLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    pub fn limiter(&self) -> Option<Arc<crate::services::limiter::ServiceLimiter>> {
+        self.limiter.clone()
     }
 
     /// Enables the reverse-request listener for this handle. Must be called
@@ -789,7 +814,7 @@ mod snapshot_helpers_tests {
                 })
                 .collect(),
             timeout_ms: 30_000,
-            max_concurrent: 16,
+            max_concurrent: Some(16),
             weight: 100,
             model_name_override: None,
             extra_config,

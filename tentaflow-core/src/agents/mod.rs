@@ -38,8 +38,8 @@ pub use run_manager::{
 };
 pub use service::AgentService;
 pub use subagent_reactor::{
-    init_global as subagent_reactor_init_global, FlowDispatcherReactorDispatch,
-    ReactorFlowDispatch, SubagentReactor,
+    init_global as subagent_reactor_init_global, bus_source_of, reactive_run_meta, FlowDispatcherReactorDispatch,
+    ReactiveDispatchError, ReactorFlowDispatch, SubagentReactor,
 };
 
 /// Late-bound `AgentService` slot (§3.5.0), mirroring `ModelRuntimeSlot`.

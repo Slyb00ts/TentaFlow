@@ -33,6 +33,7 @@ use crate::flow_engine::envelope::{
 };
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::resolver::LocalNodeIdProvider;
+use crate::services::runtime::ExecutorError;
 use base64::Engine;
 use std::sync::Arc;
 
@@ -109,8 +110,10 @@ impl LlmDispatcherImpl {
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
+            org_id: None,
         });
         let context = AiGatewayContext {
+            parent_run: None,
             // The process's own organization, not the first one the user joined.
             org_id: req.provenance.org_id.clone(),
             addon_id: None,
@@ -213,6 +216,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
         // ModelRuntimeExecutor::execute_chat nie eksponuje tych pól.
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
@@ -238,7 +242,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
                 if let Some(event) = audit_event.as_ref() {
                     let _ = event.finish_failed(&msg);
                 }
-                return Err(anyhow!(msg));
+                return Err(super::dispatcher_failure("LlmDispatcher execute_chat", e));
             }
         };
 
@@ -352,6 +356,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // §2.5 — the calling flow's stamp travels with the request; a fresh
         // runtime context here would report the nested dispatch as `system`.
         let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
+        rctx.nested_in_run = provenance.nested_in_run;
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
@@ -373,7 +378,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             Err(e) => {
                 let message = format!("LlmDispatcher stream_chat: {e}");
                 fail_event(audit_event.as_ref(), &message);
-                return Err(anyhow!(message));
+                return Err(super::dispatcher_failure("LlmDispatcher stream_chat", e));
             }
         };
 
@@ -396,14 +401,13 @@ impl LlmDispatcher for LlmDispatcherImpl {
 /// Wykonuje future z deadline (`tokio::time::timeout`) + cancel
 /// (`select!` z `cancel.cancelled()`). Te dwa pola żyją w `LlmRequest`
 /// ale `ModelRuntimeExecutor` ich nie czyta — wrapper musi sam je honorować.
-async fn run_with_deadline_and_cancel<F, T, E>(
+async fn run_with_deadline_and_cancel<F, T>(
     fut: F,
     deadline: Option<Instant>,
     cancel: CancellationToken,
 ) -> Result<T>
 where
-    F: std::future::Future<Output = std::result::Result<T, E>>,
-    E: std::fmt::Display,
+    F: std::future::Future<Output = std::result::Result<T, ExecutorError>>,
 {
     tokio::pin!(fut);
     if let Some(dl) = deadline {
@@ -411,13 +415,13 @@ where
             biased;
             _ = cancel.cancelled() => Err(anyhow!("cancelled")),
             _ = sleep_until(dl.into()) => Err(anyhow!("deadline exceeded")),
-            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+            res = &mut fut => res.map_err(ExecutorError::into_anyhow),
         }
     } else {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(anyhow!("cancelled")),
-            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+            res = &mut fut => res.map_err(ExecutorError::into_anyhow),
         }
     }
 }

@@ -321,6 +321,10 @@ async function renderBundleDiff(host, pullId) {
         selectedResourceKeys: selected,
       });
       toast(t('toast_imported', { n: result.importedCount }), 'success');
+      const demoted = Array.isArray(result.demotedFlows) ? result.demotedFlows : [];
+      if (demoted.length > 0) {
+        toast(t('toast_imported_demoted', { names: demoted.join(', ') }), 'warning');
+      }
       diffHost.innerHTML = '';
     } catch (err) {
       toast(`${I18n.t('common.error')}: ${err.message}`, 'error');

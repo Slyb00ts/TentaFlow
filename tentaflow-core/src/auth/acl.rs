@@ -17,6 +17,9 @@ use anyhow::Result;
 pub struct UserContext {
     pub user_id: String,
     pub role: String,
+    /// The organisation the caller acts in, when the entry point knows it. It
+    /// is not an access-control input here; it stamps the run's records.
+    pub org_id: Option<String>,
 }
 
 impl UserContext {
@@ -24,7 +27,13 @@ impl UserContext {
         Self {
             user_id: user_id.into(),
             role: role.into(),
+            org_id: None,
         }
+    }
+
+    pub fn with_org(mut self, org_id: impl Into<String>) -> Self {
+        self.org_id = Some(org_id.into());
+        self
     }
 
     pub fn is_admin(&self) -> bool {

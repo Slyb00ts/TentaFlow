@@ -360,3 +360,23 @@ test('an app with nothing to say is switched off without a dialog, as before', a
   assert.ok(calls.some((c) => c.kind === 'addonToggleRequest'), 'disabled at once');
   AddonsScreen.unmount();
 });
+
+test('the card status and footer follow the switch at once, without waiting for a list refresh', async () => {
+  const toggle = await mountList({
+    addonsListRequest: { addons: [{ ...tentanasInstance, isEnabled: false, backgroundOnDisable: false }] },
+    addonToggleRequest: { ok: true, enabled: true },
+  });
+  const card = document.querySelector('[data-addon-card]');
+  assert.match(card.querySelector('.a-status').textContent, /wyłączony/);
+  assert.ok(card.classList.contains('disabled'));
+  const notLoaded = card.querySelector('.a-foot-note').textContent;
+  toggle.setAttribute('checked', '');
+  toggle.dispatchEvent(new window.CustomEvent('change', { detail: { checked: true }, bubbles: true }));
+  for (let i = 0; i < 4; i += 1) await flush();
+  assert.ok(calls.some((c) => c.kind === 'addonToggleRequest' && c.payload.enabled === true));
+  assert.match(card.querySelector('.a-status').textContent, /włączony/);
+  assert.ok(card.querySelector('.a-status').classList.contains('on'));
+  assert.ok(!card.classList.contains('disabled'));
+  assert.notEqual(card.querySelector('.a-foot-note').textContent, notLoaded, 'the "not loaded" note is gone');
+  AddonsScreen.unmount();
+});

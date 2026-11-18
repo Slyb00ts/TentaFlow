@@ -4461,6 +4461,374 @@ test('B7 at 390x844: the four choices, the explanation and the key window fit th
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
+// ----------------------------------------------------------------------------
+// F4 B6 — rules on topics of Avro, Protobuf and Thrift messages. The records are
+// the golden documents of the registry (tentaflow-core/tests/fixtures/
+// bus_schema_registry), published over REST by a key that may send; what the
+// screen shows is checked against the bytes the server really returns.
+// ----------------------------------------------------------------------------
+
+const FIXTURES = path.join(REPO_ROOT, 'tentaflow-core/tests/fixtures/bus_schema_registry');
+const fixture = (rel) => fs.readFileSync(path.join(FIXTURES, rel));
+
+// `drops` = the bytes of the two fields the rule hides in `valid-full`, so the preview must be that much shorter.
+const BINARY_KINDS = {
+  avro: { label: 'Avro', pattern: 'avro/order.avsc', record: 'avro/valid-full.datum', broken: 'avro/invalid-truncated.datum', hide: ['customer', 'price'], drops: 4 + 8 },
+  protobuf: { label: 'Protobuf', pattern: 'protobuf/order.proto', record: 'protobuf/valid-full.datum', broken: 'protobuf/invalid-truncated-varint.datum', hide: ['customer', 'tags'], drops: 14 + 11 },
+  thrift: { label: 'Thrift', pattern: 'thrift/order.thrift', record: 'thrift/valid-full.datum', broken: 'thrift/invalid-truncated.datum', hide: ['customer', 'total'], drops: 10 + 11 },
+};
+
+// A pattern and a topic of binary messages, made over the wire as an administrator would; `cleanup` takes both away.
+async function binaryTopic(page, instanceId, kind) {
+  const spec = BINARY_KINDS[kind];
+  const subject = `zam-${kind}-b6-${RUN}`;
+  const topic = `zamowienia-${kind}-b6-${RUN}`;
+  await busCall(page, 'busSchemaRegisterRequest', { instanceId, subject, schemaType: kind, schemaText: fixture(spec.pattern).toString('utf8'), compatibility: 'none' });
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name: topic, options: { partitions: 1, contentType: 'application/octet-stream', schemaId: subject, validation: 'dlq' } });
+  const cleanup = async () => {
+    await clearRules(page, instanceId, topic).catch(() => {});
+    await busCall(page, 'busTopicDeleteRequest', { instanceId, name: topic }).catch(() => {});
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId, subject, deprecateOnly: false }).catch(() => {});
+  };
+  return { spec, subject, topic, cleanup };
+}
+
+// A key that may only send, issued from the topic's Dostęp, and what publishes with it; `revoke` takes it back.
+async function writerKey(page, request, instanceId, topic) {
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=access`);
+  const s = accessSection(page);
+  await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji', { timeout: 20000 });
+  await s.locator('tf-button[data-go="key-issue"]').click();
+  const issue = accessWindow(page);
+  const name = `Magazyn B6 ${topic}`;
+  await issue.locator('[data-role="name"] input').fill(name);
+  await issue.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+  await issue.locator('[data-act="save"]').click();
+  const issued = page.locator('tf-window.tb-key-issued');
+  await expect(issued).toHaveCount(1);
+  const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+  const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+  await issued.locator('[data-act="done"]').click();
+  const keyId = await page.evaluate(async (keyName) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    return (await ApiBinary.list('apiKeyListRequest', { arrayKey: 'keys' })).find((k) => k.name === keyName)?.keyId;
+  }, name);
+  expect(keyId).toBeTruthy();
+  const publish = async (bytes) => {
+    const line = JSON.stringify({ payload_b64: Buffer.from(bytes).toString('base64') });
+    const res = await request.post(url, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+    expect(res.status(), await res.text()).toBe(200);
+    return res.json();
+  };
+  const revoke = () => page.evaluate(async (id) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    await ApiBinary.action('apiKeyRevokeRequest', { keyId: id }).catch(() => {});
+  }, keyId);
+  return { publish, revoke };
+}
+
+// The words the dashboard puts to a refusal of the server, as `busRefusalText` makes them from the server's own sentence.
+async function refusalWords(page, message) {
+  return page.evaluate(async (m) => (await import('/js/modules/tentabus/schemas.js')).busRefusalText(m), message);
+}
+
+async function refusedMessage(page, kind, payload) {
+  try {
+    await busCall(page, kind, payload);
+  } catch (err) {
+    return String(err.message);
+  }
+  throw new Error(`${kind} was not refused`);
+}
+
+const hexSize = async (win) => norm(await win.locator('[data-role="payload-binary"]').textContent());
+
+async function binaryRuleScenario(page, request, kind) {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Magazyn B6 ${kind} ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  const { spec, subject, topic, cleanup } = await binaryTopic(page, instanceId, kind);
+  const original = fixture(spec.record);
+  let key = null;
+  try {
+    const caps = (await busCall(page, 'busCapabilitiesRequest', { instanceId })).capabilities;
+    expect(caps.binaryFieldActions).toEqual(['hide']);
+    key = await writerKey(page, request, instanceId, topic);
+    expect(await key.publish(original)).toMatchObject({ published: 1, schema_rejected: 0 });
+    const listed = (await busCall(page, 'busSchemaFieldsGetRequest', { instanceId, subject })).fields;
+    expect(listed).toEqual(expect.arrayContaining(spec.hide));
+
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    // Not blocked: the topic says what a rule does here, and "Dodaj zasadę" is open.
+    await expect(s.locator('[data-role="binary-note"] tf-alert')).toHaveAttribute('title', `Wiadomości binarne (${spec.label}): zasady działają na polach najwyższego poziomu`);
+    await expect(s.locator('[data-role="binary-note"] tf-alert')).toHaveAttribute('message', /Odbiorca z zasadą odczytu dostaje wiadomość zakodowaną pod-schematem/);
+    await expect(s.locator('[data-role="add"]')).not.toHaveAttribute('disabled', '');
+    await expect(s.locator('[data-role="key-card"]')).toBeHidden();
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    // The rows are the fields the server lists, in its order, each with its type; masking and hashing are drawn but locked.
+    await expect(win.locator('tf-segmented[data-field]')).toHaveCount(listed.length);
+    expect(await win.locator('tf-segmented[data-field]').evaluateAll((els) => els.map((e) => e.getAttribute('data-field')))).toEqual(listed);
+    await expect(fieldSeg(win, spec.hide[0]).locator('.tf-seg-opt')).toHaveText(['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+    await expect(fieldSeg(win, spec.hide[0]).locator('.tf-seg-opt').nth(2)).toBeDisabled();
+    await expect(fieldSeg(win, spec.hide[0]).locator('.tf-seg-opt').nth(3)).toBeDisabled();
+    await expect(win.locator('[data-role="source-note"]')).toContainText(`Pola pochodzą ze wzoru ${subject} (${spec.label}), wersja 1 — to pola najwyższego poziomu.`);
+    await expect(win.locator('[data-role="actions-note"]')).toContainText('„Zamaskuj” i „Zahaszuj” są niedostępne dla formatów binarnych.');
+    await expect(win.locator('[data-role="actions-note"]')).toContainText('Odbiorca z tą zasadą dostaje wiadomość zakodowaną pod-schematem');
+    await expect(win.locator('tf-tag-input')).toHaveCount(0);
+    for (const field of spec.hide) await pickSegment(win, `tf-segmented[data-field="${field}"]`, 'Ukryj');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Dla „${groupName}” znikną z wiadomości pola:`);
+    await expect(win.locator('[data-role="impact"]')).toContainText('Odbiorca dostanie wiadomość zakodowaną pod-schematem, w którym tych pól nie ma.');
+    await windowFits(page, 'tf-window.tb-hiding-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, `f4-b6-ukrywanie-dodaj-${kind}.png`) });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zasadę');
+    expect(await serverRuleDetail(page, instanceId, topic, `group:${groupId}:read`)).toEqual({
+      fields: listed.filter((f) => !spec.hide.includes(f)).sort(), masked: [], hashed: [],
+    });
+    const row = ruleRow(page, groupName);
+    for (const field of spec.hide) await expect(row).toContainText(field);
+    await expect(row.locator('.tf-chip', { hasText: 'Ukryj' })).toHaveCount(spec.hide.length);
+    await expect(s.locator('[data-role="legend"]')).toContainText('Ukryj — ');
+    await expect(s.locator('[data-role="legend"]')).not.toContainText('Zamaskuj');
+    await assertNoBannedWords(page);
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, `f4-b6-ukrywanie-${kind}.png`), fullPage: true });
+
+    // The preview as the group: the same record without the two fields, as bytes, shorter by exactly what they took.
+    const audits = auditCount('bus.field_policy.preview');
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = await previewAs(page, groupName);
+    await expect(preview.locator('[data-role="summary"]')).toHaveText(`Zasady ukryły 2 pola: ${spec.hide.join(', ')}.`);
+    expect(await hexSize(preview)).toBe(`Treść binarna, ${original.length - spec.drops} bajtów`);
+    await expect(preview.locator('[data-role="binary-note"]')).toContainText('Odbiorca z zasadą dostaje ją zakodowaną pod-schematem');
+    await expect(preview.locator('[data-role="record-schema"]')).toContainText(/Wzór wiadomości: numer \d+/);
+    expect(auditCount('bus.field_policy.preview')).toBe(audits + 1);
+    await windowFits(page, 'tf-window.tb-hiding-preview', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, `f4-b6-podglad-${kind}.png`) });
+    await preview.locator('[data-act="close"]').click();
+
+    // Zmień reads the rule back; the server's own refusals are told in words.
+    await row.locator('tf-button[data-act="change"]').click();
+    for (const field of spec.hide) await expect(fieldSeg(win, field)).toHaveAttribute('value', 'hide');
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+    const base = { instanceId, topic, subjectType: 'any', subjectId: '*', direction: 'read', requiredFields: [], expectAbsent: true };
+    expect(await refusalWords(page, await refusedMessage(page, 'busFieldPolicySetRequest', { ...base, fields: listed, maskedFields: [listed[0]], hashedFields: [] })))
+      .toBe(`Zamaskować ani zahaszować pola nie można: topik ${topic} ma wiadomości binarne (wzór ${subject}, ${spec.label}). Pole można tylko pokazać albo ukryć.`);
+    expect(await refusalWords(page, await refusedMessage(page, 'busFieldPolicySetRequest', { ...base, fields: ['nie_ma_takiego'], maskedFields: [], hashedFields: [] })))
+      .toBe(`Pole „nie_ma_takiego” nie należy do wzoru ${subject} topiku ${topic}. Zasada może wymieniać tylko pola najwyższego poziomu tego wzoru.`);
+
+    // The pattern cannot be unpinned or changed under the rule: the settings window says so and nothing changes.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=settings`);
+    const settings = section(page, 'settings');
+    await expect(settings.locator('[data-go="change"][data-card="pattern"]')).toBeVisible({ timeout: 20000 });
+    await settings.locator('[data-go="change"][data-card="pattern"]').click();
+    const change = changeWindow(page);
+    await change.locator('#tb-set-schema select').selectOption({ label: 'bez wzoru' });
+    await change.locator('[data-act="save"]').click();
+    await expect(change.locator('[data-role="error"]')).toContainText(`Nie można zmienić ani odpiąć wzoru ${subject} topiku ${topic}, dopóki topik ma zasady ukrywania pól`, { timeout: 15000 });
+    await expect(change.locator('[data-role="error"]')).toContainText('Usuń najpierw zasady w sekcji Ukrywanie danych.');
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, `f4-b6-odmowa-odpiecia-${kind}.png`) });
+    await cancelOut(change);
+    await expect(change).toHaveCount(0);
+    expect((await busCall(page, 'busTopicDetailRequest', { instanceId, name: topic })).topic.schemaId).toBe(subject);
+  } finally {
+    await key?.revoke();
+    await cleanup();
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(errors.filter((e) => !/BadRequest|invalid_argument|invalid_topic_config/.test(e)), errors.join('\n')).toEqual([]);
+}
+
+for (const kind of ['avro', 'protobuf', 'thrift']) {
+  test(`B6 a hiding rule on a ${BINARY_KINDS[kind].label} topic: the fields of the pattern, only "Ukryj", the preview as the group is the record without them, the server's refusals in words`, async ({ page, request }) => {
+    await binaryRuleScenario(page, request, kind);
+  });
+}
+
+test('B6 Avro writing rules: the meaning of "set", the live warning, a required field the next version drops is refused naming field and topic', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const { spec, subject, topic, cleanup } = await binaryTopic(page, instanceId, 'avro');
+  let key = null;
+  try {
+    key = await writerKey(page, request, instanceId, topic);
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await win.locator('[data-role="kind"] .tf-seg-opt', { hasText: 'Wszyscy' }).click();
+    await win.locator('[data-role="direction"] .tf-seg-opt', { hasText: 'Zapis' }).click();
+    await expect(fieldSeg(win, 'id').locator('.tf-seg-opt')).toHaveText(['Dozwolone', 'Wymagane', 'Niedozwolone']);
+    await expect(win.locator('[data-role="actions-note"]')).toContainText('Pole Avro jest „ustawione”, gdy jego wartość różni się od wartości domyślnej wzoru (a gdy domyślnej nie ma — od null).');
+    const warn = win.locator('[data-role="binary-warn"]');
+    await expect(warn).toBeHidden();
+    // `note` has null as its default, `customer` has neither: the second is set in every message.
+    await pickSegment(win, 'tf-segmented[data-field="note"]', 'Niedozwolone');
+    await expect(warn).toBeHidden();
+    await pickSegment(win, 'tf-segmented[data-field="customer"]', 'Niedozwolone');
+    await expect(warn).toBeVisible();
+    await expect(warn).toHaveAttribute('title', 'Ta zasada odrzuci każdą wiadomość');
+    await expect(warn).toHaveAttribute('message', /^Pole customer w Avro nie ma wartości domyślnej ani null, więc jest ustawione w każdej wiadomości\./);
+    await windowFits(page, 'tf-window.tb-hiding-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-zapis-avro-ostrzezenie.png') });
+    await pickSegment(win, 'tf-segmented[data-field="customer"]', 'Dozwolone');
+    await expect(warn).toBeHidden();
+    await pickSegment(win, 'tf-segmented[data-field="id"]', 'Wymagane');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, topic, 'any:*:write')).toMatchObject({ hashed: [], masked: [] });
+    expect((await serverRules(page, instanceId, topic))['any:*:write'].required).toEqual(['id']);
+
+    // The rule is enforced on the wire: a document with every field set passes, the same message is read as the rule says.
+    expect(await key.publish(fixture(spec.record))).toMatchObject({ published: 1, schema_rejected: 0 });
+
+    // The next version of the pattern drops `id`, which the rule requires: refused, naming the field and the topic.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=schemas`);
+    await schemaRow(page, subject).locator('td').first().click();
+    const p = schemaSlot(page);
+    await expect(p.locator('.tb-title')).toHaveText(subject, { timeout: 20000 });
+    await expect(p.locator('[data-role="avro-fields"] tbody tr')).toHaveCount(9, { timeout: 15000 });
+    await p.locator('[data-role="new-version"]').click();
+    const next = schemaWindow(page);
+    const without = JSON.parse(fixture(spec.pattern).toString('utf8'));
+    without.fields = without.fields.filter((f) => f.name !== 'id');
+    await next.locator('[data-role="text"] textarea').fill(JSON.stringify(without, null, 2));
+    await next.locator('[data-act="save"]').click();
+    const refusal = next.locator('[data-role="error"]');
+    await expect(refusal).toBeVisible({ timeout: 15000 });
+    await expect(refusal).toContainText(`Nowa wersja wzoru nie ma pola „id”, a zasada zapisu topiku ${topic} wymaga tego pola — każdy zapis do topiku zostałby odrzucony. Zmień najpierw tę zasadę (Ukrywanie danych topiku ${topic}), a potem dodaj wersję.`);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-wzor-nowa-wersja-odmowa.png') });
+    await cancelOut(next);
+    await expect(next).toHaveCount(0);
+    expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId, subject })).versions).toHaveLength(1);
+  } finally {
+    await key?.revoke();
+    await cleanup();
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('B6 a rule of the reader\'s own: the message browser shows a binary record with the sub-schema it was encoded under, and an unprocessed one the rule withholds says so', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const { spec, topic, cleanup } = await binaryTopic(page, instanceId, 'avro');
+  let key = null;
+  try {
+    key = await writerKey(page, request, instanceId, topic);
+    expect(await key.publish(fixture(spec.record))).toMatchObject({ published: 1, schema_rejected: 0 });
+    expect(await key.publish(fixture(spec.broken))).toMatchObject({ published: 0, schema_rejected: 1 });
+    // Without a rule the administrator reads the record as it is, and the unprocessed one too.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=dlq`);
+    await expect(unpTable(page).locator('tbody tr')).toHaveCount(1, { timeout: 20000 });
+    await unpTable(page).locator('tbody tr').first().locator('tf-button[data-act="view"]').click();
+    const view = unpWindow(page, 'tb-unp-view');
+    expect(await hexSize(view)).toBe(`Treść binarna, ${fixture(spec.broken).length} bajtów`);
+    await expect(view.locator('[data-role="record-schema-withheld"]')).toHaveCount(0);
+    await view.locator('[data-act="close"]').click();
+
+    // A rule for everyone covers the administrator too: the record is re-encoded, the broken one is withheld.
+    await busCall(page, 'busFieldPolicySetRequest', {
+      instanceId, topic, subjectType: 'any', subjectId: '*', direction: 'read',
+      fields: ['id', 'paid', 'status', 'note', 'lines', 'attrs', 'checksum', 'price'], requiredFields: [], maskedFields: [], hashedFields: [], expectAbsent: true,
+    });
+    await page.reload();
+    await expect(unpTable(page).locator('tbody tr')).toHaveCount(1, { timeout: 20000 });
+    await unpTable(page).locator('tbody tr').first().locator('tf-button[data-act="view"]').click();
+    await expect(view.locator('[data-role="record-schema-withheld"]')).toContainText('Treść wstrzymana: wiadomość nie pasuje do wzoru');
+    await expect(view.locator('[data-role="payload"]')).toContainText('(pusta)');
+    await windowFits(page, 'tf-window.tb-unp-view', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-nieprzetworzone-wstrzymana.png') });
+    await view.locator('[data-act="close"]').click();
+
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics`);
+    await topicRow(page, topic).locator('tf-button[data-act="preview"]').click();
+    const browser = page.locator('tf-window.tb-preview-window');
+    await expect(browser.locator('[data-role="payload-binary"]')).toBeVisible({ timeout: 15000 });
+    // The rule took `customer` (4 bytes) out of the record; the schema it was re-encoded under is the pattern without it.
+    expect(await hexSize(browser)).toBe(`Treść binarna, ${fixture(spec.record).length - 4} bajtów`);
+    await expect(browser.locator('[data-role="record-schema"]')).toContainText(/Wzór wiadomości: numer \d+/);
+    await browser.locator('[data-act="show-schema"]').click();
+    await expect(browser.locator('.tb-record-schema-title')).toContainText(/^Pod-schemat wzoru zam-avro-b6-.* \(Avro, wersja 1\) — tylko pola, które zasada pokazuje$/, { timeout: 15000 });
+    const derived = JSON.parse(await browser.locator('[data-role="record-schema-text"]').textContent());
+    expect(derived.fields.map((f) => f.name)).toEqual(['id', 'paid', 'status', 'note', 'lines', 'attrs', 'checksum', 'price']);
+    await windowFits(page, 'tf-window.tb-preview-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-podglad-wiadomosci-pod-schemat.png') });
+    await browser.locator('[data-action="close-preview"]').click();
+  } finally {
+    await key?.revoke();
+    await cleanup();
+  }
+  expect(errors.filter((e) => !/BadRequest|invalid_argument|schema_not_found/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('B6 at 390x844: the rule window of a binary topic, the table and the preview fit the phone', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const { spec, topic, cleanup } = await binaryTopic(page, instanceId, 'thrift');
+  let key = null;
+  try {
+    key = await writerKey(page, request, instanceId, topic);
+    expect(await key.publish(fixture(spec.record))).toMatchObject({ published: 1, schema_rejected: 0 });
+    await busCall(page, 'busFieldPolicySetRequest', {
+      instanceId, topic, subjectType: 'any', subjectId: '*', direction: 'read',
+      fields: ['id', 'status', 'lines', 'tags', 'flags', 'urgent', 'note', 'ref', 'payment', 'grade', 'checks'], requiredFields: [], maskedFields: [], hashedFields: [], expectAbsent: true,
+    });
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('[data-role="rules"] tbody tr').first()).toBeVisible({ timeout: 20000 });
+    await expect(s.locator('[data-role="binary-note"] tf-alert')).toBeVisible();
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-ukrywanie-390.png'), fullPage: true });
+    await s.locator('[data-role="rules"] tbody tr tf-button[data-act="change"]').first().click();
+    const win = hidingWindow(page);
+    await expect(fieldSeg(win, 'customer')).toHaveAttribute('value', 'hide');
+    await expect(fieldSeg(win, 'id')).toHaveAttribute('value', 'show');
+    await windowFits(page, 'tf-window.tb-hiding-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-zmien-390.png') });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = previewWindow(page);
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await preview.locator('[data-role="kind"] .tf-seg-opt', { hasText: 'Wszyscy' }).click();
+    await preview.locator('[data-act="show"]').click();
+    await expect(preview.locator('[data-role="payload-binary"]')).toBeVisible({ timeout: 15000 });
+    await windowFits(page, 'tf-window.tb-hiding-preview', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-b6-podglad-390.png') });
+  } finally {
+    await key?.revoke();
+    await cleanup();
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+
 test('T12: when the node stops, the list keeps its last data under the connection notice', async ({ page }) => {
   const errors = trackErrors(page);
   await page.setViewportSize(DESKTOP);

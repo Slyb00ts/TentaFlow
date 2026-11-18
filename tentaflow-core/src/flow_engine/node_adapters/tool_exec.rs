@@ -747,6 +747,7 @@ impl ToolExecNodeAdapter {
             &ctx.progress_scope,
             run_id,
             parent_run_id,
+            ctx.user_id.as_deref(),
             question,
             &choices,
             timeout,
@@ -840,6 +841,7 @@ impl ToolExecNodeAdapter {
                         &ctx.progress_scope,
                         run_id,
                         parent_run_id,
+                        Some(user_id.as_str()),
                         addon_id,
                         &call.name,
                         "llm",
@@ -886,12 +888,24 @@ impl ToolExecNodeAdapter {
         let service = service.clone();
         let name = call.name.clone();
         let call_for_err = call.clone();
+        // The run this tool call belongs to, so the model calls the tool makes
+        // are recorded as steps of it (and not at all for a bus run), and the
+        // organisation the run acts in.
+        let parent = crate::flow_engine::dispatchers::ParentRun::new(
+            ctx.origin,
+            ctx.progress.clone(),
+            ctx.progress_scope.clone(),
+        );
+        let expected_org = ctx.org_id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            if preauthorized {
-                service.dispatch_addon_tool_preauthorized(&name, arguments, &user_id)
-            } else {
-                service.dispatch_addon_tool(&name, arguments, &user_id)
-            }
+            service.dispatch_addon_tool_in_run(
+                &name,
+                arguments,
+                &user_id,
+                preauthorized,
+                parent,
+                expected_org.as_deref(),
+            )
         })
         .await;
         match outcome {
@@ -992,6 +1006,16 @@ impl ToolExecNodeAdapter {
         default_budget: Duration,
         call: &LlmToolCall,
     ) -> ToolCallResult {
+        if ctx.progress.wants_io() {
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                ProgressEvent::ToolIo {
+                    call_id: call.id.clone(),
+                    arguments: Some(crate::events::step_io::limit_side(call.arguments.clone())),
+                    result: None,
+                },
+            );
+        }
         ctx.progress.emit(
             &ctx.progress_scope,
             ProgressEvent::ToolCallStarted {
@@ -1033,6 +1057,16 @@ impl ToolExecNodeAdapter {
             },
         };
 
+        if ctx.progress.wants_io() {
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                ProgressEvent::ToolIo {
+                    call_id: call.id.clone(),
+                    arguments: None,
+                    result: Some(crate::events::step_io::limit_side(result.content.clone())),
+                },
+            );
+        }
         ctx.progress.emit(
             &ctx.progress_scope,
             ProgressEvent::ToolCallFinished {

@@ -58,7 +58,60 @@ const ORG_ID: &str = "org-default";
 const SOURCE_TOPIC: &str = "bus.p11.source";
 const DEST_TOPIC: &str = "bus.p11.dest";
 const GROUP: &str = "p11-gate";
-const BATCH_SIZE: usize = 500; // PLAN §9 P11's literal parameter.
+/// PLAN §9 P11's literal parameter. `P11_BATCH` overrides it for measurement
+/// runs; `bus_consume` clamps the value to its own `MAX_BATCH_SIZE`.
+const DEFAULT_BATCH_SIZE: usize = 500;
+
+/// Measurement knobs (all optional; the defaults are PLAN §9's P11 shape):
+/// `P11_BATCH` consumer batch size, `P11_PARTITIONS` source-topic partitions,
+/// `P11_DURABILITY` = `fsync` (default, `FsyncBatch`) or `os` (no fsync).
+fn env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(v) => v.parse().unwrap_or_else(|_| knob_error(name, &v)),
+    }
+}
+
+/// A bad knob is an operator error, not a test failure: say which one and
+/// stop, rather than panic deep inside the harness (a zero batch would divide
+/// by zero in the cycle arithmetic).
+fn knob_error(name: &str, value: &str) -> ! {
+    eprintln!(
+        "P11 gate: invalid {name}={value:?}: expected a positive integer \
+         (P11_BATCH, P11_PARTITIONS) or fsync|os (P11_DURABILITY)"
+    );
+    std::process::exit(2);
+}
+
+fn positive_knob(name: &str, default: usize) -> usize {
+    let value = env_usize(name, default);
+    if value == 0 {
+        knob_error(name, "0");
+    }
+    value
+}
+
+fn batch_size() -> usize {
+    positive_knob("P11_BATCH", DEFAULT_BATCH_SIZE)
+}
+
+fn source_partitions() -> u32 {
+    positive_knob("P11_PARTITIONS", 1) as u32
+}
+
+fn durability() -> topics::DurabilityPolicy {
+    match std::env::var("P11_DURABILITY").as_deref() {
+        Ok("os") => topics::DurabilityPolicy::Os,
+        Ok("fsync") | Err(_) => topics::DurabilityPolicy::FsyncBatch,
+        Ok(other) => knob_error("P11_DURABILITY", other),
+    }
+}
+
+fn is_default_shape() -> bool {
+    batch_size() == DEFAULT_BATCH_SIZE
+        && source_partitions() == 1
+        && matches!(durability(), topics::DurabilityPolicy::FsyncBatch)
+}
 /// PLAN §9 P11's own gate values for that batch size ("min >= 20k msg/s,
 /// target >= 50k msg/s"), mirroring `bus_addon_p12_gate.rs`'s P12 pair.
 const P11_MIN_MSGS_PER_SEC: f64 = 20_000.0;
@@ -165,17 +218,17 @@ fn enable_bus_instance(db: &DbPool) {
     .expect("seed bus instance row");
 }
 
-fn create_topic(svc: &BusService, ctx: &BusCallContext, name: &str) {
+fn create_topic(svc: &BusService, ctx: &BusCallContext, name: &str, partitions: u32) {
     svc.create_topic(
         ctx,
         name,
         topics::TopicOptions {
-            partitions: Some(1),
+            partitions: Some(partitions),
             // Explicit Prod-shape durability (PLAN §7.1's "fsync_batch is the
             // Prod default"), matching `bus_full_path_1m.rs`'s own choice —
             // a throughput number measured against a weaker durability tier
             // would not mean what P11's table entry means.
-            durability: Some(topics::DurabilityPolicy::FsyncBatch),
+            durability: Some(durability()),
             ..Default::default()
         },
     )
@@ -202,7 +255,7 @@ fn publish_source_messages(svc: &BusService, ctx: &BusCallContext, total: usize)
             })
             .collect();
         let batch = PublishBatch {
-            partition: Some(0),
+            partition: Some(((seq / CHUNK) as u32) % source_partitions()),
             producer: None,
             records,
         };
@@ -238,6 +291,17 @@ fn publish_source_messages(svc: &BusService, ctx: &BusCallContext, total: usize)
 /// (`payload`) — PLAN's own P11 wording is "przebieg flow trywialny", the
 /// transform step exists to be present in the chain, not to do work.
 fn seed_flow(db: &DbPool) -> (String, String) {
+    // The reactor consumes as a service account: a general API key.
+    let (_, service_account) = repository::create_api_key(
+        db,
+        "p11-gate-verifier",
+        "sk-...p11gate",
+        "P11 gate service account",
+        "general",
+        None,
+        60,
+    )
+    .expect("create service account");
     let flow_json = json!({
         "nodes": [
             {"id": "c", "type": "bus_consume", "config": {
@@ -254,7 +318,8 @@ fn seed_flow(db: &DbPool) -> (String, String) {
                 "instance_id": instance_id().as_str(),
                 "topic": SOURCE_TOPIC,
                 "group": GROUP,
-                "batch_size": BATCH_SIZE,
+                "service_account": service_account,
+                "batch_size": batch_size(),
                 "max_wait_ms": 1000,
                 "on_error": "dlq",
                 "org_id": ORG_ID,
@@ -414,10 +479,12 @@ fn drain_dest_seqs(svc: &BusService, ctx: &BusCallContext, expected_total: usize
 /// smoke variant passes `None`: its number comes from a debug build over two
 /// cycles and cannot be compared against P11's table entry.
 async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
+    // Validate every knob before any work starts.
+    let _ = (batch_size(), source_partitions(), durability());
     assert_eq!(
-        total_messages % BATCH_SIZE,
+        total_messages % batch_size().min(1000),
         0,
-        "this harness assumes an exact multiple of BATCH_SIZE so every cycle is full"
+        "this harness assumes an exact multiple of the batch size so every cycle is full"
     );
 
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -437,8 +504,8 @@ async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
             let svc = bus_service();
-            create_topic(&svc, &ctx, SOURCE_TOPIC);
-            create_topic(&svc, &ctx, DEST_TOPIC);
+            create_topic(&svc, &ctx, SOURCE_TOPIC, source_partitions());
+            create_topic(&svc, &ctx, DEST_TOPIC, 1);
             publish_source_messages(&svc, &ctx, total_messages);
         })
         .await
@@ -492,12 +559,16 @@ async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
         .expect("at least one dispatch finished");
     let elapsed = end.saturating_duration_since(start);
     let msgs_per_sec = total_messages as f64 / elapsed.as_secs_f64().max(1e-9);
-    let cycles = total_messages / BATCH_SIZE;
+    let batch = batch_size().min(1000);
+    let cycles = total_messages / batch;
     println!(
-        "P11 gate ({total_messages} messages, batch {BATCH_SIZE}, {cycles} cycles): \
+        "P11 gate ({total_messages} messages, batch {batch}, {cycles} cycles, \
+         {} partitions, {:?}): \
          {:.3}s cycle time, {msgs_per_sec:.0} msg/s \
          (PLAN §9 P11: min >= {P11_MIN_MSGS_PER_SEC:.0} msg/s, \
          target >= {P11_TARGET_MSGS_PER_SEC:.0} msg/s)",
+        source_partitions(),
+        durability(),
         elapsed.as_secs_f64()
     );
     let (append_p99_us, fsync_p99_us) = tentaflow_core::bus::BusService::bus_engine_p99_us();
@@ -534,7 +605,18 @@ async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
     // Asserted after the correctness checks on purpose: a run that lost or
     // duplicated messages has to report that, not a msg/s number computed
     // from a delivery that never actually happened.
-    if let Some(min) = min_msgs_per_sec {
+    // Only the PLAN §9 shape is held to the minimum; the knob variants are
+    // measurements.
+    if min_msgs_per_sec.is_some() && !is_default_shape() {
+        println!(
+            "P11 gate: NON-DEFAULT SHAPE (batch {}, {} partitions, {:?}): the {P11_MIN_MSGS_PER_SEC:.0} \
+             msg/s floor is NOT enforced for this run",
+            batch_size(),
+            source_partitions(),
+            durability()
+        );
+    }
+    if let Some(min) = min_msgs_per_sec.filter(|_| is_default_shape()) {
         assert!(
             msgs_per_sec >= min,
             "P11 gate FAILED minimum: {msgs_per_sec:.0} msg/s < {min:.0} msg/s minimum"

@@ -227,7 +227,7 @@ mod tests {
     use super::*;
     use crate::db::DbPool;
     use crate::events::store::{append, run_actor_user_id, EventPayload, ResponseBody, RunEvent};
-    use crate::events::test_support::{events_db, main_db};
+    use crate::events::test_support::events_db;
     use crate::flow_engine::dispatcher::FlowActor;
 
     fn request_started() -> EventPayload {
@@ -236,6 +236,7 @@ mod tests {
             flow_id: None,
             service_type: Some("llm".into()),
             modality: Some("text".into()),
+            bus_source: None,
         }
     }
 
@@ -243,7 +244,6 @@ mod tests {
     /// what comes back out, not about the `seq` going in.
     fn seed(
         pool: &DbPool,
-        main: &DbPool,
         run_id: &str,
         at_ms: i64,
         origin: FlowOrigin,
@@ -252,7 +252,6 @@ mod tests {
     ) {
         append(
             pool,
-            main,
             RunEvent::new(run_id, at_ms, origin, actor, payload),
         )
         .expect("append");
@@ -268,12 +267,10 @@ mod tests {
     #[test]
     fn a_page_comes_back_newest_first() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-a", 100), ("r-b", 300), ("r-c", 200)] {
             seed(
                 &pool,
-                &main,
                 run,
                 at,
                 FlowOrigin::Chat,
@@ -300,12 +297,10 @@ mod tests {
     #[test]
     fn a_cursor_survives_appends_that_land_after_it() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-1", 100), ("r-2", 200), ("r-3", 300), ("r-4", 400)] {
             seed(
                 &pool,
-                &main,
                 run,
                 at,
                 FlowOrigin::Chat,
@@ -323,7 +318,6 @@ mod tests {
         // Two newer runs arrive while the reader is looking at page one.
         seed(
             &pool,
-            &main,
             "r-5",
             500,
             FlowOrigin::Chat,
@@ -332,7 +326,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-6",
             600,
             FlowOrigin::Chat,
@@ -362,12 +355,10 @@ mod tests {
     #[test]
     fn rows_sharing_a_millisecond_are_paged_without_loss_or_repeat() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         for run in ["r-1", "r-2", "r-3", "r-4"] {
             seed(
                 &pool,
-                &main,
                 run,
                 777,
                 FlowOrigin::Chat,
@@ -407,11 +398,9 @@ mod tests {
     #[test]
     fn the_origin_filter_selects_only_the_named_origins() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         seed(
             &pool,
-            &main,
             "r-chat",
             100,
             FlowOrigin::Chat,
@@ -420,7 +409,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-code",
             200,
             FlowOrigin::CodeStudio,
@@ -429,7 +417,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-api",
             300,
             FlowOrigin::Api,
@@ -455,11 +442,9 @@ mod tests {
     #[test]
     fn an_empty_origin_set_matches_nothing() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         seed(
             &pool,
-            &main,
             "r-chat",
             100,
             FlowOrigin::Chat,
@@ -486,7 +471,6 @@ mod tests {
     #[test]
     fn the_visibility_filter_excludes_another_principals_rows() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         let marek = FlowActor::user("marek");
         // An API key BOUND to anna: her run, made through a key.
@@ -496,7 +480,6 @@ mod tests {
 
         seed(
             &pool,
-            &main,
             "r-anna",
             100,
             FlowOrigin::Chat,
@@ -505,7 +488,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-marek",
             200,
             FlowOrigin::Chat,
@@ -514,7 +496,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-anna-key",
             300,
             FlowOrigin::Api,
@@ -523,7 +504,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-service",
             400,
             FlowOrigin::Api,
@@ -550,12 +530,10 @@ mod tests {
     #[test]
     fn the_actor_filter_matches_the_actor_id_not_the_bound_user() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         let anna_key = FlowActor::api_key("key-42", Some("anna".into()));
         seed(
             &pool,
-            &main,
             "r-anna",
             100,
             FlowOrigin::Chat,
@@ -564,7 +542,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-key",
             200,
             FlowOrigin::Api,
@@ -587,12 +564,10 @@ mod tests {
     #[test]
     fn the_time_window_bounds_are_inclusive() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-1", 100), ("r-2", 200), ("r-3", 300)] {
             seed(
                 &pool,
-                &main,
                 run,
                 at,
                 FlowOrigin::Chat,
@@ -617,11 +592,9 @@ mod tests {
     #[test]
     fn the_correlation_and_session_filters_narrow_to_one_thread() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         append(
             &pool,
-            &main,
             RunEvent::new("r-1", 100, FlowOrigin::Chat, &anna, request_started())
                 .with_correlation("corr-9")
                 .with_session("sess-7"),
@@ -629,7 +602,6 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &main,
             RunEvent::new("r-2", 200, FlowOrigin::Chat, &anna, request_started())
                 .with_correlation("corr-other")
                 .with_session("sess-other"),
@@ -662,11 +634,9 @@ mod tests {
     #[test]
     fn the_org_filter_never_reaches_rows_with_no_tenant() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         append(
             &pool,
-            &main,
             RunEvent::new("r-org", 100, FlowOrigin::Chat, &anna, request_started())
                 .with_org("org-a"),
         )
@@ -674,7 +644,6 @@ mod tests {
         // A camera trigger: no organisation was minted for it.
         seed(
             &pool,
-            &main,
             "r-none",
             200,
             FlowOrigin::Camera,
@@ -697,11 +666,9 @@ mod tests {
     #[test]
     fn free_text_search_reaches_the_stored_payload() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         seed(
             &pool,
-            &main,
             "r-tool",
             100,
             FlowOrigin::CodeStudio,
@@ -713,7 +680,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-other",
             200,
             FlowOrigin::CodeStudio,
@@ -741,11 +707,9 @@ mod tests {
     #[test]
     fn search_wildcards_are_escaped_to_literals() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         seed(
             &pool,
-            &main,
             "r-literal",
             100,
             FlowOrigin::Api,
@@ -757,7 +721,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-decoy",
             200,
             FlowOrigin::Api,
@@ -781,23 +744,21 @@ mod tests {
     }
 
     /// Invariant 3: the browse query reads what the writer stored. An assistant
-    /// body the writer omitted (no organisation opt-in) must still read as an
+    /// body the writer omitted (a Bus run keeps none) must still read as an
     /// omission here — there is no read path that recovers it.
     #[test]
     fn an_omitted_assistant_body_stays_omitted_on_the_browse_path() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         append(
             &pool,
-            &main,
             RunEvent::new(
                 "r-1",
                 100,
-                FlowOrigin::Chat,
+                FlowOrigin::Bus,
                 &anna,
                 EventPayload::AssistantMessage {
-                    body: ResponseBody::Text("the answer nobody opted in to keep".into()),
+                    body: ResponseBody::Text("the answer a Bus run never keeps".into()),
                     tokens: Some(12),
                 },
             )
@@ -822,10 +783,8 @@ mod tests {
     #[test]
     fn run_ownership_separates_an_absent_run_from_an_unowned_one() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         seed(
             &pool,
-            &main,
             "r-service",
             100,
             FlowOrigin::Api,
@@ -834,7 +793,6 @@ mod tests {
         );
         seed(
             &pool,
-            &main,
             "r-anna",
             200,
             FlowOrigin::Chat,
@@ -855,12 +813,10 @@ mod tests {
     #[test]
     fn the_page_size_is_clamped_to_the_store_ceiling() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let anna = FlowActor::user("anna");
         for i in 0..(MAX_READ_LIMIT + 5) {
             seed(
                 &pool,
-                &main,
                 &format!("r-{i}"),
                 i as i64,
                 FlowOrigin::Chat,

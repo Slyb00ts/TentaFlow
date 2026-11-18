@@ -94,6 +94,8 @@ export const requests = {
   encodeMetaCancelStream: () => encode('', 'MetaCancelStream', {}),
   encodeMetaSchemaVersionCheck: (clientVersion) => encode('', 'MetaSchemaVersionCheck', { client_version: clientVersion }),
   encodeApiKeyListRequest: () => encode('', 'ApiKeyListRequest', {}),
+  encodeServiceAccountListRequest: () => encode('', 'ServiceAccountListRequest', {}),
+  encodeServiceAccountUsageRequest: (keyUid) => encode('', 'ServiceAccountUsageRequest', { key_uid: keyUid }),
   encodeApiKeyScopeListRequest: (keyUid) => encode('', 'ApiKeyScopeListRequest', { key_uid: keyUid }),
   encodeApiKeyScopeSetRequest: (keyUid, resourceType, resourceId, accessLevel, action) => encode('', 'ApiKeyScopeSetRequest', { key_uid: keyUid, resource_type: resourceType, resource_id: resourceId, access_level: accessLevel, action }),
   encodeApiKeyScopeClearRequest: (keyUid, resourceType, resourceId, action) => encode('', 'ApiKeyScopeClearRequest', { key_uid: keyUid, resource_type: resourceType, resource_id: resourceId, action }),
@@ -234,6 +236,8 @@ export const requests = {
   encodeBusFieldPolicyListRequest: (instanceId, topic) => encode('', 'BusBody', { instance_id: instanceId, payload: { FieldPolicyListRequest: { topic } } }),
   encodeBusFieldPolicySetRequest: (instanceId, topic, subjectType, subjectId, direction, fields, requiredFields, maskedFields, hashedFields, expectedUpdatedAtMs, expectAbsent) => encode('', 'BusBody', { instance_id: instanceId, payload: { FieldPolicySetRequest: { topic, subject_type: subjectType, subject_id: subjectId, direction, fields, required_fields: requiredFields, masked_fields: maskedFields, hashed_fields: hashedFields, expected_updated_at_ms: expectedUpdatedAtMs, expect_absent: expectAbsent } } }),
   encodeBusFieldHashKeyInfoRequest: (instanceId) => encode('', 'BusBody', { instance_id: instanceId, payload: { FieldHashKeyInfoRequest: {} } }),
+  encodeBusSchemaForRecordGetRequest: (instanceId, topic, schemaRefId) => encode('', 'BusBody', { instance_id: instanceId, payload: { SchemaForRecordGetRequest: { topic, schema_ref_id: schemaRefId } } }),
+  encodeBusSchemaFieldsGetRequest: (instanceId, subject, version) => encode('', 'BusBody', { instance_id: instanceId, payload: { SchemaFieldsGetRequest: { subject, version } } }),
   encodeBusFieldHashKeyRotateRequest: (instanceId, expectedKeyVersion) => encode('', 'BusBody', { instance_id: instanceId, payload: { FieldHashKeyRotateRequest: { expected_key_version: expectedKeyVersion } } }),
   encodeBusSubjectDirectoryRequest: (instanceId, kind, query) => encode('', 'BusBody', { instance_id: instanceId, payload: { SubjectDirectoryRequest: { kind, query } } }),
   encodeBusFieldPolicyPreviewRequest: (instanceId, topic, partition, offset, subjectType, subjectId) => encode('', 'BusBody', { instance_id: instanceId, payload: { FieldPolicyPreviewRequest: { topic, partition, offset, subject_type: subjectType, subject_id: subjectId } } }),
@@ -1067,12 +1071,13 @@ export const requests = {
     } else throw new Error(`unknown offset reset mode '${mode}'`);
     return bus(instanceId, 'OffsetResetRequest', { group, topic, partition, mode: wireMode });
   },
-  encodeBusMessagesBrowseRequest: (instanceId, topic, fromOffset, limit, fromOffsetsJson, partition) => bus(instanceId, 'MessagesBrowseRequest', {
+  encodeBusMessagesBrowseRequest: (instanceId, topic, fromOffset, limit, fromOffsetsJson, partition, correlationId) => bus(instanceId, 'MessagesBrowseRequest', {
     topic,
     from_offset: fromOffset,
     from_offsets: fromOffsetsJson == null ? [] : parseJson(fromOffsetsJson, 'from_offsets_json'),
     limit,
     partition,
+    correlation_id: correlationId ?? null,
   }),
   encodeBusDlqListRequest: (instanceId, sourceTopic, fromOffset, limit, fromOffsetsJson, partition, newestFirst) => bus(instanceId, 'DlqListRequest', {
     source_topic: sourceTopic,

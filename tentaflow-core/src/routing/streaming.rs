@@ -767,13 +767,33 @@ impl Router {
                     include_usage: true,
                 });
             }
+            // The record is the request as it is handed to the executor, with the
+            // usage tail the audit forced above: that is what the model is asked
+            // on every path that records. (An HTTP backend forces the same flag
+            // again for its own accounting, one step further down.)
+            let direct_run = crate::routing::direct_run::DirectRun::begin(
+                &direct_req,
+                origin,
+                &actor,
+                user.as_ref(),
+                self.db.as_ref(),
+                compliance_context.as_ref(),
+                compliance_event
+                    .as_ref()
+                    .map(|handle| handle.request_id().to_string()),
+            );
             let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
                 user.clone(),
                 origin,
                 actor.clone(),
             );
+            exec_ctx.nested_in_run = crate::routing::made_inside_a_run(compliance_context.as_ref());
             match executor.stream_chat(direct_req, &mut exec_ctx).await {
                 Ok(stream) => {
+                    let stream = match direct_run {
+                        Some(run) => run.record_stream(stream),
+                        None => stream,
+                    };
                     let filtered: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>> =
                         if let Some(event) = compliance_event {
                             Box::pin(ComplianceAuditStream::new(stream, event, include_usage))
@@ -800,6 +820,9 @@ impl Router {
                     });
                 }
                 Err(e) => {
+                    if let Some(run) = direct_run {
+                        run.finish_failed();
+                    }
                     if let Some(event) = compliance_event.as_ref() {
                         let _ = event.finish_failed(&e.to_string());
                     }
@@ -823,6 +846,19 @@ impl Router {
                     &blobs,
                 )
                 .await?;
+            // A true entry point: a nested flow reaches the engine through the
+            // runtime executor, which records nothing.
+            if crate::routing::records_call(origin, compliance_context.as_ref()) {
+                crate::routing::start_recording(
+                    &mut meta_stream,
+                    self.db.as_ref(),
+                    compliance_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.org_id.as_deref()),
+                );
+            }
+            meta_stream.nested_in_run =
+                crate::routing::made_inside_a_run(compliance_context.as_ref());
             // §3.4: seed the turn's correlation key with the session event's
             // request_id so per-call `llm` events in the flow link to this row.
             if let Some(handle) = compliance_event.as_ref() {

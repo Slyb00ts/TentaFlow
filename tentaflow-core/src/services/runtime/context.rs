@@ -97,6 +97,10 @@ pub struct ExecutionContext {
     /// Telemetry bag — populated as dispatch proceeds, returned on the
     /// final response.
     pub route_metadata: RouteMetadata,
+    /// The call comes from a node of a flow run that is executing now (see
+    /// `CallProvenance::nested_in_run`). Copied onto `FlowRequestMeta` when a
+    /// model resolves onto a flow, so the nested run takes no SLA slot.
+    pub nested_in_run: bool,
 }
 
 /// Reasons an `enter_*` call refused to descend further. Always actionable
@@ -133,6 +137,7 @@ impl ExecutionContext {
             flow_stack: Vec::new(),
             alias_stack: Vec::new(),
             route_metadata: RouteMetadata::default(),
+            nested_in_run: false,
         }
     }
 
@@ -190,6 +195,14 @@ impl ExecutionContext {
     /// of a resolution branch so a parallel branch can reuse the slot.
     pub fn leave_alias(&mut self) {
         self.alias_stack.pop();
+    }
+
+    /// Whether the call acts as the service account of a `bus_consume` flow:
+    /// the bus reactor's run, under an API key bound to no user.
+    pub fn is_bus_service_account(&self) -> bool {
+        self.origin == FlowOrigin::Bus
+            && self.actor.kind() == crate::auth::actor::ActorKind::ApiKey
+            && self.actor.user_id().is_none()
     }
 
     /// Push a flow id onto the recursion stack.

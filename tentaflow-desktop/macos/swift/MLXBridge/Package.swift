@@ -31,23 +31,26 @@ let package = Package(
         // weryfikowac tokenizacje/output naszego mlx-swift bez calego stacku.
     ],
     dependencies: [
-        // Core MLX bindings (Array, GPU, etc.). mlx-swift-lm 3.x wymaga 0.31.x
-        // (QuantizedKVCache + kvBits/kvGroupSize/quantizedKVStart).
-        // PrismML's fork preserves the 0.31.3 API and adds the binary g128
-        // kernels required by Bonsai models without affecting standard MLX models.
+        // Core MLX bindings (Array, GPU, etc.). Head of PrismML's v0.31.6_prism
+        // branch: upstream 0.31.6 plus the binary g128 kernels required by Bonsai
+        // models, without affecting standard MLX models. The fork's 0.32.x commits
+        // point the mlx-c submodule at a repository that cannot be cloned publicly,
+        // so SwiftPM cannot check them out.
         .package(
             url: "https://github.com/PrismML-Eng/mlx-swift.git",
-            revision: "151184940bdf97c9117ec851b50d404b33d9474f"
+            revision: "9c3a80a4ce8be105540e378c2a703bfc9de57f25"
         ),
         // MLXLLM, MLXLMCommon, MLXHuggingFace — high-level LLM runtime.
-        // Repo przemianowane z mlx-swift-examples; 3.x ma kwantyzacje KV cache.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
+        // Capped at 3.31.x: 3.32 requires mlx-swift 0.32 (MLXLogger), which the
+        // fork pinned above does not provide.
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMinor(from: "3.31.4")),
         // swift-transformers 1.x — tokenizer HF (`Tokenizers`) dla portu Whispera
         // i dla bridge tokenizera LLM przez makra MLXHuggingFace.
-        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.3"),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.4.0"),
         // swift-huggingface — `HuggingFace` (HubApi). 3.x przenioslo Hub tu;
         // makra #hubDownloader()/#huggingFaceTokenizerLoader() tego wymagaja.
-        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "1.0.0"),
     ],
     targets: [
         .target(

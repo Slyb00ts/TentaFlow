@@ -1,5 +1,5 @@
 # Manifest serwisu NVIDIA Llama-Nemotron Embed — modele embeddingow tekstu
-# serwowane przez vLLM w trybie --task embed. Docker (sidecar QUIC) oraz natywny
+# serwowane przez vLLM w trybie --runner pooling. Docker (sidecar QUIC) oraz natywny
 # python-bundle (CUDA/ROCm). Wariant Apple Silicon ma osobny silnik
 # `nemotron-embed-mlx` (embedded MLX) w nemotron-embed-mlx.toml.
 
@@ -9,8 +9,8 @@ backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calc
 provider = "tentaflow"
 category = "embeddings"
 name = "NVIDIA Llama-Nemotron Embed"
-description_pl = "Modele embeddingów tekstu NVIDIA Llama-Nemotron serwowane przez vLLM (--task embed). Wybierz wariant w kreatorze."
-description_en = "NVIDIA Llama-Nemotron text embedding models served via vLLM (--task embed). Pick a variant in the wizard."
+description_pl = "Modele embeddingów tekstu NVIDIA Llama-Nemotron serwowane przez vLLM (--runner pooling). Wybierz wariant w kreatorze."
+description_en = "NVIDIA Llama-Nemotron text embedding models served via vLLM (--runner pooling). Pick a variant in the wizard."
 homepage = "https://huggingface.co/nvidia"
 license = "nvidia-open-model-license"
 icon = "vllm"

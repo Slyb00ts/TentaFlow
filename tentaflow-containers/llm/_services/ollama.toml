@@ -11,7 +11,7 @@ license = "MIT"
 icon = "ollama"
 default_port = 11434
 api = "ollama-native"
-version = "0.4.0"
+version = "0.40.16"
 
 [deploy.docker]
 context_path = "llm/docker/ollama"

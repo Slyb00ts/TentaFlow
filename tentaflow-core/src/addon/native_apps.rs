@@ -110,6 +110,14 @@ pub struct TeardownEntry {
 /// local node; the fleet-wide fan-out happens through sync reconcile.
 pub struct NativeAppHooks {
     pub package_id: &'static str,
+    /// The package manifest compiled into this binary. Its `platforms` decide
+    /// where this build runs the app (`local_platform_refusal`), and the
+    /// catalog registers exactly this text as the package.
+    pub manifest: &'static str,
+    /// Name of the package in the catalog, or `None` for an app whose hooks
+    /// ship before its package is installable (TentaVM, until the tile has a
+    /// route to open). Such an app still runs wherever an instance exists.
+    pub catalog_name: Option<&'static str>,
     /// Prepare instance state (data dir exists when called; create the app's
     /// own database/schema here). Must be idempotent — reconcile re-runs it.
     pub init: fn(&NativeAppContext) -> Result<()>,
@@ -392,11 +400,15 @@ pub mod teardown_status {
     }
 }
 
-/// Every native app compiled into this binary. Grows with plan-01 P2
-/// (Studios retrofit) and new native apps (TentaNas, Chat).
-static REGISTRY: &[NativeAppHooks] = &[
+/// Every native app compiled into this binary, and the one list of what the
+/// build contains: the catalog registers the entries with a `catalog_name`,
+/// and every node decides from their `manifest` whether it runs them. Grows
+/// with plan-01 P2 (Studios retrofit) and new native apps (TentaNas, Chat).
+pub(crate) static REGISTRY: &[NativeAppHooks] = &[
     NativeAppHooks {
         package_id: "benchmark-studio",
+        manifest: include_str!("../benchmark/app-manifest.toml"),
+        catalog_name: Some("Benchmark Studio"),
         init: benchmark_init,
         on_enable: None,
         on_disable: None,
@@ -411,6 +423,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: "ml-studio",
+        manifest: include_str!("../ml_studio/app-manifest.toml"),
+        catalog_name: Some("ML Studio"),
         init: ml_studio_init,
         on_enable: None,
         on_disable: None,
@@ -425,6 +439,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: "projekty",
+        manifest: include_str!("../project_studio/app-manifest.toml"),
+        catalog_name: Some("Projekty"),
         init: projekty_init,
         on_enable: None,
         on_disable: None,
@@ -439,6 +455,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: "code-studio",
+        manifest: include_str!("../code_studio/app-manifest.toml"),
+        catalog_name: Some("Code Studio"),
         init: code_studio_init,
         on_enable: None,
         on_disable: None,
@@ -453,6 +471,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: "meeting-bot",
+        manifest: include_str!("../meeting/app-manifest.toml"),
+        catalog_name: Some("Meeting Bot"),
         init: meeting_bot_init,
         on_enable: None,
         on_disable: None,
@@ -467,6 +487,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: crate::tentanas::PACKAGE_ID,
+        manifest: include_str!("../tentanas/app-manifest.toml"),
+        catalog_name: Some("TentaNas"),
         init: crate::tentanas::native_init,
         on_enable: Some(crate::tentanas::native_on_enable),
         on_disable: None,
@@ -480,14 +502,16 @@ static REGISTRY: &[NativeAppHooks] = &[
         install_step: None,
     },
     // TentaVM's hooks are registered even though the package is not in the
-    // catalog yet (the tile needs the UI shell): a hook registered late is a
-    // hook nobody notices is missing. Teardown has no work of its own — the
+    // catalog yet (`catalog_name: None`, the tile needs the UI shell): a hook
+    // registered late is a hook nobody notices is missing. Teardown has no work of its own — the
     // machines belong to the hypervisor and keep running, and uninstall only
     // reaches the `addon_*` tables plus the data dir, so the environment's
     // `vm_*` registry rows STAY in the shared database; the teardown plan says
     // so and deleting them lands with the sync step.
     NativeAppHooks {
         package_id: crate::tentavm::PACKAGE_ID,
+        manifest: crate::tentavm::APP_MANIFEST,
+        catalog_name: None,
         init: crate::tentavm::native_init,
         // main made these two fields mandatory while this branch was away;
         // TentaVM has no enable/disable side effects, so both stay None.
@@ -504,6 +528,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: crate::tentaquant::PACKAGE_ID,
+        manifest: include_str!("../tentaquant/app-manifest.toml"),
+        catalog_name: Some("TentaQuant"),
         init: crate::tentaquant::native_init,
         // A laboratory has no background runtime: every run is driven by a
         // request, so enabling/disabling only has to flip the gate the
@@ -521,6 +547,8 @@ static REGISTRY: &[NativeAppHooks] = &[
     },
     NativeAppHooks {
         package_id: crate::bus::native::PACKAGE_ID,
+        manifest: include_str!("../bus/app-manifest.toml"),
+        catalog_name: Some("TentaBus"),
         init: crate::bus::native::native_init,
         on_enable: Some(crate::bus::native::native_on_enable),
         on_disable: Some(crate::bus::native::native_on_disable),
@@ -667,15 +695,16 @@ pub mod test_support {
     pub static DISABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
     pub static STEP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// A manifest for `PACKAGE_ID`, parseable by `lifecycle::parse_manifest_toml`.
-    /// `hooks_for` only recognizes `PACKAGE_ID` itself, so every fixture
-    /// instance shares this package id; a test that needs several independent
-    /// catalog rows (e.g. one singleton, one not) distinguishes them by
-    /// `version` when calling `upsert_addon_package`, not by package id.
-    pub fn fixture_manifest_toml(singleton: bool) -> String {
-        format!(
-            r#"[addon]
-id = "{PACKAGE_ID}"
+    /// The fixture manifest for package `$id`, as a literal so a fixture's
+    /// hooks can carry it as their compiled manifest. Both fixtures share the
+    /// one text; only the id differs.
+    macro_rules! fixture_manifest {
+        ($id:literal) => {
+            concat!(
+                r#"[addon]
+id = ""#,
+                $id,
+                r#""
 name = "Test Fixture App"
 version = "1.0.0"
 description = "Generic platform fixture for native-app tests."
@@ -693,8 +722,10 @@ description = "Test fixture"
 sort_order = 100
 
 [native]
-singleton = {singleton}
-routes = ["{PACKAGE_ID}"]
+singleton = false
+routes = [""#,
+                $id,
+                r#""]
 db_file = "fixture.db"
 
 [[permission]]
@@ -732,7 +763,20 @@ title_key = "test.step.fail"
 id = "boom"
 title_key = "test.step.boom"
 "#
-        )
+            )
+        };
+    }
+
+    /// The compiled manifest of `HOOKS` (non-singleton).
+    const MANIFEST: &str = fixture_manifest!("test-hook-app");
+
+    /// A manifest for `PACKAGE_ID`, parseable by `lifecycle::parse_manifest_toml`.
+    /// `hooks_for` only recognizes `PACKAGE_ID` itself, so every fixture
+    /// instance shares this package id; a test that needs several independent
+    /// catalog rows (e.g. one singleton, one not) distinguishes them by
+    /// `version` when calling `upsert_addon_package`, not by package id.
+    pub fn fixture_manifest_toml(singleton: bool) -> String {
+        MANIFEST.replace("singleton = false", &format!("singleton = {singleton}"))
     }
 
     fn init(_ctx: &NativeAppContext) -> Result<()> {
@@ -767,6 +811,8 @@ title_key = "test.step.boom"
 
     pub(super) static HOOKS: NativeAppHooks = NativeAppHooks {
         package_id: PACKAGE_ID,
+        manifest: MANIFEST,
+        catalog_name: None,
         init,
         on_enable: Some(on_enable),
         on_disable: Some(on_disable),
@@ -783,6 +829,7 @@ title_key = "test.step.boom"
     /// A second fixture whose teardown can REFUSE, the way TentaNas's does
     /// with Elastic Arrays: its plan blocks while `REFUSE` is set.
     pub const REFUSING_PACKAGE_ID: &str = "test-refusing-app";
+    const REFUSING_MANIFEST: &str = fixture_manifest!("test-refusing-app");
     pub static REFUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn refusing_plan(ctx: &NativeAppContext) -> Result<Vec<super::TeardownEntry>> {
@@ -806,6 +853,8 @@ title_key = "test.step.boom"
 
     pub(super) static REFUSING_HOOKS: NativeAppHooks = NativeAppHooks {
         package_id: REFUSING_PACKAGE_ID,
+        manifest: REFUSING_MANIFEST,
+        catalog_name: None,
         init,
         on_enable: None,
         on_disable: None,
@@ -835,9 +884,59 @@ pub fn package_of_instance(addon_id: &str) -> Option<&str> {
 
 /// True when the manifest's `platforms` list covers the OS this node runs on
 /// (empty list = all platforms). Values follow `std::env::consts::OS`
-/// ("linux" / "macos" / "windows"), same convention the manifests use.
-pub fn platform_supported(platforms: &[String]) -> bool {
+/// ("linux" / "macos" / "windows" / "ios"), same convention the manifests use.
+fn platform_supported(platforms: &[String]) -> bool {
     platforms.is_empty() || platforms.iter().any(|p| p == std::env::consts::OS)
+}
+
+/// Why this node does not run native package `package_id`, or `None` when it
+/// does — the detail recorded with an `unsupported` node status.
+///
+/// The platforms come from the package manifest COMPILED INTO this binary,
+/// never from the instance row. An instance replicates with the manifest of
+/// whichever build installed it, which says what THAT build supported: a
+/// phone whose build runs the app would otherwise stay `unsupported` behind
+/// a desktop's older row, and a node cannot run code its own binary lacks
+/// just because a newer peer's row lists its platform.
+pub fn local_platform_refusal(package_id: &str) -> Option<String> {
+    let Some(platforms) = compiled_platforms(package_id) else {
+        return Some(format!("package '{package_id}' is not part of this build"));
+    };
+    if platform_supported(&platforms) {
+        return None;
+    }
+    Some(format!(
+        "platform '{}' not in {:?}",
+        std::env::consts::OS,
+        platforms
+    ))
+}
+
+fn compiled_platforms(package_id: &str) -> Option<Vec<String>> {
+    let hooks = hooks_for(package_id)?;
+    crate::addon::lifecycle::parse_manifest_toml(hooks.manifest)
+        .ok()
+        .map(|parsed| parsed.platforms)
+}
+
+/// True when this node runs its native apps as a CONSOLE for the rest of the
+/// mesh only: it serves the screens and the registry, and the apps' requests
+/// addressed to other nodes are forwarded, but it never hosts the work itself.
+///
+/// iOS is that node. Core runs in-process inside an app sandbox: no fork/exec,
+/// no root, no block devices, no hypervisor, no container daemon. An app whose
+/// work needs any of those still installs there (the phone is how an admin
+/// reaches the NAS or the VM hosts), but must not start loops that sample,
+/// schedule or restore nothing, nor publish the phone as one of its hosts.
+pub fn console_only_node() -> bool {
+    console_only_platform(std::env::consts::OS)
+}
+
+/// The same rule for a platform name a peer reported about itself
+/// (`mesh::node_info_collector::detect_platform`, the `std::env::consts::OS`
+/// vocabulary).
+pub fn console_only_platform(os: &str) -> bool {
+    os == "ios"
 }
 
 #[cfg(test)]
@@ -961,6 +1060,57 @@ mod tests {
         assert!(platform_supported(&[]));
         assert!(platform_supported(&[std::env::consts::OS.to_string()]));
         assert!(!platform_supported(&["solaris".to_string()]));
+    }
+
+    #[test]
+    fn platform_support_is_read_from_the_compiled_package_manifest() {
+        let compiled = hooks_for("benchmark-studio").expect("compiled").manifest;
+        let platforms = crate::addon::lifecycle::parse_manifest_toml(compiled)
+            .unwrap()
+            .platforms;
+        assert_eq!(
+            local_platform_refusal("benchmark-studio").is_none(),
+            platform_supported(&platforms)
+        );
+        assert_eq!(
+            local_platform_refusal("not-a-native-package").as_deref(),
+            Some("package 'not-a-native-package' is not part of this build")
+        );
+    }
+
+    /// An app compiled in but not yet listed in the catalog is still part of
+    /// the build: a node runs an instance of it that sync brought in.
+    #[test]
+    fn an_app_outside_the_catalog_is_still_run_by_this_build() {
+        let tentavm = hooks_for(crate::tentavm::PACKAGE_ID).expect("compiled");
+        assert!(tentavm.catalog_name.is_none());
+        assert_eq!(local_platform_refusal(crate::tentavm::PACKAGE_ID), None);
+    }
+
+    /// Each compiled manifest is a native package named after the hooks that
+    /// carry it — the platform check and the catalog read the same text, so a
+    /// manifest under the wrong entry would decide another app's platforms.
+    #[test]
+    fn every_compiled_manifest_is_the_native_package_of_its_hooks() {
+        let fixtures = [&test_support::HOOKS, &test_support::REFUSING_HOOKS];
+        for hooks in REGISTRY.iter().chain(fixtures) {
+            let manifest = crate::addon::lifecycle::parse_manifest_toml(hooks.manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", hooks.package_id));
+            assert!(manifest.is_native(), "{}", hooks.package_id);
+            assert_eq!(manifest.addon_id, hooks.package_id);
+        }
+    }
+
+    #[test]
+    fn only_ios_runs_native_apps_as_a_console() {
+        assert!(console_only_platform("ios"));
+        for os in ["linux", "macos", "windows"] {
+            assert!(
+                !console_only_platform(os),
+                "{os} hosts its native apps' work"
+            );
+        }
+        assert_eq!(console_only_node(), std::env::consts::OS == "ios");
     }
 }
 

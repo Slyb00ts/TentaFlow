@@ -179,6 +179,8 @@ pub fn ingest_invoke_v1(
         call_provenance.actor_for(&addon_id),
     )
     .with_addon_identity(Some(addon_id), Some(org_id));
+    // An addon block lent to a running flow acts inside that run.
+    ctx.nested_in_run = call_provenance.parent.is_some();
 
     // Most async→sync: host function jest synchroniczna, executor async.
     let result = tokio::task::block_in_place(|| {

@@ -1,11 +1,11 @@
 // swift-tools-version:6.0
 // =============================================================================
 // Plik: Package.swift (KokoroBridge)
-// Opis: Niezalezna dylib `libKokoroBridge.dylib` wystawiajaca cdecl `Kokoro_*`
-//       dla Rusta. Trzymana osobno od MLXBridge bo `KokoroSwift` (mlalma)
-//       wymaga mlx-swift 0.30+ i Swift 5.9+, a MLXBridge LLM/Whisper jest
-//       zapinowany na starszego mlx-swift (0.21..0.26) z powodu mlx-swift-examples
-//       2.21.x. Dwie dyliby = niezalezne wersje mlx-swift, brak konfliktow.
+// Opis: Standalone `libKokoroBridge.dylib` exposing cdecl `Kokoro_*` to Rust.
+//       A separate dylib from MLXBridge, but built against the SAME
+//       mlx-swift (PrismML fork, same revision): both dylibs load one
+//       `mlx-swift_Cmlx.bundle` from beside the binary, so a second mlx-swift
+//       would ship a metallib without the fork's kernels.
 // =============================================================================
 
 import PackageDescription
@@ -26,10 +26,17 @@ let package = Package(
         // 1.0.9 importowal MLXFast bez deklarowania zaleznosci, co lamie
         // budowanie spod naszego packagea). MisakiSwift i MLXUtilsLibrary
         // zostaly jako zewnetrzne dep — sa OK.
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.29.1"),
-        // Vendored MisakiSwift (fork 1.0.6) — upstream pinuje mlx-swift exact
-        // 0.30.2, co koliduje z 0.31.3 z mlx-swift-lm (LLM) w apce iOS. Lokalna
-        // kopia luzuje pin do range. Patrz vendor/MisakiSwift/Package.swift.
+        // Same fork and revision as MLXBridge and the iOS app's root pin: one
+        // mlx-swift per binary. A revision requirement from this root (and from
+        // the local MisakiSwift) overrides MLXUtilsLibrary's version requirement
+        // on ml-explore/mlx-swift, so that one resolves to the fork as well.
+        .package(
+            url: "https://github.com/PrismML-Eng/mlx-swift.git",
+            revision: "9c3a80a4ce8be105540e378c2a703bfc9de57f25"
+        ),
+        // Vendored MisakiSwift (fork 1.0.6): upstream pins ml-explore/mlx-swift
+        // exact 0.30.2; the local copy pins the same fork revision as above. See
+        // vendor/MisakiSwift/Package.swift.
         .package(path: "../vendor/MisakiSwift"),
         .package(url: "https://github.com/mlalma/MLXUtilsLibrary.git", from: "0.0.6"),
     ],

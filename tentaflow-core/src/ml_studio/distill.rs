@@ -114,6 +114,8 @@ async fn run_generation(
     req: &MlStudioDistillGenerateRequest,
 ) -> anyhow::Result<()> {
     let max_tokens = req.max_tokens.unwrap_or(768);
+    // The runs are recorded as this person's: they asked for the dataset.
+    let attribution = crate::auth::acl::UserContext::new(user_id, "user");
 
     // 1. Zbierz pytania.
     set_progress(dataset_id, |p| {
@@ -121,7 +123,7 @@ async fn run_generation(
     });
     let questions = match req.question_source.as_str() {
         "import" => gather_questions_import(user_id, req)?,
-        "generate" => gather_questions_generated(router, req, max_tokens).await?,
+        "generate" => gather_questions_generated(router, req, max_tokens, &attribution).await?,
         other => anyhow::bail!("nieznane question_source '{other}' (import|generate)"),
     };
     if questions.is_empty() {
@@ -155,6 +157,7 @@ async fn run_generation(
             &req.teacher_model,
             &ans_prompt,
             max_tokens,
+            Some(&attribution),
         )
         .await
         .map_err(|e| anyhow::anyhow!("teacher '{}': {e:#}", req.teacher_model))?
@@ -184,7 +187,7 @@ async fn run_generation(
             // niespójne (rejected bez answer_instruction, prompt bez instrukcji).
             let rej_prompt = format!("{}\n\n{}", rej_instr, ans_prompt);
             let r =
-                crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens)
+                crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens, Some(&attribution))
                     .await
                     .map_err(|e| anyhow::anyhow!("rejected model '{}': {e:#}", rej_model))?;
             Some(r.trim().to_string())
@@ -315,6 +318,7 @@ async fn gather_questions_generated(
     router: &Arc<Router>,
     req: &MlStudioDistillGenerateRequest,
     max_tokens: u32,
+    attribution: &crate::auth::acl::UserContext,
 ) -> anyhow::Result<Vec<String>> {
     let base_prompt = req
         .generate_prompt
@@ -332,7 +336,7 @@ async fn gather_questions_generated(
         "{base_prompt}\n\nWypisz DOKLADNIE {n} pytan/instrukcji, jedno na linie, bez \
          numeracji, bez komentarzy, bez pustych linii. Kazda linia to jedno pytanie."
     );
-    let raw = crate::ml_studio::infer::run_local_chat(router, model, &prompt, max_tokens)
+    let raw = crate::ml_studio::infer::run_local_chat(router, model, &prompt, max_tokens, Some(attribution))
         .await
         .map_err(|e| anyhow::anyhow!("question_model '{model}': {e:#}"))?;
 

@@ -3793,6 +3793,7 @@ function renderChatMessages() {
     ? state.chatMessages.map(chatMessageHtml).join('')
     : `<tf-empty-state icon="message" title="${escapeAttr(t('chat_empty_thread'))}"></tf-empty-state>`;
   host.scrollTop = host.scrollHeight;
+  byId('ps-chat-composer')?.toggleAttribute('disabled', !canSendChat());
   const input = byId('ps-chat-input');
   if (input) input.toggleAttribute('disabled', !canSendChat());
   const send = byId('ps-chat-send');

@@ -261,6 +261,30 @@ impl AgentService {
             .dispatch_tool_call(tool_name, arguments, user_id)
     }
 
+    /// Executes one addon tool call made from a flow run (the tool_exec block):
+    /// the call carries the run it belongs to and the organisation it acts in.
+    /// `preauthorized` skips the addon permission check the way
+    /// [`Self::dispatch_addon_tool_preauthorized`] does, with the same
+    /// precondition: the grant was already adjudicated.
+    pub fn dispatch_addon_tool_in_run(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        user_id: &str,
+        preauthorized: bool,
+        parent: crate::flow_engine::dispatchers::ParentRun,
+        expected_org: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.tool_dispatcher.dispatch_tool_call_in_run(
+            tool_name,
+            arguments,
+            user_id,
+            preauthorized,
+            parent,
+            expected_org,
+        )
+    }
+
     /// Executes one addon tool call skipping the addon permission check — the
     /// harness already adjudicated a grant (§3.13 B, AllowOnce / AllowForRun
     /// retries). NEVER call without first gating permission via

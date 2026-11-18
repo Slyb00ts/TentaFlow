@@ -41,29 +41,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::actor::ActorKind;
 use crate::code_studio::redact;
-use crate::db::{repository, DbPool};
+use crate::db::DbPool;
 use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
 
 /// Largest page ANY reader of `run_events` will return, whatever the caller
 /// asks for — `read_run` and the browse query share it, so no entry point can
 /// turn a page request into a full dump of the log.
 pub const MAX_READ_LIMIT: usize = 1000;
-
-/// Prefix of the `settings` key that opts ONE organisation in to storing
-/// assistant response bodies on the timeline. The full key is
-/// `events.store_assistant_body:<org_id>` — the same key-per-tenant shape the
-/// main database already uses for `sync.permission_epoch:<org_id>`, in the same
-/// table, read through the same [`repository::get_setting`].
-///
-/// Deliberately absent from `repository::SHARED_SETTING_KEYS`: whether a node
-/// keeps response bodies is a property of THAT node's storage, and a fleet-wide
-/// replication of the flag would turn one admin's opt-in into everybody's.
-pub const ASSISTANT_BODY_SETTING_PREFIX: &str = "events.store_assistant_body:";
-
-/// The `settings` key that governs `org_id`.
-pub fn assistant_body_setting_key(org_id: &str) -> String {
-    format!("{ASSISTANT_BODY_SETTING_PREFIX}{org_id}")
-}
 
 /// Kind of a timeline entry (§2.3). DERIVED from the payload rather than
 /// supplied next to it, so the column and the body can never contradict each
@@ -81,6 +65,7 @@ pub enum EventKind {
     TurnEnd,
     Error,
     StepIo,
+    RequestFinished,
 }
 
 impl EventKind {
@@ -99,6 +84,7 @@ impl EventKind {
             EventKind::TurnEnd => "turn_end",
             EventKind::Error => "error",
             EventKind::StepIo => "step_io",
+            EventKind::RequestFinished => "request_finished",
         }
     }
 
@@ -115,10 +101,24 @@ impl EventKind {
             "turn_end" => EventKind::TurnEnd,
             "error" => EventKind::Error,
             "step_io" => EventKind::StepIo,
+            "request_finished" => EventKind::RequestFinished,
             _ => return None,
         };
         Some(kind)
     }
+}
+
+/// Coordinates of the bus record that triggered a run: where to find it in the
+/// TentaBus preview. Coordinates only, never the record's content (TB-02.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusRecordRef {
+    /// The TentaBus instance the record lives on: a coordinate like the rest,
+    /// needed to open the right preview when several instances are enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    pub topic: String,
+    pub partition: u32,
+    pub offset: u64,
 }
 
 /// Body of one timeline entry, stored as `payload_json`.
@@ -140,6 +140,10 @@ pub enum EventPayload {
         flow_id: Option<String>,
         service_type: Option<String>,
         modality: Option<String>,
+        /// The record that triggered a bus-origin run. Absent for every other
+        /// origin and for a reactor batch (no single triggering record).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bus_source: Option<BusRecordRef>,
     },
     /// First NON-EMPTY delta of a streaming node (§2.6). Carries no body: its
     /// whole content is the instant it happened, and `at_ms` already holds it.
@@ -199,6 +203,21 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_tokens: Option<u64>,
     },
+    /// Closes a run: the one row that says the request is over, for every
+    /// origin and whether or not an LLM was called. It carries no content, only
+    /// the outcome and timing; ids (run, correlation, org) are the row's own
+    /// columns. Written once per top-level run, so a bus-origin run needs no
+    /// special case: there is nothing in it to withhold.
+    ///
+    /// `status` is `completed`, `failed` or `cancelled` and is minted by the
+    /// engine, never taken from a node's own text. `duration_ms` is the
+    /// difference between this row's `at_ms` and the run's `request_started`
+    /// row (invariant 5); absent when that opening row was never written.
+    RequestFinished {
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
 }
 
 /// The body half of an `assistant_message` row: either the answer, or a named
@@ -231,68 +250,36 @@ impl ResponseBody {
 
 /// Why an assistant response body is absent from a row.
 ///
-/// Both values mean "this node was not asked to keep it", and they are kept
-/// apart because the fix differs: one organisation has to flip its setting, the
-/// other has no organisation to flip it for.
+/// `NotEnabled` and `NoOrganisation` belong to the retired per-organisation
+/// opt-in and are no longer written; rows written under it still read back.
+/// `NotCarried` is what a Bus run (which keeps no content) and an event that
+/// never held the text read as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyOmission {
-    /// The run's organisation has not set `events.store_assistant_body:<org>`.
-    /// This is the default state of every organisation on every node.
+    /// Retired: the run's organisation had not opted in. Kept so older rows read.
     NotEnabled,
-    /// The run named no organisation (a camera, scheduler or maintenance
-    /// trigger), so there is no tenant whose opt-in could apply. Falling back
-    /// to another tenant's setting would be borrowing a consent nobody gave.
+    /// Retired: the run named no organisation, so no opt-in could apply. Kept so
+    /// older rows read.
     NoOrganisation,
     /// The event this row was translated from did not carry the answer. The
     /// engine's progress stream announces that a streaming node FINISHED, never
     /// what it produced, so a row built from it can say when the message
-    /// completed and nothing about what it said (§2.6). Kept apart from
-    /// `NotEnabled` because no setting changes it: only a writer that holds the
-    /// text can, and storing an empty string instead would read as a model that
-    /// answered with nothing (invariant 6).
+    /// completed and nothing about what it said (§2.6). Storing an empty string
+    /// instead would read as a model that answered with nothing (invariant 6).
     NotCarried,
 }
 
-/// Resolves whether `org_id` opted in to storing response bodies (§2.8: the
-/// event log is read more widely than the compliance tables built to hold
-/// prompt and response bodies under policy, and the credential-shaped redactor
-/// does nothing about ordinary personal data inside an answer).
-///
-/// Default OFF, and fail-closed: a node that has never been configured, an
-/// organisation that has not set the key, an unparsable value or a main
-/// database that cannot be read all resolve to `Omitted`. The only way to a
-/// stored body is an explicit `true`/`1` under that organisation's own key.
-fn resolve_response_body(
-    core_db: &DbPool,
-    org_id: Option<&str>,
-    body: ResponseBody,
-) -> ResponseBody {
-    // A body that never reached the writer cannot be stored by any policy, and
-    // the reason it is missing is the more specific fact of the two.
-    if matches!(body, ResponseBody::Omitted(_)) {
-        return body;
-    }
-    let Some(org_id) = org_id else {
-        return ResponseBody::Omitted(BodyOmission::NoOrganisation);
-    };
-    let enabled = match repository::get_setting(core_db, &assistant_body_setting_key(org_id)) {
-        Ok(value) => value.is_some_and(|v| v == "true" || v == "1"),
-        Err(error) => {
-            // A settings read that failed is not an opt-in. Logged rather than
-            // propagated: the event itself must still reach the timeline.
-            tracing::warn!(
-                org_id,
-                %error,
-                "event log could not read the response-body setting; body omitted"
-            );
-            false
-        }
-    };
-    if enabled {
-        body
-    } else {
-        ResponseBody::Omitted(BodyOmission::NotEnabled)
+/// Decides whether an assistant response body goes to disk: every AI run keeps
+/// its answer, whatever the organisation, because the event log is where an AI
+/// run is audited in full. The one exception is a Bus run, whose handlers see
+/// records the publisher's field policies may hide (medical data): it keeps the
+/// timeline and no content, so a body that reaches the writer for one is
+/// dropped here as well, whatever the caller meant.
+fn resolve_response_body(origin: FlowOrigin, body: ResponseBody) -> ResponseBody {
+    match (origin, body) {
+        (FlowOrigin::Bus, ResponseBody::Text(_)) => ResponseBody::Omitted(BodyOmission::NotCarried),
+        (_, body) => body,
     }
 }
 
@@ -310,6 +297,7 @@ impl EventPayload {
             EventPayload::TurnEnd { .. } => EventKind::TurnEnd,
             EventPayload::Error { .. } => EventKind::Error,
             EventPayload::StepIo { .. } => EventKind::StepIo,
+            EventPayload::RequestFinished { .. } => EventKind::RequestFinished,
         }
     }
 
@@ -322,6 +310,8 @@ impl EventPayload {
     /// The rest of the log is DIAGNOSTIC: mirroring every token and tool result
     /// would multiply the hash-chained audit log by the traffic of the node
     /// while adding nothing an investigator cannot reach through the link.
+    /// `write_event` skips the mirror for runs of origin `bus` (one run per
+    /// record would flood the audit trail).
     pub fn security_relevant(&self) -> bool {
         matches!(self, EventPayload::RequestStarted { .. })
     }
@@ -378,6 +368,7 @@ impl EventPayload {
             | EventPayload::FirstToken {}
             | EventPayload::StepStart { .. }
             | EventPayload::StepIo { .. }
+            | EventPayload::RequestFinished { .. }
             | EventPayload::TurnStart { .. }) => payload,
         }
     }
@@ -564,15 +555,10 @@ pub struct AuditEnvelope {
 /// IMMEDIATE two writers on two connections queue on the busy handler and come
 /// out with distinct `seq`; neither is refused. The `PRIMARY KEY` stays the
 /// backstop for any path that allocates `seq` outside its own transaction.
-///
-/// `core_db` is the MAIN database, and the only thing it is read for is the
-/// per-organisation response-body setting. It is a parameter rather than a
-/// global so the decision belongs to the writer that has one in hand, and so a
-/// test can hand it an organisation of its own.
-pub fn append(pool: &DbPool, core_db: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
+pub fn append(pool: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
     let mut conn = pool.write().map_err(|e| anyhow!("events db write: {e}"))?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let appended = write_event(&tx, core_db, event)?;
+    let appended = write_event(&tx, event)?;
     tx.commit()?;
     Ok(appended)
 }
@@ -580,19 +566,15 @@ pub fn append(pool: &DbPool, core_db: &DbPool, event: RunEvent) -> Result<Append
 /// Appends one event inside a transaction the caller already owns, for the
 /// callers whose state change and the event recording it must commit together
 /// or not at all.
-pub fn append_in_tx(
-    tx: &Transaction<'_>,
-    core_db: &DbPool,
-    event: RunEvent,
-) -> Result<AppendedEvent> {
-    write_event(tx, core_db, event)
+pub fn append_in_tx(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEvent> {
+    write_event(tx, event)
 }
 
 /// The one place a row is built, and therefore the one place the response-body
-/// policy can be applied. It runs BEFORE the insert on purpose: a body filtered
-/// at read time would already be on disk, which is the whole thing the opt-in
-/// exists to prevent.
-fn write_event(tx: &Transaction<'_>, core_db: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
+/// rule can be applied. It runs BEFORE the insert on purpose: a body filtered
+/// at read time would already be on disk, which is what the Bus rule exists to
+/// prevent.
+fn write_event(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEvent> {
     if let Some(key) = event.idempotency_key.as_deref() {
         if let Some(seq) = tx
             .query_row(
@@ -611,17 +593,20 @@ fn write_event(tx: &Transaction<'_>, core_db: &DbPool, event: RunEvent) -> Resul
 
     // The event is recorded either way — the timeline still has to say that an
     // assistant message happened and when, which is what the decode-time metric
-    // is a difference of. Only the BODY is subject to the opt-in.
+    // is a difference of. Only the BODY is subject to the Bus rule.
     let payload = match event.payload {
         EventPayload::AssistantMessage { body, tokens } => EventPayload::AssistantMessage {
-            body: resolve_response_body(core_db, event.org_id.as_deref(), body),
+            body: resolve_response_body(event.origin, body),
             tokens,
         },
         other => other,
     };
     let payload = payload.redacted();
     let kind = payload.kind();
-    let security_relevant = payload.security_relevant();
+    // A bus-origin run is not mirrored: a reactor starts one per record, the
+    // publisher's own bus audit already exists, and the timeline row stays.
+    let security_relevant = payload.security_relevant()
+        && event.origin != crate::flow_engine::dispatcher::FlowOrigin::Bus;
     let seq: i64 = tx.query_row(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
         rusqlite::params![event.run_id],
@@ -781,10 +766,36 @@ pub fn read_run(
     after_seq: i64,
     limit: usize,
 ) -> Result<Vec<StoredEvent>> {
+    read_run_rows(pool, run_id, after_seq, limit, STORED_COLUMNS)
+}
+
+/// [`read_run`] for a timeline view: a `step_io` row comes back with its packed
+/// body (`z`) blanked IN THE QUERY, so a page of a long run never loads up to
+/// 1000 compressed prompts only to throw them away. The sizes stay.
+pub fn read_run_headers(
+    pool: &DbPool,
+    run_id: &str,
+    after_seq: i64,
+    limit: usize,
+) -> Result<Vec<StoredEvent>> {
+    const HEADER_COLUMNS: &str = "run_id, seq, at_ms, kind, origin, actor_kind, actor_id, \
+         actor_user_id, org_id, correlation_id, session_id, node_id, call_id, \
+         CASE WHEN kind = 'step_io' THEN json_set(payload_json, '$.z', '') \
+              ELSE payload_json END";
+    read_run_rows(pool, run_id, after_seq, limit, HEADER_COLUMNS)
+}
+
+fn read_run_rows(
+    pool: &DbPool,
+    run_id: &str,
+    after_seq: i64,
+    limit: usize,
+    columns: &str,
+) -> Result<Vec<StoredEvent>> {
     let limit = limit.clamp(1, MAX_READ_LIMIT);
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {STORED_COLUMNS} FROM run_events \
+        "SELECT {columns} FROM run_events \
          WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
     ))?;
     let rows = stmt.query_map(
@@ -819,6 +830,19 @@ pub fn run_actor_user_id(pool: &DbPool, run_id: &str) -> Result<Option<Option<St
     .map_err(|e| anyhow!("events db read: {e}"))
 }
 
+/// The organisation a run was recorded under: `None` when the run has no rows,
+/// `Some(None)` when its first row names no organisation.
+pub fn run_org_id(pool: &DbPool, run_id: &str) -> Result<Option<Option<String>>> {
+    let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
+    conn.query_row(
+        "SELECT org_id FROM run_events WHERE run_id = ?1 ORDER BY seq LIMIT 1",
+        rusqlite::params![run_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(|e| anyhow!("events db read: {e}"))
+}
+
 pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| anyhow!("json encode: {e}"))
 }
@@ -842,7 +866,7 @@ pub(crate) fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::test_support::{events_db, main_db, open_events_db};
+    use crate::events::test_support::{events_db, open_events_db};
 
     fn actor() -> FlowActor {
         FlowActor::user("u-1")
@@ -850,14 +874,6 @@ mod tests {
 
     fn event(run_id: &str, payload: EventPayload) -> RunEvent {
         RunEvent::new(run_id, now_ms(), FlowOrigin::Chat, &actor(), payload)
-    }
-
-    /// Turns the response-body opt-in ON for `org_id`, exactly the way an
-    /// administrator does: one row in the main database's `settings` table
-    /// under that organisation's own key.
-    fn enable_response_bodies(main: &DbPool, org_id: &str) {
-        repository::set_setting(main, &assistant_body_setting_key(org_id), "true")
-            .expect("write the response-body setting");
     }
 
     fn assistant(text: &str) -> EventPayload {
@@ -879,12 +895,42 @@ mod tests {
         .expect("the assistant message reached the log")
     }
 
+    /// A `request_started` row written before `bus_source` existed still reads
+    /// back, and the field survives a round trip when present.
+    #[test]
+    fn request_started_json_reads_with_and_without_the_bus_source() {
+        let legacy = r#"{"kind":"request_started","model":null,"flow_id":"f","service_type":null,"modality":null}"#;
+        match serde_json::from_str::<EventPayload>(legacy).expect("legacy row") {
+            EventPayload::RequestStarted { bus_source, .. } => assert!(bus_source.is_none()),
+            other => panic!("unexpected payload {other:?}"),
+        }
+        let with = EventPayload::RequestStarted {
+            model: None,
+            flow_id: None,
+            service_type: None,
+            modality: None,
+            bus_source: Some(BusRecordRef {
+                instance_id: None,
+                topic: "t".into(),
+                partition: 1,
+                offset: 9,
+            }),
+        };
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(!json.contains("instance_id"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<EventPayload>(&json).expect("read back"),
+            with
+        );
+    }
+
     fn request_started() -> EventPayload {
         EventPayload::RequestStarted {
             model: Some("qwen3".into()),
             flow_id: None,
             service_type: Some("llm".into()),
             modality: Some("text".into()),
+            bus_source: None,
         }
     }
 
@@ -912,11 +958,9 @@ mod tests {
     #[test]
     fn the_stored_tag_agrees_with_the_kind_column() {
         let (_dir, pool) = events_db();
-        let main = main_db();
-        append(&pool, &main, event("r-1", request_started())).unwrap();
+        append(&pool, event("r-1", request_started())).unwrap();
         append(
             &pool,
-            &main,
             event(
                 "r-1",
                 EventPayload::ToolCall {
@@ -985,7 +1029,6 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let pool = open_events_db(&path);
-                    let main = main_db();
                     barrier.wait();
                     let mut accepted = Vec::new();
                     let mut refusals = Vec::new();
@@ -993,7 +1036,7 @@ mod tests {
                         let payload = EventPayload::StepStart {
                             step: format!("w{writer}-{i}"),
                         };
-                        match append(&pool, &main, event("r-hot", payload)) {
+                        match append(&pool, event("r-hot", payload)) {
                             Ok(appended) => {
                                 assert!(!appended.duplicate);
                                 accepted.push(appended.seq);
@@ -1073,7 +1116,6 @@ mod tests {
     fn a_seq_allocated_outside_the_transaction_is_refused_by_the_constraint() {
         let dir = tempfile::tempdir().unwrap();
         drop(open_events_db(dir.path()));
-        let main = main_db();
         let stale_writer = open_events_db(dir.path());
 
         // The allocation a hoisted `MAX(seq) + 1` would produce: read before
@@ -1089,7 +1131,7 @@ mod tests {
         };
 
         let winner = open_events_db(dir.path());
-        let taken = append(&winner, &main, event("r-1", request_started())).unwrap();
+        let taken = append(&winner, event("r-1", request_started())).unwrap();
         assert_eq!(
             taken.seq, stale_seq,
             "the two writers did not race for one seq"
@@ -1129,10 +1171,8 @@ mod tests {
     #[test]
     fn a_repeat_under_the_same_key_is_a_duplicate_and_writes_nothing() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let first = append(
             &pool,
-            &main,
             event("r-1", request_started()).with_idempotency_key("start:r-1"),
         )
         .unwrap();
@@ -1140,7 +1180,6 @@ mod tests {
 
         let second = append(
             &pool,
-            &main,
             event("r-1", request_started()).with_idempotency_key("start:r-1"),
         )
         .unwrap();
@@ -1164,7 +1203,6 @@ mod tests {
         // another run is a different event.
         let other = append(
             &pool,
-            &main,
             event("r-2", request_started()).with_idempotency_key("start:r-1"),
         )
         .unwrap();
@@ -1176,9 +1214,8 @@ mod tests {
     #[test]
     fn events_without_a_key_are_never_deduplicated() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         for _ in 0..3 {
-            append(&pool, &main, event("r-1", EventPayload::FirstToken {})).unwrap();
+            append(&pool, event("r-1", EventPayload::FirstToken {})).unwrap();
         }
         let conn = pool.read().unwrap();
         let rows: i64 = conn
@@ -1193,18 +1230,12 @@ mod tests {
     #[test]
     fn secrets_are_redacted_before_the_write_not_after_the_read() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let bearer = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         let password = "S3cretPassw0rdValue";
         let query_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 
-        // The response body is stored only for an organisation that asked for
-        // it, so this run belongs to one — a body that was never written is no
-        // test of the scrubber.
-        enable_response_bodies(&main, "org-red");
         append(
             &pool,
-            &main,
             event(
                 "r-1",
                 assistant(&format!("calling with Authorization: Bearer {bearer}")),
@@ -1214,7 +1245,6 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &main,
             event(
                 "r-1",
                 EventPayload::ToolCall {
@@ -1235,7 +1265,6 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &main,
             event(
                 "r-1",
                 EventPayload::Error {
@@ -1277,11 +1306,9 @@ mod tests {
     #[test]
     fn a_run_reads_back_in_order_with_its_provenance() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let actor = FlowActor::api_key("key-7", Some("u-9".into()));
         append(
             &pool,
-            &main,
             RunEvent::new("r-1", 1_000, FlowOrigin::Api, &actor, request_started())
                 .with_correlation("corr-1")
                 .with_session("s-1"),
@@ -1289,7 +1316,6 @@ mod tests {
         .unwrap();
         append(
             &pool,
-            &main,
             RunEvent::new(
                 "r-1",
                 1_050,
@@ -1323,11 +1349,9 @@ mod tests {
     #[test]
     fn a_service_key_is_stored_as_a_null_binding_not_as_an_empty_one() {
         let (_dir, pool) = events_db();
-        let main = main_db();
         let service = FlowActor::api_key("key-svc", None);
         append(
             &pool,
-            &main,
             RunEvent::new("r-1", 1, FlowOrigin::Api, &service, request_started()),
         )
         .unwrap();
@@ -1349,13 +1373,11 @@ mod tests {
     #[test]
     fn the_tenant_is_stored_on_the_row_and_stays_null_when_there_is_none() {
         let (_dir, pool) = events_db();
-        let main = main_db();
 
         let mut meta = FlowRequestMeta::new("r-tenant", FlowOrigin::Api, FlowActor::user("u-1"));
         meta.org_id = Some("org-acme".to_string());
         append(
             &pool,
-            &main,
             RunEvent::from_meta(&meta, now_ms(), request_started()),
         )
         .unwrap();
@@ -1365,7 +1387,6 @@ mod tests {
         assert!(system_meta.org_id.is_none());
         append(
             &pool,
-            &main,
             RunEvent::from_meta(&system_meta, now_ms(), request_started()),
         )
         .unwrap();
@@ -1423,8 +1444,7 @@ mod tests {
     #[test]
     fn an_append_does_not_wait_for_a_held_read() {
         let (_dir, pool) = events_db();
-        let main = main_db();
-        append(&pool, &main, event("r-1", request_started())).unwrap();
+        append(&pool, event("r-1", request_started())).unwrap();
 
         let reader = pool.read().unwrap();
         let before: i64 = reader
@@ -1435,10 +1455,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let writer_pool = pool.clone();
         std::thread::spawn(move || {
-            let main = main_db();
             let outcome = append(
                 &writer_pool,
-                &main,
                 event("r-1", EventPayload::FirstToken {}),
             );
             let _ = tx.send(
@@ -1468,98 +1486,20 @@ mod tests {
         );
     }
 
-    /// §2.8 — a node nobody configured stores NO response body. The event still
-    /// has to be there: the timeline says an assistant message happened and
-    /// when, which is what a decode time is a difference of. Only the body is
-    /// left out, and the omission is written as an omission.
+    /// Every AI run keeps its answer, for any organisation or none; the event
+    /// is intact either way. A Bus run, whose handlers see records the
+    /// publisher's policies may hide, keeps the timeline and no body, and says
+    /// so.
     #[test]
-    fn a_response_body_is_not_stored_unless_the_organisation_asked_for_it() {
+    fn a_response_body_is_stored_for_every_run_but_a_bus_one() {
         let (_dir, pool) = events_db();
-        let main = main_db();
-        let secret = "the applicant lives at Wiejska 4 and was refused";
 
         append(
             &pool,
-            &main,
-            RunEvent::new("r-1", 1_700, FlowOrigin::Chat, &actor(), assistant(secret))
-                .with_org("org-quiet"),
-        )
-        .unwrap();
-
-        // Asserted against the FILE, not the struct: the whole point is that
-        // the text never reached the disk.
-        let raw: String = {
-            let conn = pool.read().unwrap();
-            conn.query_row(
-                "SELECT payload_json FROM run_events WHERE kind = 'assistant_message'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert!(
-            !raw.contains("Wiejska"),
-            "the response body was stored for an organisation that never opted in: {raw}"
-        );
-        assert_eq!(
-            stored_body(&pool, "r-1"),
-            r#"{"omitted":"not_enabled"}"#,
-            "an omitted body must READ as omitted, not as an empty answer"
-        );
-
-        // The event itself is intact — kind, instant and token count.
-        let stored = read_run(&pool, "r-1", 0, 10).unwrap();
-        assert_eq!(stored.len(), 1, "the event was dropped along with its body");
-        assert_eq!(stored[0].kind, EventKind::AssistantMessage);
-        assert_eq!(stored[0].at_ms, 1_700);
-        match &stored[0].payload {
-            EventPayload::AssistantMessage { body, tokens } => {
-                assert_eq!(*body, ResponseBody::Omitted(BodyOmission::NotEnabled));
-                assert_eq!(body.text(), None, "a reader must not get a body back");
-                assert_eq!(*tokens, Some(12), "the token count is not the body");
-            }
-            other => panic!("expected an assistant_message payload, got {other:?}"),
-        }
-    }
-
-    /// The opt-in works: with the organisation's own `settings` key set, the
-    /// body is stored — the ability was kept, it just stopped being the default.
-    #[test]
-    fn an_organisation_that_opted_in_keeps_the_response_body() {
-        let (_dir, pool) = events_db();
-        let main = main_db();
-        enable_response_bodies(&main, "org-loud");
-
-        append(
-            &pool,
-            &main,
-            event("r-1", assistant("the full answer")).with_org("org-loud"),
+            event("r-1", assistant("the full answer")).with_org("org-quiet"),
         )
         .unwrap();
         assert_eq!(stored_body(&pool, "r-1"), r#"{"text":"the full answer"}"#);
-
-        // Another organisation on the same node is unaffected — the key is per
-        // tenant, not per file.
-        append(
-            &pool,
-            &main,
-            event("r-2", assistant("the full answer")).with_org("org-quiet"),
-        )
-        .unwrap();
-        assert_eq!(stored_body(&pool, "r-2"), r#"{"omitted":"not_enabled"}"#);
-    }
-
-    /// A camera, scheduler or maintenance run names no organisation, so there
-    /// is no tenant whose opt-in could apply and the body is left out. The
-    /// reason is its OWN value: borrowing the default tenant's setting would be
-    /// acting on a consent nobody gave (invariant 6).
-    #[test]
-    fn a_run_with_no_organisation_omits_the_body_and_names_that_reason() {
-        let (_dir, pool) = events_db();
-        let main = main_db();
-        // Even with every organisation on the node opted in.
-        enable_response_bodies(&main, "org-loud");
-        enable_response_bodies(&main, crate::services::org::DEFAULT_ORG_ID);
 
         let system = RunEvent::new(
             "r-system",
@@ -1569,12 +1509,43 @@ mod tests {
             assistant("what the camera pipeline answered"),
         );
         assert!(system.org_id.is_none());
-        append(&pool, &main, system).unwrap();
-
+        append(&pool, system).unwrap();
         assert_eq!(
             stored_body(&pool, "r-system"),
-            r#"{"omitted":"no_organisation"}"#
+            r#"{"text":"what the camera pipeline answered"}"#
         );
+
+        let bus = RunEvent::new(
+            "r-bus",
+            2,
+            FlowOrigin::Bus,
+            &FlowActor::system(),
+            assistant("the applicant lives at Wiejska 4 and was refused"),
+        )
+        .with_org("org-quiet");
+        append(&pool, bus).unwrap();
+        let raw: String = {
+            let conn = pool.read().unwrap();
+            conn.query_row(
+                "SELECT payload_json FROM run_events WHERE run_id = 'r-bus' \
+                 AND kind = 'assistant_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!raw.contains("Wiejska"), "a Bus body reached the disk: {raw}");
+        assert_eq!(stored_body(&pool, "r-bus"), r#"{"omitted":"not_carried"}"#);
+
+        let stored = read_run(&pool, "r-bus", 0, 10).unwrap();
+        assert_eq!(stored.len(), 1, "the event was dropped along with its body");
+        match &stored[0].payload {
+            EventPayload::AssistantMessage { body, tokens } => {
+                assert_eq!(body.text(), None);
+                assert_eq!(*tokens, Some(12), "the token count is not the body");
+            }
+            other => panic!("expected an assistant_message payload, got {other:?}"),
+        }
     }
 
     /// Invariant 4, over EVERY table the event log actually holds — read out of

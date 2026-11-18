@@ -73,6 +73,8 @@ export function simulationServiceSteps(model) {
       nodeId: node.id,
       hasResultExpression: typeof task.resultExpression === 'string' && task.resultExpression.length > 0,
       machineVerdict: ['Test', 'Critic'].includes(processVerificationMode(task.verification)),
+      // A simulation runs a step once whatever its policy says; the form tells the operator.
+      ...(task.retry ? { hasRetryPolicy: true } : {}),
       supported: !implementation?.Agent && !implementation?.Unbound && node.activityIo == null,
     };
   }).filter((step) => step.supported);
@@ -181,7 +183,8 @@ export function simulationWaitSteps(waits, model) {
     wait,
     step: { nodeId: wait.nodeId,
       hasResultExpression: wait.hasResultExpression ?? known.get(wait.nodeId)?.hasResultExpression ?? false,
-      machineVerdict: wait.verdictApplicable === true },
+      machineVerdict: wait.verdictApplicable === true,
+      ...(known.get(wait.nodeId)?.hasRetryPolicy ? { hasRetryPolicy: true } : {}) },
   }));
 }
 

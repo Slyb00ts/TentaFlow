@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: vLLM w trybie embeddings (vllm --task embed), direct-http (bez sidecara).
+# Opis: vLLM w trybie embeddings (vllm --runner pooling), direct-http (bez sidecara).
 #       Core gada HTTP wprost do host-mapped portu. vLLM serwuje
 #       /v1/embeddings. Bind 0.0.0.0 WEWNATRZ kontenera: ruch z docker-publish
 #       trafia na interfejs kontenera, nie na jego loopback.
@@ -43,10 +43,10 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   esac
 fi
 
-echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--task embed, ${#ENGINE_ARGS[@]} args)"
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--runner pooling, ${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \
   --host 0.0.0.0 \
   --port "$VLLM_PORT" \
-  --task embed \
+  --runner pooling \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
   "${ENGINE_ARGS[@]}"
