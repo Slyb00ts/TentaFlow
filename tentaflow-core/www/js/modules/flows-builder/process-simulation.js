@@ -611,7 +611,7 @@ export function simulationWindow(view, model = null, options = {}) {
     if (ending || asking || !simulationOpen(current)) return;
     event.preventDefault();
     asking = true;
-    const end = await TfWindow.confirm({ title: text('simulation_end_title'), message: escapeHtml(text('simulation_end_hint')),
+    const end = await TfWindow.confirm({ title: text('simulation_end_title'), message: text('simulation_end_hint'),
       confirmLabel: text('simulation_end'), cancelLabel: text('simulation_keep'), danger: true });
     asking = false;
     if (end && win.isConnected) {

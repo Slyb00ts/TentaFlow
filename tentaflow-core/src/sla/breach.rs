@@ -14,6 +14,8 @@
 //! are its parameters, so the UI words it in the user's language. The unit of
 //! the two numbers follows the kind, see [`BreachKind::unit`].
 
+use std::collections::HashMap;
+
 use rusqlite::{params, OptionalExtension};
 
 use super::repository::Result;
@@ -442,6 +444,60 @@ pub fn list_samples(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Which organizations' samples a read covers.
+#[derive(Debug, Clone, Copy)]
+pub enum OrgScope<'a> {
+    Only(&'a str),
+    AllBut(&'a str),
+}
+
+/// Refusals stored in the samples stamped `since_ms` or later, as
+/// `(rejected_calls, rejected_concurrency)` per service: one query for every
+/// service in scope. A service named in `watermarks` is counted only up to its
+/// watermark (inclusive): what the evaluator flushed after the watermark was
+/// read is still in the gate's unflushed part and must not be counted twice.
+pub fn rejections_since(
+    pool: &DbPool,
+    scope: OrgScope<'_>,
+    since_ms: i64,
+    watermarks: &HashMap<String, i64>,
+) -> Result<HashMap<String, (u64, u64)>> {
+    let (op, org) = match scope {
+        OrgScope::Only(org) => ("=", org),
+        OrgScope::AllBut(org) => ("<>", org),
+    };
+    let mut values: Vec<rusqlite::types::Value> = vec![org.to_string().into(), since_ms.into()];
+    let mut cap = String::new();
+    for (target, watermark) in watermarks {
+        values.push(target.clone().into());
+        values.push((*watermark).into());
+        let n = values.len();
+        cap.push_str(&format!(" WHEN ?{} THEN ?{}", n - 1, n));
+    }
+    let upper = if cap.is_empty() {
+        String::new()
+    } else {
+        format!(" AND sampled_at_ms <= CASE target_id{cap} ELSE 9223372036854775807 END")
+    };
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT target_id, SUM(rejected_calls), SUM(rejected_concurrency) \
+           FROM sla_samples \
+          WHERE org_id {op} ?1 AND sampled_at_ms >= ?2{upper} \
+          GROUP BY target_id"
+    ))?;
+    let from_sql = |v: i64| u64::try_from(v).unwrap_or(0);
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (from_sql(r.get(1)?), from_sql(r.get(2)?)),
+            ))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
     Ok(rows)
 }
 

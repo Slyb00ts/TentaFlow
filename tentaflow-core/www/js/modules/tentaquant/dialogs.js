@@ -498,7 +498,7 @@ export function confirmDeleteProject(name) {
   return TfWindow.confirm({
     title: T('projects.delete_title'),
     // TfWindow.confirm inserts the message as HTML, so the name is escaped here.
-    message: T('projects.delete_message', { name: escapeHtml(name) }),
+    message: T('projects.delete_message', { name: name }),
     confirmLabel: T('projects.menu_delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,

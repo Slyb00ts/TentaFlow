@@ -90,6 +90,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   naruszenie, zajęcie, wykorzystanie okna). Flow objęty polityką innej
   organizacji ma w skrócie znacznik `governed_elsewhere` z bieżącym stanem,
   bez nazwy i identyfikatora polityki.
+- Strona Przepływy ma zakładkę „Polityki SLA” z listą, edytorem i oknem
+  przypisania. Bez `sla.manage` zakładka jest tylko do odczytu. Usunięcie
+  polityki przypisanej do flow jest wyłączone z podpowiedzią o liczbie
+  przypisań.
+- Lista flow ma kolumnę „Polityka SLA” ze stanem i zajęciem. Przypisanie jest
+  wyłączone dla flow systemowych, dla flow objętych polityką innej
+  organizacji i bez prawa edycji flow.
+- Historia wykonań flow ma kartę „Stan SLA” z wierszem na każdy węzeł:
+  zajęcie, okno limitu z godziną resetu, p95, błędy, odmowy (dziś i w oknie)
+  oraz stronicowaną historię naruszeń. Flow zasilany z TentaBus pokazuje
+  „Wstrzymania limitem” i węzeł prowadzący odbiór. Wolny węzeł nie blokuje
+  karty.
+- TentaBus, odbiorca: kafel „Równoległość”, alert „Wstrzymano limitem do”
+  oraz karta polityki SLA w ustawieniach. Stan jest czytany z węzła, który
+  prowadzi odbiór.
+- Edycja serwisu ma sekcję „Limity”: maks. liczba wątków (0 lub puste pole
+  = bez limitu) i czas czekania na wolny slot. Limity działają od razu po
+  zapisie; zapis samych limitów nigdy nie restartuje serwisu. Węzeł ze
+  starszą wersją odmawia zmiany limitów z prośbą o aktualizację, a okno
+  pokazuje wtedy sekcję wyłączoną. Audyt `service.update` zapisuje faktyczny
+  restart i nowe limity.
+- Stan SLA podaje odmowy od lokalnej północy węzła. Tuż po północy licznik
+  może przez około 30 s obejmować odmowy z ostatnich sekund poprzedniego
+  dnia albo je zgubić, bo próbka minutowa zapisana po północy ma znacznik
+  poprzedniej minuty.
+- Okna potwierdzenia wyświetlają treść komunikatu jako tekst. Nazwy
+  przepływów, polityk i plików nie mogą już wstrzyknąć HTML.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

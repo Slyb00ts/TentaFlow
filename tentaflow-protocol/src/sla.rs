@@ -188,6 +188,11 @@ pub struct SlaFlowStatusWire {
     pub rejected_calls_total: u64,
     #[serde(default)]
     pub rejected_concurrency_total: u64,
+    /// Refusals since local midnight on the answering node.
+    #[serde(default)]
+    pub rejected_calls_today: u64,
+    #[serde(default)]
+    pub rejected_concurrency_today: u64,
     #[serde(default)]
     pub open_breaches: Vec<SlaBreachWire>,
 }
@@ -478,6 +483,8 @@ mod tests {
                     }),
                     rejected_calls_total: 7,
                     rejected_concurrency_total: 8,
+                    rejected_calls_today: 3,
+                    rejected_concurrency_today: 2,
                     open_breaches: vec![breach()],
                 }],
             },
@@ -538,5 +545,12 @@ mod tests {
         assert_eq!(status.flow_id, "f-1");
         assert_eq!(status.in_flight, 0);
         assert!(status.window.is_none() && status.open_breaches.is_empty());
+        assert_eq!(
+            (
+                status.rejected_calls_today,
+                status.rejected_concurrency_today
+            ),
+            (0, 0)
+        );
     }
 }

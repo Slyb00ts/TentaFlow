@@ -255,6 +255,8 @@ fn status_to_wire(status: &ServiceStatus) -> SlaFlowStatusWire {
         }),
         rejected_calls_total: status.rejected_calls_total,
         rejected_concurrency_total: status.rejected_concurrency_total,
+        rejected_calls_today: status.rejected_calls_today,
+        rejected_concurrency_today: status.rejected_concurrency_today,
         open_breaches: status.open_breaches.iter().map(breach_to_wire).collect(),
     }
 }
@@ -294,10 +296,11 @@ pub(crate) fn flow_sla_overview(
     };
     let views = WindowViews::global();
     let db = &ctx.state.db;
+    let day_start_ms = status::local_day_start_ms();
     let read = || -> Result<_, SlaError> {
         Ok((
-            status::list_service_statuses(db, registry, &views, &org.org_id)?,
-            status::list_foreign_service_statuses(db, registry, &views, &org.org_id)?,
+            status::list_service_statuses(db, registry, &views, &org.org_id, day_start_ms)?,
+            status::list_foreign_service_statuses(db, registry, &views, &org.org_id, day_start_ms)?,
         ))
     };
     let (own, foreign) = match read() {
@@ -643,14 +646,20 @@ fn flow_status(
 ) -> Result<SlaPayload, ProtocolError> {
     let org = read_org(ctx, requested)?;
     let views = WindowViews::global();
+    let day_start_ms = status::local_day_start_ms();
     let statuses = match flow_id {
         Some(flow_id) => {
-            vec![
-                status::service_status(&ctx.state.db, registry, &views, &org, flow_id)
-                    .map_err(read_failure)?,
-            ]
+            vec![status::service_status(
+                &ctx.state.db,
+                registry,
+                &views,
+                &org,
+                flow_id,
+                day_start_ms,
+            )
+            .map_err(read_failure)?]
         }
-        None => status::list_service_statuses(&ctx.state.db, registry, &views, &org)
+        None => status::list_service_statuses(&ctx.state.db, registry, &views, &org, day_start_ms)
             .map_err(read_failure)?,
     };
     Ok(SlaPayload::StatusResponse {

@@ -1054,6 +1054,7 @@ mod tests {
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
                 gpu_selection: String::new(),
+                limits_editable: false,
                 cluster_deployment_id: String::new(),
                 cluster_coordinator_node_id: String::new(),
             }],
@@ -1135,6 +1136,7 @@ mod tests {
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
                 gpu_selection: String::new(),
+                limits_editable: false,
                 cluster_deployment_id: String::new(),
                 cluster_coordinator_node_id: String::new(),
             }],
@@ -1202,6 +1204,7 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
+            limits_editable: false,
             cluster_deployment_id: String::new(),
             cluster_coordinator_node_id: String::new(),
         };
@@ -1367,6 +1370,7 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
+            limits_editable: false,
             cluster_deployment_id: String::new(),
             cluster_coordinator_node_id: String::new(),
         }

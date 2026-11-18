@@ -146,6 +146,12 @@ pub struct ServiceInfo {
     /// kompatybilnosci ze starszymi peerami mesh.
     #[serde(default)]
     pub gpu_selection: String,
+    /// The owning node applies `max_concurrent` / `timeout_ms` of a
+    /// `ServiceUpdateRemote` itself and reports whether it restarted the
+    /// service. A peer from before that change never sets it, so a sender can
+    /// refuse to forward limits to it instead of triggering a silent restart.
+    #[serde(default)]
+    pub limits_editable: bool,
     /// Gdy niepuste: ten wiersz jest czlonkiem distributed-deploymentu klastra
     /// (head/worker kontenera TP) i niesie `deployment_cluster_id` calego
     /// klastra. GUI uzywa go do skierowania akcji stop/usun na CALY klaster
@@ -299,8 +305,18 @@ pub struct ServiceUpdateRequest {
     /// Pinned/paused flagi — pomija jeśli `None`.
     pub pinned: Option<bool>,
     pub paused: Option<bool>,
+    /// Most requests in flight to the service (1..=1024). `None` leaves it
+    /// unchanged, `Some(0)` clears it back to "unlimited". Applied at once,
+    /// without a restart.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    /// How long a request waits for a free slot, in ms (100..=86_400_000).
+    /// `None` leaves it unchanged. Applied at once, without a restart.
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
     /// `true` = stop running service + respawn z nowym configiem.
     /// `false` = tylko zapisz do DB (zmiany aktywne po następnym restarcie).
+    /// A request that carries only limits never restarts the service.
     pub restart_after_save: bool,
 }
 
@@ -8847,6 +8863,30 @@ pub enum MessageBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_update_without_limits_decodes_and_limits_round_trip() {
+        let old_shape = serde_json::json!({
+            "service_id": 4, "node_id": null, "model_repo": null, "model_preset_id": null,
+            "gpu_memory_utilization": null, "max_model_len": null, "max_num_seqs": null,
+            "max_num_batched_tokens": null, "kv_cache_dtype": null, "chunked_prefill": null,
+            "vllm_args_override": null, "pinned": null, "paused": null,
+            "restart_after_save": false
+        });
+        let bytes = crate::cbor::encode(&old_shape).expect("encode the old shape");
+        let old: ServiceUpdateRequest = crate::cbor::decode(&bytes)
+            .expect("a request from a client that does not know the limits");
+        assert_eq!((old.max_concurrent, old.timeout_ms), (None, None));
+
+        let with = ServiceUpdateRequest {
+            max_concurrent: Some(0),
+            timeout_ms: Some(1_500),
+            ..old
+        };
+        let bytes = crate::cbor::encode(&with).expect("encode");
+        let back: ServiceUpdateRequest = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, with);
+    }
 
     fn sample_model() -> ModelSummary {
         ModelSummary {

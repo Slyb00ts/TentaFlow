@@ -428,6 +428,7 @@ mod tests {
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
+            limits_editable: false,
             cluster_deployment_id: String::new(),
             cluster_coordinator_node_id: String::new(),
         }

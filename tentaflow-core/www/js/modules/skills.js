@@ -363,7 +363,7 @@ async function deleteSkill(skillId) {
   if (!skill) return;
   const ok = await TfWindow.confirm({
     title: I18n.t('skills.delete_confirm_title'),
-    message: I18n.t('skills.delete_confirm_message', { name: escapeHtml(skill.name) }),
+    message: I18n.t('skills.delete_confirm_message', { name: skill.name }),
     confirmLabel: I18n.t('skills.action_delete'),
     cancelLabel: I18n.t('skills.action_cancel'),
     danger: true,

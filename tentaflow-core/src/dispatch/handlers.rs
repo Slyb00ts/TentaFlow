@@ -11740,12 +11740,24 @@ async fn forward_service_action(
     target_node_id: &str,
     cmd: tentaflow_protocol::mesh::MeshCommandType,
 ) -> (bool, Option<String>) {
+    let (ok, error, _) = forward_service_command(ctx, target_node_id, cmd).await;
+    (ok, error)
+}
+
+/// As [`forward_service_action`], plus whether the receiver restarted the
+/// service (`None` when it did not say).
+async fn forward_service_command(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> (bool, Option<String>, Option<bool>) {
     let iroh = match ctx.state.quic_mesh.as_ref() {
         Some(m) => m.clone(),
         None => {
             return (
                 false,
                 Some("mesh transport not available on this node".to_string()),
+                None,
             );
         }
     };
@@ -11754,6 +11766,7 @@ async fn forward_service_action(
             return (
                 false,
                 Some(format!("peer {} is not trusted", target_node_id)),
+                None,
             );
         }
     }
@@ -11761,8 +11774,8 @@ async fn forward_service_action(
         .send_command_and_wait(target_node_id, cmd, SERVICE_ACTION_FORWARD_TIMEOUT_SECS)
         .await
     {
-        Ok(resp) => (resp.ok, resp.error),
-        Err(e) => (false, Some(e.to_string())),
+        Ok(resp) => (resp.ok, resp.error, resp.restarted),
+        Err(e) => (false, Some(e.to_string()), None),
     }
 }
 
@@ -12245,6 +12258,73 @@ pub async fn service_start(
     ))
 }
 
+/// The mesh command that carries an edit to the node that owns the service.
+fn service_update_remote_command(
+    payload: &tentaflow_protocol::ServiceUpdateRequest,
+) -> tentaflow_protocol::mesh::MeshCommandType {
+    tentaflow_protocol::mesh::MeshCommandType::ServiceUpdateRemote {
+        service_id: payload.service_id,
+        model_repo: payload.model_repo.clone(),
+        model_preset_id: payload.model_preset_id.clone(),
+        gpu_memory_utilization: payload.gpu_memory_utilization,
+        max_model_len: payload.max_model_len,
+        max_num_seqs: payload.max_num_seqs,
+        max_num_batched_tokens: payload.max_num_batched_tokens,
+        kv_cache_dtype: payload.kv_cache_dtype.clone(),
+        chunked_prefill: payload.chunked_prefill,
+        vllm_args_override: payload.vllm_args_override.clone(),
+        pinned: payload.pinned,
+        paused: payload.paused,
+        max_concurrent: payload.max_concurrent,
+        timeout_ms: payload.timeout_ms,
+        restart_after_save: payload.restart_after_save,
+    }
+}
+
+/// The edit a `ServiceUpdateRequest` asks for.
+fn service_edit_of(
+    p: &tentaflow_protocol::ServiceUpdateRequest,
+) -> crate::services::edit::ServiceEdit {
+    crate::services::edit::ServiceEdit {
+        model_repo: p.model_repo.clone(),
+        model_preset_id: p.model_preset_id.clone(),
+        tuning: crate::deploy::launch_dialect::ServiceTuningPatch {
+            gpu_memory_utilization: p.gpu_memory_utilization,
+            max_model_len: p.max_model_len,
+            max_num_seqs: p.max_num_seqs,
+            max_num_batched_tokens: p.max_num_batched_tokens,
+            kv_cache_dtype: p.kv_cache_dtype.clone(),
+            chunked_prefill: p.chunked_prefill,
+            vllm_args_override: p.vllm_args_override.clone(),
+        },
+        pinned: p.pinned,
+        paused: p.paused,
+        max_concurrent: p.max_concurrent,
+        timeout_ms: p.timeout_ms,
+    }
+}
+
+/// Limits go only to a node that applies them itself and reports whether it
+/// restarted; an older node would ignore them and restart on its own rule.
+fn ensure_peer_applies_limits(
+    ctx: &HandlerContext,
+    node_id: &str,
+    service_id: i64,
+) -> Result<(), ProtocolError> {
+    let supported = ctx
+        .state
+        .mesh_services_registry
+        .find_service(node_id, service_id)
+        .is_some_and(|svc| svc.limits_editable);
+    if supported {
+        Ok(())
+    } else {
+        Err(ProtocolError::bad_request(
+            "the hosting node is too old to change limits; upgrade it",
+        ))
+    }
+}
+
 #[handler(variant = "ServiceConfigUpdateRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
@@ -12261,107 +12341,52 @@ pub async fn service_update(
         }
     };
 
+    crate::services_repo::services::validate_service_limits(
+        payload.max_concurrent,
+        payload.timeout_ms,
+    )
+    .map_err(ProtocolError::bad_request)?;
+
     if let Some(target) = forward_target_node(ctx, &payload.node_id) {
-        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceUpdateRemote {
-            service_id: payload.service_id,
-            model_repo: payload.model_repo.clone(),
-            model_preset_id: payload.model_preset_id.clone(),
-            gpu_memory_utilization: payload.gpu_memory_utilization,
-            max_model_len: payload.max_model_len,
-            max_num_seqs: payload.max_num_seqs,
-            max_num_batched_tokens: payload.max_num_batched_tokens,
-            kv_cache_dtype: payload.kv_cache_dtype.clone(),
-            chunked_prefill: payload.chunked_prefill,
-            vllm_args_override: payload.vllm_args_override.clone(),
-            pinned: payload.pinned,
-            paused: payload.paused,
-            restart_after_save: payload.restart_after_save,
-        };
-        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        if payload.max_concurrent.is_some() || payload.timeout_ms.is_some() {
+            ensure_peer_applies_limits(ctx, target, payload.service_id)?;
+        }
+        let cmd = service_update_remote_command(&payload);
+        let (success, error, restarted) = forward_service_command(ctx, target, cmd).await;
+        // The receiver says whether it restarted. A peer that predates the
+        // reply field says nothing and applies the old rule itself, which
+        // is all that can be reported for it.
+        let restarted = restarted.unwrap_or(payload.restart_after_save) && success;
         return Ok(MessageBody::ServiceBody(
             tentaflow_protocol::ServicePayload::ResUpdate(
                 tentaflow_protocol::ServiceUpdateResponse {
                     success,
                     error,
-                    restarted: payload.restart_after_save && success,
+                    restarted,
                 },
             ),
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
-    let svc = fetch_service_row(ctx, payload.service_id)?;
-
-    // Zaktualizuj config_json: parsujemy istniejący JSON, mergujemy podane
-    // pola, serializujemy. Pozostałe pola (np. ścieżki bundle) zostają.
-    let mut cfg: serde_json::Value =
-        serde_json::from_str(&svc.config_json).unwrap_or_else(|_| serde_json::json!({}));
-    let cfg_obj = cfg
-        .as_object_mut()
-        .ok_or_else(|| ProtocolError::bad_request("service config_json is not an object"))?;
-
-    if let Some(repo) = payload.model_repo.as_ref() {
-        cfg_obj.insert("model_repo".into(), serde_json::Value::String(repo.clone()));
-        cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
-    }
-    if let Some(preset_id) = payload.model_preset_id.as_ref() {
-        cfg_obj.insert(
-            "model_preset_id".into(),
-            serde_json::Value::String(preset_id.clone()),
-        );
-        cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
-    }
-    // Scalar keys + the matching flags inside `vllm_args` (the runtime builds
-    // argv from that string, so scalar-only edits would be inert for vLLM/sglang).
-    crate::deploy::launch_dialect::apply_service_tuning(
-        &svc.engine_id,
-        cfg_obj,
-        &crate::deploy::launch_dialect::ServiceTuningPatch {
-            gpu_memory_utilization: payload.gpu_memory_utilization,
-            max_model_len: payload.max_model_len,
-            max_num_seqs: payload.max_num_seqs,
-            max_num_batched_tokens: payload.max_num_batched_tokens,
-            kv_cache_dtype: payload.kv_cache_dtype.clone(),
-            chunked_prefill: payload.chunked_prefill,
-            vllm_args_override: payload.vllm_args_override.clone(),
-        },
-    );
-
-    let new_config_json = serde_json::to_string(&cfg)
-        .map_err(|e| ProtocolError::internal(format!("serialize config: {e}")))?;
-
-    {
-        let conn = ctx
-            .state
-            .db
-            .write()
-            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-        crate::services_repo::services::update_config_json(
-            &conn,
-            payload.service_id,
-            &new_config_json,
-        )
-        .map_err(db_err)?;
-        if let Some(p) = payload.pinned {
-            crate::services_repo::services::set_pinned(&conn, payload.service_id, p)
-                .map_err(db_err)?;
-        }
-        if let Some(p) = payload.paused {
-            crate::services_repo::services::set_paused(&conn, payload.service_id, p)
-                .map_err(db_err)?;
-        }
-    }
+    let applied = crate::services::edit::apply_edit(
+        &ctx.state.db,
+        ctx.state.local_node_id.as_ref(),
+        payload.service_id,
+        &service_edit_of(&payload),
+    )
+    .map_err(|e| match e {
+        crate::services::edit::EditError::NotFound(m) => ProtocolError::not_found(m),
+        crate::services::edit::EditError::Invalid(m) => ProtocolError::bad_request(m),
+        crate::services::edit::EditError::Db(m) => ProtocolError::internal(m),
+    })?;
+    let svc = applied.before.clone();
+    let new_config_json = applied.config_json.clone();
 
     let mut restarted = false;
     let mut respawn_error: Option<String> = None;
-    let was_running = matches!(
-        svc.status,
-        crate::services_repo::services::ServiceStatus::Running
-            | crate::services_repo::services::ServiceStatus::Degraded
-            | crate::services_repo::services::ServiceStatus::Starting
-    );
 
-    if payload.restart_after_save && was_running {
+    if applied.restart_wanted(payload.restart_after_save) {
         // Stop running runtime — terminate(pid) + release ports.
         if let Some(ports) = ctx.state.port_allocator.clone() {
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
@@ -12461,8 +12486,17 @@ pub async fn service_update(
         "service.update",
         Some(&svc.engine_id),
         Some(&format!(
-            "service_id={} restart={}",
-            payload.service_id, payload.restart_after_save
+            "service_id={} restarted={}{}{}",
+            payload.service_id,
+            restarted,
+            payload
+                .max_concurrent
+                .map(|v| format!(" max_concurrent={v}"))
+                .unwrap_or_default(),
+            payload
+                .timeout_ms
+                .map(|v| format!(" timeout_ms={v}"))
+                .unwrap_or_default(),
         )),
     );
 
@@ -14822,5 +14856,281 @@ mod flow_executions_list_tests {
         );
         assert_eq!(by_request["run-1"].origin.as_deref(), Some("bus"));
         assert_eq!(by_request["run-2"].correlation_id, None);
+    }
+}
+
+#[cfg(test)]
+mod service_limits_update_tests {
+    //! Limits of a service (`max_concurrent`, `timeout_ms`) saved through
+    //! `service_update` apply to the limiter at once and never restart it.
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use crate::services_repo::services::{self, DeployMethod, NewService, ServiceStatus};
+    use std::time::Duration;
+    use tentaflow_protocol::{ServicePayload, ServiceUpdateRequest};
+
+    fn ctx() -> HandlerContext {
+        crate::dispatch::test_handler_context(AppState::for_test(), Some("admin"), None)
+    }
+
+    /// Inserts a Running service and returns its id. The limiter map is global
+    /// and keyed by node and id, so each test pads the ids to get its own.
+    fn running_service(ctx: &HandlerContext, pad: usize) -> i64 {
+        let conn = ctx.state.db.write().expect("db");
+        let mut id = 0;
+        for _ in 0..=pad {
+            let mut new = NewService::minimal(
+                "vllm",
+                DeployMethod::NativeBinary,
+                crate::services::transport::Transport::HttpDirect,
+            );
+            new.status = ServiceStatus::Running;
+            id = services::insert(&conn, &new).expect("insert");
+        }
+        id
+    }
+
+    fn request(service_id: i64) -> ServiceUpdateRequest {
+        ServiceUpdateRequest {
+            service_id,
+            node_id: None,
+            model_repo: None,
+            model_preset_id: None,
+            gpu_memory_utilization: None,
+            max_model_len: None,
+            max_num_seqs: None,
+            max_num_batched_tokens: None,
+            kv_cache_dtype: None,
+            chunked_prefill: None,
+            vllm_args_override: None,
+            pinned: None,
+            paused: None,
+            max_concurrent: None,
+            timeout_ms: None,
+            restart_after_save: false,
+        }
+    }
+
+    async fn update(
+        ctx: &HandlerContext,
+        req: ServiceUpdateRequest,
+    ) -> Result<tentaflow_protocol::ServiceUpdateResponse, ProtocolError> {
+        match service_update(
+            &MessageBody::ServiceBody(ServicePayload::ReqUpdate(req)),
+            ctx,
+        )
+        .await?
+        {
+            MessageBody::ServiceBody(ServicePayload::ResUpdate(res)) => Ok(res),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn stored_config(ctx: &HandlerContext, id: i64) -> serde_json::Value {
+        let conn = ctx.state.db.read().expect("db");
+        let row = services::get(&conn, id).expect("get").expect("row");
+        serde_json::from_str(&row.config_json).expect("json")
+    }
+
+    fn limiter(
+        ctx: &HandlerContext,
+        id: i64,
+    ) -> std::sync::Arc<crate::services::limiter::ServiceLimiter> {
+        crate::services::limiter::limiter_for(ctx.state.local_node_id.as_ref(), id)
+    }
+
+    #[tokio::test]
+    async fn limits_apply_to_the_limiter_at_once_and_zero_clears_them() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 20);
+        // Held so a parallel prune of this node's limiters cannot drop it.
+        let _keep = limiter(&ctx, id);
+        assert_eq!(limiter(&ctx, id).limit(), None);
+
+        let mut req = request(id);
+        req.max_concurrent = Some(3);
+        req.timeout_ms = Some(2_500);
+        let res = update(&ctx, req).await.expect("update");
+        assert!(res.success && !res.restarted);
+        assert_eq!(limiter(&ctx, id).limit(), Some(3));
+        let cfg = stored_config(&ctx, id);
+        assert_eq!(
+            (cfg["max_concurrent"].clone(), cfg["timeout_ms"].clone()),
+            (3.into(), 2_500.into())
+        );
+
+        // An absent field leaves the other one alone.
+        let mut req = request(id);
+        req.max_concurrent = Some(5);
+        update(&ctx, req).await.expect("update");
+        assert_eq!(limiter(&ctx, id).limit(), Some(5));
+        assert_eq!(stored_config(&ctx, id)["timeout_ms"], 2_500);
+
+        // Zero clears the limit and removes the key.
+        let mut req = request(id);
+        req.max_concurrent = Some(0);
+        update(&ctx, req).await.expect("update");
+        assert_eq!(limiter(&ctx, id).limit(), None);
+        assert!(stored_config(&ctx, id).get("max_concurrent").is_none());
+
+        // The wait is the one just saved: a full limiter refuses after it.
+        let mut req = request(id);
+        req.max_concurrent = Some(1);
+        req.timeout_ms = Some(100);
+        update(&ctx, req).await.expect("update");
+        let _held = limiter(&ctx, id).acquire().await.expect("first slot");
+        let started = std::time::Instant::now();
+        assert!(limiter(&ctx, id).acquire().await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn invalid_limits_are_refused_before_anything_is_written() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 21);
+        // Held so a parallel prune of this node's limiters cannot drop it.
+        let _keep = limiter(&ctx, id);
+        let mut base = request(id);
+        base.max_concurrent = Some(2);
+        update(&ctx, base).await.expect("update");
+
+        for (max_concurrent, timeout_ms) in [
+            (Some(1025), None),
+            (None, Some(99)),
+            (None, Some(0)),
+            (None, Some(86_400_001)),
+            (Some(4), Some(99)),
+        ] {
+            let mut req = request(id);
+            req.max_concurrent = max_concurrent;
+            req.timeout_ms = timeout_ms;
+            let err = update(&ctx, req).await.expect_err("refused");
+            assert!(
+                err.message.contains("max_concurrent") || err.message.contains("timeout_ms"),
+                "{}",
+                err.message
+            );
+        }
+        assert_eq!(limiter(&ctx, id).limit(), Some(2));
+        assert_eq!(stored_config(&ctx, id)["max_concurrent"], 2);
+
+        let mut edge = request(id);
+        edge.max_concurrent = Some(1024);
+        edge.timeout_ms = Some(86_400_000);
+        update(&ctx, edge).await.expect("upper bounds are valid");
+    }
+
+    #[tokio::test]
+    async fn a_limits_only_save_does_not_restart_the_service() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 22);
+        // Held so a parallel prune of this node's limiters cannot drop it.
+        let _keep = limiter(&ctx, id);
+
+        let mut req = request(id);
+        req.max_concurrent = Some(2);
+        req.restart_after_save = true;
+        let res = update(&ctx, req).await.expect("update");
+        assert!(res.success && res.error.is_none() && !res.restarted);
+
+        // Control: with another field the restart path is taken. The test state
+        // has no port allocator, which is what stops it.
+        let mut req = request(id);
+        req.max_concurrent = Some(2);
+        req.max_num_seqs = Some(8);
+        req.restart_after_save = true;
+        let res = update(&ctx, req).await.expect("update");
+        assert_eq!(res.error.as_deref(), Some("port allocator not initialized"));
+    }
+
+    /// The remote service as the peer advertised it.
+    fn advertise_peer_service(ctx: &HandlerContext, local_id: i64, limits_editable: bool) {
+        let mut info =
+            crate::services::snapshot_builder::build_one(&ctx.state.db, local_id, "peer-x")
+                .expect("build")
+                .expect("row");
+        info.limits_editable = limits_editable;
+        ctx.state
+            .mesh_services_registry
+            .replace_node("peer-x".to_string(), vec![info]);
+    }
+
+    #[tokio::test]
+    async fn limits_are_not_forwarded_to_a_peer_that_does_not_support_them() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 23);
+        let mut req = request(id);
+        req.node_id = Some("peer-x".into());
+        req.max_concurrent = Some(2);
+        req.restart_after_save = true;
+
+        // Not advertised at all, then advertised by an old peer.
+        let err = update(&ctx, req.clone()).await.expect_err("refused");
+        assert!(
+            err.message.contains("too old to change limits"),
+            "{}",
+            err.message
+        );
+        advertise_peer_service(&ctx, id, false);
+        let err = update(&ctx, req.clone()).await.expect_err("refused");
+        assert!(err.message.contains("upgrade it"), "{}", err.message);
+
+        // A supporting peer is sent the command (the test node has no mesh
+        // transport, which is what stops it), and a request without limits is
+        // never refused for it.
+        advertise_peer_service(&ctx, id, true);
+        let res = update(&ctx, req.clone()).await.expect("forwarded");
+        assert_eq!(
+            res.error.as_deref(),
+            Some("mesh transport not available on this node")
+        );
+        assert!(!res.success && !res.restarted);
+        advertise_peer_service(&ctx, id, false);
+        req.max_concurrent = None;
+        req.max_num_seqs = Some(8);
+        let res = update(&ctx, req).await.expect("forwarded");
+        assert_eq!(
+            res.error.as_deref(),
+            Some("mesh transport not available on this node")
+        );
+    }
+
+    #[tokio::test]
+    async fn resending_unchanged_fields_with_new_limits_does_not_restart() {
+        let ctx = ctx();
+        let id = running_service(&ctx, 24);
+        let _keep = limiter(&ctx, id);
+        let mut first = request(id);
+        first.max_num_seqs = Some(8);
+        update(&ctx, first).await.expect("update");
+
+        // The client resends the tuning it already has, next to new limits.
+        let mut again = request(id);
+        again.max_num_seqs = Some(8);
+        again.max_concurrent = Some(2);
+        again.restart_after_save = true;
+        let res = update(&ctx, again).await.expect("update");
+        assert!(res.success && res.error.is_none() && !res.restarted);
+        assert_eq!(limiter(&ctx, id).limit(), Some(2));
+    }
+
+    #[test]
+    fn the_remote_command_forwards_the_limits() {
+        let mut req = request(7);
+        req.max_concurrent = Some(0);
+        req.timeout_ms = Some(1_500);
+        let tentaflow_protocol::mesh::MeshCommandType::ServiceUpdateRemote {
+            service_id,
+            max_concurrent,
+            timeout_ms,
+            ..
+        } = service_update_remote_command(&req)
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(
+            (service_id, max_concurrent, timeout_ms),
+            (7, Some(0), Some(1_500))
+        );
     }
 }

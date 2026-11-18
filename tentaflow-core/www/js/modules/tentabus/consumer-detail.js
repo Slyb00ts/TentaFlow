@@ -32,6 +32,7 @@ import { valueRow, settingsCard } from '/js/modules/tentabus/topic-settings.js';
 import { commitModeLabel, commitModeHint } from '/js/modules/tentabus/consumers.js';
 import { partitionPlace, lastRead, lastMessage } from '/js/modules/tentabus/offset-move.js';
 import { headerText } from '/js/modules/tentabus/payload.js';
+import { concurrencyTile, slaSettingsHtml, throttledTexts, throttledUntilMs } from '/js/modules/tentabus/consumer-sla.js';
 import { UNPROCESSED_PAGE } from '/js/modules/tentabus/unprocessed.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-select.js';
@@ -80,7 +81,7 @@ export function positionRows({ detail, topicPartitions }) {
  * The four Stan tiles. `live` = this consumer's row of the stats snapshot
  * (newer than the page's own answer), `topicStats` = its topic's row.
  */
-export function consumerKpis({ live, detail, topicStats, dlq, samples, nowMs }) {
+export function consumerKpis({ live, detail, topicStats, dlq, samples, nowMs, sla = null }) {
   const partitions = detail?.partitions || [];
   const waiting = live?.lagTotal != null ? Number(live.lagTotal) : partitions.reduce((s, p) => s + (Number(p.lag) || 0), 0);
   const paused = live ? Boolean(live.paused) : Boolean(detail?.paused);
@@ -94,6 +95,7 @@ export function consumerKpis({ live, detail, topicStats, dlq, samples, nowMs }) 
     paused,
     commitMode: detail?.commitMode || '',
     dlq,
+    sla,
   };
 }
 
@@ -108,6 +110,7 @@ export function rateText(perMin) {
 /** What needs attention on this consumer, each with the place where it is dealt with. */
 export function consumerAlerts({ live, kpis, nowMs }) {
   const out = [];
+  if (throttledUntilMs(kpis.sla, nowMs) != null) out.push({ key: 'throttled', kind: 'throttled' });
   const row = live ? { ...live, lagTotal: kpis.waiting } : null;
   if (row && isLagging(row, nowMs)) out.push({ key: 'lagging', kind: 'lagging' });
   if (row && isPausedWithBacklog(row)) out.push({ key: 'paused', kind: 'paused' });
@@ -273,6 +276,8 @@ function tiles(host, k, nowMs) {
     dlqDelta = T('detail.state.kpi_dlq_hour', { count: fmtCount(k.dlq.lastHour), n: k.dlq.lastHour });
     if (k.dlq.partial) dlqDelta = `${dlqDelta} · ${T('consumer.kpi_dlq_partial', { count: fmtCount(UNPROCESSED_PAGE) })}`;
   } else dlqDelta = T('consumer.kpi_dlq_unknown');
+  const concurrency = concurrencyTile(k.sla);
+  host.classList.toggle('tb-kpi-five', concurrency != null);
   paintStatCards(host, [
     {
       key: 'waiting',
@@ -321,24 +326,36 @@ function tiles(host, k, nowMs) {
         'delta-position': 'under-value',
       },
     },
+    ...(concurrency ? [{
+      key: 'concurrency',
+      attrs: {
+        label: T('consumer.sla.kpi_label'),
+        icon: 'layers',
+        value: concurrency.value,
+        delta: concurrency.delta,
+        'delta-position': 'under-value',
+      },
+    }] : []),
   ]);
 }
 
 function alertSkeleton(a, canAdmin) {
-  const action = a.kind === 'dlq'
-    ? `<tf-button variant="secondary" size="sm" data-go="dlq">${escapeHtml(T(canAdmin ? 'detail.state.act_dlq_admin' : 'detail.state.act_dlq'))}</tf-button>`
-    : `<tf-button variant="secondary" size="sm" data-go="section" data-section="position">${escapeHtml(T('consumer.act_position'))}</tf-button>`;
+  let action;
+  if (a.kind === 'dlq') action = `<tf-button variant="secondary" size="sm" data-go="dlq">${escapeHtml(T(canAdmin ? 'detail.state.act_dlq_admin' : 'detail.state.act_dlq'))}</tf-button>`;
+  else if (a.kind === 'throttled') action = `<tf-button variant="secondary" size="sm" data-go="section" data-section="settings">${escapeHtml(T('consumer.sla.act_policy'))}</tf-button>`;
+  else action = `<tf-button variant="secondary" size="sm" data-go="section" data-section="position">${escapeHtml(T('consumer.act_position'))}</tf-button>`;
   return `
     <div class="tb-alert warning" data-alert="${escapeAttr(a.key)}">
       <div class="tb-alert-main">
         <div class="tb-alert-title" data-role="title"></div>
-        <div class="tb-alert-meta"><span data-role="m1"></span></div>
+        <div class="tb-alert-meta"><span data-role="m1"></span>${a.kind === 'throttled' ? '<span data-role="m2"></span>' : ''}</div>
       </div>
       ${action}
     </div>`;
 }
 
 function alertTexts(a, k, nowMs) {
+  if (a.kind === 'throttled') return throttledTexts(k.sla, nowMs) ?? { title: '', m1: '', m2: '' };
   const waiting = T('alerts.waiting', { count: fmtCount(k.waiting), n: k.waiting });
   if (a.kind === 'lagging') {
     const since = T(k.wording === 'rising' ? 'alerts.rising_since' : 'alerts.waiting_since', { duration: fmtSince(k.risingSinceMs, nowMs) });
@@ -378,7 +395,7 @@ function paintStateSection(host, view) {
   }
   patchHtml(host.querySelector('[data-role="notice"]'), noticeHtml(view.notice));
   const topicStats = (stats?.topics || []).find((t) => t.topic === view.topic) || null;
-  const k = consumerKpis({ live, detail: data.detail, topicStats, dlq: data.dlq, samples: data.samples, nowMs });
+  const k = consumerKpis({ live, detail: data.detail, topicStats, dlq: data.dlq, samples: data.samples, nowMs, sla: data.sla ?? null });
   tiles(host.querySelector('[data-role="kpi"]'), k, nowMs);
 
   const alerts = consumerAlerts({ live, kpis: k, nowMs });
@@ -390,6 +407,7 @@ function paintStateSection(host, view) {
     const t = alertTexts(a, k, nowMs);
     setText(el.querySelector('[data-role="title"]'), t.title);
     setText(el.querySelector('[data-role="m1"]'), t.m1);
+    setText(el.querySelector('[data-role="m2"]'), t.m2 ?? '');
   });
   const count = host.querySelector('[data-role="attn-count"]');
   patchHtml(count, alerts.length ? '<tf-chip size="sm" variant="outline" status="warn"></tf-chip>' : '');
@@ -520,6 +538,7 @@ function settingsHtml(view) {
   return `
     ${noticeHtml(notice)}
     ${settingsCard('confirm', 'check', T('consumer.settings.confirm_title'), confirm, false)}
+    ${slaSettingsHtml(data.sla ?? null)}
     ${settingsCard('other', 'settings', T('consumer.settings.other_title'), other, false)}`;
 }
 

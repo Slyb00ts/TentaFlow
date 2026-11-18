@@ -81,6 +81,7 @@ pub mod storage_admin;
 pub mod storage_proxy;
 pub mod stream_hub;
 pub mod streaming;
+pub mod edit;
 pub mod supervisor;
 pub mod transport;
 pub mod vector;

@@ -722,7 +722,7 @@ async function deleteAgent(agentId) {
   if (!agent) return;
   const ok = await TfWindow.confirm({
     title: t('delete_confirm_title'),
-    message: t('delete_confirm_message', { name: escapeHtml(agent.name) }),
+    message: t('delete_confirm_message', { name: agent.name }),
     confirmLabel: t('action_delete'),
     cancelLabel: t('action_cancel'),
     danger: true,

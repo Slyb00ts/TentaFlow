@@ -244,6 +244,7 @@ fn embedded_service(id: i64, engine_id: &str, model_name: &str) -> ServiceInfo {
         updated_at: String::new(),
         request_time_parameters: RequestTimeParameters::default(),
         gpu_selection: String::new(),
+        limits_editable: false,
     }
 }
 

@@ -38,6 +38,9 @@ pub struct CommandResponse {
     pub ok: bool,
     pub payload: MeshCommandResponsePayload,
     pub error: Option<String>,
+    /// Set by the commands that may restart a service: whether the receiver
+    /// did. `None` from a peer that predates the field.
+    pub restarted: Option<bool>,
 }
 
 impl CommandResponse {
@@ -47,7 +50,13 @@ impl CommandResponse {
             ok: true,
             payload,
             error: None,
+            restarted: None,
         }
+    }
+
+    fn with_restarted(mut self, restarted: bool) -> Self {
+        self.restarted = Some(restarted);
+        self
     }
 
     /// Pomocniczy konstruktor bledu — payload Empty + komunikat.
@@ -56,6 +65,7 @@ impl CommandResponse {
             ok: false,
             payload: MeshCommandResponsePayload::Empty,
             error: Some(error.into()),
+            restarted: None,
         }
     }
 }
@@ -636,6 +646,8 @@ impl MeshCommandExecutor {
                 vllm_args_override,
                 pinned,
                 paused,
+                max_concurrent,
+                timeout_ms,
                 restart_after_save,
             } => {
                 self.handle_service_update_remote(
@@ -651,6 +663,8 @@ impl MeshCommandExecutor {
                     vllm_args_override,
                     pinned,
                     paused,
+                    max_concurrent,
+                    timeout_ms,
                     restart_after_save,
                 )
                 .await
@@ -1884,49 +1898,18 @@ impl MeshCommandExecutor {
         vllm_args_override: Option<String>,
         pinned: Option<bool>,
         paused: Option<bool>,
+        max_concurrent: Option<u32>,
+        timeout_ms: Option<u32>,
         restart_after_save: bool,
     ) -> CommandResponse {
         let actions = match self.service_action_ctx().await {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        let svc = {
-            let conn = match actions.db.read() {
-                Ok(c) => c,
-                Err(_) => return CommandResponse::fail("db pool poisoned"),
-            };
-            match crate::services_repo::services::get(&conn, service_id) {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return CommandResponse::fail(format!("service id={} not found", service_id));
-                }
-                Err(e) => return CommandResponse::fail(e.to_string()),
-            }
-        };
-
-        // Merge config_json (sama logika co handler local).
-        let mut cfg: serde_json::Value =
-            serde_json::from_str(&svc.config_json).unwrap_or_else(|_| serde_json::json!({}));
-        let Some(cfg_obj) = cfg.as_object_mut() else {
-            return CommandResponse::fail("service config_json is not an object");
-        };
-        if let Some(repo) = model_repo {
-            cfg_obj.insert("model_repo".into(), serde_json::Value::String(repo));
-            cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
-        }
-        if let Some(preset_id) = model_preset_id {
-            cfg_obj.insert(
-                "model_preset_id".into(),
-                serde_json::Value::String(preset_id),
-            );
-            cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
-        }
-        // Same merge as the local handler: scalar keys + flags rewritten inside
-        // `vllm_args`, otherwise the edit never reaches a vLLM/sglang engine.
-        crate::deploy::launch_dialect::apply_service_tuning(
-            &svc.engine_id,
-            cfg_obj,
-            &crate::deploy::launch_dialect::ServiceTuningPatch {
+        let edit = crate::services::edit::ServiceEdit {
+            model_repo,
+            model_preset_id,
+            tuning: crate::deploy::launch_dialect::ServiceTuningPatch {
                 gpu_memory_utilization,
                 max_model_len,
                 max_num_seqs,
@@ -1935,45 +1918,32 @@ impl MeshCommandExecutor {
                 chunked_prefill,
                 vllm_args_override,
             },
-        );
-        let new_config_json = match serde_json::to_string(&cfg) {
-            Ok(s) => s,
-            Err(e) => return CommandResponse::fail(format!("serialize config: {}", e)),
+            pinned,
+            paused,
+            max_concurrent,
+            timeout_ms,
         };
-
-        {
-            let conn = match actions.db.write() {
-                Ok(c) => c,
-                Err(_) => return CommandResponse::fail("db pool poisoned"),
-            };
-            if let Err(e) = crate::services_repo::services::update_config_json(
-                &conn,
-                service_id,
-                &new_config_json,
-            ) {
-                return CommandResponse::fail(e.to_string());
-            }
-            if let Some(p) = pinned {
-                if let Err(e) = crate::services_repo::services::set_pinned(&conn, service_id, p) {
-                    return CommandResponse::fail(e.to_string());
-                }
-            }
-            if let Some(p) = paused {
-                if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, p) {
-                    return CommandResponse::fail(e.to_string());
-                }
-            }
-        }
+        // The same merge, validation and restart rule as the local handler.
+        let applied = match crate::services::edit::apply_edit(
+            &actions.db,
+            &self.local_node_id,
+            service_id,
+            &edit,
+        ) {
+            Ok(applied) => applied,
+            Err(
+                crate::services::edit::EditError::NotFound(e)
+                | crate::services::edit::EditError::Invalid(e)
+                | crate::services::edit::EditError::Db(e),
+            ) => return CommandResponse::fail(e),
+        };
+        let svc = applied.before.clone();
+        let new_config_json = applied.config_json.clone();
+        let restarted = applied.restart_wanted(restart_after_save);
 
         // Optional restart — stop running runtime + spawn detached respawn
         // (mirror lokalnego handler'a żeby UX był identyczny).
-        let was_running = matches!(
-            svc.status,
-            crate::services_repo::services::ServiceStatus::Running
-                | crate::services_repo::services::ServiceStatus::Degraded
-                | crate::services_repo::services::ServiceStatus::Starting
-        );
-        if restart_after_save && was_running {
+        if restarted {
             let ports = actions.port_allocator.clone();
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
                 tracing::warn!(service_id, "service_update_remote: stop failed: {}", e);
@@ -2046,6 +2016,7 @@ impl MeshCommandExecutor {
 
         push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
         CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+            .with_restarted(restarted)
     }
 
     async fn handle_service_pause_remote(&self, service_id: i64, paused: bool) -> CommandResponse {
@@ -3643,5 +3614,147 @@ mod tests {
             error.contains("Konta agentów"),
             "the refusal must point at the agent accounts screen: {error}"
         );
+    }
+
+    /// The receiving side of `ServiceUpdateRemote`: it applies limits at once,
+    /// does not restart for them, refuses bad values and reports `restarted`.
+    mod service_update_remote {
+        use super::*;
+        use crate::dispatch::state::AppState;
+        use crate::services_repo::services::{self, DeployMethod, NewService, ServiceStatus};
+
+        const NODE: &str = "exec-limits-node";
+
+        async fn executor_with_service(pad: usize) -> (MeshCommandExecutor, DbPoolAlias, i64) {
+            let state = AppState::for_test();
+            let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+            let security = Arc::new(MeshSecurity::new(state.db.clone(), cipher.clone()).unwrap());
+            let iroh = crate::mesh::iroh_manager::IrohMeshManager::new(
+                crate::mesh::iroh_manager::IrohMeshConfig {
+                    node_id: String::new(),
+                    bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                    relay_url: None,
+                    enable_lan_discovery: false,
+                    enable_dht_discovery: false,
+                    ..Default::default()
+                },
+                security.clone(),
+            )
+            .await
+            .expect("iroh manager");
+            let addons = Arc::new(
+                crate::addon::AddonManager::new(state.db.clone(), cipher).expect("addon manager"),
+            );
+            let ports = Arc::new(
+                crate::services::ports::PortAllocator::new((41_000, 41_100), Default::default())
+                    .expect("ports"),
+            );
+            let tmp = std::env::temp_dir().join(format!(
+                "tentaflow-mesh-cmd-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&tmp).expect("test data dir");
+            let executor = MeshCommandExecutor::new(security, NODE.to_string(), tmp);
+            executor
+                .set_service_action_context(ServiceActionContext {
+                    db: state.db.clone(),
+                    port_allocator: ports,
+                    iroh,
+                    router: state.router.clone(),
+                    addon_manager: addons,
+                })
+                .await;
+            let mut id = 0;
+            {
+                let conn = state.db.write().unwrap();
+                for _ in 0..=pad {
+                    let mut new = NewService::minimal(
+                        "vllm",
+                        DeployMethod::NativeBinary,
+                        crate::services::transport::Transport::HttpDirect,
+                    );
+                    new.status = ServiceStatus::Running;
+                    id = services::insert(&conn, &new).unwrap();
+                }
+            }
+            (executor, state.db.clone(), id)
+        }
+
+        type DbPoolAlias = crate::db::DbPool;
+
+        async fn call(
+            executor: &MeshCommandExecutor,
+            service_id: i64,
+            max_concurrent: Option<u32>,
+            timeout_ms: Option<u32>,
+            max_num_seqs: Option<u32>,
+            restart_after_save: bool,
+        ) -> CommandResponse {
+            executor
+                .handle_service_update_remote(
+                    service_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    max_num_seqs,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    max_concurrent,
+                    timeout_ms,
+                    restart_after_save,
+                )
+                .await
+        }
+
+        #[tokio::test]
+        async fn limits_apply_at_once_without_a_restart_and_the_reply_says_so() {
+            let (executor, _db, id) = executor_with_service(30).await;
+            let limiter = crate::services::limiter::limiter_for(NODE, id);
+            let resp = call(&executor, id, Some(4), Some(2_000), None, true).await;
+            assert!(resp.ok, "{:?}", resp.error);
+            assert_eq!(resp.restarted, Some(false));
+            assert_eq!(limiter.limit(), Some(4));
+
+            let resp = call(&executor, id, Some(0), None, None, true).await;
+            assert_eq!((resp.ok, resp.restarted), (true, Some(false)));
+            assert_eq!(limiter.limit(), None);
+        }
+
+        #[tokio::test]
+        async fn bad_limits_are_refused_and_change_nothing() {
+            let (executor, db, id) = executor_with_service(31).await;
+            let limiter = crate::services::limiter::limiter_for(NODE, id);
+            call(&executor, id, Some(3), None, None, false).await;
+            for (mc, ms) in [(Some(1025), None), (None, Some(5))] {
+                let resp = call(&executor, id, mc, ms, None, false).await;
+                assert!(!resp.ok);
+                assert!(resp.restarted.is_none());
+            }
+            assert_eq!(limiter.limit(), Some(3));
+            let conn = db.read().unwrap();
+            let row = services::get(&conn, id).unwrap().unwrap();
+            assert!(
+                row.config_json.contains("\"max_concurrent\":3"),
+                "{}",
+                row.config_json
+            );
+        }
+
+        #[tokio::test]
+        async fn another_field_with_restart_after_save_restarts_and_says_so() {
+            let (executor, _db, id) = executor_with_service(32).await;
+            // Unchanged tuning resent with limits: no restart.
+            call(&executor, id, None, None, Some(8), false).await;
+            let resp = call(&executor, id, Some(2), None, Some(8), true).await;
+            assert_eq!((resp.ok, resp.restarted), (true, Some(false)));
+            // A changed value does restart; the respawn runs detached.
+            let resp = call(&executor, id, None, None, Some(16), true).await;
+            assert_eq!((resp.ok, resp.restarted), (true, Some(true)));
+        }
     }
 }

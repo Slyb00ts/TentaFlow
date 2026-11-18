@@ -130,6 +130,8 @@ pub struct CommandWaitResponse {
     pub ok: bool,
     pub payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
     pub error: Option<String>,
+    /// See `CommandResponse::restarted`.
+    pub restarted: Option<bool>,
 }
 
 const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
@@ -2698,6 +2700,7 @@ impl IrohMeshManager {
                 ok: r.ok,
                 payload: r.payload,
                 error: r.error,
+                restarted: r.restarted,
             })
     }
 
@@ -2780,6 +2783,7 @@ impl IrohMeshManager {
         ok: bool,
         payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
         error: Option<String>,
+        restarted: Option<bool>,
     ) -> bool {
         if let Some((_, tx)) = self.command_waiters.remove(command_id) {
             let _ = tx.send(CommandWaitResponse {
@@ -2787,6 +2791,7 @@ impl IrohMeshManager {
                 ok,
                 payload,
                 error,
+                restarted,
             });
             true
         } else {
@@ -2814,6 +2819,8 @@ impl IrohMeshManager {
             payload: &'a tentaflow_protocol::mesh::MeshCommandResponsePayload,
             #[serde(skip_serializing_if = "Option::is_none")]
             error: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            restarted: Option<bool>,
         }
 
         let envelope: RequestEnvelope = match crate::mesh::cbor::decode(data) {
@@ -2842,6 +2849,7 @@ impl IrohMeshManager {
                     ok: false,
                     payload: &tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
                     error: Some("command executor not configured"),
+                    restarted: None,
                 };
                 if let Ok(bytes) = crate::mesh::cbor::encode(&resp) {
                     let _ = self
@@ -2862,6 +2870,7 @@ impl IrohMeshManager {
             ok: response.ok,
             payload: &response.payload,
             error: response.error.as_deref(),
+            restarted: response.restarted,
         };
         match crate::mesh::cbor::encode(&resp_envelope) {
             Ok(bytes) => {
@@ -2900,11 +2909,19 @@ impl IrohMeshManager {
             payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
             #[serde(default)]
             error: Option<String>,
+            #[serde(default)]
+            restarted: Option<bool>,
         }
         if let Ok(env) = crate::mesh::cbor::decode::<ResponseEnvelope>(data) {
             if !env.command_id.is_empty() {
-                self.resolve_command_waiter(&env.command_id, env.ok, env.payload, env.error)
-                    .await;
+                self.resolve_command_waiter(
+                    &env.command_id,
+                    env.ok,
+                    env.payload,
+                    env.error,
+                    env.restarted,
+                )
+                .await;
             }
         }
     }

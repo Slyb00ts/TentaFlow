@@ -542,6 +542,55 @@ pub fn validate_max_concurrent(config: &serde_json::Value) -> std::result::Resul
     }
 }
 
+/// Bounds of a service's `timeout_ms` (how long a request waits for a free
+/// slot), the same as the SLA policy's `timeout_ms`.
+pub const MIN_TIMEOUT_MS: u32 = 100;
+pub const MAX_TIMEOUT_MS: u32 = 86_400_000;
+
+/// Checks the limits an edit request carries before anything is written.
+/// `max_concurrent` 0 means "clear" and is valid.
+pub fn validate_service_limits(
+    max_concurrent: Option<u32>,
+    timeout_ms: Option<u32>,
+) -> std::result::Result<(), String> {
+    if let Some(n) = max_concurrent {
+        if u64::from(n) > MAX_CONCURRENT_LIMIT {
+            return Err(format!(
+                "max_concurrent must be a whole number from 1 to {MAX_CONCURRENT_LIMIT} (0 = no limit), got {n}"
+            ));
+        }
+    }
+    if let Some(ms) = timeout_ms {
+        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&ms) {
+            return Err(format!(
+                "timeout_ms must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS}, got {ms}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Merges validated limits into a service config: `None` leaves a key alone,
+/// `max_concurrent == Some(0)` removes it (unlimited).
+pub fn merge_service_limits(
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+    max_concurrent: Option<u32>,
+    timeout_ms: Option<u32>,
+) {
+    match max_concurrent {
+        Some(0) => {
+            cfg.remove("max_concurrent");
+        }
+        Some(n) => {
+            cfg.insert("max_concurrent".into(), n.into());
+        }
+        None => {}
+    }
+    if let Some(ms) = timeout_ms {
+        cfg.insert("timeout_ms".into(), ms.into());
+    }
+}
+
 /// Nadpisuje `config_json`. Używane przez `service_update` handler gdy
 /// admin edytuje serwis przez Edit modal — backend regeneruje konfigurację
 /// z manifest schema parameters i deserializuje całość do JSON.

@@ -196,3 +196,21 @@ test('confirm keeps its boolean answer: only the confirm button is true', async 
   escape();
   assert.equal(await answer, false);
 });
+
+test('confirm shows message and description as text, markup only through the explicit Html options', async () => {
+  const hostile = '<img src=x onerror=alert(1)>';
+  const pending = TfWindow.confirm({ title: 'Delete', message: `Delete ${hostile}?`, description: hostile });
+  const win = document.querySelector('tf-window');
+  const body = win.querySelector('[slot="body"]');
+  assert.equal(body.querySelector('img'), null, 'no element was created from the name');
+  assert.ok(body.textContent.includes(hostile));
+  win.close();
+  await pending;
+
+  const trusted = TfWindow.confirm({ title: 'Delete', messageHtml: 'File <b>a</b> goes.', descriptionHtml: '<i>soon</i>' });
+  const second = document.querySelector('tf-window');
+  assert.ok(second.querySelector('[slot="body"] b'));
+  assert.ok(second.querySelector('[slot="body"] i'));
+  second.close();
+  await trusted;
+});

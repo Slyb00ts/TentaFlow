@@ -911,14 +911,10 @@ impl Supervisor {
         let snapshot = self.read_snapshot().await?;
         // Applied on every rebuild, so a changed `max_concurrent` resizes the
         // limiter in place (and a removed key lifts the limit); handles are not
-        // rebuilt for it.
+        // rebuilt for it. Each service is read again at the moment it is
+        // configured, so a save that landed after the snapshot was read wins.
         for svc in &snapshot.services {
-            crate::services::limiter::configure(
-                &self.local_node_id,
-                svc.id,
-                svc.max_concurrent,
-                Duration::from_millis(svc.timeout_ms),
-            );
+            apply_limits_from_row(&self.db, &self.local_node_id, svc.id);
         }
         crate::services::limiter::prune(&self.local_node_id, |id| {
             snapshot.services_by_id.contains_key(&id)
@@ -1201,22 +1197,7 @@ impl Supervisor {
     /// Reads `max_concurrent` / `timeout_ms` of one local service from its row
     /// and applies them to its limiter.
     fn configure_limiter_from_row(&self, service_id: i64) {
-        let config_json = self
-            .db
-            .read()
-            .ok()
-            .and_then(|conn| services_repo::get(&conn, service_id).ok().flatten())
-            .map(|row| row.config_json);
-        let Some(config_json) = config_json else {
-            return;
-        };
-        let meta = parse_backend_meta(&config_json);
-        crate::services::limiter::configure(
-            &self.local_node_id,
-            service_id,
-            meta.max_concurrent,
-            Duration::from_millis(meta.timeout_ms),
-        );
+        apply_limits_from_row(&self.db, &self.local_node_id, service_id);
     }
 
     /// Drain every live handle and abort every reconnect task. Called on
@@ -1800,6 +1781,33 @@ async fn http_probe_external(url: &str, timeout: Duration) -> HealthStatus {
         Ok(resp) => HealthStatus::Degraded(format!("provider http {}", resp.status())),
         Err(e) => HealthStatus::Degraded(format!("provider unreachable: {}", e)),
     }
+}
+
+/// Serializes "read the stored limits, then configure the limiter" so that the
+/// last one to run always applies what the database holds at that moment: a
+/// save that commits between a snapshot rebuild's read and its configure is
+/// followed by its own apply, which then reads the newer row.
+static LIMITS_APPLY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Applies `max_concurrent` / `timeout_ms` of the stored row of one local
+/// service to its limiter. A row that no longer exists is left alone.
+pub(crate) fn apply_limits_from_row(db: &DbPool, node_id: &str, service_id: i64) {
+    let _serialized = LIMITS_APPLY.lock().unwrap_or_else(|e| e.into_inner());
+    let config_json = db
+        .read()
+        .ok()
+        .and_then(|conn| services_repo::get(&conn, service_id).ok().flatten())
+        .map(|row| row.config_json);
+    let Some(config_json) = config_json else {
+        return;
+    };
+    let meta = parse_backend_meta(&config_json);
+    crate::services::limiter::configure(
+        node_id,
+        service_id,
+        meta.max_concurrent,
+        Duration::from_millis(meta.timeout_ms),
+    );
 }
 
 // ----- config_json materialisation ------------------------------------------
@@ -2844,6 +2852,7 @@ mod tests {
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
+            limits_editable: false,
             cluster_deployment_id: String::new(),
             cluster_coordinator_node_id: String::new(),
         };

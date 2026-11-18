@@ -75,6 +75,7 @@ function textField(field) {
       return true;
     },
     focus: () => control.focus(),
+    markError: (msg) => setError(host, msg),
   };
 }
 
@@ -89,6 +90,7 @@ function areaField(field) {
       return true;
     },
     focus: () => control.focus(),
+    markError: (msg) => setError(host, msg),
   };
 }
 
@@ -114,6 +116,7 @@ function numberField(field) {
       return true;
     },
     focus: () => control.focus(),
+    markError: (msg) => setError(host, msg),
   };
 }
 
@@ -145,6 +148,7 @@ function selectControl(field, options) {
       return true;
     },
     focus: () => control.focus(),
+    markError: (msg) => setError(host, msg),
   };
 }
 
@@ -188,7 +192,9 @@ const BUILDERS = {
 };
 
 /**
- * Builds the controller for one field.
+ * Builds the controller for one field. `markError(text)` puts a message of the caller's own (a
+ * refusal of the server, a rule across fields) under a text, area, number or select field; an
+ * empty text clears it.
  * `field` = { key, label, kind: text|area|select|date|person|number, value,
  * options, required, hint, placeholder, min, max, step, maxLength }.
  */

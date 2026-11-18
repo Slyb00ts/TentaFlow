@@ -1119,6 +1119,16 @@ function processFrame(correlationId, sequence, variant, payload) {
   );
 }
 
+/** The organization a read names (platform administrator only); `null` = the caller's own. */
+const slaOrg = (payload) => {
+  const org = payload.orgId ?? payload.org_id;
+  return org == null || org === '' ? null : String(org);
+};
+
+function slaFrame(correlationId, sequence, body) {
+  return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+}
+
 export const encode = {
   processOptionsRequest(correlationId, payload = {}, sequence = 1) {
     return processFrame(correlationId, sequence, 'OptionsRequest', payload);
@@ -13002,6 +13012,66 @@ export const encode = {
     };
     const body = requests.encodeTentaQuantExampleForkRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::SlaBody(PolicyListRequest). payload: { orgId? } (orgId only for the platform administrator). */
+  slaPolicyListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    return slaFrame(correlationId, sequence, requests.encodeSlaPolicyListRequest(slaOrg(payload)));
+  },
+
+  /** MessageBody::SlaBody(PolicyGetRequest). payload: { policyId, orgId? }. */
+  slaPolicyGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    return slaFrame(correlationId, sequence, requests.encodeSlaPolicyGetRequest(String(payload.policyId ?? payload.policy_id ?? ''), slaOrg(payload)));
+  },
+
+  /** MessageBody::SlaBody(PolicyUpsertRequest). payload: { policyId? (absent = create), spec }; a spec limit left null/undefined means no such limit. */
+  slaPolicyUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const policyId = payload.policyId ?? payload.policy_id;
+    return slaFrame(correlationId, sequence, requests.encodeSlaPolicyUpsertRequest(policyId == null ? null : String(policyId), payload.spec ?? {}));
+  },
+
+  /** MessageBody::SlaBody(PolicyDeleteRequest). payload: { policyId }. */
+  slaPolicyDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    return slaFrame(correlationId, sequence, requests.encodeSlaPolicyDeleteRequest(String(payload.policyId ?? payload.policy_id ?? '')));
+  },
+
+  /** MessageBody::SlaBody(AssignRequest). payload: { flowId, policyId }. */
+  slaAssignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    return slaFrame(correlationId, sequence, requests.encodeSlaAssignRequest(
+      String(payload.flowId ?? payload.flow_id ?? ''),
+      String(payload.policyId ?? payload.policy_id ?? ''),
+    ));
+  },
+
+  /** MessageBody::SlaBody(UnassignRequest). payload: { flowId }. */
+  slaUnassignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    return slaFrame(correlationId, sequence, requests.encodeSlaUnassignRequest(String(payload.flowId ?? payload.flow_id ?? '')));
+  },
+
+  /** MessageBody::SlaBody(StatusRequest). payload: { flowId?, orgId? } — no flowId answers for every governed flow. */
+  slaStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const flowId = payload.flowId ?? payload.flow_id;
+    return slaFrame(correlationId, sequence, requests.encodeSlaStatusRequest(flowId == null ? null : String(flowId), slaOrg(payload)));
+  },
+
+  /** MessageBody::SlaBody(BreachListRequest). payload: { flowId?, openOnly?, offset?, limit?, orgId? } — newest first; limit 0 = the default page. */
+  slaBreachListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const flowId = payload.flowId ?? payload.flow_id;
+    return slaFrame(correlationId, sequence, requests.encodeSlaBreachListRequest(
+      flowId == null ? null : String(flowId),
+      Boolean(payload.openOnly ?? payload.open_only),
+      Number(payload.offset ?? 0),
+      Number(payload.limit ?? 0),
+      slaOrg(payload),
+    ));
   },
 
 };

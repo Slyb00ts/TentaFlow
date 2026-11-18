@@ -421,6 +421,11 @@ pub enum MeshCommandType {
         vllm_args_override: Option<String>,
         pinned: Option<bool>,
         paused: Option<bool>,
+        /// `None` = unchanged, `Some(0)` = unlimited.
+        #[serde(default)]
+        max_concurrent: Option<u32>,
+        #[serde(default)]
+        timeout_ms: Option<u32>,
         restart_after_save: bool,
     },
     /// Forwarded web research request. Receiver executes it against its local
@@ -2583,6 +2588,28 @@ impl MeshMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_update_command_without_limits_still_decodes() {
+        let value = serde_json::json!({ "ServiceUpdateRemote": {
+            "service_id": 4, "model_repo": null, "model_preset_id": null,
+            "gpu_memory_utilization": null, "max_model_len": null, "max_num_seqs": null,
+            "max_num_batched_tokens": null, "kv_cache_dtype": null, "chunked_prefill": null,
+            "vllm_args_override": null, "pinned": null, "paused": null,
+            "restart_after_save": true
+        }});
+        let bytes = crate::cbor::encode(&value).expect("encode the old shape");
+        let command: MeshCommandType = crate::cbor::decode(&bytes).expect("decode");
+        let MeshCommandType::ServiceUpdateRemote {
+            max_concurrent,
+            timeout_ms,
+            ..
+        } = command
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!((max_concurrent, timeout_ms), (None, None));
+    }
 
     fn epoch(counter: u64, origin: &str) -> BaselineEpoch {
         BaselineEpoch {

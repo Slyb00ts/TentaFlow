@@ -49,6 +49,7 @@ import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partit
 import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
 import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
+import { loadConsumerSla } from '/js/modules/tentabus/consumer-sla.js';
 import { openOffsetMove, movedText } from '/js/modules/tentabus/offset-move.js';
 import { drawUnprocessed, unprocessedRecord, unprocessedTopics, mergeNewest, retryAllPlan, topicConsumers, messageName, receiversText, retryAllDoneNotice, UNPROCESSED_PAGE, LIST_STEP } from '/js/modules/tentabus/unprocessed.js';
 import { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll } from '/js/modules/tentabus/unprocessed-windows.js';
@@ -1327,7 +1328,7 @@ const detailContext = {
       accessData: state.access.topic === state.view.name ? state.access : null,
       hidingData: state.hiding.topic === state.view.name ? state.hiding : null,
       schemaProblem: state.schemaCheck.topic === state.view.name ? state.schemaCheck.problem : null,
-      instanceId: state.instanceId,
+      instanceId: iid,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
     };
@@ -1867,6 +1868,7 @@ function closeConsumer() {
   state.consumerNotice = null;
   state.consumerMoved = new Set();
   state.consumerBusy = false;
+  consumerFlowGraphs.clear();
 }
 
 // Everything the consumer's page shows, in one answer: the consumer itself
@@ -1881,6 +1883,10 @@ function closeConsumer() {
 // page opens and on "Odśwież" — not on every poll, where the count it gives
 // would cost a stream of audit rows the reader never asked for.
 let consumerDlqDue = true;
+
+// The graphs of the flows that read the bus, by flow id: which flow reads as a consumer
+// is decided from them, and a graph is read once, not on every poll.
+const consumerFlowGraphs = new Map();
 
 async function fetchConsumer(instanceId, group, topic) {
   const iid = requireInstanceId(instanceId);
@@ -1909,7 +1915,16 @@ async function fetchConsumer(instanceId, group, topic) {
   const series = history.status === 'fulfilled'
     ? (history.value?.groups || []).find((x) => x.group === group && x.topic === topic)
     : null;
-  return { detail: groupResp?.detail, topicDetail, dlq, samples: series?.samples || [] };
+  const sla = await loadConsumerSla({
+    group,
+    topic,
+    instanceId: iid,
+    call: (kind, payload, options) => ApiBinary.action(kind, payload, options),
+    nodes: () => ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
+    cache: consumerFlowGraphs,
+  })
+    .catch(() => null);
+  return { detail: groupResp?.detail, topicDetail, dlq, samples: series?.samples || [], sla };
 }
 
 // A failed reload keeps the page it already shows (the header says the data
@@ -1920,7 +1935,7 @@ const loadConsumer = topicDetailLoader({
     return fetchConsumer(instanceId, group, topic);
   },
   context: () => ({
-    instanceId: state.instanceId,
+    instanceId: iid,
     name: state.view?.kind === 'consumer-detail' ? consumerKey(state.view.group, state.view.topic) : null,
   }),
   apply({ detail, error }) {
@@ -1969,6 +1984,7 @@ const consumerContext = {
     else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(v.topic, DEFAULT_SECTION); }
     else if (action.kind === 'topic-settings') { setTab('topics'); openTopicDetail(v.topic, 'settings'); }
     else if (action.kind === 'dlq') tabContext.go({ kind: 'dlq', topic: v.topic });
+    else if (action.kind === 'sla-policies') Router.navigate('flows', { tab: 'sla' });
     else if (action.kind === 'retry') { state.consumerError = null; renderPanel(); loadConsumer(consumerKey(v.group, v.topic)); }
   },
 };

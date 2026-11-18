@@ -168,6 +168,7 @@ pub fn project_service_row(
         updated_at: svc.updated_at,
         request_time_parameters,
         gpu_selection,
+        limits_editable: true,
         cluster_deployment_id,
         cluster_coordinator_node_id,
     })

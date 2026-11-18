@@ -15,6 +15,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
+import { limitRefusal, limitsDelta, initialValues, limitsEditable, limitsFromConfig, readLimits, renderLimitsSection, savePlan, showLimitProblems, validateLimits } from '/js/modules/services-limits.js';
 
 // True when the engine is served by CUDA vLLM (manifest backend="vllm", not the
 // Metal variant) — single source of truth shared with the deploy wizard and the
@@ -124,20 +125,36 @@ export async function openEditModal(svc, opts = {}) {
     });
   }
 
+  // What the window opened with: a save that changes nothing but the limits sends only the limits.
+  const baseline = collectPayload(overlay, svc.id, opts.nodeId);
+  const initialLimits = limitsFromConfig(cfg);
+  overlay.querySelectorAll('[data-limit]').forEach((input) => input.addEventListener('input', () => showLimitProblems(overlay, {})));
+
   // Save handler
   const saveLabel = I18n.t('services_edit.save') || 'Zapisz i restartuj';
   const savingLabel = I18n.t('services_edit.saving') || 'Zapisuję…';
   overlay.querySelector('[data-save]').addEventListener('click', async () => {
     const saveBtn = overlay.querySelector('[data-save]');
+    const editable = limitsEditable(svc);
+    const values = editable ? readLimits(overlay) : initialValues(initialLimits);
+    const first = showLimitProblems(overlay, editable ? validateLimits(values, initialLimits) : {});
+    if (first) {
+      first.focus();
+      return;
+    }
+    const plan = savePlan({ full: collectPayload(overlay, svc.id, opts.nodeId), baseline, delta: limitsDelta(initialLimits, values) });
     saveBtn.setAttribute('disabled', '');
-    saveBtn.textContent = savingLabel;
+    // Limits apply without a restart, so a limits-only save never says it is restarting.
+    saveBtn.textContent = plan.limitsOnly ? I18n.t('services_edit.limits_saving') : savingLabel;
     try {
-      const payload = collectPayload(overlay, svc.id, opts.nodeId);
+      const payload = plan.payload;
       // Save-and-restart on a remote owner answers after the runtime stopped,
       // which the server allows 60 s for.
       const res = await ApiBinary.action('serviceConfigUpdateRequest', payload, { timeoutMs: 75000 });
       if (res && res.success === false && res.error) {
-        showInlineError(overlay, res.error);
+        const refusal = plan.limitsOnly ? limitRefusal({ code: 'bad_request', message: res.error }) : null;
+        if (refusal?.field) showLimitProblems(overlay, { [refusal.field]: refusal.message });
+        else showInlineError(overlay, refusal ? refusal.message : res.error);
         saveBtn.removeAttribute('disabled');
         saveBtn.textContent = saveLabel;
         return;
@@ -145,7 +162,10 @@ export async function openEditModal(svc, opts = {}) {
       closeModal();
       onSaved();
     } catch (e) {
-      showInlineError(overlay, e.message || String(e));
+      const found = limitRefusal(e);
+      const refusal = found && (found.field || plan.limitsOnly) ? found : null;
+      if (refusal?.field) showLimitProblems(overlay, { [refusal.field]: refusal.message });
+      else showInlineError(overlay, refusal ? refusal.message : (e.message || String(e)));
       saveBtn.removeAttribute('disabled');
       saveBtn.textContent = saveLabel;
     }
@@ -694,6 +714,8 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
         ${isVllm ? renderVramSection(tk) : ''}
 
         ${isVllm ? renderEngineArgsSection(cfg, tk) : renderGenericArgsSection(tk)}
+
+        ${renderLimitsSection(limitsFromConfig(cfg), { editable: limitsEditable(svc) })}
 
         <div class="body-section">
           <div class="body-section-title">${escapeHtml(tk('immutable'))}</div>

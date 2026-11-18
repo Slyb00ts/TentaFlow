@@ -45,6 +45,7 @@
 import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
 import { Sfx } from '/js/lib/sfx.js';
 import { I18n } from '/js/i18n.js';
+import { escapeHtml } from '/js/utils.js';
 
 let _zCounter = 1000;
 
@@ -797,10 +798,16 @@ TfWindow.choose = function chooseDialog({
   description = '',
   icon = null,
   choices = [],
+  messageHtml = null,
+  descriptionHtml = null,
 } = {}) {
+  // `message` and `description` are text. A caller that deliberately sends markup
+  // (already escaped where it embeds data) says so with `messageHtml` / `descriptionHtml`.
+  const shownMessage = messageHtml ?? escapeHtml(message);
+  const shownDescription = descriptionHtml ?? (description ? escapeHtml(description) : '');
   const bodyHtml = `
-    <p style="color: var(--tf-text-2); font-size: 13px;">${message}</p>
-    ${description ? `<p style="color: var(--tf-text-3); font-size: 12px;">${description}</p>` : ''}
+    <p style="color: var(--tf-text-2); font-size: 13px;">${shownMessage}</p>
+    ${shownDescription ? `<p style="color: var(--tf-text-3); font-size: 12px;">${shownDescription}</p>` : ''}
   `;
   const footerHtml = choices.map(({ action, label, variant = 'ghost', icon: choiceIcon = null }) =>
     `<tf-button variant="${variant}" wrap${choiceIcon ? ` icon="${choiceIcon}"` : ''} data-action="${action}">${label}</tf-button>`).join('\n');
@@ -828,11 +835,15 @@ TfWindow.confirm = function confirmDialog({
   cancelLabel = I18n.t('common.cancel'),
   danger = false,
   icon = null,
+  messageHtml = null,
+  descriptionHtml = null,
 } = {}) {
   return TfWindow.choose({
     title,
     message,
     description,
+    messageHtml,
+    descriptionHtml,
     icon,
     choices: [
       { action: 'cancel', label: cancelLabel },

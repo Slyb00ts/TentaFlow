@@ -4012,7 +4012,7 @@ async function deleteChat(chatId) {
   if (!chat) return;
   const ok = await TfWindow.confirm({
     title: t('chat_delete_title'),
-    message: t('chat_delete_message', { title: escapeHtml(chat.title || t('chat_untitled')) }),
+    message: t('chat_delete_message', { title: chat.title || t('chat_untitled') }),
     confirmLabel: t('action_delete'),
     cancelLabel: t('action_cancel'),
     danger: true,
@@ -4316,7 +4316,7 @@ async function transferOwnership(userId) {
   const member = state.members.find((entry) => entry?.userId === userId);
   if (!member || !canTransferOwnership()) return;
   const ok = await TfWindow.confirm({ title: t('members_transfer_title'),
-    message: t('members_transfer_message', { name: escapeHtml(member?.displayName || '') }),
+    message: t('members_transfer_message', { name: member?.displayName || '' }),
     confirmLabel: t('members_transfer'), cancelLabel: t('action_cancel'), danger: true });
   if (!ok) return;
   try {
@@ -4707,7 +4707,7 @@ async function renderSettings() {
       const tag = (state.settings?.tags ?? []).find((x) => (x.tagId) === tagId);
       const ok = await TfWindow.confirm({
         title: t('tags_delete_title'),
-        message: t('tags_delete_message', { name: escapeHtml(tag?.name || '') }),
+        message: t('tags_delete_message', { name: tag?.name || '' }),
         confirmLabel: t('action_delete'),
         cancelLabel: t('action_cancel'),
         danger: true,

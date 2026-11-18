@@ -44,6 +44,7 @@
 
 .tb-overview { display: flex; flex-direction: column; gap: 16px; }
 .tb-kpi { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.tb-kpi.tb-kpi-five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .tb-dash { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; align-items: stretch; }
 
 .tb-root .topic-mini { display: grid; grid-template-columns: 34px minmax(0, 1fr) 96px; gap: 12px; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--tf-border); cursor: pointer; border-radius: var(--tf-radius-sm); }
@@ -106,7 +107,7 @@
 .tb-root [data-tb-view-slot="schemas"][hidden] { display: none; }
 
 @media (max-width: 1100px) {
-  .tb-kpi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tb-kpi, .tb-kpi.tb-kpi-five { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tb-root .legend-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 960px) {

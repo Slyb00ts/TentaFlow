@@ -911,7 +911,7 @@ export async function openAccountWindow(accountId, {
   footer.querySelector('[data-act="delete"]').addEventListener('click', async () => {
     const confirmed = await TfWindow.confirm({
       title: T('delete_confirm_title'),
-      message: T('delete_confirm_body', { name: escapeHtml(state.account.displayName ?? '') }),
+      message: T('delete_confirm_body', { name: state.account.displayName ?? '' }),
       description: T('delete_confirm_hint'),
       confirmLabel: T('action_delete'),
       cancelLabel: I18n.t('common.cancel'),

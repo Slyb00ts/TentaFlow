@@ -166,10 +166,24 @@ pub struct WindowSummary {
     pub error_rate_pct: Option<f64>,
 }
 
+/// What the stored minute samples of one service account for: the gate's
+/// refusal totals at the last flush, and the stamp of the last sample written
+/// (or, before one is, of the minute the service was first seen). A reader that
+/// counts samples up to `watermark_ms` and the gate's totals beyond `calls` /
+/// `concurrency` counts every refusal once, even while a flush runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flushed {
+    pub calls: u64,
+    pub concurrency: u64,
+    pub watermark_ms: i64,
+}
+
 /// The latest [`WindowSummary`] of every governed service of this node.
 #[derive(Debug, Default)]
 pub struct WindowViews {
     views: DashMap<String, WindowSummary>,
+    /// Per service, what the stored minute samples already account for.
+    flushed: DashMap<String, Flushed>,
 }
 
 impl WindowViews {
@@ -187,8 +201,33 @@ impl WindowViews {
         self.views.insert(target_id.to_string(), summary);
     }
 
+    /// A copy of every service's flush state, taken before the samples are
+    /// read.
+    pub fn flushed_snapshot(&self) -> HashMap<String, Flushed> {
+        self.flushed
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
+    fn set_flushed(&self, target_id: &str, base: &Snapshot, watermark_ms: i64) {
+        let mut entry = self
+            .flushed
+            .entry(target_id.to_string())
+            .or_insert(Flushed {
+                calls: 0,
+                concurrency: 0,
+                watermark_ms,
+            });
+        // A wall clock that stepped back must not lower the watermark.
+        entry.watermark_ms = entry.watermark_ms.max(watermark_ms);
+        entry.calls = base.rejected_calls;
+        entry.concurrency = base.rejected_concurrency;
+    }
+
     fn retain(&self, keep: &HashSet<String>) {
         self.views.retain(|target, _| keep.contains(target));
+        self.flushed.retain(|target, _| keep.contains(target));
     }
 }
 
@@ -666,6 +705,15 @@ impl Evaluator {
 
         self.audit_rejections(pool, assignment, &since_previous, now);
         self.write_minute_sample(pool, assignment, &snapshot, now);
+        if let Some(state) = self.targets.get(&assignment.target_id) {
+            // The sample just written is stamped one minute before the sample
+            // minute, so that stamp is the last one the base accounts for.
+            let watermark_ms = state.last_sample_minute.map_or(i64::MIN, |minute| {
+                i64::try_from(minute.saturating_sub(1) * MINUTE_MS).unwrap_or(i64::MAX)
+            });
+            self.views
+                .set_flushed(&assignment.target_id, &state.sample_base, watermark_ms);
+        }
         candidates
     }
 
@@ -1671,9 +1719,15 @@ mod tests {
         let held = gate.admit(AdmitOrigin::Request).await.unwrap();
         f.tick();
 
-        let status =
-            crate::sla::status::service_status(&f.pool, &f.registry, &f.views, "org-a", "flow-1")
-                .unwrap();
+        let status = crate::sla::status::service_status(
+            &f.pool,
+            &f.registry,
+            &f.views,
+            "org-a",
+            "flow-1",
+            0,
+        )
+        .unwrap();
         assert_eq!((status.in_flight, status.max_concurrency), (1, Some(2)));
         let window = status.call_window.unwrap();
         assert_eq!((window.used, window.limit, window.window_secs), (2, 10, 60));
@@ -1682,19 +1736,196 @@ mod tests {
         assert_eq!(status.open_breaches.len(), 1);
         assert_eq!(status.open_breaches[0].kind, BreachKind::Errors);
 
-        let other =
-            crate::sla::status::service_status(&f.pool, &f.registry, &f.views, "org-b", "flow-1");
-        assert_eq!(other.unwrap_err().code(), "not_found");
-        assert!(
-            crate::sla::status::list_service_statuses(&f.pool, &f.registry, &f.views, "org-b")
-                .unwrap()
-                .is_empty()
+        let other = crate::sla::status::service_status(
+            &f.pool,
+            &f.registry,
+            &f.views,
+            "org-b",
+            "flow-1",
+            0,
         );
+        assert_eq!(other.unwrap_err().code(), "not_found");
+        assert!(crate::sla::status::list_service_statuses(
+            &f.pool,
+            &f.registry,
+            &f.views,
+            "org-b",
+            0
+        )
+        .unwrap()
+        .is_empty());
         let all =
-            crate::sla::status::list_service_statuses(&f.pool, &f.registry, &f.views, "org-a")
+            crate::sla::status::list_service_statuses(&f.pool, &f.registry, &f.views, "org-a", 0)
                 .unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].open_breaches.len(), 1);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn refusals_today_are_the_samples_since_midnight_plus_what_no_sample_holds_yet() {
+        use crate::sla::status::{list_foreign_service_statuses, list_service_statuses};
+        let mut f = Fixture::new();
+        f.govern(
+            "org-a",
+            "flow-1",
+            SlaPolicySpec {
+                max_concurrency: Some(1),
+                max_queue: Some(0),
+                call_limit: Some(1),
+                call_window_secs: Some(3600),
+                ..spec("today")
+            },
+        );
+        let gate = f.gate("flow-1");
+        let held = gate.admit(AdmitOrigin::Request).await.unwrap();
+        // Two refusals by the call limit, before the first sighting.
+        for _ in 0..2 {
+            assert!(gate.admit(AdmitOrigin::Request).await.is_err());
+        }
+        f.tick();
+        // The next minute's first tick stores them in a sample stamped T0.
+        f.run(Duration::from_secs(60));
+        assert_eq!(
+            breach::list_samples(&f.pool, "org-a", "flow-1", 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Three more are counted by the gate only.
+        for _ in 0..3 {
+            assert!(gate.admit(AdmitOrigin::Request).await.is_err());
+        }
+
+        let today = |day_start: u64| {
+            let all =
+                list_service_statuses(&f.pool, &f.registry, &f.views, "org-a", day_start as i64)
+                    .unwrap();
+            assert_eq!(all.len(), 1);
+            let one = crate::sla::status::service_status(
+                &f.pool,
+                &f.registry,
+                &f.views,
+                "org-a",
+                "flow-1",
+                day_start as i64,
+            )
+            .unwrap();
+            assert_eq!(
+                (one.rejected_calls_today, one.rejected_concurrency_today),
+                (
+                    all[0].rejected_calls_today,
+                    all[0].rejected_concurrency_today
+                )
+            );
+            (one.rejected_calls_today, one.rejected_concurrency_today)
+        };
+        let total = |f: &Fixture| {
+            let s = f.gate("flow-1").stats();
+            (s.rejected_calls, s.rejected_concurrency)
+        };
+        let (calls_total, concurrency_total) = total(&f);
+        assert_eq!(calls_total + concurrency_total, 5);
+
+        // Midnight at the sample's own minute: the sample counts, and the two
+        // refusals it holds are not counted again from the gate.
+        assert_eq!(today(T0), (calls_total, concurrency_total));
+        // Midnight after the sample: only the unsampled part is today's.
+        let after = today(T0 + 60 * SECOND);
+        assert_eq!(after.0 + after.1, 3);
+        // The totals stay lifetime counts.
+        let status = crate::sla::status::service_status(
+            &f.pool,
+            &f.registry,
+            &f.views,
+            "org-a",
+            "flow-1",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            status.rejected_calls_total + status.rejected_concurrency_total,
+            5
+        );
+
+        // Another organization's flow list sees the same flow, with the same
+        // figures, through the foreign read.
+        let foreign =
+            list_foreign_service_statuses(&f.pool, &f.registry, &f.views, "org-b", T0 as i64)
+                .unwrap();
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(
+            (
+                foreign[0].rejected_calls_today,
+                foreign[0].rejected_concurrency_today
+            ),
+            (calls_total, concurrency_total)
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_flush_in_the_middle_of_a_status_read_is_counted_once() {
+        use crate::sla::breach::OrgScope;
+        let mut f = Fixture::new();
+        f.govern(
+            "org-a",
+            "flow-1",
+            SlaPolicySpec {
+                max_concurrency: Some(1),
+                max_queue: Some(0),
+                ..spec("watermark")
+            },
+        );
+        let gate = f.gate("flow-1");
+        let held = gate.admit(AdmitOrigin::Request).await.unwrap();
+        for _ in 0..2 {
+            assert!(gate.admit(AdmitOrigin::Request).await.is_err());
+        }
+        f.tick();
+        f.run(Duration::from_secs(60));
+        let flushed = f.views.flushed_snapshot()["flow-1"];
+        assert_eq!(
+            (flushed.calls + flushed.concurrency, flushed.watermark_ms),
+            (2, T0 as i64)
+        );
+
+        // The flush writes the sample, and only then publishes its base. A read
+        // that took the flush state before the write must not see the sample.
+        for _ in 0..3 {
+            assert!(gate.admit(AdmitOrigin::Request).await.is_err());
+        }
+        let stale = f.views.flushed_snapshot();
+        f.run(Duration::from_secs(60));
+        let marks = |s: &HashMap<String, Flushed>| -> HashMap<String, i64> {
+            s.iter().map(|(k, v)| (k.clone(), v.watermark_ms)).collect()
+        };
+        let sum = |m: &HashMap<String, (u64, u64)>| m.get("flow-1").map_or(0, |(c, n)| c + n);
+        let stored = |marks: &HashMap<String, i64>| {
+            sum(&breach::rejections_since(&f.pool, OrgScope::Only("org-a"), 0, marks).unwrap())
+        };
+        // With the stale watermark: the first sample only, and the gate's
+        // unflushed part is everything since the stale base.
+        let total = {
+            let s = gate.stats();
+            s.rejected_calls + s.rejected_concurrency
+        };
+        let unflushed_stale = total - (stale["flow-1"].calls + stale["flow-1"].concurrency);
+        assert_eq!(stored(&marks(&stale)) + unflushed_stale, total);
+        // With the fresh state: both samples, nothing unflushed.
+        let fresh = f.views.flushed_snapshot();
+        let unflushed_fresh = total - (fresh["flow-1"].calls + fresh["flow-1"].concurrency);
+        assert_eq!(stored(&marks(&fresh)) + unflushed_fresh, total);
+        assert_eq!(
+            stored(&marks(&stale)),
+            2,
+            "the second sample is past the stale watermark"
+        );
+        assert_eq!(
+            stored(&HashMap::new()),
+            total,
+            "no watermark counts every stored sample"
+        );
         drop(held);
     }
 
@@ -1886,16 +2117,22 @@ mod tests {
             "an idle consumer is neither at its call limit nor saturated: {:?}",
             f.breaches("org-a")
         );
-        let status =
-            crate::sla::status::service_status(&f.pool, &f.registry, &f.views, "org-a", "flow-1")
-                .unwrap();
+        let status = crate::sla::status::service_status(
+            &f.pool,
+            &f.registry,
+            &f.views,
+            "org-a",
+            "flow-1",
+            0,
+        )
+        .unwrap();
         assert_eq!(status.in_flight, 0);
         assert_eq!(status.call_window.unwrap().used, 0);
         assert_eq!(gate.take_window_peak(), 0);
         let samples = breach::list_samples(&f.pool, "org-a", "flow-1", 0).unwrap();
         assert!(!samples.is_empty() && samples.iter().all(|s| s.in_flight_peak == 0));
         assert_eq!(
-            crate::sla::status::list_service_statuses(&f.pool, &f.registry, &f.views, "org-a")
+            crate::sla::status::list_service_statuses(&f.pool, &f.registry, &f.views, "org-a", 0)
                 .unwrap()[0]
                 .in_flight,
             0

@@ -573,7 +573,7 @@ function wireAgentCards(grid) {
       if (!account) return;
       const ok = await TfWindow.confirm({
         title: T('apps_disconnect_confirm_title'),
-        message: T('apps_disconnect_confirm_body', { name: escapeHtml(account.displayName ?? '') }),
+        message: T('apps_disconnect_confirm_body', { name: account.displayName ?? '' }),
         confirmLabel: T('apps_disconnect'),
         cancelLabel: I18n.t('common.cancel'),
         danger: true,

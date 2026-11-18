@@ -16,6 +16,13 @@ import { emptyProcessModel, processCommand } from './flows-builder/bpmn.js';
 import { openProcessInstances } from './flows-builder/process-monitor.js';
 import { busConsumerText, busConsumerChipStatus } from './flows-builder/bus-consumer.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
+import { setRowsIfChanged } from '/js/lib/dom-patch.js';
+import { Router } from '/js/router.js';
+import { slaCellHtml, paintSlaCells } from '/js/modules/sla/flow-cell.js';
+import { loadPolicies, policiesById, policyActions, renderPolicyTab } from '/js/modules/sla/policies-tab.js';
+import { openAssignPolicyWindow } from '/js/modules/sla/assign-window.js';
+import { startSlaState } from '/js/modules/sla/exec-state.js';
+import { T as slaT, assignAction, failureText, newestRequest, slaView } from '/js/modules/sla/model.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-input.js';
@@ -24,6 +31,10 @@ import '/js/components/tf-textarea.js';
 let flows = [];
 let mode = 'flow';
 let mounted = null;
+// How often the flow list refreshes the SLA state of its rows. The refresh writes into the cells
+// that are already on screen; it never draws the table again.
+const SLA_POLL_MS = 5000;
+const VOLATILE_ROW_FIELDS = new Set(['slaBrief', 'busConsumer']);
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -36,6 +47,12 @@ function statusChip(status) {
   return `<tf-chip status="${cls === 'active' ? 'ok' : cls === 'archived' ? 'neutral' : 'warn'}">${escapeHtml(label)}</tf-chip>`;
 }
 
+function subtitleText(selectedMode, canManagePolicies) {
+  if (selectedMode === 'bpmn') return I18n.t('bpmn.list_description');
+  if (selectedMode === 'sla') return slaT(canManagePolicies ? 'subtitle' : 'subtitle_readonly');
+  return I18n.t('flows.subtitle');
+}
+
 const FlowsScreen = {
   get title() { return I18n.t('flows.list_title'); },
   render() {
@@ -43,26 +60,36 @@ const FlowsScreen = {
       <div class="page-header">
         <div>
           <h1>${sprite('flow')} ${escapeHtml(I18n.t('flows.list_title'))}</h1>
-          <div class="sub" id="flows-subtitle">${escapeHtml(I18n.t(mode === 'bpmn' ? 'bpmn.list_description' : 'flows.subtitle'))}</div>
+          <div class="sub" id="flows-subtitle">${escapeHtml(subtitleText(mode, true))}</div>
         </div>
         <div class="actions">
           <tf-button variant="secondary" icon="clock" id="btn-process-instances">${escapeHtml(I18n.t('bpmn.my_work'))}</tf-button>
           <tf-button variant="primary" icon="plus" id="btn-new-flow">${escapeHtml(I18n.t('flows.new_flow_btn'))}</tf-button>
         </div>
       </div>
-      <tf-tabs id="flows-mode" value="${mode}" variant="underline"><tf-tab id="flow" label="${escapeAttr(I18n.t('flows.list_title'))}"></tf-tab><tf-tab id="bpmn" label="${escapeAttr(I18n.t('bpmn.processes'))}"></tf-tab></tf-tabs>
+      <tf-tabs id="flows-mode" value="${mode}" variant="underline"><tf-tab id="flow" label="${escapeAttr(I18n.t('flows.list_title'))}"></tf-tab><tf-tab id="bpmn" label="${escapeAttr(I18n.t('bpmn.processes'))}"></tf-tab><tf-tab id="sla" label="${escapeAttr(slaT('tab'))}"></tf-tab></tf-tabs>
       <div id="flows-host"></div>
       <div id="execs-host"></div>`;
   },
-  async mount() {
-    const state = { host: byId('flows-host'), generation: 0, offset: 0, canCreateFlow: false };
+  async mount(params = {}) {
+    const state = {
+      host: byId('flows-host'), generation: 0, offset: 0, canCreateFlow: false,
+      policies: new Map(), policyList: [], canManagePolicies: false, statuses: new Map(), polling: false, timer: null, execState: null, execs: newestRequest(),
+    };
     mounted = state;
-    byId('btn-new-flow').addEventListener('click', () => mode === 'bpmn' ? newProcess() : newFlow());
+    if (params?.tab === 'sla') { mode = 'sla'; byId('flows-mode').value = mode; }
+    byId('btn-new-flow').addEventListener('click', () => {
+      if (mode === 'sla') policyHandlers().onNew();
+      else if (mode === 'bpmn') newProcess();
+      else newFlow();
+    });
     byId('btn-process-instances').addEventListener('click', () => openProcessInstances());
     byId('flows-mode').addEventListener('change', (event) => {
       if (event.target.id !== 'flows-mode') return;
       mode = event.detail.value;
       state.offset = 0;
+      state.execs.cancel();
+      stopExecState();
       byId('execs-host').replaceChildren();
       load();
     });
@@ -70,14 +97,20 @@ const FlowsScreen = {
       const me = await ApiBinary.one('authMeRequest');
       if (mounted !== state || !state.host.isConnected) return;
       state.canCreateFlow = ['admin', 'power_user'].includes(me.role);
-      if (!state.canCreateFlow) { mode = 'bpmn'; byId('flows-mode').value = mode; }
+      if (!state.canCreateFlow && mode === 'flow') { mode = 'bpmn'; byId('flows-mode').value = mode; }
     } catch (error) {
       if (mounted !== state || !state.host.isConnected) return;
       toast(I18n.t('bpmn.request_error', { error: error.message }), 'error');
     }
+    state.timer = setInterval(pollSla, SLA_POLL_MS);
     await load();
   },
-  unmount() { mounted = null; flows = []; },
+  unmount() {
+    if (mounted?.timer) clearInterval(mounted.timer);
+    stopExecState();
+    mounted = null;
+    flows = [];
+  },
 };
 
 async function load() {
@@ -85,22 +118,67 @@ async function load() {
   if (!state || !state.host.isConnected) return;
   const generation = ++state.generation;
   const selectedMode = mode;
-  byId('flows-subtitle').textContent = I18n.t(selectedMode === 'bpmn' ? 'bpmn.list_description' : 'flows.subtitle');
+  byId('flows-subtitle').textContent = subtitleText(selectedMode, state.canManagePolicies);
   state.host.replaceChildren();
   const button = byId('btn-new-flow');
-  button.textContent = I18n.t(mode === 'bpmn' ? 'bpmn.new_process' : 'flows.new_flow_btn');
-  button.hidden = mode === 'flow' && !state.canCreateFlow;
+  button.textContent = I18n.t(mode === 'bpmn' ? 'bpmn.new_process' : (mode === 'sla' ? 'sla.new_policy' : 'flows.new_flow_btn'));
+  button.hidden = mode === 'flow' ? !state.canCreateFlow : (mode === 'sla' && !state.canManagePolicies);
+  const stale = () => mounted !== state || generation !== state.generation || !state.host.isConnected;
   try {
-    const response = selectedMode === 'bpmn'
-      ? await ApiBinary.one('processDefinitionListRequest', { offset: state.offset, limit: 25 })
-      : await ApiBinary.list('flowListRequest', { arrayKey: 'flows' });
-    if (mounted !== state || generation !== state.generation || !state.host.isConnected) return;
-    flows = selectedMode === 'bpmn' ? response.definitions : response;
-    renderTable(selectedMode === 'bpmn' ? response.total : flows.length);
+    if (selectedMode === 'sla') {
+      const response = await loadPolicies();
+      if (stale()) return;
+      state.policyList = response.policies;
+      state.policies = policiesById(response.policies);
+      state.canManagePolicies = response.canManage;
+      byId('flows-subtitle').textContent = subtitleText('sla', state.canManagePolicies);
+      button.hidden = !state.canManagePolicies;
+      renderPolicyTab(state.host, response, policyHandlers());
+      return;
+    }
+    if (selectedMode === 'bpmn') {
+      const response = await ApiBinary.one('processDefinitionListRequest', { offset: state.offset, limit: 25 });
+      if (stale()) return;
+      flows = response.definitions;
+      renderTable(response.total);
+      return;
+    }
+    const [list, policies, statuses] = await Promise.all([
+      ApiBinary.list('flowListRequest', { arrayKey: 'flows' }),
+      loadPolicies().catch(() => null),
+      readSlaStatuses(),
+    ]);
+    if (stale()) return;
+    flows = list;
+    state.statuses = statuses;
+    if (policies) {
+      state.policyList = policies.policies;
+      state.policies = policiesById(policies.policies);
+      state.canManagePolicies = policies.canManage;
+    }
+    renderTable(flows.length);
   } catch (err) {
-    if (mounted !== state || generation !== state.generation || !state.host.isConnected) return;
-    toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
+    if (stale()) return;
+    toast(selectedMode === 'sla' ? failureText(err) : `${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
+}
+
+/** The state of every governed flow of the caller's organization, by flow id; empty when it cannot be read. */
+async function readSlaStatuses() {
+  try {
+    const response = await ApiBinary.one('slaStatusRequest', {});
+    return new Map((response.statuses ?? []).map((status) => [status.flowId, status]));
+  } catch {
+    return new Map();
+  }
+}
+
+function policyHandlers() {
+  const state = mounted;
+  return policyActions({
+    policies: () => state?.policyList ?? [],
+    onChanged: () => { if (mounted === state && mode === 'sla') load(); },
+  });
 }
 
 function renderTable(total) {
@@ -121,12 +199,14 @@ function renderTable(total) {
   host.innerHTML = `<tf-table id="flows-table" ${mode === 'bpmn' ? `page-size="25" total="${total}" page="${mounted.offset / 25 + 1}"` : ''}>
     <tf-column key="nameHtml" renderer="html" label="${escapeAttr(I18n.t('flows.col_name'))}"></tf-column>
     <tf-column key="description" label="${escapeAttr(I18n.t('flows.col_desc'))}"></tf-column>
+    ${mode === 'bpmn' ? '' : `<tf-column key="slaHtml" renderer="html" label="${escapeAttr(slaT('col_sla'))}"></tf-column>`}
     <tf-column key="statusHtml" renderer="html" label="${escapeAttr(I18n.t('flows.col_status'))}"></tf-column>
     <tf-column key="versionLabel" label="${escapeAttr(I18n.t(mode === 'bpmn' ? 'bpmn.published_version' : 'flows.col_updated'))}"></tf-column></tf-table>`;
   const table = host.querySelector('tf-table');
   table.rowKey = mode === 'bpmn' ? 'definitionId' : 'id';
-  table.rows = flows.map(renderRow);
   bindRowActions();
+  if (mode === 'bpmn') table.rows = flows.map(renderRow);
+  else paintFlowRows(table);
   const state = mounted;
   table.addEventListener('page-change', (event) => { if (mounted !== state || !state.host.contains(table)) return; state.offset = (event.detail.page - 1) * 25; load(); });
 }
@@ -155,7 +235,51 @@ function renderRow(f) {
     ? ` <tf-chip status="${busConsumerChipStatus(consumer.state)}" title="${escapeAttr(consumer.detail)}" data-flow-consumer="${escapeAttr(f.id)}">${escapeHtml(consumer.text)}</tf-chip>`
       + (consumer.reason ? `<div class="flows-consumer-reason" data-flow-consumer-reason="${escapeAttr(f.id)}">${escapeHtml(consumer.reason)}</div>` : '')
     : '';
-  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
+  const sla = slaView(f, mounted.policies, mounted.statuses.get(f.id));
+  return {
+    ...f,
+    nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`,
+    slaHtml: slaCellHtml(f.id, sla),
+    slaKind: sla.kind,
+    statusHtml: statusChip(status),
+    versionLabel: formatDate(updated),
+  };
+}
+
+/** The SLA views of every flow row, by flow id. */
+function slaViews() {
+  return new Map(flows.map((flow) => [flow.id, slaView(flow, mounted.policies, mounted.statuses.get(flow.id))]));
+}
+
+/**
+ * Gives the table its rows and paints the SLA values. The rows hold only what does not move
+ * between polls (the volatile counters are left out of the comparison), so a refresh that changed
+ * nothing visible assigns nothing; the SLA cells are written into the nodes already on screen.
+ */
+function paintFlowRows(table) {
+  setRowsIfChanged(table, flows.map(renderRow), VOLATILE_ROW_FIELDS);
+  paintSlaCells(table.shadowRoot, slaViews());
+}
+
+/** Refreshes the SLA column of the flow list in place. */
+async function pollSla() {
+  const state = mounted;
+  if (!state || mode !== 'flow' || state.polling || document.hidden) return;
+  state.polling = true;
+  const generation = state.generation;
+  try {
+    const [list, statuses] = await Promise.all([ApiBinary.list('flowListRequest', { arrayKey: 'flows' }), readSlaStatuses()]);
+    if (mounted !== state || mode !== 'flow' || generation !== state.generation || !state.host.isConnected) return;
+    flows = list;
+    state.statuses = statuses;
+    const table = byId('flows-table');
+    if (table) paintFlowRows(table);
+    else renderTable(flows.length);
+  } catch {
+    // The next tick tries again; a failed refresh keeps what is on screen.
+  } finally {
+    state.polling = false;
+  }
 }
 
 function bindRowActions() {
@@ -163,13 +287,18 @@ function bindRowActions() {
   byId('flows-table').rowActions = (row, _index, current) => {
     const group = document.createElement('div');
     group.className = 'flows-row-actions';
-    const add = (icon, label, action, variant = 'ghost') => {
+    const add = (icon, label, action, variant = 'ghost', disabled = false) => {
       const button = document.createElement('tf-button');
       button.setAttribute('icon', icon); button.setAttribute('variant', variant); button.setAttribute('size', 'sm');
       button.setAttribute('title', label);
-      button.addEventListener('click', () => action(current()));
+      if (disabled) button.setAttribute('disabled', '');
+      else button.addEventListener('click', () => action(current()));
       group.append(button);
     };
+    const assign = process ? { show: false } : assignAction({ flow: row, kind: row.slaKind, canManage: mounted.canManagePolicies, canEditFlows: mounted.canCreateFlow });
+    if (assign.show) {
+      add('shield', assign.title, (selected) => openAssignPolicyWindow({ flow: selected, policies: mounted.policyList, onChanged: () => load() }), 'ghost', assign.disabled);
+    }
     add(row.isSystem ? 'eye' : 'settings', I18n.t(row.isSystem ? 'flows.preview' : 'flows.edit_title'), (selected) => openFlowBuilder(process ? selected.definitionId : selected.id, { mode: process ? 'bpmn' : 'flow' }));
     add('clock', I18n.t('flows.history_title_short'), (selected) => process ? openProcessInstances(selected.definitionId) : showExecs(selected.id));
     if (!process && row.isFactory) add('refresh', I18n.t('flows.factory_restore'), (selected) => restoreFactoryFlow(selected.id, selected.name));
@@ -258,13 +387,29 @@ async function deleteFlow(flowId, flowName) {
   }
 }
 
+function stopExecState() {
+  if (!mounted?.execState) return;
+  mounted.execState.dispose();
+  mounted.execState = null;
+}
+
 async function showExecs(flowId) {
+  const state = mounted;
+  if (!state) return;
+  const newest = state.execs.begin();
+  // An answer that arrives after another flow was asked for, or after the tab changed, draws nothing.
+  const current = () => mounted === state && newest() && mode === 'flow';
   try {
     const resp = await ApiBinary.one('flowExecutionsListRequest', { flowId });
+    if (!current()) return;
     const execs = resp.executions ?? [];
     const host = byId('execs-host');
     if (!host) return;
+    stopExecState();
+    const flow = flows.find((item) => item.id === flowId);
+    const governed = Boolean(flow?.slaPolicyId) && !flow.isSystem;
     host.innerHTML = `
+      ${governed ? '<div id="sla-state-host"></div>' : ''}
       <div class="card" style="margin-top: var(--space-4);">
         <div class="card-header">
           <h3 class="card-title">${escapeHtml(I18n.t('flows.exec_title', { id: flowId }))}</h3>
@@ -274,8 +419,16 @@ async function showExecs(flowId) {
           <div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('flows.exec_empty'))}</div></div>
         ` : executionsTableHtml(execs)}
       </div>`;
-    byId('execs-close')?.addEventListener('click', () => { host.innerHTML = ''; });
+    byId('execs-close')?.addEventListener('click', () => { stopExecState(); host.innerHTML = ''; });
+    if (governed) {
+      mounted.execState = startSlaState({
+        host: byId('sla-state-host'),
+        flow,
+        onOpenPolicies: () => Router.navigate('flows', { tab: 'sla' }),
+      });
+    }
   } catch (err) {
+    if (!current()) return;
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
 }

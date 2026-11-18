@@ -88,6 +88,23 @@ function profileScope(scope) {
   };
 }
 
+/** The numeric limits of a policy, wire name → the camelCase the screens use. */
+const SLA_LIMITS = {
+  max_concurrency: 'maxConcurrency', max_queue: 'maxQueue', queue_timeout_ms: 'queueTimeoutMs', call_limit: 'callLimit',
+  call_window_secs: 'callWindowSecs', timeout_ms: 'timeoutMs', latency_p95_ms: 'latencyP95Ms', error_rate_pct: 'errorRatePct',
+  warn_at_pct: 'warnAtPct',
+};
+
+/** The policy spec in the wire's own shape: an empty or missing limit is `null` (no such limit), `ordering` defaults to the server's "partition". */
+function slaSpec(spec) {
+  const wire = { name: String(spec.name ?? ''), description: String(spec.description ?? ''), ordering: spec.ordering || 'partition' };
+  for (const [snake, camel] of Object.entries(SLA_LIMITS)) {
+    const value = spec[camel] ?? spec[snake];
+    wire[snake] = value == null || value === '' ? null : Number(value);
+  }
+  return wire;
+}
+
 export const requests = {
   encodeModelListRequest: () => encode('', 'ModelListRequest', {}),
   encodeMetaHeartbeat: (sentAtEpoch) => encode('', 'MetaHeartbeat', { sent_at_epoch: sentAtEpoch }),
@@ -1225,4 +1242,14 @@ export const requests = {
   encodeOrgStructureImportDryRunRequest: (requestJson, file) => encodeBlobs('OrgStructureBody', 'ImportDryRunRequest', { ...parseJson(requestJson, 'ImportDryRunRequest'), bytes: { $bytes: 0 } }, [file]),
   encodeOrgStructureImportApplyRequest: (requestJson, file) => encodeBlobs('OrgStructureBody', 'ImportApplyRequest', { ...parseJson(requestJson, 'ImportApplyRequest'), bytes: { $bytes: 0 } }, [file]),
   encodeOrgStructureExportErrorsRequest: (requestJson, file) => encodeBlobs('OrgStructureBody', 'ExportErrorsRequest', { ...parseJson(requestJson, 'ExportErrorsRequest'), bytes: { $bytes: 0 } }, [file]),
+  encodeSlaPolicyListRequest: (orgId) => encode('SlaBody', 'PolicyListRequest', { org_id: orgId ?? null }),
+  encodeSlaPolicyGetRequest: (policyId, orgId) => encode('SlaBody', 'PolicyGetRequest', { policy_id: policyId, org_id: orgId ?? null }),
+  encodeSlaPolicyUpsertRequest: (policyId, spec) => encode('SlaBody', 'PolicyUpsertRequest', { policy_id: policyId ?? null, spec: slaSpec(spec) }),
+  encodeSlaPolicyDeleteRequest: (policyId) => encode('SlaBody', 'PolicyDeleteRequest', { policy_id: policyId }),
+  encodeSlaAssignRequest: (flowId, policyId) => encode('SlaBody', 'AssignRequest', { flow_id: flowId, policy_id: policyId }),
+  encodeSlaUnassignRequest: (flowId) => encode('SlaBody', 'UnassignRequest', { flow_id: flowId }),
+  encodeSlaStatusRequest: (flowId, orgId) => encode('SlaBody', 'StatusRequest', { flow_id: flowId ?? null, org_id: orgId ?? null }),
+  encodeSlaBreachListRequest: (flowId, openOnly, offset, limit, orgId) => encode('SlaBody', 'BreachListRequest', {
+    flow_id: flowId ?? null, open_only: Boolean(openOnly), offset: offset ?? 0, limit: limit ?? 0, org_id: orgId ?? null,
+  }),
 };

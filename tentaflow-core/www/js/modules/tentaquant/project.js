@@ -129,8 +129,8 @@ async function deleteFile(screen, file) {
   if (!file) return;
   const ok = await TfWindow.confirm({
     title: T('files.delete_title'),
-    // TfWindow.confirm inserts the message as HTML, so the path is escaped here.
-    message: T('files.delete_message', { name: escapeHtml(file.path) }),
+    // The message carries markup of its own (<b>), so it goes in as HTML with the path escaped.
+    messageHtml: T('files.delete_message', { name: escapeHtml(file.path) }),
     confirmLabel: T('files.delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
