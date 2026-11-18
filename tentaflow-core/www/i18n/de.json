@@ -3872,7 +3872,8 @@
     "delete_cancel_btn": "Abbrechen",
     "deleted_ok": "Flow gelöscht",
     "delete_not_found": "Flow nicht gefunden",
-    "exec_title": "Ausführungsverlauf — Flow {id}",
+    "exec_title": "Ausführungsverlauf — Flow „{name}“",
+    "exec_meta": "flow_id: {id} · {count} {n|Ausführung|Ausführungen} · Status: {status}",
     "exec_empty": "Keine Ausführungen",
     "col_exec_id": "ID",
     "col_exec_start": "Start",
@@ -16521,13 +16522,14 @@
       "system_title": "Plattform-Flows unterliegen keiner Richtlinie"
     },
     "cells": {
+      "calls_n": "{count} {n|Aufruf|Aufrufe}",
       "held_until": "angehalten bis {time}",
       "reset_at": "Reset um {time}",
       "queue": "Warteschlange {waiting}/{max}",
       "ms": "{value} ms",
       "threshold_ms": "Schwelle {value} ms",
       "threshold_pct": "Schwelle {value} %",
-      "today_in_window": "in diesem Fenster · heute {count}",
+      "today_in_window": "in den letzten 5 Min. · heute {count}",
       "today_count": "heute {count}",
       "today": "heute",
       "up_to_ms": "bis {value} ms",
@@ -16633,6 +16635,32 @@
       "queue": "sind die Threads belegt, wartet eine Anfrage bis zu {wait} in der Warteschlange und erhält dann 429 mit Retry-After",
       "resumes": "das Lesen setzt sich um {time} von selbst fort; Nachrichten warten im Topic und landen nicht bei den unverarbeiteten",
       "parallel": "Pakete aus verschiedenen Partitionen laufen parallel, höchstens {count} gleichzeitig"
+    }
+  },
+  "flow_publication": {
+    "button": "Einstellungen",
+    "button_title": "Flow-Einstellungen",
+    "title": "Flow-Einstellungen",
+    "subject": "Flow: {name}",
+    "toggle": "Als Modell in der /v1-API bereitstellen",
+    "name": "Modellname",
+    "name_placeholder": "z. B. anmeldung-api",
+    "name_hint": "Anwendungen rufen diesen Flow über /v1/chat/completions auf, wobei das Feld model diesem Namen entspricht. Der Name muss eindeutig sein; wird er entfernt, ist die Veröffentlichung zurückgezogen.",
+    "address": "Aufrufadresse",
+    "submit": "Speichern",
+    "chip_title": "Der Flow ist in der /v1-API als Modell „{name}“ verfügbar",
+    "saved_published": "Der Flow ist als Modell „{name}“ verfügbar",
+    "saved_unpublished": "Die Veröffentlichung des Flows wurde zurückgezogen",
+    "saved_unchanged": "Keine Änderungen",
+    "load_error": "Die Flow-Einstellungen konnten nicht geladen werden.",
+    "error": {
+      "required": "Geben Sie einen Modellnamen an oder schalten Sie die Bereitstellung aus.",
+      "too_long": "Der Modellname darf höchstens {max} Zeichen haben.",
+      "characters": "Der Modellname darf keine Steuerzeichen enthalten.",
+      "taken": "Der Modellname wird bereits von einem anderen Flow verwendet.",
+      "taken_by": "Der Modellname wird bereits vom Flow „{flow}“ verwendet.",
+      "alias": "Der Modellname wird bereits von einem Modell-Alias verwendet.",
+      "generic": "Die Einstellungen konnten nicht gespeichert werden. Versuchen Sie es erneut."
     }
   }
 }

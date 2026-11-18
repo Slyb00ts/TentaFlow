@@ -4044,7 +4044,8 @@
     "delete_cancel_btn": "Anuluj",
     "deleted_ok": "Usunięto przepływ",
     "delete_not_found": "Przepływ nie znaleziony",
-    "exec_title": "Historia wykonań — flow {id}",
+    "exec_title": "Historia wykonań — flow „{name}”",
+    "exec_meta": "flow_id: {id} · {count} {n|wykonanie|wykonania|wykonań} · status: {status}",
     "exec_empty": "Brak wykonań",
     "col_exec_id": "ID",
     "col_exec_start": "Start",
@@ -17659,13 +17660,14 @@
       "system_title": "Przepływów systemowych nie obejmuje się polityką"
     },
     "cells": {
+      "calls_n": "{count} {n|wywołanie|wywołania|wywołań}",
       "held_until": "wstrzymano do {time}",
       "reset_at": "reset o {time}",
       "queue": "kolejka {waiting}/{max}",
       "ms": "{value} ms",
       "threshold_ms": "próg {value} ms",
       "threshold_pct": "próg {value} %",
-      "today_in_window": "w tym oknie · dziś {count}",
+      "today_in_window": "w ostatnich 5 min · dziś {count}",
       "today_count": "dziś {count}",
       "today": "dziś",
       "up_to_ms": "do {value} ms",
@@ -17771,6 +17773,32 @@
       "queue": "po zajęciu wątków żądanie czeka w kolejce do {wait}, potem dostaje 429 z Retry-After",
       "resumes": "odbiór ruszy sam o {time}; wiadomości czekają w topiku i nie trafiają do nieprzetworzonych",
       "parallel": "paczki z różnych partycji idą równolegle, najwyżej {count} naraz"
+    }
+  },
+  "flow_publication": {
+    "button": "Ustawienia",
+    "button_title": "Ustawienia przepływu",
+    "title": "Ustawienia przepływu",
+    "subject": "Przepływ: {name}",
+    "toggle": "Udostępnij jako model w API /v1",
+    "name": "Nazwa modelu",
+    "name_placeholder": "np. rejestracja-api",
+    "name_hint": "Aplikacje wywołują ten przepływ przez /v1/chat/completions z polem model równym tej nazwie. Nazwa musi być unikalna; usunięcie nazwy wycofuje publikację.",
+    "address": "Adres wywołania",
+    "submit": "Zapisz",
+    "chip_title": "Przepływ jest dostępny w API /v1 jako model „{name}”",
+    "saved_published": "Przepływ jest dostępny jako model „{name}”",
+    "saved_unpublished": "Publikacja przepływu została wycofana",
+    "saved_unchanged": "Bez zmian",
+    "load_error": "Nie udało się wczytać ustawień przepływu.",
+    "error": {
+      "required": "Podaj nazwę modelu albo wyłącz udostępnianie.",
+      "too_long": "Nazwa modelu może mieć najwyżej {max} znaków.",
+      "characters": "Nazwa modelu nie może zawierać znaków sterujących.",
+      "taken": "Nazwa modelu jest już zajęta przez inny przepływ.",
+      "taken_by": "Nazwa modelu jest już zajęta przez przepływ „{flow}”.",
+      "alias": "Nazwa modelu jest już zajęta przez alias modelu.",
+      "generic": "Nie udało się zapisać ustawień. Spróbuj ponownie."
     }
   }
 }

@@ -4044,7 +4044,8 @@
     "delete_cancel_btn": "Cancel",
     "deleted_ok": "Flow deleted",
     "delete_not_found": "Flow not found",
-    "exec_title": "Execution history — flow {id}",
+    "exec_title": "Execution history — flow “{name}”",
+    "exec_meta": "flow_id: {id} · {count} {n|execution|executions} · status: {status}",
     "exec_empty": "No executions",
     "col_exec_id": "ID",
     "col_exec_start": "Start",
@@ -17659,13 +17660,14 @@
       "system_title": "Platform flows are not governed by a policy"
     },
     "cells": {
+      "calls_n": "{count} {n|call|calls}",
       "held_until": "held until {time}",
       "reset_at": "resets at {time}",
       "queue": "queue {waiting}/{max}",
       "ms": "{value} ms",
       "threshold_ms": "threshold {value} ms",
       "threshold_pct": "threshold {value} %",
-      "today_in_window": "in this window · today {count}",
+      "today_in_window": "in the last 5 min · today {count}",
       "today_count": "today {count}",
       "today": "today",
       "up_to_ms": "up to {value} ms",
@@ -17771,6 +17773,32 @@
       "queue": "once the threads are taken a request waits in the queue for up to {wait}, then gets 429 with Retry-After",
       "resumes": "reading resumes by itself at {time}; messages wait in the topic and do not land in the unprocessed ones",
       "parallel": "batches from different partitions run in parallel, at most {count} at a time"
+    }
+  },
+  "flow_publication": {
+    "button": "Settings",
+    "button_title": "Flow settings",
+    "title": "Flow settings",
+    "subject": "Flow: {name}",
+    "toggle": "Offer as a model in the /v1 API",
+    "name": "Model name",
+    "name_placeholder": "e.g. patient-intake-api",
+    "name_hint": "Applications call this flow through /v1/chat/completions with the model field set to this name. The name must be unique; removing the name withdraws the publication.",
+    "address": "Call address",
+    "submit": "Save",
+    "chip_title": "The flow is available in the /v1 API as the model “{name}”",
+    "saved_published": "The flow is available as the model “{name}”",
+    "saved_unpublished": "The flow is no longer published",
+    "saved_unchanged": "No changes",
+    "load_error": "The flow settings could not be loaded.",
+    "error": {
+      "required": "Enter a model name or turn publishing off.",
+      "too_long": "The model name can have at most {max} characters.",
+      "characters": "The model name cannot contain control characters.",
+      "taken": "The model name is already used by another flow.",
+      "taken_by": "The model name is already used by the flow “{flow}”.",
+      "alias": "The model name is already used by a model alias.",
+      "generic": "The settings could not be saved. Try again."
     }
   }
 }

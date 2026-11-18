@@ -40,9 +40,14 @@ function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
-function statusChip(status) {
+/** `active`, `archived` or `draft`: the key of a flow's status label. */
+const statusKey = (status) => {
   const s = (status || '').toLowerCase();
-  const cls = s === 'active' ? 'active' : (s === 'archived' ? 'archived' : 'draft');
+  return s === 'active' ? 'active' : (s === 'archived' ? 'archived' : 'draft');
+};
+
+function statusChip(status) {
+  const cls = statusKey(status);
   const label = I18n.t(`flows.status_${cls}`);
   return `<tf-chip status="${cls === 'active' ? 'ok' : cls === 'archived' ? 'neutral' : 'warn'}">${escapeHtml(label)}</tf-chip>`;
 }
@@ -238,12 +243,22 @@ function renderRow(f) {
   const sla = slaView(f, mounted.policies, mounted.statuses.get(f.id));
   return {
     ...f,
-    nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${consumerChip}`,
+    nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}${publishedChipHtml(f)}${consumerChip}`,
     slaHtml: slaCellHtml(f.id, sla),
     slaKind: sla.kind,
     statusHtml: statusChip(status),
     versionLabel: formatDate(updated),
   };
+}
+
+/**
+ * The chip of a flow offered as a /v1 model: `/v1 · <model-name>`. The outline variant is sentence-case,
+ * so the name keeps the case it was published with (the plain pill upper-cases its text).
+ */
+export function publishedChipHtml(f) {
+  const name = (f.publishedModelName ?? '').trim();
+  if (!name) return '';
+  return ` <tf-chip status="info" variant="outline" data-flow-published="${escapeAttr(f.id)}" title="${escapeAttr(I18n.t('flow_publication.chip_title', { name }))}">/v1 · ${escapeHtml(name)}</tf-chip>`;
 }
 
 /** The SLA views of every flow row, by flow id. */
@@ -412,7 +427,10 @@ async function showExecs(flowId) {
       ${governed ? '<div id="sla-state-host"></div>' : ''}
       <div class="card" style="margin-top: var(--space-4);">
         <div class="card-header">
-          <h3 class="card-title">${escapeHtml(I18n.t('flows.exec_title', { id: flowId }))}</h3>
+          <div>
+            <h3 class="card-title">${escapeHtml(I18n.t('flows.exec_title', { name: flow?.name || flowId }))}</h3>
+            <div class="hint" style="margin:0">${escapeHtml(I18n.t('flows.exec_meta', { id: flowId, count: execs.length, n: execs.length, status: I18n.t(`flows.status_${statusKey(flow?.status || (flow?.enabled ? 'active' : 'draft'))}`) }))}</div>
+          </div>
           <tf-button variant="ghost" size="sm" icon="x" id="execs-close" title="${escapeAttr(I18n.t('flows.close_title'))}"></tf-button>
         </div>
         ${execs.length === 0 ? `

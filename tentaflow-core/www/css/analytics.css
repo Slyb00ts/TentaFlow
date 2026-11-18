@@ -130,6 +130,9 @@
   border-top: 1px solid var(--tf-border); background: var(--tf-bg-3);
 }
 .an-tfoot:empty { display: none; }
+/* A value of the Stan SLA card at or above its threshold: warning from the warn percentage, danger over it. */
+.sla-near { color: var(--tf-warning); font-weight: 700; }
+.sla-over { color: var(--tf-danger); font-weight: 700; }
 .an-card tf-table { display: block; }
 .an-card tf-table[hidden] { display: none; }
 .an-row-actions { display: inline-flex; gap: 4px; }

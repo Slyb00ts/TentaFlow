@@ -17,6 +17,9 @@ test('a flow reads as the consumer whose instance, effective group and topic all
   assert.deepEqual(s.consumeConfigs('not json'), []);
 });
 
+// The flow list has no payload: `flows(options)` is its own dependency next to `call`.
+const withFlows = (call) => ({ call, flows: (options) => call('flowListRequest', {}, options) });
+
 const baseCall = (extra = {}) => async (kind, payload, options) => {
   if (kind === 'flowListRequest') {
     const node = options?.targetNodeId ?? 'n1';
@@ -34,23 +37,23 @@ test('loadConsumerSla finds the flow, reads each graph once and answers null wit
   const calls = [];
   const call = (kind, ...rest) => { calls.push(kind); return baseCall()(kind, ...rest); };
   const cache = new Map();
-  const found = await s.loadConsumerSla({ ...ASK, call, cache });
+  const found = await s.loadConsumerSla({ ...ASK, ...withFlows(call), cache });
   assert.equal(found.flow.name, 'Orders');
   assert.equal(found.policy.spec.name, 'Std');
-  await s.loadConsumerSla({ ...ASK, call, cache });
+  await s.loadConsumerSla({ ...ASK, ...withFlows(call), cache });
   assert.equal(calls.filter((k) => k === 'flowDetailRequest').length, 1);
-  assert.equal(await s.loadConsumerSla({ ...ASK, group: 'k:zz.g', call, cache: new Map() }), null);
-  assert.equal(await s.loadConsumerSla({ ...ASK, instanceId: 'bus-2', call, cache: new Map() }), null);
+  assert.equal(await s.loadConsumerSla({ ...ASK, group: 'k:zz.g', ...withFlows(call), cache: new Map() }), null);
+  assert.equal(await s.loadConsumerSla({ ...ASK, instanceId: 'bus-2', ...withFlows(call), cache: new Map() }), null);
 });
 
 test('the consumer status comes from the node whose consumer runs, not from the connected one', async () => {
   const nodes = async () => [{ nodeId: 'n1', isLocal: true }, { nodeId: 'n2', isLocal: false }];
   const call = baseCall({ consumers: { n1: { state: 'standby', inFlight: 0, maxConcurrency: 4 }, n2: { state: 'running', inFlight: 3, maxConcurrency: 4, throttledUntil: 9 } } });
-  const found = await s.loadConsumerSla({ ...ASK, call, cache: new Map(), nodes });
+  const found = await s.loadConsumerSla({ ...ASK, ...withFlows(call), cache: new Map(), nodes });
   assert.equal(found.consumer.inFlight, 3);
   assert.equal(found.consumer.throttledUntil, 9);
   const hung = async (kind, payload, options) => (options?.targetNodeId === 'n2' ? new Promise(() => {}) : call(kind, payload, options));
-  const fallback = await s.loadConsumerSla({ ...ASK, call: hung, cache: new Map(), nodes, deadlineMs: 20 });
+  const fallback = await s.loadConsumerSla({ ...ASK, ...withFlows(hung), cache: new Map(), nodes, deadlineMs: 20 });
   assert.equal(fallback.consumer.state, 'standby', 'a node that does not answer falls back to the connected one');
 });
 
@@ -89,9 +92,9 @@ test('without a readable policy nothing says "Brak polityki" and no empty name i
 });
 
 test('a policy fetch that fails is reported as a load error, not as no policy', async () => {
-  const found = await s.loadConsumerSla({ ...ASK, call: baseCall({ policyFails: true }), cache: new Map(), deadlineMs: 50 });
+  const found = await s.loadConsumerSla({ ...ASK, ...withFlows(baseCall({ policyFails: true })), cache: new Map(), deadlineMs: 50 });
   assert.equal(found.policyError, true);
-  const elsewhere = await s.loadConsumerSla({ ...ASK, call: baseCall({ brief: { governedElsewhere: true } }), cache: new Map() });
+  const elsewhere = await s.loadConsumerSla({ ...ASK, ...withFlows(baseCall({ brief: { governedElsewhere: true } })), cache: new Map() });
   assert.equal(elsewhere.elsewhere, true);
   assert.equal(elsewhere.policyError, false);
 });

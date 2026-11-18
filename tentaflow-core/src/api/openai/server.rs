@@ -1974,31 +1974,34 @@ async fn handle_passthrough(
         Err(resp) => return Ok(resp),
     };
 
+    // Embedded vision (`/v1/infer`): silniki wkompilowane w binarkę (detekcja
+    // twarzy/pozy/emocji + OCR) nie wystawiają HTTP — uruchamiamy je in-process
+    // przez `crate::vision`, zamiast forwardować po sieci. Reszta (`/v1/rerank`,
+    // kontenery HTTP) idzie niezmienioną ścieżką passthrough poniżej.
+    if let Some(response) = serve_embedded_infer(
+        &target,
+        forward_path,
+        &parsed,
+        router.executor.clone(),
+        actor,
+    )
+    .await
+    {
+        return Ok(response);
+    }
+
     let _slot = match local_service_slot(&target).await {
         Ok(slot) => slot,
         Err(e) => return Ok(core_error_to_response(&e)),
     };
 
-    // Embedded vision (`/v1/infer`): silniki wkompilowane w binarkę (detekcja
-    // twarzy/pozy/emocji + OCR) nie wystawiają HTTP — uruchamiamy je in-process
-    // przez `crate::vision`, zamiast forwardować po sieci. Reszta (`/v1/rerank`,
-    // kontenery HTTP) idzie niezmienioną ścieżką passthrough poniżej.
-    if let crate::services::runtime::target::ResolvedExecutionTarget::Local {
-        handle: crate::services::handles_cache::BackendHandle::Embedded { engine_id, .. },
-        model_name,
-        ..
-    } = &target
-    {
-        if forward_path == "/v1/infer" {
-            return Ok(infer_embedded_vision(
-                &parsed,
-                model_name,
-                engine_id,
-                router.executor.clone(),
-                actor,
-            )
-            .await);
+    if matches!(
+        &target,
+        crate::services::runtime::target::ResolvedExecutionTarget::Local {
+            handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+            ..
         }
+    ) {
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
@@ -2118,7 +2121,7 @@ fn resolve_local_v1_target(
             Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
-                format!("model '{}' niedostępny: {}", model, e),
+                format!("model '{}' unavailable", model),
             ))
         }
     }
@@ -2148,6 +2151,115 @@ async fn local_service_slot(
             ..
         } => client.acquire_slot().await,
         _ => Ok(None),
+    }
+}
+
+/// Serves `/v1/infer` for an embedded engine: picks the call's slot, then runs
+/// the engine while holding it. `None` when the target is not an embedded
+/// engine on `/v1/infer`, so the caller takes the HTTP path.
+async fn serve_embedded_infer(
+    target: &crate::services::runtime::target::ResolvedExecutionTarget,
+    forward_path: &str,
+    parsed: &serde_json::Value,
+    runtime: crate::flow_engine::dispatchers_impl::ModelRuntimeSlot,
+    actor: crate::flow_engine::dispatcher::FlowActor,
+) -> Option<Response<OpenAIBody>> {
+    let crate::services::runtime::target::ResolvedExecutionTarget::Local {
+        handle: crate::services::handles_cache::BackendHandle::Embedded { engine_id, .. },
+        model_name,
+        ..
+    } = target
+    else {
+        return None;
+    };
+    if forward_path != "/v1/infer" {
+        return None;
+    }
+    let _slot = match infer_slot(target, forward_path).await {
+        Ok(slot) => slot,
+        Err(e) => return Some(core_error_to_response(&e)),
+    };
+    Some(infer_embedded_vision(parsed, model_name, engine_id, runtime, actor).await)
+}
+
+/// Engines whose `/v1/infer` call runs OCR through the runtime executor.
+fn is_embedded_ocr_engine(engine_id: &str) -> bool {
+    matches!(engine_id, "onnx-ocr" | "apple-ocr" | "plate-ocr")
+}
+
+/// The slot `/v1/infer` holds for one call. Embedded OCR goes through the
+/// executor, which takes the service's slot itself, so taking it here as well
+/// would make one call wait for its own slot at a limit of 1: that call holds
+/// no slot here and the executor's is the only one. Every other `/v1/infer`
+/// target does not reach the executor and takes its slot here.
+async fn infer_slot(
+    target: &crate::services::runtime::target::ResolvedExecutionTarget,
+    forward_path: &str,
+) -> crate::error::Result<Option<crate::services::limiter::ServicePermit>> {
+    use crate::services::handles_cache::BackendHandle;
+    use crate::services::runtime::target::ResolvedExecutionTarget;
+    if let ResolvedExecutionTarget::Local {
+        handle: BackendHandle::Embedded { engine_id, .. },
+        ..
+    } = target
+    {
+        if forward_path == "/v1/infer" && is_embedded_ocr_engine(engine_id) {
+            return Ok(None);
+        }
+    }
+    local_service_slot(target).await
+}
+
+/// A failure of a `/v1` call that carries its text and, for a busy service,
+/// how long to wait; the edge answers 503 and sets `Retry-After` from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V1Failure {
+    pub message: String,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl From<String> for V1Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retry_after_secs: None,
+        }
+    }
+}
+
+impl V1Failure {
+    /// A failure whose cause stays in the server log: the client gets only
+    /// `client_message`, since the cause can name nodes, addresses, resolver
+    /// internals or an upstream body.
+    fn internal(
+        context: &str,
+        client_message: impl Into<String>,
+        cause: impl std::fmt::Display,
+    ) -> Self {
+        warn!("{}: {}", context, cause);
+        client_message.into().into()
+    }
+
+    fn of_refused_slot(e: &anyhow::Error) -> Self {
+        Self {
+            message: slot_refusal_message(e),
+            retry_after_secs: e
+                .downcast_ref::<CoreError>()
+                .and_then(CoreError::retry_after_secs),
+        }
+    }
+
+    /// The 503 the edge answers with.
+    fn into_response(self) -> Response<OpenAIBody> {
+        let response = error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            self.message,
+        );
+        match self.retry_after_secs {
+            Some(secs) => with_retry_after(response, secs),
+            None => response,
+        }
     }
 }
 
@@ -2261,7 +2373,7 @@ async fn infer_embedded_vision(
     // `VisionEngineKind` — rozpoznajemy go po engine_id i obsługujemy przez
     // `VisionDispatcher` (in-process runner / Burn PlateOcr), zwracając kontrakt
     // OCR NVIDIA z pojedynczą detekcją obejmującą cały kadr (jak paddle-ocr).
-    if matches!(engine_id, "onnx-ocr" | "apple-ocr" | "plate-ocr") {
+    if is_embedded_ocr_engine(engine_id) {
         let dispatcher =
             crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(runtime_slot);
         let req = crate::flow_engine::dispatchers::VisionOcrRequest {
@@ -2282,11 +2394,16 @@ async fn infer_embedded_vision(
                 StatusCode::OK,
                 ocr_response_json(text.unwrap_or_default(), images_size_mb),
             ),
-            Err(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("embedded OCR '{}': {:#}", model_name, e),
-            ),
+            // A service at its limit stays a 503 with `Retry-After`.
+            Err(e) if e.downcast_ref::<CoreError>().is_some() => core_error_to_response(&e),
+            Err(e) => {
+                error!("embedded OCR '{}': {:#}", model_name, e);
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "embedded OCR failed".to_string(),
+                )
+            }
         };
     }
 
@@ -2294,10 +2411,11 @@ async fn infer_embedded_vision(
     let out = match crate::vision::infer(model_name, &rgb, width, height) {
         Ok(o) => o,
         Err(e) => {
+            error!("embedded vision '{}': {:#}", model_name, e);
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
-                format!("embedded vision '{}': {:#}", model_name, e),
+                "embedded vision failed".to_string(),
             );
         }
     };
@@ -2429,10 +2547,10 @@ pub async fn resolve_local_v1_base_url(
     input_modalities: &[crate::services::catalog::InputModality],
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
-) -> std::result::Result<(String, Option<crate::services::limiter::ServicePermit>), String> {
+) -> std::result::Result<(String, Option<crate::services::limiter::ServicePermit>), V1Failure> {
     let executor = match router.executor() {
         Some(e) => e,
-        None => return Err("Executor niedostępny".to_string()),
+        None => return Err("Executor niedostępny".to_string().into()),
     };
 
     // §2.5 — /v1 target resolution only. This context resolves a backend and
@@ -2446,8 +2564,11 @@ pub async fn resolve_local_v1_base_url(
     let target = match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
         Ok(t) => t,
         Err(e) => {
-            warn!("{} resolve dla '{}': {}", context_label, model, e);
-            return Err(format!("model '{}' niedostępny: {}", model, e));
+            return Err(V1Failure::internal(
+                context_label,
+                format!("model '{}' unavailable", model),
+                format!("resolve for '{}': {}", model, e),
+            ));
         }
     };
 
@@ -2467,28 +2588,33 @@ pub async fn resolve_local_v1_base_url(
                         .client
                         .acquire_slot()
                         .await
-                        .map_err(|e| slot_refusal_message(&e))?;
+                        .map_err(|e| V1Failure::of_refused_slot(&e))?;
                     Ok((
                         resolved.client.url().trim_end_matches('/').to_string(),
                         slot,
                     ))
                 }
-                Err(e) => Err(format!(
-                    "model '{}' nie jest lokalnym serwisem HTTP: {}",
-                    model, e
+                Err(e) => Err(V1Failure::internal(
+                    context_label,
+                    format!("model '{}' is not a local HTTP service", model),
+                    e,
                 )),
             }
         }
         crate::services::runtime::target::ResolvedExecutionTarget::MeshForward {
             node_id, ..
-        } => Err(format!(
-            "model '{}' żyje tylko na zdalnym nodzie '{}' — {} obsługuje wyłącznie lokalne serwisy",
-            model, node_id, context_label
+        } => Err(V1Failure::internal(
+            context_label,
+            format!("model '{}' is not served by a local HTTP service", model),
+            format!("'{}' lives only on remote node '{}'", model, node_id),
         )),
-        crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => Err(format!(
-            "model '{}' rozwiązał się do flow, nie do serwisu HTTP",
-            model
-        )),
+        crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => {
+            Err(V1Failure::internal(
+                context_label,
+                format!("model '{}' is not served by a local HTTP service", model),
+                format!("'{}' resolved to a flow", model),
+            ))
+        }
     }
 }
 
@@ -2504,7 +2630,7 @@ async fn try_embedded_rerank(
     return_documents: bool,
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
-) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
+) -> Option<std::result::Result<tentaflow_protocol::RerankResult, V1Failure>> {
     let executor = router.executor()?;
     // §2.5 — /v1 target resolution only. This context resolves a backend and
     // never dispatches a flow, so no event carries its actor; the authenticated
@@ -2532,7 +2658,7 @@ async fn try_embedded_rerank(
     };
     let _slot = match local_service_slot(&target).await {
         Ok(slot) => slot,
-        Err(e) => return Some(Err(slot_refusal_message(&e))),
+        Err(e) => return Some(Err(V1Failure::of_refused_slot(&e))),
     };
     let request = crate::api::openai::types::RerankRequest {
         model: model.to_string(),
@@ -2540,11 +2666,17 @@ async fn try_embedded_rerank(
         documents: documents.to_vec(),
         top_n,
     };
-    let ranked = match crate::services::runtime::executor::embedded_rerank(&engine_id, &request).await
-    {
-        Ok(r) => r,
-        Err(e) => return Some(Err(format!("{context_label}: {e}"))),
-    };
+    let ranked =
+        match crate::services::runtime::executor::embedded_rerank(&engine_id, &request).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(Err(V1Failure::internal(
+                    context_label,
+                    "embedded rerank failed",
+                    e,
+                )));
+            }
+        };
     let results = ranked
         .results
         .into_iter()
@@ -2580,7 +2712,7 @@ pub async fn rerank_forward(
     return_documents: bool,
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
-) -> std::result::Result<tentaflow_protocol::RerankResult, String> {
+) -> std::result::Result<tentaflow_protocol::RerankResult, V1Failure> {
     // Embedded MLX reranker liczy in-process; brak (None) -> forward HTTP nizej.
     if let Some(result) = try_embedded_rerank(
         router,
@@ -2629,7 +2761,7 @@ pub async fn rerank_forward(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
-        .map_err(|e| format!("budowa klienta HTTP: {}", e))?;
+        .map_err(|e| V1Failure::internal(context_label, "rerank service unavailable", e))?;
 
     let resp = client
         .post(&target_url)
@@ -2637,35 +2769,49 @@ pub async fn rerank_forward(
         .send()
         .await
         .map_err(|e| {
-            error!("{} → {}: {}", context_label, target_url, e);
-            format!("błąd forwardu do serwisu: {}", e)
+            V1Failure::internal(
+                context_label,
+                "rerank service unavailable",
+                format!("forward to {}: {}", target_url, e),
+            )
         })?;
 
     let upstream_status = resp.status();
     let upstream_bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("błąd odczytu odpowiedzi z serwisu: {}", e))?;
+        .map_err(|e| V1Failure::internal(context_label, "rerank service unavailable", e))?;
 
     if !upstream_status.is_success() {
         let detail = String::from_utf8_lossy(&upstream_bytes);
-        warn!(
-            "{}: upstream {} zwrócił {}: {}",
-            context_label, target_url, upstream_status, detail
-        );
-        return Err(format!(
-            "serwis rerank zwrócił {}: {}",
-            upstream_status, detail
+        return Err(V1Failure::internal(
+            context_label,
+            format!("rerank service returned {}", upstream_status),
+            format!(
+                "upstream {} returned {}: {}",
+                target_url, upstream_status, detail
+            ),
         ));
     }
 
-    let vllm: serde_json::Value = serde_json::from_slice(&upstream_bytes)
-        .map_err(|e| format!("serwis rerank zwrócił niepoprawny JSON: {}", e))?;
+    let vllm: serde_json::Value = serde_json::from_slice(&upstream_bytes).map_err(|e| {
+        V1Failure::internal(
+            context_label,
+            "rerank service returned an invalid response",
+            e,
+        )
+    })?;
 
     let results_arr = vllm
         .get("results")
         .and_then(|r| r.as_array())
-        .ok_or_else(|| "serwis rerank nie zwrócił pola 'results'".to_string())?;
+        .ok_or_else(|| {
+            V1Failure::internal(
+                context_label,
+                "rerank service returned an invalid response",
+                "missing 'results'",
+            )
+        })?;
 
     let results = results_arr
         .iter()
@@ -2826,13 +2972,7 @@ async fn handle_ranking(
     .await
     {
         Ok(r) => r,
-        Err(msg) => {
-            return Ok(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                msg,
-            ));
-        }
+        Err(failure) => return Ok(failure.into_response()),
     };
 
     // vLLM zwraca `results` już posortowane malejąco po score; zachowujemy ten
@@ -3115,6 +3255,328 @@ mod error_mapping_tests {
         drop(held);
         assert_eq!(limiter_for(node, 11).in_flight(), 0);
         assert!(local_service_slot(&target).await.unwrap().is_some());
+    }
+
+    type ResolvedTarget = crate::services::runtime::target::ResolvedExecutionTarget;
+
+    struct SlowOcr;
+
+    impl crate::vision::OcrRunner for SlowOcr {
+        fn read_lines(&self, _rgb: &[u8], _w: u32, _h: u32) -> anyhow::Result<Vec<String>> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(vec!["PLATE".to_string()])
+        }
+    }
+
+    /// Installs an OCR runner for one test and removes it on drop. The runner
+    /// is process-global, so the guard also serializes the tests that use it.
+    struct OcrRunnerGuard {
+        _serial: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    static OCR_RUNNER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    impl OcrRunnerGuard {
+        async fn install(runner: Arc<dyn crate::vision::OcrRunner>) -> Self {
+            let serial = OCR_RUNNER_LOCK.lock().await;
+            crate::vision::set_ocr_runner(runner);
+            Self { _serial: serial }
+        }
+    }
+
+    impl Drop for OcrRunnerGuard {
+        fn drop(&mut self) {
+            crate::vision::clear_ocr_runner();
+        }
+    }
+
+    /// A runtime executor with one embedded OCR service (`apple-ocr`) on `node`.
+    fn ocr_runtime(
+        node: &str,
+        service_id: i64,
+    ) -> crate::flow_engine::dispatchers_impl::ModelRuntimeSlot {
+        embedded_runtime(
+            node,
+            service_id,
+            "ocr-test",
+            "apple-ocr",
+            crate::services::catalog::ServiceSurface::CameraCv,
+            crate::services::catalog::InputModality::Image,
+        )
+    }
+
+    /// A runtime executor with one embedded service `model` on `node`.
+    fn embedded_runtime(
+        node: &str,
+        service_id: i64,
+        model: &str,
+        engine: &str,
+        surface: crate::services::catalog::ServiceSurface,
+        input: crate::services::catalog::InputModality,
+    ) -> crate::flow_engine::dispatchers_impl::ModelRuntimeSlot {
+        use crate::services::catalog::{
+            CatalogEntry, CatalogEntryKind, ModelInstance, OutputModality,
+        };
+        use crate::services::handles_cache::{BackendHandle, LiveHandlesCache};
+        use crate::services::runtime::resolver::AliasResolver;
+
+        let handles = Arc::new(LiveHandlesCache::new());
+        handles.insert(
+            node.to_string(),
+            service_id,
+            BackendHandle::Embedded {
+                model_name: model.into(),
+                node_id: node.into(),
+                engine_id: engine.into(),
+            },
+        );
+        let catalog = Arc::new(crate::services::catalog::CatalogProvider::new());
+        catalog.install_for_test(vec![CatalogEntry {
+            reasoning_levels: Vec::new(),
+            id: model.into(),
+            kind: CatalogEntryKind::ServiceModel {
+                instances: vec![ModelInstance {
+                    node_id: node.to_string(),
+                    node_hostname: None,
+                    service_id,
+                    status: "running".into(),
+                    backend: Some(engine.into()),
+                    size_mb: None,
+                    loaded: true,
+                    input_modalities: vec![],
+                    output_modalities: vec![],
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
+                }],
+            },
+            service_surfaces: vec![surface],
+            input_modalities: vec![input],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }]);
+        let resolver = Arc::new(AliasResolver::new_with_static_id(handles, node.to_string()));
+        let executor = crate::services::runtime::executor::ModelRuntimeExecutor::new(
+            catalog,
+            resolver,
+            None,
+            Arc::new(crate::inference::local::LocalInferenceHandler::new(
+                crate::inference::shared_inference_manager(),
+            )),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+        );
+        Arc::new(parking_lot::RwLock::new(Some(Arc::new(executor))))
+    }
+
+    fn png_data_url() -> String {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    }
+
+    fn ocr_target(node: &str, service_id: i64) -> ResolvedTarget {
+        crate::services::runtime::target::ResolvedExecutionTarget::Local {
+            service_id,
+            model_name: "ocr-test".into(),
+            handle: crate::services::handles_cache::BackendHandle::Embedded {
+                model_name: "ocr-test".into(),
+                node_id: node.into(),
+                engine_id: "apple-ocr".into(),
+            },
+        }
+    }
+
+    /// One `/v1/infer` call as `handle_passthrough` serves it once the target
+    /// is resolved: the same `serve_embedded_infer` the handler calls.
+    async fn infer_ocr(
+        target: &ResolvedTarget,
+        runtime: &crate::flow_engine::dispatchers_impl::ModelRuntimeSlot,
+    ) -> Response<OpenAIBody> {
+        let parsed = serde_json::json!({
+            "model": "ocr-test",
+            "input": [{ "type": "image_url", "url": png_data_url() }],
+        });
+        serve_embedded_infer(
+            target,
+            "/v1/infer",
+            &parsed,
+            runtime.clone(),
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        )
+        .await
+        .expect("embedded target on /v1/infer is served")
+    }
+
+    /// At a limit of 1 one embedded OCR call must not wait for its own slot,
+    /// and two parallel ones give one 200 and one 503 with `Retry-After` once
+    /// the service's wait runs out. The only slot is the executor's: the
+    /// `/v1/infer` handler takes none for embedded OCR.
+    #[tokio::test]
+    async fn embedded_ocr_at_a_limit_of_one_serves_one_and_refuses_the_other() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "ocr-limit-one-node";
+        let _runner = OcrRunnerGuard::install(Arc::new(SlowOcr)).await;
+        configure(node, 21, Some(1), std::time::Duration::from_millis(100));
+        let runtime = ocr_runtime(node, 21);
+
+        let target = ocr_target(node, 21);
+        assert!(infer_slot(&target, "/v1/infer").await.unwrap().is_none());
+        assert_eq!(limiter_for(node, 21).in_flight(), 0);
+
+        let started = std::time::Instant::now();
+        assert_eq!(infer_ocr(&target, &runtime).await.status(), StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(infer_ocr(&target, &runtime).await.status(), StatusCode::OK);
+
+        let (a, b) = tokio::join!(infer_ocr(&target, &runtime), infer_ocr(&target, &runtime));
+        let mut statuses = [a.status(), b.status()];
+        statuses.sort_by_key(|s| s.as_u16());
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE]);
+        let refused = if a.status() == StatusCode::OK { &b } else { &a };
+        assert!(refused.headers().get(hyper::header::RETRY_AFTER).is_some());
+        assert_eq!(
+            limiter_for(node, 21).in_flight(),
+            0,
+            "the slot was returned"
+        );
+    }
+
+    /// Anything but an embedded engine on `/v1/infer` is left to the caller.
+    #[tokio::test]
+    async fn serve_embedded_infer_leaves_other_targets_to_the_caller() {
+        let runtime = ocr_runtime("serve-other-node", 24);
+        let parsed = serde_json::json!({ "model": "ocr-test" });
+        let target = ocr_target("serve-other-node", 24);
+        let actor = crate::flow_engine::dispatcher::FlowActor::system;
+        assert!(
+            serve_embedded_infer(&target, "/v1/rerank", &parsed, runtime.clone(), actor())
+                .await
+                .is_none()
+        );
+        let flow = ResolvedTarget::Flow {
+            flow_id: "f".into(),
+            published_name: "f".into(),
+        };
+        assert!(
+            serve_embedded_infer(&flow, "/v1/infer", &parsed, runtime, actor())
+                .await
+                .is_none()
+        );
+    }
+
+    /// Every other `/v1/infer` target still takes its one slot in the handler:
+    /// a detection engine (no executor), OCR on another path, and a refusal
+    /// keeps its 503 + `Retry-After`.
+    #[tokio::test]
+    async fn infer_takes_a_slot_unless_the_executor_does() {
+        use crate::services::limiter::{configure, limiter_for};
+        let node = "infer-slot-node";
+        configure(node, 22, Some(1), std::time::Duration::from_millis(50));
+        let embedded =
+            |engine: &str| crate::services::runtime::target::ResolvedExecutionTarget::Local {
+                service_id: 22,
+                model_name: "m".into(),
+                handle: crate::services::handles_cache::BackendHandle::Embedded {
+                    model_name: "m".into(),
+                    node_id: node.into(),
+                    engine_id: engine.into(),
+                },
+            };
+
+        let held = infer_slot(&embedded("face-detect"), "/v1/infer")
+            .await
+            .unwrap();
+        assert!(held.is_some());
+        assert_eq!(limiter_for(node, 22).in_flight(), 1);
+        let refused = infer_slot(&embedded("face-detect"), "/v1/infer")
+            .await
+            .expect_err("saturated");
+        let resp = core_error_to_response(&refused);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_some());
+        drop(held);
+
+        // OCR on `/v1/rerank` does not go through the executor.
+        let held = infer_slot(&embedded("apple-ocr"), "/v1/rerank")
+            .await
+            .unwrap();
+        assert!(held.is_some());
+    }
+
+    /// A router whose executor serves one embedded rerank service `rr`.
+    fn rerank_router(node: &str, service_id: i64) -> Router {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = crate::db::init(&path).expect("init db");
+        let router = Router::new(crate::config::RouterConfig::default(), Some(db)).expect("router");
+        let runtime = embedded_runtime(
+            node,
+            service_id,
+            "rr",
+            "test-engine",
+            crate::services::catalog::ServiceSurface::Rerank,
+            crate::services::catalog::InputModality::Text,
+        );
+        *router.executor.write() = runtime.read().clone();
+        router
+    }
+
+    async fn rerank(
+        router: &Router,
+    ) -> std::result::Result<tentaflow_protocol::RerankResult, V1Failure> {
+        rerank_forward(
+            router,
+            "rr",
+            "q",
+            &["a".to_string()],
+            None,
+            false,
+            None,
+            "/v1/ranking",
+        )
+        .await
+    }
+
+    /// A busy service on the rerank path is a 503 with `Retry-After`, and any
+    /// other failure reaches the client without its cause.
+    #[tokio::test]
+    async fn rerank_forward_keeps_retry_after_and_hides_causes() {
+        use crate::services::limiter::configure;
+        let node = "rerank-refusal-node";
+        configure(node, 23, Some(1), std::time::Duration::from_millis(50));
+        let router = rerank_router(node, 23);
+        let target = ResolvedTarget::Local {
+            service_id: 23,
+            model_name: "rr".into(),
+            handle: crate::services::handles_cache::BackendHandle::Embedded {
+                model_name: "rr".into(),
+                node_id: node.into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+
+        let held = local_service_slot(&target).await.unwrap();
+        let busy = rerank(&router).await.expect_err("saturated");
+        assert_eq!(busy.retry_after_secs, Some(1));
+        let resp = busy.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_some());
+        drop(held);
+
+        let failed = rerank(&router).await.expect_err("unknown engine");
+        assert_eq!(failed.retry_after_secs, None);
+        assert_eq!(failed.message, "embedded rerank failed");
+        let resp = failed.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(hyper::header::RETRY_AFTER).is_none());
     }
 
     /// A missing STT service must reach external clients as 503

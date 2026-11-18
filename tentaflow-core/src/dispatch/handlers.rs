@@ -2389,7 +2389,13 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // Validate the catalog publish name against active aliases and other
     // published flows before writing — guards/D.19 collision detection
     // only happens here, not at the SQL layer.
-    if let Some(name) = payload.published_model_name.as_deref() {
+    // A blank name means "not published", like on update.
+    let published = payload
+        .published_model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if let Some(name) = published {
         crate::services::catalog::guards::check_flow_publish_collision(&ctx.state.db, name, None)
             .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
     }
@@ -2402,12 +2408,12 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         service_type: None,
         flow_json: &payload.graph_json,
         status: "active",
-        published_model_name: payload.published_model_name.as_deref(),
+        published_model_name: published,
         actor_user_id: user_id.as_deref(),
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
     // A flow without a publish name cannot appear in the catalog.
-    if payload.published_model_name.is_some() {
+    if published.is_some() {
         ctx.state.router.rebuild_catalog();
     }
     invalidate_flow_cache();
@@ -2588,10 +2594,14 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         diff_service_account_bindings(active_flow_json(&existing), None)
     };
 
-    // Resolve the publish-name update: `Some(Some)` writes a new value,
-    // `Some(None)` clears it, `None` leaves the existing value alone.
+    // Resolve the publish-name update: absent (`None`) leaves the existing
+    // value alone, a name publishes or re-publishes, and an empty or blank
+    // string (or an explicit `Some(None)`) un-publishes. A JSON `null` cannot
+    // be told from an absent field, which is why the UI clears with "".
     let new_published = match &payload.published_model_name {
-        Some(value) => value.clone(),
+        Some(Some(name)) if name.trim().is_empty() => None,
+        Some(Some(name)) => Some(name.trim().to_string()),
+        Some(None) => None,
         None => existing.published_model_name.clone(),
     };
     if let Some(name) = new_published.as_deref() {
@@ -2941,6 +2951,7 @@ pub fn flow_version_restore(
         }
         Err(e) => return Err(db_err(e)),
     }
+    ctx.state.router.rebuild_catalog();
     invalidate_flow_cache();
 
     audit(
@@ -4477,7 +4488,7 @@ pub async fn rerank(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         "rerank (binary)",
     )
     .await
-    .map_err(|msg| ProtocolError::internal(msg))?;
+    .map_err(|failure| ProtocolError::internal(failure.message))?;
 
     Ok(MessageBody::RerankBody(
         tentaflow_protocol::RerankExchange::Response(result),
@@ -7942,6 +7953,7 @@ fn proto_entry_from_db(e: crate::db::models::AuditLogEntry) -> tentaflow_protoco
         ip_address: e.ip_address,
         node_id: e.node_id,
         correlation_id: e.correlation_id,
+        severity: e.severity,
     }
 }
 
@@ -15200,6 +15212,307 @@ mod service_limits_update_tests {
         assert_eq!(
             (service_id, max_concurrent, timeout_ms),
             (7, Some(0), Some(1_500))
+        );
+    }
+}
+
+#[cfg(test)]
+mod flow_publish_update_tests {
+    //! `FlowUpdateRequest.published_model_name`: absent leaves the name alone,
+    //! a name publishes or renames, an empty string un-publishes, and a name
+    //! another flow holds is refused with a coded error.
+    use super::*;
+    use crate::dispatch::state::AppState;
+
+    const FLOW_JSON: &str = r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#;
+
+    fn ctx() -> HandlerContext {
+        let ctx = crate::dispatch::test_handler_context(AppState::for_test(), Some("admin"), None);
+        // The acting user, so the sync capture of the write can name them.
+        ctx.state
+            .db
+            .write()
+            .expect("db lock")
+            .execute(
+                "INSERT INTO user_accounts (id, username, password_hash, role) \
+                 VALUES ('07070707-0707-0707-0707-070707070707', 'publisher', 'x', 'admin')",
+                [],
+            )
+            .expect("seed the acting user");
+        ctx
+    }
+
+    fn new_flow(ctx: &HandlerContext, name: &str, published: Option<&str>) -> String {
+        repository::create_flow(
+            &ctx.state.db,
+            &db::models::FlowParams {
+                name,
+                description: None,
+                is_default: false,
+                service_type: None,
+                flow_json: FLOW_JSON,
+                status: "active",
+                published_model_name: published,
+                actor_user_id: None,
+            },
+        )
+        .expect("create flow")
+    }
+
+    fn publish(
+        ctx: &HandlerContext,
+        flow_id: &str,
+        name: Option<Option<&str>>,
+    ) -> Result<(), ProtocolError> {
+        let request = MessageBody::FlowUpdateRequestBody(tentaflow_protocol::FlowUpdateRequest {
+            flow_id: flow_id.to_string(),
+            name: None,
+            description: None,
+            flow_json: None,
+            status: None,
+            published_model_name: name.map(|n| n.map(str::to_string)),
+        });
+        flow_update(&request, ctx).map(|_| ())
+    }
+
+    fn stored(ctx: &HandlerContext, flow_id: &str) -> Option<String> {
+        repository::get_flow(&ctx.state.db, flow_id)
+            .expect("get")
+            .expect("row")
+            .published_model_name
+    }
+
+    fn listed(ctx: &HandlerContext, flow_id: &str) -> Option<String> {
+        let MessageBody::FlowListResponse { flows } =
+            flow_list(&MessageBody::FlowListRequest, ctx).expect("list")
+        else {
+            panic!("unexpected response");
+        };
+        flows
+            .into_iter()
+            .find(|f| f.id == flow_id)
+            .expect("listed")
+            .published_model_name
+    }
+
+    #[test]
+    fn a_name_is_set_changed_kept_and_cleared() {
+        let ctx = ctx();
+        let id = new_flow(&ctx, "Publish me", None);
+
+        publish(&ctx, &id, Some(Some("pub-model-a"))).expect("set");
+        assert_eq!(stored(&ctx, &id).as_deref(), Some("pub-model-a"));
+        assert_eq!(listed(&ctx, &id).as_deref(), Some("pub-model-a"));
+        assert_eq!(
+            repository::get_flow_by_published_model_name(&ctx.state.db, "pub-model-a")
+                .expect("lookup")
+                .map(|f| f.id.to_string()),
+            Some(id.clone()),
+            "the name the catalog resolves"
+        );
+
+        publish(&ctx, &id, Some(Some("pub-model-b"))).expect("change");
+        assert_eq!(stored(&ctx, &id).as_deref(), Some("pub-model-b"));
+        assert!(
+            repository::get_flow_by_published_model_name(&ctx.state.db, "pub-model-a")
+                .expect("lookup")
+                .is_none()
+        );
+
+        publish(&ctx, &id, None).expect("absent");
+        assert_eq!(
+            stored(&ctx, &id).as_deref(),
+            Some("pub-model-b"),
+            "absent is unchanged"
+        );
+
+        publish(&ctx, &id, Some(Some(""))).expect("clear");
+        assert_eq!(stored(&ctx, &id), None);
+        assert_eq!(listed(&ctx, &id), None);
+        publish(&ctx, &id, Some(Some("pub-model-c"))).expect("set again");
+        publish(&ctx, &id, Some(Some("  "))).expect("blank clears");
+        assert_eq!(stored(&ctx, &id), None);
+    }
+
+    #[test]
+    fn a_name_another_flow_holds_is_refused_with_a_coded_error() {
+        let ctx = ctx();
+        let first = new_flow(&ctx, "Holder", Some("pub-taken"));
+        let second = new_flow(&ctx, "Wanter", None);
+
+        let err = publish(&ctx, &second, Some(Some("pub-taken"))).expect_err("clash");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert_eq!(stored(&ctx, &second), None);
+        assert_eq!(stored(&ctx, &first).as_deref(), Some("pub-taken"));
+
+        // Re-sending a flow's own name is not a clash.
+        publish(&ctx, &first, Some(Some("pub-taken"))).expect("own name");
+    }
+
+    #[test]
+    fn a_race_on_the_unique_index_is_a_coded_bad_request() {
+        let ctx = ctx();
+        let first = new_flow(&ctx, "Holder", Some("pub-raced"));
+        let second = new_flow(&ctx, "Racer", None);
+        let params = |published| db::models::FlowParams {
+            name: "Racer",
+            description: None,
+            is_default: false,
+            service_type: None,
+            flow_json: FLOW_JSON,
+            status: "active",
+            published_model_name: published,
+            actor_user_id: None,
+        };
+
+        // What the collision guard would have stopped, written past it: the
+        // index refuses, and the handler maps that to a BadRequest.
+        let on_update = repository::update_flow_with_snapshot(
+            &ctx.state.db,
+            &second,
+            1,
+            &params(Some("pub-raced")),
+            None,
+        )
+        .expect_err("unique index");
+        let err = flow_write_err(on_update);
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(err.message.contains("already taken"), "{}", err.message);
+
+        let on_create = repository::create_flow(&ctx.state.db, &params(Some("pub-raced")))
+            .expect_err("unique index");
+        assert_eq!(
+            flow_write_err(on_create).code,
+            ProtocolErrorCode::BadRequest
+        );
+
+        assert_eq!(stored(&ctx, &first).as_deref(), Some("pub-raced"));
+        assert_eq!(stored(&ctx, &second), None);
+    }
+
+    #[test]
+    fn create_trims_the_published_name_and_treats_blank_as_unpublished() {
+        let ctx = ctx();
+        let create = |name: &str, published: &str| {
+            let request =
+                MessageBody::FlowCreateRequestBody(tentaflow_protocol::FlowCreateRequest {
+                    name: name.to_string(),
+                    description: None,
+                    graph_json: FLOW_JSON.to_string(),
+                    published_model_name: Some(published.to_string()),
+                });
+            flow_create(&request, &ctx)
+        };
+        let created_id = |response: MessageBody| match response {
+            MessageBody::FlowCreateResponse { flow_id } => flow_id,
+            other => panic!("unexpected response {other:?}"),
+        };
+
+        let padded = created_id(create("Padded", "  pub-padded  ").expect("create"));
+        assert_eq!(stored(&ctx, &padded).as_deref(), Some("pub-padded"));
+
+        // The trimmed name is what the collision check sees.
+        let clash = create("Clash", " pub-padded ").expect_err("trimmed clash");
+        assert_eq!(clash.code, ProtocolErrorCode::BadRequest);
+
+        let blank = created_id(create("Blank", "   ").expect("create"));
+        assert_eq!(stored(&ctx, &blank), None);
+    }
+
+    #[test]
+    fn a_version_restore_keeps_the_published_name() {
+        let ctx = ctx();
+        let id = new_flow(&ctx, "Before", Some("pub-kept"));
+        let rename = MessageBody::FlowUpdateRequestBody(tentaflow_protocol::FlowUpdateRequest {
+            flow_id: id.clone(),
+            name: Some("After".to_string()),
+            description: None,
+            flow_json: None,
+            status: None,
+            published_model_name: None,
+        });
+        flow_update(&rename, &ctx).expect("rename snapshots the old state");
+        let version = repository::list_flow_versions(&ctx.state.db, &id)
+            .expect("versions")
+            .into_iter()
+            .next()
+            .expect("a snapshot");
+
+        let restore = MessageBody::FlowVersionRestoreRequestBody(
+            tentaflow_protocol::FlowVersionRestoreRequest {
+                flow_id: id.clone(),
+                version_id: version.id,
+            },
+        );
+        flow_version_restore(&restore, &ctx).expect("restore");
+
+        let row = repository::get_flow(&ctx.state.db, &id)
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.name, "Before");
+        assert_eq!(row.published_model_name.as_deref(), Some("pub-kept"));
+        assert_eq!(listed(&ctx, &id).as_deref(), Some("pub-kept"));
+    }
+}
+
+#[cfg(test)]
+mod audit_severity_tests {
+    //! The audit list carries the stored `severity` column to the UI.
+    use super::*;
+    use crate::dispatch::state::AppState;
+
+    #[test]
+    fn the_audit_list_returns_the_stored_severity() {
+        let ctx = crate::dispatch::test_handler_context(AppState::for_test(), Some("admin"), None);
+        for (action, severity) in [
+            ("sla.breach.raised", "warning"),
+            ("sla.breach.resolved", "info"),
+        ] {
+            repository::log_audit_full(
+                &ctx.state.db,
+                None,
+                None,
+                action,
+                Some("service"),
+                Some("svc-1"),
+                None,
+                severity,
+                "low",
+                None,
+                None,
+                None,
+                Some("node-a"),
+            )
+            .expect("audit row");
+        }
+
+        let list = |action: &str| {
+            let request =
+                MessageBody::AuditLogListRequestBody(tentaflow_protocol::AuditLogListRequest {
+                    filters: tentaflow_protocol::AuditLogFilters {
+                        user_id: None,
+                        addon_id: None,
+                        action: Some(action.to_string()),
+                        from_date: None,
+                        to_date: None,
+                        search: None,
+                    },
+                    offset: 0,
+                    limit: 10,
+                });
+            let MessageBody::AuditLogListResponseBody(response) =
+                audit_log_list(&request, &ctx).expect("list")
+            else {
+                panic!("unexpected response");
+            };
+            response.entries
+        };
+        let raised = list("sla.breach.raised");
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].severity.as_deref(), Some("warning"));
+        assert_eq!(
+            list("sla.breach.resolved")[0].severity.as_deref(),
+            Some("info")
         );
     }
 }

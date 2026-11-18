@@ -1186,6 +1186,11 @@ pub struct AuditLogEntry {
     /// invalidate every chain hash already written to disk.
     #[serde(default)]
     pub correlation_id: Option<String>,
+    /// Severity stored with the row (`info`, `warning`, ...), as written by the
+    /// emitting code; `None` for a peer that predates the field. Like
+    /// `correlation_id` it is not part of `AuditRowHashInput`.
+    #[serde(default)]
+    pub severity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -5198,10 +5203,13 @@ pub struct FlowUpdateRequest {
     pub flow_json: Option<String>,
     /// Raw status column ("active" | "draft" | "decoded" ...).
     pub status: Option<String>,
-    /// Update or clear the catalog publish name. `Some(Some("..."))`
-    /// publishes / re-publishes; `Some(None)` un-publishes; `None` leaves
-    /// the existing value untouched. Validated against the catalog before
-    /// the row is written.
+    /// Update or clear the catalog publish name. Absent leaves the existing
+    /// value untouched, and so does `null`: on the wire (JSON and CBOR alike)
+    /// `Some(None)` reads back as `None`, so an empty string is the only way
+    /// to un-publish. A name publishes / re-publishes. Validated against the
+    /// catalog before the row is written; a clash with an alias or another
+    /// published flow is a `BadRequest`.
+    #[serde(default)]
     pub published_model_name: Option<Option<String>>,
 }
 
@@ -9030,6 +9038,7 @@ mod tests {
                 ip_address: None,
                 node_id: None,
                 correlation_id: Some("corr-42".to_string()),
+                severity: Some("warning".to_string()),
             }],
             total_count: 1,
         });
@@ -9037,9 +9046,90 @@ mod tests {
         match round_trip(body) {
             MessageBody::AuditLogListResponseBody(resp) => {
                 assert_eq!(resp.entries[0].correlation_id.as_deref(), Some("corr-42"));
+                assert_eq!(resp.entries[0].severity.as_deref(), Some("warning"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// A peer built before `severity` was appended sends the entry without that
+    /// key; it decodes with no severity instead of failing the frame.
+    #[test]
+    fn an_audit_entry_from_a_peer_without_the_severity_field_still_decodes() {
+        #[derive(SerdeSerialize)]
+        struct EntryWithoutSeverity {
+            id: i64,
+            timestamp: String,
+            action: String,
+            user_id: Option<String>,
+            addon_id: Option<String>,
+            resource: Option<String>,
+            details: Option<String>,
+            ip_address: Option<String>,
+            node_id: Option<String>,
+            correlation_id: Option<String>,
+        }
+
+        let bytes = crate::cbor::encode(&EntryWithoutSeverity {
+            id: 8,
+            timestamp: "2026-08-21T10:00:00Z".to_string(),
+            action: "sla.breach.raised".to_string(),
+            user_id: None,
+            addon_id: None,
+            resource: None,
+            details: None,
+            ip_address: None,
+            node_id: None,
+            correlation_id: Some("corr-1".to_string()),
+        })
+        .expect("encode");
+
+        let decoded: AuditLogEntry = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(decoded.severity, None);
+    }
+
+    /// `published_model_name` on the update request over both encodings: an
+    /// absent key and `null` both mean "unchanged", a name publishes, and the
+    /// empty string survives as the one way to un-publish.
+    #[test]
+    fn flow_update_publish_name_distinguishes_empty_from_null_on_the_wire() {
+        let json = |tail: &str| -> FlowUpdateRequest {
+            serde_json::from_str(&format!(r#"{{"flow_id":"f"{tail}}}"#)).expect("json")
+        };
+        assert_eq!(json("").published_model_name, None, "absent");
+        assert_eq!(
+            json(r#","published_model_name":null"#).published_model_name,
+            None,
+            "null reads as absent"
+        );
+        assert_eq!(
+            json(r#","published_model_name":"""#).published_model_name,
+            Some(Some(String::new())),
+            "an empty string is kept, so it can un-publish"
+        );
+        assert_eq!(
+            json(r#","published_model_name":"m""#).published_model_name,
+            Some(Some("m".to_string()))
+        );
+
+        let request = |published| FlowUpdateRequest {
+            flow_id: "f".to_string(),
+            name: None,
+            description: None,
+            flow_json: None,
+            status: None,
+            published_model_name: published,
+        };
+        let cbor = |published| {
+            let bytes = crate::cbor::encode(&request(published)).expect("encode");
+            crate::cbor::decode::<FlowUpdateRequest>(&bytes)
+                .expect("decode")
+                .published_model_name
+        };
+        assert_eq!(cbor(Some(Some(String::new()))), Some(Some(String::new())));
+        assert_eq!(cbor(Some(None)), None, "Some(None) comes back as None");
+        assert_eq!(cbor(None), None);
     }
 
     #[test]

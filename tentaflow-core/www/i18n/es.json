@@ -3872,7 +3872,8 @@
     "delete_cancel_btn": "Cancelar",
     "deleted_ok": "Flujo eliminado",
     "delete_not_found": "Flujo no encontrado",
-    "exec_title": "Historial de ejecuciones — flujo {id}",
+    "exec_title": "Historial de ejecuciones — flujo «{name}»",
+    "exec_meta": "flow_id: {id} · {count} {n|ejecución|ejecuciones} · estado: {status}",
     "exec_empty": "Sin ejecuciones",
     "col_exec_id": "ID",
     "col_exec_start": "Inicio",
@@ -16521,13 +16522,14 @@
       "system_title": "Los flujos de la plataforma no se rigen por una política"
     },
     "cells": {
+      "calls_n": "{count} {n|llamada|llamadas}",
       "held_until": "retenido hasta las {time}",
       "reset_at": "reinicio a las {time}",
       "queue": "cola {waiting}/{max}",
       "ms": "{value} ms",
       "threshold_ms": "umbral {value} ms",
       "threshold_pct": "umbral {value} %",
-      "today_in_window": "en esta ventana · hoy {count}",
+      "today_in_window": "en los últimos 5 min · hoy {count}",
       "today_count": "hoy {count}",
       "today": "hoy",
       "up_to_ms": "hasta {value} ms",
@@ -16633,6 +16635,32 @@
       "queue": "con los hilos ocupados, la solicitud espera en la cola hasta {wait} y luego recibe 429 con Retry-After",
       "resumes": "la lectura se reanuda sola a las {time}; los mensajes esperan en el topic y no pasan a los no procesados",
       "parallel": "los lotes de distintas particiones se ejecutan en paralelo, como máximo {count} a la vez"
+    }
+  },
+  "flow_publication": {
+    "button": "Ajustes",
+    "button_title": "Ajustes del flujo",
+    "title": "Ajustes del flujo",
+    "subject": "Flujo: {name}",
+    "toggle": "Ofrecer como modelo en la API /v1",
+    "name": "Nombre del modelo",
+    "name_placeholder": "p. ej. registro-api",
+    "name_hint": "Las aplicaciones llaman a este flujo mediante /v1/chat/completions con el campo model igual a este nombre. El nombre debe ser único; quitarlo retira la publicación.",
+    "address": "Dirección de llamada",
+    "submit": "Guardar",
+    "chip_title": "El flujo está disponible en la API /v1 como el modelo «{name}»",
+    "saved_published": "El flujo está disponible como el modelo «{name}»",
+    "saved_unpublished": "Se ha retirado la publicación del flujo",
+    "saved_unchanged": "Sin cambios",
+    "load_error": "No se pudieron cargar los ajustes del flujo.",
+    "error": {
+      "required": "Indica un nombre de modelo o desactiva la publicación.",
+      "too_long": "El nombre del modelo puede tener como máximo {max} caracteres.",
+      "characters": "El nombre del modelo no puede contener caracteres de control.",
+      "taken": "El nombre del modelo ya lo usa otro flujo.",
+      "taken_by": "El nombre del modelo ya lo usa el flujo «{flow}».",
+      "alias": "El nombre del modelo ya lo usa un alias de modelo.",
+      "generic": "No se pudieron guardar los ajustes. Inténtalo de nuevo."
     }
   }
 }

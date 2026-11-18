@@ -192,7 +192,7 @@ async function loadEntries() {
     const resp = await ApiBinary.one('auditLogListRequest', payload);
     let rows = resp.entries || [];
     if (filters.severity) {
-      rows = rows.filter(e => severityForAction(e.action) === filters.severity);
+      rows = rows.filter(e => severityOf(e) === filters.severity);
     }
     entries = rows;
     totalCount = Number(resp.totalCount ?? rows.length);
@@ -225,12 +225,23 @@ function prependLiveEvent(ev) {
 
 // Mapowanie nazwy akcji na severity chip. Wzorzec z wireframe + istniejacy
 // stary kod (modules/audit/AuditBinary.js chipStatusForKind).
-function severityForAction(action) {
+export function severityForAction(action) {
   const a = String(action || '').toLowerCase();
   if (a.includes('error') || a.includes('fail') || a.includes('deny') || a.includes('reject')) return 'err';
   if (a.includes('warn') || a.includes('rate') || a.includes('offline')) return 'warn';
   if (a.includes('success') || a.includes('ok') || a.includes('create') || a.includes('pair') || a.includes('rotation') || a.includes('accept')) return 'ok';
   return 'info';
+}
+
+const STORED_SEVERITY = { info: 'info', ok: 'ok', warning: 'warn', warn: 'warn', error: 'err', err: 'err', critical: 'err', fatal: 'err' };
+
+/**
+ * The chip of a row: the severity the row was stored with when it has one ("warning" is `warn`,
+ * "error" and "critical" are `err`), otherwise the guess from the action's name.
+ */
+export function severityOf(entry) {
+  const stored = STORED_SEVERITY[String(entry?.severity ?? '').trim().toLowerCase()];
+  return stored ?? severityForAction(entry?.action);
 }
 
 function renderBody() {
@@ -243,7 +254,7 @@ function renderBody() {
     return;
   }
   host.innerHTML = entries.map((e, idx) => {
-    const sev = severityForAction(e.action);
+    const sev = severityOf(e);
     const event = buildEventText(e);
     const actor = buildActorText(e);
     const details = buildDetailsText(e);

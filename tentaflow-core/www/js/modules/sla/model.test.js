@@ -83,15 +83,18 @@ test('a throttled bus node says "wstrzymany limitem" in its row and in the heade
   assert.equal(m.stateLabel(m.overallState([cells.state])), 'wstrzymany limitem');
   assert.equal(m.overallState(['ok', 'throttled']), 'throttled');
   assert.equal(m.overallState(['throttled', 'warn']), 'warn');
-  assert.equal(m.nodeCells({ status: { ...status, state: 'breach' }, spec, consumer, nowMs: 1_000_000, bus: true }).state, 'breach');
+  const breach = (kind) => m.nodeCells({ status: { ...status, state: 'breach', openBreaches: [{ kind }] }, spec, consumer, nowMs: 1_000_000, bus: true }).state;
+  assert.equal(breach('latency'), 'breach', 'a breach about something other than the limits is not hidden by the hold');
+  assert.equal(breach('calls_limit'), 'throttled', 'the hold itself opens a calls_limit breach');
   assert.equal(m.nodeCells({ status, spec, consumer, nowMs: 3_000_000, bus: true }).state, 'ok');
 });
 
-test('call limits read "na minutę": breach rows and the window names', () => {
+test('the window names after "na", and a breach row states its own stored numbers', () => {
   assert.equal(m.windowPer(60), 'minutę');
   assert.equal(m.windowPer(86400), 'dobę');
-  const cells = m.breachCells({ kind: 'calls_limit', peakValue: 60, threshold: 60 }, { callWindowSecs: 60 });
-  assert.equal(cells.threshold, '60 na minutę');
+  const cells = m.breachCells({ kind: 'calls_limit', peakValue: 60, threshold: 60 });
+  assert.equal(cells.threshold, '60 wywołań');
+  assert.equal(m.breachCells({ kind: 'calls_limit', peakValue: 1, threshold: 1 }).threshold, '1 wywołanie');
 });
 
 test('the delete tooltip agrees in number: one assignment, several assignments', () => {

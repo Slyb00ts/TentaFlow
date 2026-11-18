@@ -258,15 +258,27 @@ export function dayAndClock(epochMs) {
   return new Intl.DateTimeFormat(I18n.getLanguage(), { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(at);
 }
 
+const LIMIT_BREACH_KINDS = new Set(['calls_warn', 'calls_limit', 'concurrency_saturated']);
+
 /**
  * The cells of one node's row. `status` is that node's `SlaFlowStatusWire` (`null` when the
  * node did not answer), `policy.spec` the policy's limits, `consumer` the flow's
  * `BusConsumerStatus` on that node when the flow reads a topic.
  */
+/** `'over'` for a value above its threshold, `''` otherwise (or when there is nothing to compare). */
+const exceeds = (value, threshold) => (value != null && threshold != null && Number(value) > Number(threshold) ? 'over' : '');
+
+/** The call window: `'over'` when it is used up, `'near'` from the policy's warning percentage on. */
+function windowTone(window, spec) {
+  if (!window.limit) return '';
+  if (window.used >= window.limit) return 'over';
+  return spec.warnAtPct != null && window.used * 100 >= window.limit * spec.warnAtPct ? 'near' : '';
+}
+
 export function nodeCells({ status, spec, consumer = null, nowMs, bus = false }) {
   if (!status) {
     return {
-      inFlight: DASH, inFlightSub: '', window: DASH, windowSub: '', p95: DASH, p95Sub: '', errors: DASH, errorsSub: '',
+      inFlight: DASH, inFlightSub: '', window: DASH, windowSub: '', windowTone: '', p95: DASH, p95Sub: '', p95Tone: '', errors: DASH, errorsSub: '', errorsTone: '',
       refused: DASH, refusedSub: '', nodeSub: '', chipStatus: 'neutral', label: T('state.unreachable'), state: 'unreachable',
     };
   }
@@ -276,7 +288,10 @@ export function nodeCells({ status, spec, consumer = null, nowMs, bus = false })
   const limit = status.maxConcurrency ?? spec.maxConcurrency ?? null;
   const today = (status.rejectedCallsToday ?? 0) + (status.rejectedConcurrencyToday ?? 0);
   const inWindow = evaluation ? (evaluation.rejectedCalls ?? 0) + (evaluation.rejectedConcurrency ?? 0) : null;
-  const shownState = throttledUntil != null && status.state === 'ok' ? 'throttled' : status.state;
+  // A hold by the call limit opens a calls_limit breach of its own, so "held" wins over ok, warn and a
+  // breach that is only about the limits; a breach about latency, errors or timeouts still shows.
+  const limitOnly = (status.openBreaches ?? []).every((b) => LIMIT_BREACH_KINDS.has(b.kind));
+  const shownState = throttledUntil != null && limitOnly ? 'throttled' : status.state;
   const windowSub = throttledUntil != null
     ? T('cells.held_until', { time: clockText(throttledUntil, true) })
     : (window?.resetsAtMs ? T('cells.reset_at', { time: clockText(window.resetsAtMs) }) : '');
@@ -287,10 +302,13 @@ export function nodeCells({ status, spec, consumer = null, nowMs, bus = false })
       ? (limit == null ? '' : T(spec.ordering === 'none' ? 'cells.unordered' : 'cells.in_partition'))
       : (limit != null && effectiveQueue(spec) > 0 ? T('cells.queue', { waiting: num(status.waiting ?? 0), max: num(effectiveQueue(spec)) }) : ''),
     window: window ? `${num(window.used)}/${num(window.limit)}` : DASH,
+    windowTone: window ? windowTone(window, spec) : '',
     windowSub,
     p95: evaluation?.p95Ms == null ? DASH : T('cells.ms', { value: num(Math.round(evaluation.p95Ms)) }),
+    p95Tone: exceeds(evaluation?.p95Ms, spec.latencyP95Ms),
     p95Sub: spec.latencyP95Ms == null ? '' : T('cells.threshold_ms', { value: num(spec.latencyP95Ms) }),
     errors: percentText(evaluation?.errorRatePct),
+    errorsTone: exceeds(evaluation?.errorRatePct, spec.errorRatePct),
     errorsSub: spec.errorRatePct == null ? '' : T('cells.threshold_pct', { value: num(spec.errorRatePct) }),
     // A bus flow is slowed, not refused: its column counts today's holds. A refused flow counts the
     // window the evaluator looked at, with today's total beside it.
@@ -310,20 +328,19 @@ export function overallState(states) {
 }
 
 /** `{ kind, threshold, peak }` texts of one breach for the history table. */
-export function breachCells(breach, spec) {
+export function breachCells(breach) {
   const peak = Number(breach.peakValue);
   const threshold = Number(breach.threshold);
   const kind = T(`breach.${breach.kind}`);
   switch (breach.kind) {
     case 'latency': return { kind, threshold: T('cells.up_to_ms', { value: num(Math.round(threshold)) }), peak: T('cells.ms', { value: num(Math.round(peak)) }) };
     case 'errors': return { kind, threshold: T('cells.up_to_pct', { value: formatPercent(threshold) }), peak: percentText(peak) };
-    case 'calls_warn': {
-      const limit = spec.callLimit;
-      const at = limit == null ? '' : ` (${num(Math.ceil((limit * threshold) / 100))}/${num(limit)})`;
-      return { kind, threshold: `${T('warn_detail', { pct: formatPercent(threshold) })}${at}`, peak: limit == null ? percentText(peak) : `${num(Math.round((limit * peak) / 100))}/${num(limit)}` };
-    }
+    // A breach states what was measured against what was set at the time; the policy has changed
+    // since, so nothing here is read from it.
+    case 'calls_warn':
+      return { kind, threshold: T('warn_detail', { pct: formatPercent(threshold) }), peak: percentText(peak) };
     case 'calls_limit':
-      return { kind, threshold: T('calls_per', { limit: num(Math.round(threshold)), window: windowPer(spec.callWindowSecs) }), peak: `${num(Math.round(peak))}/${num(Math.round(threshold))}` };
+      return { kind, threshold: T('cells.calls_n', { count: num(Math.round(threshold)), n: Math.round(threshold) }), peak: `${num(Math.round(peak))}/${num(Math.round(threshold))}` };
     case 'concurrency_saturated':
       return { kind, threshold: T('cells.slots', { count: num(Math.round(threshold)), n: Math.round(threshold) }), peak: num(Math.round(peak)) };
     default:

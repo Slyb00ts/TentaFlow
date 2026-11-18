@@ -3872,7 +3872,8 @@
     "delete_cancel_btn": "Annuler",
     "deleted_ok": "Flux supprimé",
     "delete_not_found": "Flux introuvable",
-    "exec_title": "Historique d’exécutions — flux {id}",
+    "exec_title": "Historique d’exécutions — flux « {name} »",
+    "exec_meta": "flow_id : {id} · {count} {n|exécution|exécutions} · statut : {status}",
     "exec_empty": "Aucune exécution",
     "col_exec_id": "ID",
     "col_exec_start": "Début",
@@ -16521,13 +16522,14 @@
       "system_title": "Les flux de la plateforme ne sont pas soumis à une politique"
     },
     "cells": {
+      "calls_n": "{count} {n|appel|appels}",
       "held_until": "retenu jusqu’à {time}",
       "reset_at": "réinitialisation à {time}",
       "queue": "file {waiting}/{max}",
       "ms": "{value} ms",
       "threshold_ms": "seuil {value} ms",
       "threshold_pct": "seuil {value} %",
-      "today_in_window": "dans cette fenêtre · aujourd’hui {count}",
+      "today_in_window": "sur les 5 dernières min · aujourd’hui {count}",
       "today_count": "aujourd’hui {count}",
       "today": "aujourd’hui",
       "up_to_ms": "jusqu’à {value} ms",
@@ -16633,6 +16635,32 @@
       "queue": "quand les threads sont occupés, la requête attend dans la file jusqu’à {wait} puis reçoit 429 avec Retry-After",
       "resumes": "la lecture reprend toute seule à {time} ; les messages attendent dans le topic et n’arrivent pas dans les non traités",
       "parallel": "les lots de partitions différentes s’exécutent en parallèle, {count} au plus à la fois"
+    }
+  },
+  "flow_publication": {
+    "button": "Paramètres",
+    "button_title": "Paramètres du flux",
+    "title": "Paramètres du flux",
+    "subject": "Flux : {name}",
+    "toggle": "Proposer comme modèle dans l’API /v1",
+    "name": "Nom du modèle",
+    "name_placeholder": "p. ex. inscription-api",
+    "name_hint": "Les applications appellent ce flux via /v1/chat/completions avec le champ model égal à ce nom. Le nom doit être unique ; le supprimer retire la publication.",
+    "address": "Adresse d’appel",
+    "submit": "Enregistrer",
+    "chip_title": "Le flux est disponible dans l’API /v1 comme modèle « {name} »",
+    "saved_published": "Le flux est disponible comme modèle « {name} »",
+    "saved_unpublished": "La publication du flux a été retirée",
+    "saved_unchanged": "Aucun changement",
+    "load_error": "Impossible de charger les paramètres du flux.",
+    "error": {
+      "required": "Indiquez un nom de modèle ou désactivez la publication.",
+      "too_long": "Le nom du modèle peut avoir {max} caractères au plus.",
+      "characters": "Le nom du modèle ne peut pas contenir de caractères de contrôle.",
+      "taken": "Le nom du modèle est déjà utilisé par un autre flux.",
+      "taken_by": "Le nom du modèle est déjà utilisé par le flux « {flow} ».",
+      "alias": "Le nom du modèle est déjà utilisé par un alias de modèle.",
+      "generic": "Impossible d’enregistrer les paramètres. Réessayez."
     }
   }
 }

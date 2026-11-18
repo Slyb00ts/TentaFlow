@@ -12,6 +12,7 @@ import { FlowCanvas } from '/js/modules/flows-builder/canvas.js';
 import { FlowPalette } from '/js/modules/flows-builder/palette.js';
 import { FlowConfig } from '/js/modules/flows-builder/config.js';
 import { openVariablesEditor } from '/js/modules/flows-builder/variables.js';
+import { currentPublication, openPublicationWindow } from '/js/modules/flows-builder/publication.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
@@ -102,7 +103,7 @@ const FlowBuilderScreen = {
             <tf-menu-item icon="inbox" data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-menu-item>
             <tf-menu-divider></tf-menu-divider>
             <tf-menu-item icon="history" data-role="history">${escapeHtml(I18n.t('flows_builder.history_title'))}</tf-menu-item>
-          </tf-menu>` : `<tf-button variant="ghost" size="sm" icon="code" data-compact data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
+          </tf-menu>` : `<tf-button variant="ghost" size="sm" icon="globe" data-compact data-role="flow-settings" title="${escapeAttr(I18n.t('flow_publication.button_title'))}">${escapeHtml(I18n.t('flow_publication.button'))}</tf-button><tf-button variant="ghost" size="sm" icon="code" data-compact data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>`}
         </header>
@@ -403,7 +404,7 @@ const FlowBuilderScreen = {
       root.classList.add('fb-readonly');
       nameEl.setAttribute('disabled', '');
       statusEl.setAttribute('disabled', '');
-      for (const role of ['save', 'variables', 'test', 'undo', 'redo', 'autosave']) {
+      for (const role of ['save', 'variables', 'flow-settings', 'test', 'undo', 'redo', 'autosave']) {
         root.querySelector(`[data-role="${role}"]`)?.setAttribute('hidden', '');
       }
       const banner = document.createElement('tf-alert');
@@ -429,6 +430,7 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="zoom-fit-more"]')?.addEventListener('click', () => state.canvas.fitToContent());
     root.querySelector('[data-role="save"]').addEventListener('click', () => this._save());
     root.querySelector('[data-role="variables"]').addEventListener('click', () => this._openVariables());
+    root.querySelector('[data-role="flow-settings"]')?.addEventListener('click', (event) => this._openPublication(event.currentTarget));
     root.querySelector('[data-role="history"]').addEventListener('click', () => this._openHistory());
 
     root.querySelector('[data-role="undo"]').addEventListener('click', () => state.canvas.undo());
@@ -1639,6 +1641,26 @@ const FlowBuilderScreen = {
     state.root.querySelector('[data-role="error"]')?.setAttribute('message', text);
     this._syncDraftNext(state);
     if (kind === 'draftsSave') this._setAutosave('error', text);
+  },
+
+  /** "Ustawienia przepływu": offer the flow as a /v1 model. The current name is read from the flow list, which carries it. */
+  async _openPublication(anchor) {
+    const s = this._state;
+    if (!s || s.readOnly || s.mode === 'bpmn') return;
+    let current;
+    try {
+      current = await currentPublication(String(s.flowId));
+    } catch {
+      toast(I18n.t('flow_publication.load_error'), 'error');
+      return;
+    }
+    if (!this._current(s)) return;
+    openPublicationWindow({
+      flow: { id: String(s.flowId), name: s.flow?.name ?? '' },
+      current,
+      anchor,
+      onSaved: ({ publishedModelName }) => { s.flow = { ...s.flow, publishedModelName }; },
+    });
   },
 
   async _openVariables() {

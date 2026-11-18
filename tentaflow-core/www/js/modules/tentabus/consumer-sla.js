@@ -44,14 +44,14 @@ const NODE_DEADLINE_MS = 4000;
 
 /**
  * Finds the flow that reads `group` on `topic` of the bus instance `instanceId` and what the policy
- * says about it. `call(kind, payload, options)` is the transport, `nodes()` the mesh nodes; `cache`
+ * says about it. `call(kind, payload, options)` is the transport, `flows(options)` reads the payload-less flow list, `nodes()` the mesh nodes; `cache`
  * (a Map kept by the page) remembers each flow's graph, which is read once, not once per poll.
  * The flow's consumer is read from every node on its own short deadline and the one that
  * runs is used, as the "Stan SLA" card does. Answers `null` when no flow reads as this consumer
  * (an external program does).
  */
-export async function loadConsumerSla({ group, topic, instanceId, call, cache, nodes = async () => [], deadlineMs = NODE_DEADLINE_MS }) {
-  const list = await call('flowListRequest', {});
+export async function loadConsumerSla({ group, topic, instanceId, call, flows, cache, nodes = async () => [], deadlineMs = NODE_DEADLINE_MS }) {
+  const list = await flows({});
   const candidates = (list.flows ?? []).filter((flow) => flow.busConsumer);
   let match = null;
   for (const flow of candidates) {
@@ -68,7 +68,7 @@ export async function loadConsumerSla({ group, topic, instanceId, call, cache, n
   const [policyResponse, status, consumer] = await Promise.all([
     match.slaPolicyId && !elsewhere ? bounded(call('slaPolicyGetRequest', { policyId: match.slaPolicyId }), deadlineMs) : Promise.resolve(null),
     match.slaPolicyId && !elsewhere ? bounded(call('slaStatusRequest', { flowId: match.id }).then((r) => r.statuses?.[0] ?? null), deadlineMs) : Promise.resolve(null),
-    runningConsumer({ flowId: match.id, local: match.busConsumer, call, nodes, deadlineMs }),
+    runningConsumer({ flowId: match.id, local: match.busConsumer, flows, nodes, deadlineMs }),
   ]);
   return {
     flow,
@@ -80,14 +80,14 @@ export async function loadConsumerSla({ group, topic, instanceId, call, cache, n
   };
 }
 
-async function runningConsumer({ flowId, local, call, nodes, deadlineMs }) {
+async function runningConsumer({ flowId, local, flows, nodes, deadlineMs }) {
   const known = (await bounded(nodes(), deadlineMs)) ?? [];
   if (known.length < 2) return local;
   const readings = await Promise.all(known.map(async (node) => {
     const consumer = node.isLocal
       ? local
       : await bounded(
-        call('flowListRequest', {}, { targetNodeId: node.nodeId, timeoutMs: deadlineMs }).then((r) => r.flows?.find((f) => f.id === flowId)?.busConsumer ?? null),
+        flows({ targetNodeId: node.nodeId, timeoutMs: deadlineMs }).then((r) => r.flows?.find((f) => f.id === flowId)?.busConsumer ?? null),
         deadlineMs,
       );
     return { node, consumer };

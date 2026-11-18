@@ -2,7 +2,10 @@ import '../tentabus/_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { startSlaState } = await import('./exec-state.js');
+const { startSlaState: startReal } = await import('./exec-state.js');
+
+// The flow list has no payload, so the card reads it through its own `flows` dependency.
+const startSlaState = (args) => startReal({ ...args, deps: { flows: (options) => args.deps.call('flowListRequest', {}, options), ...args.deps } });
 
 test('a second poll patches the node row in place: cell nodes survive, values change', async () => {
   let inFlight = 1;
@@ -158,11 +161,11 @@ test('refusals "dziś": the window count with today beside it, painted in place 
   const main = host.querySelector('[data-v="refused"]');
   const sub = host.querySelector('[data-v="refused-sub"]');
   assert.equal(main.textContent, '3');
-  assert.equal(sub.textContent, 'w tym oknie · dziś 41');
+  assert.equal(sub.textContent, 'w ostatnich 5 min · dziś 41');
   today = 44;
   await card.refresh();
   assert.equal(host.querySelector('[data-v="refused"]'), main, 'same node, repainted in place');
-  assert.equal(sub.textContent, 'w tym oknie · dziś 44');
+  assert.equal(sub.textContent, 'w ostatnich 5 min · dziś 44');
   card.dispose();
 });
 
@@ -203,4 +206,75 @@ test('with no breaches the paging footer and the "none" line follow their hidden
   assert.equal(full.querySelector('[data-v="breach-more-row"]').style.display, 'none', 'all shown: no "Pokaż więcej"');
   assert.equal(full.querySelector('[data-v="breach-empty"]').style.display, 'none');
   second.dispose();
+});
+
+test('a throttled bus flow shows who leads, until when it is held and when reading resumes', async () => {
+  const until = new Date(2026, 10, 18, 7, 16, 0).getTime();
+  const host = document.createElement('div');
+  const card = startSlaState({
+    host, flow: { id: 'f1', slaPolicyId: 'p1', busConsumer: { state: 'running' } }, intervalMs: 3_600_000,
+    deps: {
+      call: fakeCall({
+        // The hold opened a calls_limit breach: the state is "breach", but it is the hold that is shown.
+        statuses: { n1: { state: 'breach', inFlight: 2, maxConcurrency: 4, window: { used: 600, limit: 600, resetsAtMs: until }, openBreaches: [{ kind: 'calls_limit' }] } },
+        consumers: { n1: { state: 'running', throttledUntil: until } },
+      }),
+      nodes: async () => [NODES[0]], now: () => until - 30_000,
+    },
+  });
+  await card.ready;
+  const text = host.textContent;
+  assert.match(text, /prowadzi odbiór/);
+  assert.match(text, /wstrzymano do 07:16:00/);
+  assert.match(text, /odbiór ruszy sam o 07:16:00/);
+  assert.equal(host.querySelector('[data-v="overall"]').getAttribute('label'), 'wstrzymany limitem');
+  assert.equal(host.querySelector('[data-v="chip"]').getAttribute('label'), 'wstrzymany limitem');
+  card.dispose();
+});
+
+test('values at or over their threshold are coloured like the mockup: near, then over', async () => {
+  const host = document.createElement('div');
+  const card = startSlaState({
+    host, flow: { id: 'f1', slaPolicyId: 'p1' }, intervalMs: 3_600_000,
+    deps: {
+      call: async (kind) => {
+        if (kind === 'slaPolicyGetRequest') return { policy: { id: 'p1', spec: { ...SPEC, callLimit: 60, warnAtPct: 80, latencyP95Ms: 2000, errorRatePct: 5 } } };
+        if (kind === 'slaStatusRequest') return { statuses: [{ state: 'breach', inFlight: 1, maxConcurrency: 4, window: { used: 57, limit: 60 }, evaluation: { p95Ms: 2840, errorRatePct: 3.1 } }] };
+        return { breaches: [], total: 0 };
+      },
+      nodes: async () => [NODES[0]], now: () => 1,
+    },
+  });
+  await card.ready;
+  assert.ok(host.querySelector('[data-v="window"]').classList.contains('sla-near'));
+  assert.ok(host.querySelector('[data-v="p95"]').classList.contains('sla-over'));
+  assert.ok(!host.querySelector('[data-v="errors"]').classList.contains('sla-over'));
+  card.dispose();
+});
+
+test('a breach row shows what it stored, not the policy as it is now', async () => {
+  const breaches = [
+    { id: 'a', nodeId: 'n1', kind: 'calls_limit', peakValue: 60, threshold: 60, raisedAtMs: 1, resolvedAtMs: 2 },
+    { id: 'b', nodeId: 'n1', kind: 'calls_warn', peakValue: 80, threshold: 80, raisedAtMs: 1, resolvedAtMs: 2 },
+  ];
+  const host = document.createElement('div');
+  const card = startSlaState({
+    host, flow: { id: 'f1', slaPolicyId: 'p1' }, intervalMs: 3_600_000,
+    deps: {
+      call: async (kind) => {
+        if (kind === 'slaPolicyGetRequest') return { policy: { id: 'p1', spec: { ...SPEC, callLimit: 10, callWindowSecs: 60, warnAtPct: 90 } } };
+        if (kind === 'slaStatusRequest') return { statuses: [{ state: 'ok' }] };
+        return { breaches, total: 2 };
+      },
+      nodes: async () => [NODES[0]], now: () => 1,
+    },
+  });
+  await card.ready;
+  const rows = [...host.querySelectorAll('[data-v="breaches"] tr')].map((tr) => tr.textContent);
+  assert.match(rows[0], /60 wywołań/);
+  assert.match(rows[0], /60\/60/);
+  assert.doesNotMatch(rows[0] + rows[1], /\/10/, 'the new limit of 10 does not leak into the history');
+  assert.match(rows[1], /ostrzeżenie przy 80 %/);
+  assert.doesNotMatch(rows[1], /\(\d+\/\d+\)/);
+  card.dispose();
 });

@@ -50,6 +50,7 @@ import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
 import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
 import { loadConsumerSla } from '/js/modules/tentabus/consumer-sla.js';
+import { readFlowList } from '/js/modules/sla/flow-list.js';
 import { openOffsetMove, movedText } from '/js/modules/tentabus/offset-move.js';
 import { drawUnprocessed, unprocessedRecord, unprocessedTopics, mergeNewest, retryAllPlan, topicConsumers, messageName, receiversText, retryAllDoneNotice, UNPROCESSED_PAGE, LIST_STEP } from '/js/modules/tentabus/unprocessed.js';
 import { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll } from '/js/modules/tentabus/unprocessed-windows.js';
@@ -1328,7 +1329,7 @@ const detailContext = {
       accessData: state.access.topic === state.view.name ? state.access : null,
       hidingData: state.hiding.topic === state.view.name ? state.hiding : null,
       schemaProblem: state.schemaCheck.topic === state.view.name ? state.schemaCheck.problem : null,
-      instanceId: iid,
+      instanceId: state.instanceId,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
     };
@@ -1920,6 +1921,7 @@ async function fetchConsumer(instanceId, group, topic) {
     topic,
     instanceId: iid,
     call: (kind, payload, options) => ApiBinary.action(kind, payload, options),
+    flows: readFlowList,
     nodes: () => ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
     cache: consumerFlowGraphs,
   })
@@ -1929,15 +1931,19 @@ async function fetchConsumer(instanceId, group, topic) {
 
 // A failed reload keeps the page it already shows (the header says the data
 // is old); only a consumer never loaded, or one gone since, shows the failure.
+function consumerLoaderContext() {
+  return {
+    instanceId: state.instanceId,
+    name: state.view?.kind === 'consumer-detail' ? consumerKey(state.view.group, state.view.topic) : null,
+  };
+}
+
 const loadConsumer = topicDetailLoader({
   fetch: (instanceId, key) => {
     const [group, topic] = key.split('\u0000');
     return fetchConsumer(instanceId, group, topic);
   },
-  context: () => ({
-    instanceId: iid,
-    name: state.view?.kind === 'consumer-detail' ? consumerKey(state.view.group, state.view.topic) : null,
-  }),
+  context: consumerLoaderContext,
   apply({ detail, error }) {
     if (!error) {
       state.consumer = detail;
@@ -2715,5 +2721,8 @@ function openSchemaDeleteWindow(name) {
     },
   });
 }
+
+// What the page tests reach into: the screen's state and the contexts its two detail pages are drawn from.
+export const pageInternals = { state, detailContext, consumerContext, consumerLoaderContext };
 
 export default TentaBusScreen;

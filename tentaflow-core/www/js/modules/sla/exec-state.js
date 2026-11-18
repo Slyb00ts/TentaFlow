@@ -10,6 +10,7 @@
 // nothing blinks and a selection or scroll position survives.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { readFlowList } from './flow-list.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { setAttr, setText } from '/js/lib/dom-patch.js';
 import '/js/components/tf-chip.js';
@@ -23,6 +24,7 @@ const NODE_ID_SHORT = 8;
 
 const defaultDeps = {
   call: (kind, payload, options) => ApiBinary.action(kind, payload, options),
+  flows: readFlowList,
   nodes: async () => (await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' })),
   now: () => Date.now(),
 };
@@ -69,6 +71,10 @@ const put = (scope, name, text) => setText(scope.querySelector(`[data-v="${name}
 function paintNodeRow(tr, cells) {
   for (const name of ['inFlight', 'window', 'p95', 'errors', 'refused']) {
     put(tr, name, cells[name]);
+    const tone = cells[`${name}Tone`] ?? '';
+    const main = tr.querySelector(`[data-v="${name}"]`);
+    main?.classList.toggle('sla-over', tone === 'over');
+    main?.classList.toggle('sla-near', tone === 'near');
     put(tr, `${name}-sub`, cells[`${name}Sub`]);
   }
   put(tr, 'node-sub', cells.nodeSub);
@@ -144,6 +150,10 @@ export function startSlaState({ host, flow, onOpenPolicies = () => {}, deps = {}
     ? api.call(kind, payload)
     : api.call(kind, payload, { targetNodeId: node.nodeId, timeoutMs: nodeDeadlineMs }));
 
+  const askFlows = (node) => (node.isLocal || !node.nodeId
+    ? api.flows({ timeoutMs: nodeDeadlineMs })
+    : api.flows({ targetNodeId: node.nodeId, timeoutMs: nodeDeadlineMs }));
+
   async function loadNodes() {
     const nodes = (await bounded(api.nodes(), nodeDeadlineMs)) ?? [];
     const list = nodes.length ? nodes : [{ nodeId: '', hostname: T('node_this'), isLocal: true }];
@@ -158,7 +168,7 @@ export function startSlaState({ host, flow, onOpenPolicies = () => {}, deps = {}
     let consumer = null;
     if (bus && status) {
       consumer = await bounded(
-        ask('flowListRequest', {}, node).then((response) => response.flows?.find((item) => item.id === flow.id)?.busConsumer ?? null),
+        askFlows(node).then((response) => response.flows?.find((item) => item.id === flow.id)?.busConsumer ?? null),
         nodeDeadlineMs,
       );
     }
@@ -252,7 +262,7 @@ export function startSlaState({ host, flow, onOpenPolicies = () => {}, deps = {}
     setText(host.querySelector('[data-v="breach-shown"]'), T('breaches_shown', { shown: breaches.length, total }));
     syncRows(host.querySelector('[data-v="breaches"]'), breaches.map((breach) => ({
       key: breach.id,
-      html: breachRowHtml(breach, { nodeName: names.get(breach.nodeId) ?? shortNode(breach.nodeId), cells: breachCells(breach, context.policy.spec) }),
+      html: breachRowHtml(breach, { nodeName: names.get(breach.nodeId) ?? shortNode(breach.nodeId), cells: breachCells(breach) }),
     })));
   }
 

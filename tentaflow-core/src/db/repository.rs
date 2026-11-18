@@ -8052,8 +8052,9 @@ pub fn update_flow_with_snapshot(
     // Wlasciwa aktualizacja z optimistic locking
     let rows_affected = tx.execute(
         "UPDATE flows SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, \
-         flow_json = ?6, status = ?7, version = version + 1, updated_at = datetime('now') \
-         WHERE id = ?1 AND version = ?8",
+         flow_json = ?6, status = ?7, published_model_name = ?8, version = version + 1, \
+         updated_at = datetime('now') \
+         WHERE id = ?1 AND version = ?9",
         rusqlite::params![
             id,
             params.name,
@@ -8062,6 +8063,7 @@ pub fn update_flow_with_snapshot(
             params.service_type,
             params.flow_json,
             params.status,
+            params.published_model_name,
             expected_version
         ],
     )?;
@@ -13885,7 +13887,7 @@ pub fn list_audit_logs(
     let conn = acquire_read(pool)?;
 
     let mut sql = String::from(
-        "SELECT id, timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, correlation_id \
+        "SELECT id, timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, correlation_id, severity \
          FROM audit_log WHERE 1=1",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -13941,6 +13943,7 @@ pub fn list_audit_logs(
                 ip_address: row.get(7)?,
                 node_id: row.get(8)?,
                 correlation_id: row.get(9)?,
+                severity: row.get(10)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -16,7 +16,7 @@ use super::ModelRuntimeSlot;
 use crate::flow_engine::dispatcher::CallProvenance;
 use crate::flow_engine::dispatchers::{VisionClassifyRequest, VisionDispatcher, VisionOcrRequest};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
-use crate::services::runtime::executor::ModelRuntimeExecutor;
+use crate::services::runtime::executor::{ExecutorError, ModelRuntimeExecutor};
 use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest, CvFrameLocal};
 use tentaflow_protocol::{CameraCvResult, CvOcrMode};
 
@@ -61,6 +61,23 @@ fn runtime_ctx(caller_addon_id: Option<String>, provenance: CallProvenance) -> R
     ctx
 }
 
+/// An executor failure as an `anyhow` error. A service at its concurrency limit
+/// keeps its type, so the edge can answer 503 with `Retry-After` instead of a
+/// flattened 500; everything else becomes text as before.
+fn executor_failure(what: &str, e: ExecutorError) -> anyhow::Error {
+    match e {
+        ExecutorError::Busy {
+            backend,
+            retry_after_ms,
+        } => crate::error::CoreError::BackendBusy {
+            backend,
+            retry_after_ms,
+        }
+        .into(),
+        other => anyhow!("{what}: {other}"),
+    }
+}
+
 /// OCR przez executor: alias → resolve → local/mesh dispatch. Tryb `Plate`
 /// jest jedynym wariantem osiągalnym z flow — `VisionOcrRequest` nie niesie
 /// klasy tablicy (ADR ma dedykowaną ścieżkę w silniku kamer).
@@ -86,7 +103,7 @@ async fn ocr_via_executor(
         Ok(_) => Err(anyhow!(
             "vision ocr: nieoczekiwany wariant wyniku camera-cv"
         )),
-        Err(e) => Err(anyhow!("vision ocr: {e}")),
+        Err(e) => Err(executor_failure("vision ocr", e)),
     }
 }
 
@@ -112,7 +129,7 @@ async fn classify_via_executor(
         Ok(_) => Err(anyhow!(
             "vision classify: nieoczekiwany wariant wyniku camera-cv"
         )),
-        Err(e) => Err(anyhow!("vision classify: {e}")),
+        Err(e) => Err(executor_failure("vision classify", e)),
     }
 }
 

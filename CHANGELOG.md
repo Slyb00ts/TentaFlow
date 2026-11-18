@@ -118,6 +118,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   poprzedniej minuty.
 - Okna potwierdzenia wyświetlają treść komunikatu jako tekst. Nazwy
   przepływów, polityk i plików nie mogą już wstrzyknąć HTML.
+- Przepływ można opublikować jako model `/v1` z poziomu Flow Buildera
+  („Ustawienia” → „Udostępnij jako model w API /v1”); lista przepływów
+  pokazuje znacznik `/v1 · <model>`. Edycja przepływu zapisuje teraz nazwę
+  modelu (pusta nazwa wycofuje publikację), a zajęta nazwa daje błąd zamiast
+  cichego pominięcia. Tworzenie przepływu przycina nazwę tak samo, a
+  przywrócenie wersji odświeża katalog `/v1/models`.
+- Wbudowany OCR na `/v1/infer` zajmuje jeden slot limitu serwisu zamiast
+  dwóch, więc limit 1 już go nie blokuje. Zajęty serwis zwraca 503
+  z `Retry-After` także dla OCR i reranku. Odpowiedzi błędów `/v1` nie
+  zawierają już szczegółów wewnętrznych (identyfikatorów węzłów, treści
+  odpowiedzi usługi); szczegóły trafiają do logu.
+- Karta „Stan SLA” przepływu z TentaBus pokazuje węzeł prowadzący odbiór,
+  czas wstrzymania i stan „wstrzymany limitem”; historia naruszeń używa
+  progu zapisanego przy naruszeniu. Dziennik audytu pokazuje zapisaną
+  ważność zdarzenia (`AuditLogEntry.severity`).
+- Dokumentacja administratora: `docs/SLA_POLITYKI_ADMIN.md`.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

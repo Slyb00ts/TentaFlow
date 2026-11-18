@@ -1143,6 +1143,8 @@ pub struct AuditLogEntry {
     pub node_id: Option<String>,
     /// Korelacja z przebiegiem, ktory wygenerowal wpis (kolumna z migracji 132).
     pub correlation_id: Option<String>,
+    /// Severity stored with the row (kolumna `audit_log.severity`).
+    pub severity: Option<String>,
 }
 
 /// Zainstalowany addon
