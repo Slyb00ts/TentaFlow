@@ -221,6 +221,8 @@ fn breach_to_wire(breach: &Breach) -> SlaBreachWire {
         peak_value: breach.peak_value,
         raised_at_ms: breach.raised_at_ms,
         resolved_at_ms: breach.resolved_at_ms,
+        call_limit: breach.call_limit,
+        peak_calls: breach.peak_calls,
     }
 }
 
@@ -926,6 +928,7 @@ mod tests {
                 kind,
                 threshold: 100.0,
                 value: 150.0,
+                calls: None,
             },
             "node-1",
             1_000,

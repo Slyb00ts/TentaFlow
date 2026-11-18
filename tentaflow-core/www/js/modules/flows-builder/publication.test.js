@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
 const p = await import('./publication.js');
-const { publishedChipHtml } = await import('../flows.js');
+const { publishedChipHtml, execMetaKey } = await import('../flows.js');
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
 const flow = { id: 'f1', name: 'Camera Analysis' };
@@ -128,4 +128,10 @@ test('the list chip reads "/v1 · name" and keeps the case of the name', () => {
   assert.equal(publishedChipHtml({ id: 'f2', publishedModelName: null }), '');
   assert.equal(publishedChipHtml({ id: 'f2', publishedModelName: '  ' }), '');
   assert.match(publishedChipHtml({ id: 'f3', publishedModelName: '<b>x</b>' }), /&lt;b&gt;x&lt;\/b&gt;/);
+});
+
+test('the history header says "latest" only when a full page was loaded', () => {
+  assert.equal(execMetaKey(5), 'flows.exec_meta');
+  assert.equal(execMetaKey(99), 'flows.exec_meta');
+  assert.equal(execMetaKey(100), 'flows.exec_meta_latest');
 });

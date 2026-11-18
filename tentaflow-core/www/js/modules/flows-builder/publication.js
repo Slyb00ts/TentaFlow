@@ -127,11 +127,12 @@ export function openPublicationWindow({ flow, current, onSaved = () => {}, ancho
   nameControl.addEventListener('input', refresh);
 
   const section = document.createElement('div');
+  section.className = 'tf-act__content';
   section.append(toggleField, nameField.el, addressField);
 
   return openFormWindow({
     title: T('title'),
-    icon: 'globe',
+    icon: 'settings',
     subject: T('subject', { name: flow.name }),
     sections: [section],
     fields: [],

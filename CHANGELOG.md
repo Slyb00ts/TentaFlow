@@ -133,6 +133,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   czas wstrzymania i stan „wstrzymany limitem”; historia naruszeń używa
   progu zapisanego przy naruszeniu. Dziennik audytu pokazuje zapisaną
   ważność zdarzenia (`AuditLogEntry.severity`).
+- Migracja 214 dodaje do `sla_breaches` limit wywołań i najwyższą liczbę
+  wywołań. Wiersz ostrzeżenia pokazuje „ostrzeżenie przy 80 % (48/60)”,
+  a szczyt jako „57/60”; starsze wiersze zachowują dotychczasowy opis.
+- Kafel „Równoległość” odświeża się co 5 s. Nagłówek historii wykonań
+  mówi „ostatnie 100 wykonań”, gdy lista jest pełna.
 - Dokumentacja administratora: `docs/SLA_POLITYKI_ADMIN.md`.
 
 ### Zdarzenia i konta usługowe (TB-02)

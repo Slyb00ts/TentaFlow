@@ -97,6 +97,17 @@ test('the window names after "na", and a breach row states its own stored number
   assert.equal(m.breachCells({ kind: 'calls_limit', peakValue: 1, threshold: 1 }).threshold, '1 wywołanie');
 });
 
+test('breach rows show the stored call numbers and fall back to percentages without them', () => {
+  const warn = { kind: 'calls_warn', threshold: 80, peakValue: 95, callLimit: 60, peakCalls: 57 };
+  assert.equal(m.breachCells(warn).threshold, 'ostrzeżenie przy 80 % (48/60)');
+  assert.equal(m.breachCells(warn).peak, '57/60');
+  const old = m.breachCells({ kind: 'calls_warn', threshold: 80, peakValue: 95 });
+  assert.equal(old.threshold, 'ostrzeżenie przy 80 %');
+  assert.equal(old.peak, '95 %');
+  assert.equal(m.breachCells({ kind: 'calls_limit', threshold: 60, peakValue: 60, callLimit: 60, peakCalls: 60 }).peak, '60/60');
+  assert.equal(m.breachCells({ kind: 'calls_warn', threshold: 80, peakValue: 95, callLimit: null, peakCalls: null }).peak, '95 %');
+});
+
 test('the delete tooltip agrees in number: one assignment, several assignments', () => {
   assert.match(m.deleteBlockedText(1), /przypisana do 1 przepływu\. Najpierw zdejmij przypisanie\.$/);
   assert.match(m.deleteBlockedText(3), /do 3 przepływów\. Najpierw zdejmij przypisania\.$/);

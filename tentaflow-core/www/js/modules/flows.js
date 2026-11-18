@@ -408,6 +408,10 @@ function stopExecState() {
   mounted.execState = null;
 }
 
+// The list answers one page without a total: a full page means "the latest N", not "N in all".
+const EXEC_PAGE_SIZE = 100;
+export const execMetaKey = (count) => (count >= EXEC_PAGE_SIZE ? 'flows.exec_meta_latest' : 'flows.exec_meta');
+
 async function showExecs(flowId) {
   const state = mounted;
   if (!state) return;
@@ -429,7 +433,7 @@ async function showExecs(flowId) {
         <div class="card-header">
           <div>
             <h3 class="card-title">${escapeHtml(I18n.t('flows.exec_title', { name: flow?.name || flowId }))}</h3>
-            <div class="hint" style="margin:0">${escapeHtml(I18n.t('flows.exec_meta', { id: flowId, count: execs.length, n: execs.length, status: I18n.t(`flows.status_${statusKey(flow?.status || (flow?.enabled ? 'active' : 'draft'))}`) }))}</div>
+            <div class="hint" style="margin:0">${escapeHtml(I18n.t(execMetaKey(execs.length), { id: flowId, count: execs.length, n: execs.length, status: I18n.t(`flows.status_${statusKey(flow?.status || (flow?.enabled ? 'active' : 'draft'))}`) }))}</div>
           </div>
           <tf-button variant="ghost" size="sm" icon="x" id="execs-close" title="${escapeAttr(I18n.t('flows.close_title'))}"></tf-button>
         </div>

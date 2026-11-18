@@ -1352,6 +1352,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "sla_manage_permission",
             MigrationStep::Rust(roles_add_sla_manage_permission),
         ),
+        (
+            214,
+            "sla_breaches_call_counts",
+            MigrationStep::Sql(SLA_BREACHES_CALL_COUNTS),
+        ),
     ]
 }
 
@@ -1699,6 +1704,20 @@ BEGIN
     FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id = i.definition_id
     WHERE i.instance_id = NEW.instance_id;
 END;
+"#;
+
+/// v214 — a breach of the call limit keeps the numbers the UI words it with:
+/// `call_limit` is the policy's limit of calls per window when the breach was
+/// opened (carried over if the policy changes while it lasts) and `peak_calls`
+/// the highest absolute count seen while it is open. Both are NULL for the
+/// kinds that are not about calls and for rows written before this rung. The
+/// table is node-local, so the columns are added in place with no replication
+/// concern.
+const SLA_BREACHES_CALL_COUNTS: &str = r#"
+ALTER TABLE sla_breaches ADD COLUMN call_limit INTEGER
+    CHECK(call_limit IS NULL OR (typeof(call_limit)='integer' AND call_limit>0));
+ALTER TABLE sla_breaches ADD COLUMN peak_calls INTEGER
+    CHECK(peak_calls IS NULL OR (typeof(peak_calls)='integer' AND peak_calls>=0));
 "#;
 
 /// v213 — `sla.manage` lets a role create, change and delete SLA policies and
@@ -17326,7 +17345,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 213);
+        assert_eq!(head, 214);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -17345,7 +17364,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 34);
+        assert_eq!(applied_after_179.len(), 35);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -17368,6 +17387,7 @@ mod tests {
         assert_eq!(applied_after_179[31], "service_sla_policies");
         assert_eq!(applied_after_179[32], "sla_breaches_and_samples");
         assert_eq!(applied_after_179[33], "sla_manage_permission");
+        assert_eq!(applied_after_179[34], "sla_breaches_call_counts");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17910,6 +17930,73 @@ mod tests {
         for role in ["org_operator", "org_viewer"] {
             assert!(!perms(&conn, role).iter().any(|p| p == "sla.manage"), "{role}");
         }
+    }
+
+    /// v214 adds the two nullable call columns on a fresh database and on one
+    /// that was at the previous head; a row written before the rung reads NULL.
+    #[test]
+    fn migration_214_adds_the_breach_call_columns_fresh_and_upgraded() {
+        let breach_insert = "INSERT INTO sla_breaches \
+            (id, org_id, target_id, policy_id, kind, node_id, threshold, peak_value, \
+             raised_at_ms, dedupe_key) \
+            VALUES ('b-old', 'o', 't', 'p', 'calls_limit', 'n', 60, 60, 1, 'o:t:calls_limit')";
+
+        let fresh = Connection::open_in_memory().unwrap();
+        run(&fresh).unwrap();
+
+        let upgraded = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&upgraded, 213);
+        for column in ["call_limit", "peak_calls"] {
+            assert!(!column_exists(&upgraded, "sla_breaches", column).unwrap());
+        }
+        upgraded.execute(breach_insert, []).unwrap();
+        run(&upgraded).unwrap();
+        run(&upgraded).unwrap();
+
+        for conn in [&fresh, &upgraded] {
+            for column in ["call_limit", "peak_calls"] {
+                assert!(
+                    column_exists(conn, "sla_breaches", column).unwrap(),
+                    "{column}"
+                );
+            }
+            let rung: String = conn
+                .query_row(
+                    "SELECT name FROM _migrations WHERE version = 214",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rung, "sla_breaches_call_counts");
+        }
+        let old: (Option<i64>, Option<i64>) = upgraded
+            .query_row(
+                "SELECT call_limit, peak_calls FROM sla_breaches WHERE id = 'b-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old, (None, None), "a row of the old shape keeps NULLs");
+
+        fresh.execute(breach_insert, []).unwrap();
+        fresh
+            .execute(
+                "UPDATE sla_breaches SET call_limit = 60, peak_calls = 48 WHERE id = 'b-old'",
+                [],
+            )
+            .unwrap();
+        assert!(fresh
+            .execute(
+                "UPDATE sla_breaches SET call_limit = 0 WHERE id = 'b-old'",
+                []
+            )
+            .is_err());
+        assert!(fresh
+            .execute(
+                "UPDATE sla_breaches SET peak_calls = -1 WHERE id = 'b-old'",
+                []
+            )
+            .is_err());
     }
 
     fn sla_policy_insert(

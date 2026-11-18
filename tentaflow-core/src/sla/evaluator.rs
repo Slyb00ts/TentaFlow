@@ -98,7 +98,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use super::breach::{self, Breach, BreachKind, Candidate, RaiseOutcome, Sample};
+use super::breach::{self, Breach, BreachKind, CallCounts, Candidate, RaiseOutcome, Sample};
 use super::gate::ServiceGate;
 use super::gate::{system_clock, Clock, GateStats, HistogramSnapshot, LatencyHistogram};
 use super::policy::SLA_TARGET_FLOW;
@@ -659,6 +659,7 @@ impl Evaluator {
             kind,
             threshold,
             value,
+            calls: None,
         };
         let spec = &assignment.spec;
         if let (Some(threshold), Some(p95)) = (spec.latency_p95_ms, window.p95_ms) {
@@ -676,21 +677,27 @@ impl Evaluator {
         }
         if let Some((limit, _)) = limits.call_limit {
             let used_pct = f64::from(call_peak) * 100.0 / f64::from(limit);
+            let counts = Some(CallCounts {
+                limit: u64::from(limit),
+                calls: u64::from(call_peak),
+            });
             if let Some(warn_at) = spec.warn_at_pct {
                 if used_pct >= f64::from(warn_at) {
-                    candidates.push(candidate(
-                        BreachKind::CallsWarn,
-                        f64::from(warn_at),
-                        used_pct,
-                    ));
+                    candidates.push(Candidate {
+                        calls: counts,
+                        ..candidate(BreachKind::CallsWarn, f64::from(warn_at), used_pct)
+                    });
                 }
             }
             if call_peak >= limit {
-                candidates.push(candidate(
-                    BreachKind::CallsLimit,
-                    f64::from(limit),
-                    f64::from(call_peak),
-                ));
+                candidates.push(Candidate {
+                    calls: counts,
+                    ..candidate(
+                        BreachKind::CallsLimit,
+                        f64::from(limit),
+                        f64::from(call_peak),
+                    )
+                });
             }
         }
         if let (Some(max), Some(since)) = (limits.max_concurrency, state.saturated_since_ms) {
@@ -1392,6 +1399,79 @@ mod tests {
         assert_eq!(limit.kind.unit(), BreachUnit::Calls);
     }
 
+    /// The call kinds keep the policy's limit and the absolute count; the count
+    /// grows with the breach while the limit stays the policy's.
+    #[tokio::test]
+    async fn call_breaches_store_the_limit_and_a_growing_peak_count() {
+        let mut f = Fixture::new();
+        f.govern(
+            "org-a",
+            "flow-1",
+            SlaPolicySpec {
+                call_limit: Some(10),
+                call_window_secs: Some(3600),
+                warn_at_pct: Some(80),
+                ..spec("calls")
+            },
+        );
+        let gate = f.gate("flow-1");
+        let counts = |f: &Fixture, kind: BreachKind| {
+            let breach = f
+                .breaches("org-a")
+                .into_iter()
+                .find(|b| b.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind:?} breach"));
+            (breach.call_limit, breach.peak_calls)
+        };
+        for _ in 0..8 {
+            call(&gate, Outcome::Ok).await;
+        }
+        f.tick();
+        assert_eq!(counts(&f, BreachKind::CallsWarn), (Some(10), Some(8)));
+        assert!(f
+            .breaches("org-a")
+            .iter()
+            .all(|b| b.kind == BreachKind::CallsWarn));
+
+        call(&gate, Outcome::Ok).await;
+        f.advance(ms(TICK));
+        f.tick();
+        assert_eq!(
+            counts(&f, BreachKind::CallsWarn),
+            (Some(10), Some(9)),
+            "the peak grows on refresh"
+        );
+
+        call(&gate, Outcome::Ok).await;
+        f.advance(ms(TICK));
+        f.tick();
+        assert_eq!(counts(&f, BreachKind::CallsWarn), (Some(10), Some(10)));
+        assert_eq!(counts(&f, BreachKind::CallsLimit), (Some(10), Some(10)));
+    }
+
+    /// A breach of a kind that is not about calls has no call numbers, and a
+    /// refresh never invents them.
+    #[test]
+    fn breaches_of_other_kinds_keep_the_call_columns_null() {
+        let pool = test_pool();
+        let candidate = |value: f64| Candidate {
+            org_id: "org-a".into(),
+            target_id: "flow-1".into(),
+            policy_id: "p".into(),
+            kind: BreachKind::Latency,
+            threshold: 500.0,
+            value,
+            calls: None,
+        };
+        breach::raise_or_refresh(&pool, &candidate(600.0), "n", 1).unwrap();
+        assert_eq!(
+            breach::raise_or_refresh(&pool, &candidate(700.0), "n", 2).unwrap(),
+            RaiseOutcome::Refreshed
+        );
+        let open = breach::open_breaches(&pool).unwrap();
+        assert_eq!((open[0].call_limit, open[0].peak_calls), (None, None));
+    }
+
     #[tokio::test]
     async fn a_short_window_that_rolled_over_before_the_tick_is_still_seen_through_its_peak() {
         let mut f = Fixture::new();
@@ -1419,6 +1499,10 @@ mod tests {
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].kind, BreachKind::CallsLimit);
         assert_eq!(breaches[0].peak_value, 3.0);
+        assert_eq!(
+            (breaches[0].call_limit, breaches[0].peak_calls),
+            (Some(3), Some(3))
+        );
 
         // Nothing since: the peak leaves the evaluation window and it resolves.
         f.run(Duration::from_secs(6 * 60));
@@ -1947,6 +2031,7 @@ mod tests {
                 kind,
                 threshold: 1.0,
                 value: 2.0,
+                calls: None,
             };
             breach::raise_or_refresh(&pool, &candidate("org-a"), "n", 100 + i as i64).unwrap();
             breach::raise_or_refresh(&pool, &candidate("org-b"), "n", 100 + i as i64).unwrap();

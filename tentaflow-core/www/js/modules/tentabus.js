@@ -72,6 +72,8 @@ const PACKAGE_ID = 'tentabus';
 
 const STATS_POLL_MS = 3000;
 const REPLICA_POLL_MS = 10_000;
+// The consumer page carries the SLA tiles, which the other SLA cards refresh every 5 s.
+const CONSUMER_POLL_MS = 5000;
 const TABS = MAIN_TABS;
 const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'inbox', schemas: 'file-code', replication: 'branch' };
 // The mutually-exclusive views `#tb-panel` can show (six tabs, a topic's
@@ -948,6 +950,20 @@ function startStatsPolling() {
     }, REPLICA_POLL_MS);
   };
   next();
+  // The consumer page (reading places, SLA tiles) has its own, faster cycle;
+  // chained so a slow node never overlaps two reloads.
+  const consumerPoll = { timer: null };
+  state.shell.consumerPoll = consumerPoll;
+  const nextConsumer = () => {
+    consumerPoll.timer = setTimeout(async () => {
+      try {
+        if (state.view?.kind === 'consumer-detail') await loadConsumer(consumerKey(state.view.group, state.view.topic));
+      } finally {
+        if (state.shell.consumerPoll === consumerPoll) nextConsumer();
+      }
+    }, CONSUMER_POLL_MS);
+  };
+  nextConsumer();
 }
 
 function stopStatsPolling() {
@@ -955,6 +971,8 @@ function stopStatsPolling() {
   state.statsTimer = null;
   if (state.shell.replicaPoll) clearTimeout(state.shell.replicaPoll.timer);
   state.shell.replicaPoll = null;
+  if (state.shell.consumerPoll) clearTimeout(state.shell.consumerPoll.timer);
+  state.shell.consumerPoll = null;
 }
 
 async function refreshStats() {
@@ -1049,11 +1067,7 @@ async function refreshReplicas() {
     loadTopicDetail(state.view.name);
     return;
   }
-  if (state.view?.kind === 'consumer-detail') {
-    // Its reading places move with the log, asked again on the same cadence.
-    loadConsumer(consumerKey(state.view.group, state.view.topic));
-    return;
-  }
+  if (state.view?.kind === 'consumer-detail') return;
   if (!state.view && (state.tab === 'overview' || state.tab === 'replication')) renderPanel();
 }
 

@@ -98,6 +98,12 @@ pub struct Breach {
     pub peak_value: f64,
     pub raised_at_ms: i64,
     pub resolved_at_ms: Option<i64>,
+    /// The policy's calls-per-window limit; set for `calls_warn` and
+    /// `calls_limit` only.
+    pub call_limit: Option<u64>,
+    /// The highest absolute call count seen while the breach is open; set with
+    /// `call_limit`.
+    pub peak_calls: Option<u64>,
 }
 
 impl Breach {
@@ -119,6 +125,15 @@ pub struct Candidate {
     pub kind: BreachKind,
     pub threshold: f64,
     pub value: f64,
+    /// For the call kinds: the policy's limit and the absolute count seen.
+    pub calls: Option<CallCounts>,
+}
+
+/// The absolute numbers behind a call-window breach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallCounts {
+    pub limit: u64,
+    pub calls: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +147,16 @@ pub enum RaiseOutcome {
 }
 
 const BREACH_SELECT: &str = "SELECT id, org_id, target_id, policy_id, kind, node_id, threshold, \
-     peak_value, raised_at_ms, resolved_at_ms FROM sla_breaches";
+     peak_value, raised_at_ms, resolved_at_ms, call_limit, peak_calls FROM sla_breaches";
+
+fn opt_count(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    let value: Option<i64> = r.get(index)?;
+    Ok(value.and_then(|v| u64::try_from(v).ok()))
+}
+
+fn sql_count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
 
 fn row_to_breach(r: &rusqlite::Row<'_>) -> rusqlite::Result<Breach> {
     let kind: String = r.get(4)?;
@@ -154,11 +178,13 @@ fn row_to_breach(r: &rusqlite::Row<'_>) -> rusqlite::Result<Breach> {
         peak_value: r.get(7)?,
         raised_at_ms: r.get(8)?,
         resolved_at_ms: r.get(9)?,
+        call_limit: opt_count(r, 10)?,
+        peak_calls: opt_count(r, 11)?,
     })
 }
 
-/// Opens the breach, or refreshes the one that is open: its `peak_value` only
-/// ever rises while it lasts, and a changed threshold or policy is carried over
+/// Opens the breach, or refreshes the one that is open: its `peak_value` and
+/// `peak_calls` only ever rise while it lasts, and a changed threshold or policy is carried over
 /// so the row describes the policy that is in force now. Reads first, so an
 /// open breach that says exactly this costs no write.
 pub fn raise_or_refresh(
@@ -168,32 +194,53 @@ pub fn raise_or_refresh(
     now_ms: i64,
 ) -> Result<RaiseOutcome> {
     let key = dedupe_key(&candidate.org_id, &candidate.target_id, candidate.kind);
-    let open: Option<(String, f64, f64, String)> = {
+    let open: Option<(String, f64, f64, String, Option<u64>, Option<u64>)> = {
         let conn = pool.read()?;
         conn.query_row(
-            "SELECT id, peak_value, threshold, policy_id FROM sla_breaches \
-             WHERE dedupe_key = ?1 AND resolved_at_ms IS NULL",
+            "SELECT id, peak_value, threshold, policy_id, call_limit, peak_calls \
+             FROM sla_breaches WHERE dedupe_key = ?1 AND resolved_at_ms IS NULL",
             [&key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    opt_count(r, 4)?,
+                    opt_count(r, 5)?,
+                ))
+            },
         )
         .optional()?
     };
     let conn = pool.write()?;
-    if let Some((id, peak, threshold, policy_id)) = open {
+    if let Some((id, peak, threshold, policy_id, call_limit, peak_calls)) = open {
+        let counts_changed = candidate.calls.is_some_and(|c| {
+            call_limit != Some(c.limit) || peak_calls.map_or(true, |peak| c.calls > peak)
+        });
         let unchanged = candidate.value <= peak
             && candidate.threshold == threshold
-            && candidate.policy_id == policy_id;
+            && candidate.policy_id == policy_id
+            && !counts_changed;
         if unchanged {
             return Ok(RaiseOutcome::Unchanged);
         }
+        // The limit follows the policy in force, like the threshold; a row
+        // opened before the columns existed picks both up here.
         conn.execute(
             "UPDATE sla_breaches SET peak_value = MAX(peak_value, ?2), threshold = ?3, \
-             policy_id = ?4 WHERE id = ?1 AND resolved_at_ms IS NULL",
+             policy_id = ?4, \
+             call_limit = COALESCE(?5, call_limit), \
+             peak_calls = CASE WHEN ?6 IS NULL THEN peak_calls \
+                               ELSE MAX(COALESCE(peak_calls, 0), ?6) END \
+             WHERE id = ?1 AND resolved_at_ms IS NULL",
             params![
                 id,
                 candidate.value,
                 candidate.threshold,
-                candidate.policy_id
+                candidate.policy_id,
+                candidate.calls.map(|c| sql_count(c.limit)),
+                candidate.calls.map(|c| sql_count(c.calls)),
             ],
         )?;
         return Ok(RaiseOutcome::Refreshed);
@@ -202,8 +249,8 @@ pub fn raise_or_refresh(
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO sla_breaches \
             (id, org_id, target_id, policy_id, kind, node_id, threshold, peak_value, \
-             raised_at_ms, resolved_at_ms, dedupe_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+             raised_at_ms, resolved_at_ms, dedupe_key, call_limit, peak_calls) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)",
         params![
             id,
             candidate.org_id,
@@ -215,6 +262,8 @@ pub fn raise_or_refresh(
             candidate.value,
             now_ms,
             key,
+            candidate.calls.map(|c| sql_count(c.limit)),
+            candidate.calls.map(|c| sql_count(c.calls)),
         ],
     )?;
     if inserted == 0 {
@@ -231,6 +280,8 @@ pub fn raise_or_refresh(
         peak_value: candidate.value,
         raised_at_ms: now_ms,
         resolved_at_ms: None,
+        call_limit: candidate.calls.map(|c| c.limit),
+        peak_calls: candidate.calls.map(|c| c.calls),
     }))
 }
 

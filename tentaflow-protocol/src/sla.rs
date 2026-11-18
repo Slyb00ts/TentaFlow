@@ -159,6 +159,15 @@ pub struct SlaBreachWire {
     /// `None` while the breach is open.
     #[serde(default)]
     pub resolved_at_ms: Option<i64>,
+    /// The policy's calls-per-window limit; set for `calls_warn` and
+    /// `calls_limit`, `None` for the other kinds. Together with `peak_calls`
+    /// it words the row as "48/60".
+    #[serde(default)]
+    pub call_limit: Option<u64>,
+    /// The highest absolute call count seen while the breach is open; set with
+    /// `call_limit`.
+    #[serde(default)]
+    pub peak_calls: Option<u64>,
 }
 
 /// The state of one governed flow on the answering node.
@@ -378,7 +387,56 @@ mod tests {
             peak_value: 912.5,
             raised_at_ms: 10,
             resolved_at_ms: None,
+            call_limit: None,
+            peak_calls: None,
         }
+    }
+
+    /// A peer that predates the call numbers sends the breach without them; it
+    /// still decodes, with both absent. The new fields round-trip over CBOR.
+    #[test]
+    fn a_breach_carries_its_call_numbers_and_decodes_without_them() {
+        #[derive(Serialize)]
+        struct BreachWithoutCalls {
+            id: String,
+            flow_id: String,
+            policy_id: String,
+            kind: String,
+            unit: String,
+            node_id: String,
+            threshold: f64,
+            peak_value: f64,
+            raised_at_ms: i64,
+            resolved_at_ms: Option<i64>,
+        }
+        let old = crate::cbor::encode(&BreachWithoutCalls {
+            id: "b-old".into(),
+            flow_id: "f-1".into(),
+            policy_id: "p-1".into(),
+            kind: "calls_warn".into(),
+            unit: "percent".into(),
+            node_id: "n-1".into(),
+            threshold: 80.0,
+            peak_value: 80.0,
+            raised_at_ms: 10,
+            resolved_at_ms: None,
+        })
+        .expect("encode");
+        let decoded: SlaBreachWire = crate::cbor::decode(&old).expect("old shape");
+        assert_eq!((decoded.call_limit, decoded.peak_calls), (None, None));
+        assert_eq!(decoded.threshold, 80.0);
+
+        let new = SlaBreachWire {
+            kind: "calls_warn".into(),
+            unit: "percent".into(),
+            call_limit: Some(60),
+            peak_calls: Some(48),
+            ..breach()
+        };
+        let bytes = crate::cbor::encode(&new).expect("encode");
+        let back: SlaBreachWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, new);
+        assert_eq!((back.call_limit, back.peak_calls), (Some(60), Some(48)));
     }
 
     fn error() -> SlaErrorWire {

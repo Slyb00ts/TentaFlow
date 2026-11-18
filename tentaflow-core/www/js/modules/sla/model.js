@@ -327,6 +327,8 @@ export function overallState(states) {
   return null;
 }
 
+const hasCallNumbers = (breach) => breach.callLimit != null && breach.peakCalls != null;
+
 /** `{ kind, threshold, peak }` texts of one breach for the history table. */
 export function breachCells(breach) {
   const peak = Number(breach.peakValue);
@@ -337,10 +339,22 @@ export function breachCells(breach) {
     case 'errors': return { kind, threshold: T('cells.up_to_pct', { value: formatPercent(threshold) }), peak: percentText(peak) };
     // A breach states what was measured against what was set at the time; the policy has changed
     // since, so nothing here is read from it.
-    case 'calls_warn':
-      return { kind, threshold: T('warn_detail', { pct: formatPercent(threshold) }), peak: percentText(peak) };
-    case 'calls_limit':
-      return { kind, threshold: T('cells.calls_n', { count: num(Math.round(threshold)), n: Math.round(threshold) }), peak: `${num(Math.round(peak))}/${num(Math.round(threshold))}` };
+    // The call numbers (`callLimit`, `peakCalls`) are stored with the breach; rows from before
+    // they were kept, and other kinds, have none and show the percentages.
+    case 'calls_warn': {
+      if (!hasCallNumbers(breach)) return { kind, threshold: T('warn_detail', { pct: formatPercent(threshold) }), peak: percentText(peak) };
+      const limit = Number(breach.callLimit);
+      return {
+        kind,
+        threshold: T('warn_detail_calls', { pct: formatPercent(threshold), count: num(Math.ceil((limit * threshold) / 100)), limit: num(limit) }),
+        peak: `${num(Number(breach.peakCalls))}/${num(limit)}`,
+      };
+    }
+    case 'calls_limit': {
+      const limit = hasCallNumbers(breach) ? Number(breach.callLimit) : Math.round(threshold);
+      const reached = hasCallNumbers(breach) ? Number(breach.peakCalls) : Math.round(peak);
+      return { kind, threshold: T('cells.calls_n', { count: num(Math.round(threshold)), n: Math.round(threshold) }), peak: `${num(reached)}/${num(limit)}` };
+    }
     case 'concurrency_saturated':
       return { kind, threshold: T('cells.slots', { count: num(Math.round(threshold)), n: Math.round(threshold) }), peak: num(Math.round(peak)) };
     default:
