@@ -46,13 +46,13 @@
 // assignment.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tentaflow_protocol::environment::NodeEnvironment;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -60,8 +60,10 @@ use crate::bus::replication::assignment::{PartitionAssignment, SqliteLedgerAssig
 use crate::bus::replication::election::{
     self, AbandonReason, LocalRole, LogPosition, PromotionAction, PromotionEvent, PromotionState,
 };
+use crate::bus::replication::forward::{self, ForwardUnavailable, ForwardedPublishHandler};
 use crate::bus::replication::frames::{
-    self, ReplFrame, ReplHello, ReplHelloAck, ReplLeoQuery, ReplLeoReply, ReplReject,
+    self, ProduceForward, ProduceForwardReply, ReplFrame, ReplHello, ReplHelloAck, ReplLeoQuery,
+    ReplLeoReply, ReplReject,
 };
 use crate::bus::topics::Acks;
 use crate::bus::{
@@ -189,6 +191,13 @@ fn now_ms() -> i64 {
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError>;
+
+    /// A stream for one forwarded publish (`ProduceForward`). Such streams
+    /// are short and frequent, so an implementor may reuse a connection to
+    /// the peer; the default opens a plain stream.
+    async fn open_forward_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        self.open_stream(node_id).await
+    }
 }
 
 /// PLAN-M2 §1c's majority-admission proof, abstracted: "liczba wpisów
@@ -293,6 +302,13 @@ pub trait LeaderHandle: Send + Sync {
     fn observed_stale_epoch(&self) -> Option<u32> {
         None
     }
+    /// How long ago `node_id`, a replica fed by this leader, last
+    /// acknowledged; `None` when it never did, and the default for a handle
+    /// that does not track it. Feeds `ReplicationManager::node_reachable`.
+    fn replica_ack_age(&self, node_id: &str) -> Option<Duration> {
+        let _ = node_id;
+        None
+    }
     /// Whether a majority of the replica set (this leader counted) has
     /// acknowledged recently enough for this leader to still be the live
     /// one. What `answer_leo_query` reports as `leading`: a leader that
@@ -344,6 +360,12 @@ pub trait FollowerRunner: Send + Sync {
     /// this just lets a runner treat the lease as expired sooner than
     /// 3000 ms when the transport already knows the leader is gone.
     fn mark_leader_disconnected(&self);
+    /// How long ago the last frame arrived from the leader of this stream;
+    /// `None` when none ever did, and the default for a runner that does not
+    /// track it. Feeds `ReplicationManager::node_reachable`.
+    fn last_frame_age(&self) -> Option<Duration> {
+        None
+    }
     /// The `ReplReject` reason of the most recent refused `Hello` on this
     /// partition's follower side, if any — the accept path's own record of
     /// WHY the last leader dial-in was turned away (P8 diagnosis aid: the
@@ -763,6 +785,93 @@ pub struct ReplicationManager {
     /// made here never start from the same row and hand one slot to two
     /// nodes.
     reconfiguring: parking_lot::Mutex<()>,
+    /// Runtime the forwarding round trips are spawned onto: `forward_publish`
+    /// is called from blocking threads, never from a worker. `None` when the
+    /// manager was built outside a runtime, which turns forwarding off.
+    runtime: Option<tokio::runtime::Handle>,
+    /// The leader's half of forwarding (`set_forward_handler`). Weak: the
+    /// handler is the `BusService`, which holds this manager back, and a
+    /// strong reference here would keep a disabled engine alive.
+    forward_handler: parking_lot::RwLock<Option<Weak<dyn ForwardedPublishHandler>>>,
+    /// What this node knows about each peer's liveness (`PeerLiveness`).
+    peers: DashMap<String, PeerLiveness>,
+    /// `ReplHello::bus_features` of the leaders that dialed this node.
+    peer_features: DashMap<String, u32>,
+    /// The synchronous twin of `assignments_changed`, for the blocking
+    /// callers of `wait_for_assignment_change`.
+    assignment_changes: AssignmentChanges,
+}
+
+/// What the mesh and the replication streams have told this node about one
+/// peer.
+#[derive(Default)]
+struct PeerLiveness {
+    /// The last mesh connection event for the peer: `Some(true)` after
+    /// `PeerConnected`, `Some(false)` after `PeerDisconnected`, `None` while
+    /// the mesh has said nothing.
+    mesh_up: Option<bool>,
+    /// The last mesh event or heartbeat from the peer.
+    last_signal: Option<Instant>,
+}
+
+/// How recent a frame from a peer must be for the peer to count as reachable
+/// when the mesh does not vouch for it (it reported the peer gone, or said
+/// nothing): a few heartbeat periods, beyond the lease after which a silent
+/// leader is replaced.
+const PEER_FRAME_FRESH: Duration = Duration::from_secs(5);
+
+/// How recent the last sign of life must be for a peer the mesh holds a
+/// connection to. A connection can outlive its peer (a half-open path), and
+/// the node's mesh heartbeat runs every 500 ms, so this much silence is a
+/// peer that is not answering whatever the connection table says.
+const MESH_SIGNAL_FRESH: Duration = Duration::from_secs(15);
+
+/// How long dialing and opening a stream for a forwarded publish may take:
+/// beyond it nothing was sent and the leader is as good as unreachable.
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the wait for a forwarded publish's reply checks that its leader
+/// is still the one asked.
+const FORWARD_POLL: Duration = Duration::from_millis(100);
+
+/// A counter bumped on every assignment or role change, with a condition
+/// variable for blocking waiters.
+struct AssignmentChanges {
+    generation: parking_lot::Mutex<u64>,
+    changed: parking_lot::Condvar,
+}
+
+impl AssignmentChanges {
+    fn new() -> Self {
+        Self {
+            generation: parking_lot::Mutex::new(0),
+            changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn bump(&self) {
+        *self.generation.lock() += 1;
+        self.changed.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        *self.generation.lock()
+    }
+
+    fn wait_after(&self, seen: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut generation = self.generation.lock();
+        while *generation == seen {
+            if self
+                .changed
+                .wait_until(&mut generation, deadline)
+                .timed_out()
+            {
+                return *generation != seen;
+            }
+        }
+        true
+    }
 }
 
 fn slots_exhausted(key: &PartitionKey) -> ReplError {
@@ -786,6 +895,7 @@ fn reject_ack(environment: NodeEnvironment, reject: ReplReject) -> ReplHelloAck 
         reject: Some(reject),
         follower_log_epoch: None,
         follower_committed: None,
+        bus_features: frames::LOCAL_BUS_FEATURES,
     }
 }
 
@@ -809,7 +919,25 @@ impl ReplicationManager {
             isr_shrink_total: AtomicU64::new(0),
             leadership_seq: AtomicU64::new(0),
             reconfiguring: parking_lot::Mutex::new(()),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            forward_handler: parking_lot::RwLock::new(None),
+            peers: DashMap::new(),
+            peer_features: DashMap::new(),
+            assignment_changes: AssignmentChanges::new(),
         })
+    }
+
+    /// Installs the leader's half of forwarding: what runs a `ProduceForward`
+    /// this node accepts. Until it is set, or once the handler is gone, such
+    /// a request is refused.
+    pub fn set_forward_handler(&self, handler: Weak<dyn ForwardedPublishHandler>) {
+        *self.forward_handler.write() = Some(handler);
+    }
+
+    /// Wakes everything waiting for an assignment or role change.
+    fn notify_assignments_changed(&self) {
+        self.assignments_changed.send_replace(());
+        self.assignment_changes.bump();
     }
 
     fn next_leadership(&self) -> u64 {
@@ -896,7 +1024,86 @@ impl ReplicationManager {
             Ok(ReplFrame::LeoQuery(query)) => {
                 self.answer_leo_query(&remote_hex, query, send).await;
             }
+            Ok(ReplFrame::ProduceForward(request)) => {
+                self.accept_produce_forward(&remote_hex, request, send)
+                    .await;
+            }
             _ => return,
+        }
+    }
+
+    /// Answers one inbound `ProduceForward`: a follower of this node's
+    /// partitions handing over a publish. Refused unless the request names
+    /// this instance and environment and its sender replicates every
+    /// partition it targets (a node outside the replica set has no business
+    /// writing to it); everything else — authorization, policies, quotas —
+    /// is the publish pipeline's own, run on a blocking thread because
+    /// `publish` is synchronous. One request, one reply, then the stream is
+    /// finished.
+    ///
+    /// `pub(crate)`: `replication::router` calls it for a `ProduceForward`
+    /// it has already matched to this manager's instance.
+    pub(crate) async fn accept_produce_forward(
+        &self,
+        remote_node_id: &str,
+        request: ProduceForward,
+        mut send: BusSend,
+    ) {
+        let reply = self.answer_produce_forward(remote_node_id, request).await;
+        let _ = frames::write_frame(&mut send, &ReplFrame::ProduceForwardReply(reply)).await;
+        let _ = send.shutdown().await;
+    }
+
+    async fn answer_produce_forward(
+        &self,
+        remote_node_id: &str,
+        request: ProduceForward,
+    ) -> ProduceForwardReply {
+        if request.instance_id != self.instance_id || self.shutdown.is_cancelled() {
+            return forward::refusal("unknown_instance");
+        }
+        if request.environment != self.local_env {
+            tracing::warn!(
+                forwarded_from = %remote_node_id,
+                theirs = ?request.environment, ours = ?self.local_env,
+                "replication: refused a forwarded publish from another environment"
+            );
+            return forward::refusal("environment_mismatch");
+        }
+        let Some(handler) = self.forward_handler.read().as_ref().and_then(Weak::upgrade) else {
+            return forward::refusal("forwarding_disabled");
+        };
+        if request.groups.is_empty() {
+            return forward::refusal("no_partition_groups");
+        }
+        // The sender need not hold a replica of the partitions: a node that
+        // placed none of a topic still writes to it (the broker's own
+        // `__bus.metrics` rollup is written from every node). What it may do
+        // is decided by the leader's authorization of the ORIGINAL actor; the
+        // mesh admitted the peer as a trusted node of this environment and
+        // the frame's environment was checked above.
+        for group in &request.groups {
+            let key: PartitionKey = (
+                request.org_id.clone(),
+                request.topic.clone(),
+                group.partition,
+            );
+            // No row yet: this node has not materialized the assignment the
+            // sender already acts on. The sender waits and asks again.
+            if !self.registry.contains_key(&key) {
+                return forward::not_leader_reply();
+            }
+        }
+        let from = remote_node_id.to_string();
+        match tokio::task::spawn_blocking(move || handler.publish_forwarded(&from, request)).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                tracing::error!(
+                    forwarded_from = %remote_node_id, error = %e,
+                    "replication: the forwarded publish handler failed"
+                );
+                forward::refusal("handler_failed")
+            }
         }
     }
 
@@ -1195,6 +1402,8 @@ impl ReplicationManager {
             let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
             return;
         }
+        self.peer_features
+            .insert(remote_node_id.to_string(), hello.bus_features);
         let key: PartitionKey = (hello.org_id.clone(), hello.topic.clone(), hello.partition);
 
         // A registry miss is not yet an answer: resolve it against the
@@ -1332,7 +1541,7 @@ impl ReplicationManager {
             );
             // Outside the guard: `stop()` flushes partition meta.
             leader.stop();
-            self.assignments_changed.send_replace(());
+            self.notify_assignments_changed();
         }
 
         // Judged and adopted under ONE write guard. They used to be two
@@ -1720,7 +1929,7 @@ impl ReplicationManager {
                         e.assignment = assignment;
                     }
                 }
-                self.assignments_changed.send_replace(());
+                self.notify_assignments_changed();
                 return;
             }
             Reconcile::Rebuild => {
@@ -1834,7 +2043,7 @@ impl ReplicationManager {
         // Reached only when something actually changed — the `unchanged`
         // path above returns first. Wakes anything parked in
         // `await_local_assignment` without waiting for its own re-read tick.
-        self.assignments_changed.send_replace(());
+        self.notify_assignments_changed();
     }
 
     /// The `apply_assignment` path for a key it found no entry for. It may
@@ -1994,7 +2203,7 @@ impl ReplicationManager {
             if let Some(follower) = entry.follower.take() {
                 follower.stop();
             }
-            self.assignments_changed.send_replace(());
+            self.notify_assignments_changed();
         }
     }
 
@@ -2113,13 +2322,126 @@ impl ReplicationManager {
     /// accelerator, not the only signal — marks every follower runner
     /// whose leader is `node_id` so its own lease watchdog can treat the
     /// lease as expired sooner than the full 3000 ms.
+    ///
+    /// It also records that the mesh lost the peer, which is what
+    /// `node_reachable` and `snapshot` report from then on (unless the peer
+    /// keeps sending replication frames).
     pub fn on_peer_disconnected(&self, node_id: &str) {
+        self.peers.entry(node_id.to_string()).or_default().mesh_up = Some(false);
         for entry in self.registry.iter() {
             if entry.assignment.leader_node_id == node_id {
                 if let Some(follower) = entry.follower.as_ref() {
                     follower.mark_leader_disconnected();
                 }
             }
+        }
+    }
+
+    /// `IrohMeshEvent::PeerConnected`, or the mesh's connected set read at
+    /// startup: the peer is up.
+    pub fn on_peer_connected(&self, node_id: &str) {
+        let mut peer = self.peers.entry(node_id.to_string()).or_default();
+        peer.mesh_up = Some(true);
+        peer.last_signal = Some(Instant::now());
+    }
+
+    /// Records the peers the mesh is connected to at startup. Only peers the
+    /// event stream has said nothing about are touched: an event handled
+    /// before this snapshot was read is newer than it.
+    pub fn seed_connected_peers(&self, connected: &[String]) {
+        for node_id in connected {
+            let mut peer = self.peers.entry(node_id.clone()).or_default();
+            if peer.mesh_up.is_none() {
+                peer.mesh_up = Some(true);
+                peer.last_signal = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Replaces the recorded connection state with the mesh's current one,
+    /// for use after missed events (a lagged subscriber): a peer in
+    /// `connected` is up, a peer recorded as up that is not in it is down.
+    pub fn reconcile_connected_peers(&self, connected: &[String]) {
+        for node_id in connected {
+            let mut peer = self.peers.entry(node_id.clone()).or_default();
+            if peer.mesh_up != Some(true) {
+                peer.mesh_up = Some(true);
+                peer.last_signal = Some(Instant::now());
+            }
+        }
+        for mut peer in self.peers.iter_mut() {
+            if peer.mesh_up == Some(true) && !connected.iter().any(|c| c == peer.key()) {
+                peer.mesh_up = Some(false);
+            }
+        }
+    }
+
+    /// A mesh heartbeat from `node_id`: the peer is alive right now.
+    pub fn note_peer_signal(&self, node_id: &str) {
+        self.peers
+            .entry(node_id.to_string())
+            .or_default()
+            .last_signal = Some(Instant::now());
+    }
+
+    /// How long ago anything was heard from `node_id`: its latest mesh event
+    /// or heartbeat, or the latest frame of a replication stream with it (as
+    /// the follower of its partitions, or as their leader).
+    fn peer_signal_age(&self, node_id: &str) -> Option<Duration> {
+        let mesh = self
+            .peers
+            .get(node_id)
+            .and_then(|p| p.last_signal)
+            .map(|at| at.elapsed());
+        mesh.into_iter()
+            .chain(self.stream_signal_age(node_id))
+            .min()
+    }
+
+    /// How long ago a replication stream with `node_id` last carried a frame
+    /// from it.
+    fn stream_signal_age(&self, node_id: &str) -> Option<Duration> {
+        self.registry
+            .iter()
+            .filter_map(|entry| {
+                if entry.role == LocalRole::Follower && entry.assignment.leader_node_id == node_id {
+                    entry.follower.as_ref().and_then(|f| f.last_frame_age())
+                } else if entry.role == LocalRole::Leader
+                    && entry.assignment.replicas.iter().any(|r| r == node_id)
+                {
+                    entry
+                        .leader
+                        .as_ref()
+                        .and_then(|l| l.replica_ack_age(node_id))
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
+    /// Whether `node_id` answers: this node itself, a peer the mesh holds a
+    /// connection to, or one that sent a replication frame within
+    /// `PEER_FRAME_FRESH`. A peer the mesh reports gone is reachable only
+    /// while its frames keep arriving.
+    fn peer_reachable(&self, node_id: &str) -> bool {
+        if node_id == self.local_node_id {
+            return true;
+        }
+        let mesh_up = self.peers.get(node_id).and_then(|p| p.mesh_up);
+        // The mesh's own last word does not count once it has reported the
+        // peer gone: only a stream that keeps delivering overrules that. A
+        // peer it holds a connection to still has to have been heard from.
+        match mesh_up {
+            Some(true) => self
+                .peer_signal_age(node_id)
+                .is_some_and(|age| age <= MESH_SIGNAL_FRESH),
+            Some(false) => self
+                .stream_signal_age(node_id)
+                .is_some_and(|age| age <= PEER_FRAME_FRESH),
+            None => self
+                .peer_signal_age(node_id)
+                .is_some_and(|age| age <= PEER_FRAME_FRESH),
         }
     }
 
@@ -2236,7 +2558,7 @@ impl ReplicationManager {
             if let Some(leader) = stepped_down {
                 leader.stop();
             }
-            self.assignments_changed.send_replace(());
+            self.notify_assignments_changed();
             self.cut_stepped_down_log(&key).await;
         }
     }
@@ -2361,7 +2683,7 @@ impl ReplicationManager {
             if let Some(handle) = handle {
                 handle.stop();
             }
-            self.assignments_changed.send_replace(());
+            self.notify_assignments_changed();
         }
     }
 
@@ -3194,7 +3516,7 @@ impl ReplicationManager {
                 if let Some(follower) = old_follower {
                     follower.stop();
                 }
-                self.assignments_changed.send_replace(());
+                self.notify_assignments_changed();
                 self.audit.failover(
                     &key.0,
                     &key.1,
@@ -3644,8 +3966,19 @@ impl ReplicationCoordinator for ReplicationManager {
                 unavailable_reason: None,
             });
         }
+        // After the registry walk above, not inside it: the liveness lookup
+        // reads the registry again.
+        let mut nodes: Vec<ReplicaNodeInfo> = nodes.into_values().collect();
+        for node in &mut nodes {
+            if !node.is_local {
+                node.reachable = self.peer_reachable(&node.node_id);
+                node.last_heartbeat_ms_ago = self
+                    .peer_signal_age(&node.node_id)
+                    .map(|age| age.as_millis() as u64);
+            }
+        }
         ReplicationSnapshot {
-            nodes: nodes.into_values().collect(),
+            nodes,
             partitions,
             // `audit_log`-sourced (PLAN-M2 §1f, `bus.leader.failover` rows)
             // — belongs to whichever layer owns `repository::log_audit`
@@ -3661,6 +3994,187 @@ impl ReplicationCoordinator for ReplicationManager {
     fn local_node_id(&self) -> String {
         self.local_node_id.clone()
     }
+
+    fn can_forward_publish(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    fn forward_publish(
+        &self,
+        target: &str,
+        request: ProduceForward,
+        timeout: Duration,
+        still_valid: &dyn Fn() -> bool,
+    ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+        let Some(runtime) = self.runtime.clone() else {
+            return Err(ForwardUnavailable::Unsupported);
+        };
+        if self.forward_blocked(target) {
+            return Err(ForwardUnavailable::PeerCannotForward(target.to_string()));
+        }
+        let not_sent = |reason: String| ForwardUnavailable::NotSent {
+            node: target.to_string(),
+            reason,
+        };
+        let unknown = |reason: String| ForwardUnavailable::OutcomeUnknown {
+            node: target.to_string(),
+            reason,
+        };
+        // Whether any byte of the request may have left this node: from then
+        // on the leader may append it, and a missing answer is not a refusal.
+        let sent = Arc::new(AtomicBool::new(false));
+        let ended_without_answer = |sent: &AtomicBool, reason: &str| {
+            if sent.load(Ordering::SeqCst) {
+                unknown(reason.to_string())
+            } else {
+                not_sent(reason.to_string())
+            }
+        };
+        // The round trip runs on the runtime and this blocking thread waits
+        // on a std channel: `block_on` would panic on a worker thread and a
+        // `Runtime` handle must never be blocked on from one. Dial, stream
+        // and exchange share the one deadline `timeout`; the caller waits a
+        // second longer, so the round trip reports its own expiry exactly.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let transport = Arc::clone(&self.transport);
+        let node = target.to_string();
+        let task_sent = Arc::clone(&sent);
+        let task = runtime.spawn(async move {
+            let outcome =
+                forward_round_trip(transport.as_ref(), &node, request, timeout, &task_sent).await;
+            let _ = tx.send(outcome);
+        });
+        let give_up_at = Instant::now() + timeout + Duration::from_secs(1);
+        loop {
+            match rx.recv_timeout(FORWARD_POLL) {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(RoundTripError::NotSent(reason))) => return Err(not_sent(reason)),
+                Ok(Err(RoundTripError::NoAnswer(reason))) => return Err(unknown(reason)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !still_valid() {
+                        task.abort();
+                        return Err(ended_without_answer(
+                            &sent,
+                            "the leader changed or was lost while the write was in flight",
+                        ));
+                    }
+                    if Instant::now() >= give_up_at {
+                        task.abort();
+                        return Err(ended_without_answer(&sent, "no reply in time"));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ended_without_answer(
+                        &sent,
+                        "the forwarding task ended without a result",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn assigned_leader(&self, org_id: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
+        self.assignments
+            .get(&self.instance_id, org_id, topic, partition)
+            .ok()
+            .flatten()
+            .map(|a| (a.leader_node_id, a.leader_epoch))
+    }
+
+    fn assignment_generation(&self) -> u64 {
+        self.assignment_changes.generation()
+    }
+
+    fn wait_for_assignment_change(&self, seen: u64, timeout: Duration) -> bool {
+        self.assignment_changes.wait_after(seen, timeout)
+    }
+
+    fn node_reachable(&self, node_id: &str) -> bool {
+        self.peer_reachable(node_id)
+    }
+}
+
+/// Why a forwarded publish got no reply.
+enum RoundTripError {
+    /// Nothing left this node: no stream could be opened, the dial timed
+    /// out, or the request could not be encoded (too large).
+    NotSent(String),
+    /// The request left and no reply came: the stream ended, reset or
+    /// garbled, or the deadline passed.
+    NoAnswer(String),
+}
+
+/// One forwarded publish on a fresh stream: the request out, the reply back,
+/// all under the one deadline `timeout`. `sent` is set before the first byte
+/// is written.
+async fn forward_round_trip(
+    transport: &dyn Transport,
+    node: &str,
+    request: ProduceForward,
+    timeout: Duration,
+    sent: &AtomicBool,
+) -> Result<ProduceForwardReply, RoundTripError> {
+    let exchange = async {
+        let (mut recv, mut send) = match tokio::time::timeout(
+            FORWARD_CONNECT_TIMEOUT,
+            transport.open_forward_stream(node),
+        )
+        .await
+        {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => return Err(RoundTripError::NotSent(e.to_string())),
+            Err(_) => {
+                return Err(RoundTripError::NotSent(
+                    "no stream within the connect timeout".to_string(),
+                ))
+            }
+        };
+        // Encoded, and its size checked, before any byte goes out: a request
+        // this node cannot send is not a peer that cannot receive it.
+        let mut encoded = Vec::new();
+        if let Err(e) = frames::write_frame(&mut encoded, &ReplFrame::ProduceForward(request)).await
+        {
+            return Err(RoundTripError::NotSent(format!(
+                "the request cannot be encoded: {e}"
+            )));
+        }
+        sent.store(true, Ordering::SeqCst);
+        send.write_all(&encoded)
+            .await
+            .map_err(|e| RoundTripError::NoAnswer(e.to_string()))?;
+        let _ = send.shutdown().await;
+        match frames::read_frame(&mut recv).await {
+            Ok(ReplFrame::ProduceForwardReply(reply)) => Ok(reply),
+            Ok(other) => Err(RoundTripError::NoAnswer(format!(
+                "unexpected {} frame in answer to a forwarded publish",
+                crate::bus::replication::leader::frame_kind_name(&other)
+            ))),
+            Err(e) => Err(RoundTripError::NoAnswer(e.to_string())),
+        }
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(outcome) => outcome,
+        Err(_) if sent.load(Ordering::SeqCst) => {
+            Err(RoundTripError::NoAnswer("no reply in time".to_string()))
+        }
+        Err(_) => Err(RoundTripError::NotSent(
+            "no stream within the deadline".to_string(),
+        )),
+    }
+}
+
+impl ReplicationManager {
+    /// Whether `node` is known not to take a forwarded publish: its `Hello`
+    /// did not advertise the feature (a build from before forwarding).
+    ///
+    /// A peer that advertised it, or one never heard from, is dialed; one
+    /// that then gives no answer is an unknown outcome, not an unsupported
+    /// peer: the request may have been processed.
+    fn forward_blocked(&self, node: &str) -> bool {
+        self.peer_features
+            .get(node)
+            .is_some_and(|features| *features & frames::BUS_FEATURE_PRODUCE_FORWARD == 0)
+    }
 }
 
 // ===== Real production implementations ======================================
@@ -3669,13 +4183,197 @@ impl ReplicationCoordinator for ReplicationManager {
 /// this wave — replication streams are long-lived, so the extra dial cost
 /// on the rare leader-change/partition-open path is not worth the added
 /// connection-cache bookkeeping yet) plus one `open_bi()` per call.
+///
+/// Streams for forwarded publishes (`open_forward_stream`) are different:
+/// they are short and frequent, so they share one connection per peer
+/// (`ConnectionPool`), which is closed once it has been idle, with no stream
+/// in flight, for `FORWARD_CONNECTION_IDLE`. It must not outlive a peer's
+/// restart for long: iroh keeps selecting the address of a peer's old
+/// incarnation while any connection to it is open, which stalls every new
+/// dial (`IrohMeshManager::close_bus_connections`).
 pub struct IrohTransport {
     mesh: Arc<IrohMeshManager>,
+    forward_connections: Arc<ConnectionPool<iroh::endpoint::Connection>>,
+}
+
+/// How long a pooled connection stays open with no forwarded request on it.
+const FORWARD_CONNECTION_IDLE: Duration = Duration::from_secs(15);
+
+/// A connection the pool can hold.
+trait PoolConnection: Clone + Send + Sync + 'static {
+    fn id(&self) -> usize;
+    fn is_closed(&self) -> bool;
+    fn close_idle(&self);
+}
+
+impl PoolConnection for iroh::endpoint::Connection {
+    fn id(&self) -> usize {
+        self.stable_id()
+    }
+    fn is_closed(&self) -> bool {
+        self.close_reason().is_some()
+    }
+    fn close_idle(&self) {
+        self.close(0u32.into(), b"idle");
+    }
+}
+
+/// How busy a pooled connection is: the streams open on it, and when one
+/// last started or ended.
+struct UseState {
+    in_flight: std::sync::atomic::AtomicUsize,
+    last_used: parking_lot::Mutex<Instant>,
+}
+
+/// One stream's claim on a pooled connection; the connection is not idle
+/// while any exists.
+struct InFlight(Arc<UseState>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Stamped before the count drops, so a reaper that sees zero also
+        // sees the end of this stream as the last use.
+        *self.0.last_used.lock() = Instant::now();
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct PoolEntry<C> {
+    connection: C,
+    state: Arc<UseState>,
+}
+
+/// What a reaper pass found.
+#[derive(Debug, PartialEq, Eq)]
+enum Reaped {
+    /// Closed and removed.
+    Closed,
+    /// Streams are open, or one ended recently: look again later.
+    Busy,
+    /// Already replaced or removed: nothing left to watch.
+    Gone,
+}
+
+/// One connection per peer for forwarded publishes.
+struct ConnectionPool<C: PoolConnection> {
+    entries: DashMap<String, PoolEntry<C>>,
+}
+
+impl<C: PoolConnection> ConnectionPool<C> {
+    fn new() -> Self {
+        Self {
+            entries: DashMap::new(),
+        }
+    }
+
+    /// The live pooled connection to `node_id`, with a claim on it taken
+    /// while the entry is locked: a reaper cannot close it in between.
+    fn checkout(&self, node_id: &str) -> Option<(C, InFlight)> {
+        let entry = self.entries.get_mut(node_id)?;
+        if entry.connection.is_closed() {
+            return None;
+        }
+        entry
+            .state
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *entry.state.last_used.lock() = Instant::now();
+        Some((entry.connection.clone(), InFlight(Arc::clone(&entry.state))))
+    }
+
+    /// Pools a freshly dialed connection, already carrying the stream the
+    /// caller is about to open on it.
+    fn insert(&self, node_id: &str, connection: C) -> InFlight {
+        let state = Arc::new(UseState {
+            in_flight: std::sync::atomic::AtomicUsize::new(1),
+            last_used: parking_lot::Mutex::new(Instant::now()),
+        });
+        self.entries.insert(
+            node_id.to_string(),
+            PoolEntry {
+                connection,
+                state: Arc::clone(&state),
+            },
+        );
+        InFlight(state)
+    }
+
+    /// Drops the pooled connection `id` to `node_id` — only that one: a
+    /// newer connection another caller pooled meanwhile stays.
+    fn discard(&self, node_id: &str, id: usize) {
+        self.entries
+            .remove_if(node_id, |_, e| e.connection.id() == id);
+    }
+
+    /// Closes connection `id` to `node_id` if it has no stream in flight and
+    /// none ended within `idle`. Both are checked again under the entry's
+    /// lock, where `checkout` also takes its claim.
+    fn reap_if_idle(&self, node_id: &str, id: usize, idle: Duration) -> Reaped {
+        match self.entries.get(node_id) {
+            Some(e) if e.connection.id() == id => {}
+            _ => return Reaped::Gone,
+        }
+        match self.entries.remove_if(node_id, |_, e| {
+            e.connection.id() == id
+                && e.state.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && e.state.last_used.lock().elapsed() >= idle
+        }) {
+            Some((_, e)) => {
+                e.connection.close_idle();
+                Reaped::Closed
+            }
+            None => match self.entries.get(node_id) {
+                Some(e) if e.connection.id() == id => Reaped::Busy,
+                _ => Reaped::Gone,
+            },
+        }
+    }
+}
+
+/// A forwarded-publish reply stream that keeps its connection's claim until
+/// it is dropped.
+struct TrackedRecv {
+    inner: BusRecv,
+    _claim: InFlight,
+}
+
+impl AsyncRead for TrackedRecv {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 impl IrohTransport {
     pub fn new(mesh: Arc<IrohMeshManager>) -> Self {
-        Self { mesh }
+        Self {
+            mesh,
+            forward_connections: Arc::new(ConnectionPool::new()),
+        }
+    }
+
+    /// Closes the pooled connection `connection_id` to `node_id` once it is
+    /// idle; ends when it was closed, replaced or removed meanwhile.
+    fn spawn_idle_reaper(&self, node_id: String, connection_id: usize) {
+        let pool = Arc::downgrade(&self.forward_connections);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FORWARD_CONNECTION_IDLE).await;
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                if pool.reap_if_idle(&node_id, connection_id, FORWARD_CONNECTION_IDLE)
+                    != Reaped::Busy
+                {
+                    return;
+                }
+            }
+        });
     }
 }
 
@@ -3692,6 +4390,48 @@ impl Transport for IrohTransport {
             .await
             .map_err(|e| ReplError::Internal(format!("open_bi({node_id}): {e}")))?;
         Ok((Box::new(recv), Box::new(send)))
+    }
+
+    async fn open_forward_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        if let Some((connection, claim)) = self.forward_connections.checkout(node_id) {
+            match connection.open_bi().await {
+                Ok((send, recv)) => {
+                    return Ok((
+                        Box::new(TrackedRecv {
+                            inner: Box::new(recv),
+                            _claim: claim,
+                        }),
+                        Box::new(send),
+                    ));
+                }
+                Err(_) => {
+                    drop(claim);
+                    // Only this connection: another caller may already have
+                    // pooled a fresh one.
+                    self.forward_connections
+                        .discard(node_id, connection.stable_id());
+                }
+            }
+        }
+        let connection = self
+            .mesh
+            .connect_bus(node_id)
+            .await
+            .map_err(|e| ReplError::Internal(format!("connect_bus({node_id}): {e}")))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| ReplError::Internal(format!("open_bi({node_id}): {e}")))?;
+        let connection_id = connection.stable_id();
+        let claim = self.forward_connections.insert(node_id, connection);
+        self.spawn_idle_reaper(node_id.to_string(), connection_id);
+        Ok((
+            Box::new(TrackedRecv {
+                inner: Box::new(recv),
+                _claim: claim,
+            }),
+            Box::new(send),
+        ))
     }
 }
 
@@ -3849,9 +4589,25 @@ mod tests {
     /// peer's registered script. Anything else written (e.g. a leader
     /// feeder's own protocol) is simply never read back — harmless for the
     /// tests in this module, which never assert on feeder-side traffic.
+    /// How a peer answers a forwarded publish stream.
+    #[derive(Clone)]
+    enum ForwardPeer {
+        /// Reads the request, then drops the stream: what a build that does
+        /// not know `ProduceForward` does, and what a leader that crashed
+        /// after appending looks like to the sender.
+        Old,
+        /// Reads the request and never answers.
+        Silent,
+        /// Never completes the dial.
+        HangsOnDial,
+        Reply(ProduceForwardReply),
+    }
+
     struct FakeTransport {
         scripts: DashMap<String, PeerScript>,
         dial_count: DashMap<String, u32>,
+        forward_peers: DashMap<String, ForwardPeer>,
+        forward_dials: DashMap<String, u32>,
     }
 
     impl FakeTransport {
@@ -3859,7 +4615,17 @@ mod tests {
             Self {
                 scripts: DashMap::new(),
                 dial_count: DashMap::new(),
+                forward_peers: DashMap::new(),
+                forward_dials: DashMap::new(),
             }
+        }
+
+        fn set_forward_peer(&self, node_id: &str, peer: ForwardPeer) {
+            self.forward_peers.insert(node_id.to_string(), peer);
+        }
+
+        fn forward_dials(&self, node_id: &str) -> u32 {
+            self.forward_dials.get(node_id).map(|v| *v).unwrap_or(0)
         }
 
         fn set_script(&self, node_id: &str, script: PeerScript) {
@@ -3873,6 +4639,41 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for FakeTransport {
+        async fn open_forward_stream(
+            &self,
+            node_id: &str,
+        ) -> Result<(BusRecv, BusSend), ReplError> {
+            *self.forward_dials.entry(node_id.to_string()).or_insert(0) += 1;
+            let peer = self
+                .forward_peers
+                .get(node_id)
+                .map(|p| p.clone())
+                .ok_or_else(|| ReplError::Internal(format!("unreachable: {node_id}")))?;
+            if matches!(peer, ForwardPeer::HangsOnDial) {
+                std::future::pending::<()>().await;
+            }
+            let (ours, theirs) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let (mut peer_recv, mut peer_send) = split(theirs);
+                if !matches!(
+                    frames::read_frame(&mut peer_recv).await,
+                    Ok(ReplFrame::ProduceForward(_))
+                ) {
+                    return;
+                }
+                if matches!(peer, ForwardPeer::Silent) {
+                    std::future::pending::<()>().await;
+                }
+                if let ForwardPeer::Reply(reply) = peer {
+                    let _ =
+                        frames::write_frame(&mut peer_send, &ReplFrame::ProduceForwardReply(reply))
+                            .await;
+                }
+            });
+            let (our_recv, our_send) = split(ours);
+            Ok((Box::new(our_recv), Box::new(our_send)))
+        }
+
         async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
             *self.dial_count.entry(node_id.to_string()).or_insert(0) += 1;
             let script = self
@@ -4351,6 +5152,8 @@ mod tests {
         committed: AtomicU64,
         disconnected: AtomicBool,
         stopped: AtomicBool,
+        /// `last_frame_age` in milliseconds; `u64::MAX`: nothing received.
+        frame_age_ms: AtomicU64,
     }
 
     struct FakeFollowerRunner {
@@ -4375,6 +5178,12 @@ mod tests {
         }
         fn mark_leader_disconnected(&self) {
             self.shared.disconnected.store(true, Ordering::SeqCst);
+        }
+        fn last_frame_age(&self) -> Option<Duration> {
+            match self.shared.frame_age_ms.load(Ordering::SeqCst) {
+                u64::MAX => None,
+                ms => Some(Duration::from_millis(ms)),
+            }
         }
         fn stop(&self) {
             self.shared.stopped.store(true, Ordering::SeqCst);
@@ -4451,6 +5260,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             };
             // `spawn` is sync and the frame write is not, so the ack goes out
             // on its own task — the same shape the real factory has (it hands
@@ -4471,6 +5281,7 @@ mod tests {
                 committed: AtomicU64::new(0),
                 disconnected: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
+                frame_age_ms: AtomicU64::new(u64::MAX),
             });
             self.handles.lock().push(Arc::clone(&shared));
             Ok(Box::new(FakeFollowerRunner { shared }))
@@ -5096,6 +5907,553 @@ mod tests {
         assert_eq!(snap.partitions[0].isr.len(), 3);
     }
 
+    fn node_info(snap: &ReplicationSnapshot, node_id: &str) -> ReplicaNodeInfo {
+        snap.nodes
+            .iter()
+            .find(|n| n.node_id == node_id)
+            .unwrap_or_else(|| panic!("{node_id} missing from the snapshot"))
+            .clone()
+    }
+
+    /// K1: `reachable` and `last_heartbeat_ms_ago` come from the mesh's
+    /// connect/disconnect events and the last signal heard, not constants.
+    #[tokio::test]
+    async fn snapshot_reports_a_disconnected_peer_as_unreachable_with_a_growing_heartbeat_age() {
+        let fx = build("l");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1", "f2"],
+                &["l", "f1", "f2"],
+                1,
+            ))
+            .await;
+        fx.manager.on_peer_connected("f1");
+        fx.manager.on_peer_connected("f2");
+        let snap = fx.manager.snapshot("org", Some("orders"));
+        assert!(node_info(&snap, "f1").reachable);
+        assert!(node_info(&snap, "f1").last_heartbeat_ms_ago.is_some());
+        assert!(
+            node_info(&snap, "l").reachable,
+            "the local node is always reachable"
+        );
+
+        fx.manager.on_peer_disconnected("f1");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let first = node_info(&fx.manager.snapshot("org", Some("orders")), "f1");
+        assert!(!first.reachable, "a peer the mesh dropped is unreachable");
+        let first_age = first.last_heartbeat_ms_ago.expect("a past signal");
+        assert!(first_age >= 60, "age {first_age} must cover the sleep");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second = node_info(&fx.manager.snapshot("org", Some("orders")), "f1");
+        assert!(
+            second.last_heartbeat_ms_ago.unwrap() > first_age,
+            "the age must keep growing while the peer stays silent"
+        );
+        assert!(
+            node_info(&fx.manager.snapshot("org", Some("orders")), "f2").reachable,
+            "an unrelated peer stays reachable"
+        );
+    }
+
+    /// The frames of a replication stream count as proof of life even after
+    /// the mesh reported the peer gone, until they stop arriving.
+    #[tokio::test]
+    async fn a_disconnected_leader_whose_stream_still_delivers_is_reachable_until_it_goes_quiet() {
+        let fx = build("f1");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1"],
+                &["l", "f1"],
+                1,
+            ))
+            .await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let runner = Arc::new(FakeFollowerHandle {
+            leo: AtomicU64::new(0),
+            hw: AtomicU64::new(0),
+            lease_expired: AtomicBool::new(false),
+            log_epoch: AtomicU32::new(0),
+            committed: AtomicU64::new(0),
+            disconnected: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            frame_age_ms: AtomicU64::new(200),
+        });
+        fx.manager.registry.get_mut(&key).unwrap().follower = Some(Box::new(FakeFollowerRunner {
+            shared: Arc::clone(&runner),
+        }));
+        fx.manager.on_peer_connected("l");
+        fx.manager.on_peer_disconnected("l");
+
+        let snap = fx.manager.snapshot("org", Some("orders"));
+        assert!(node_info(&snap, "l").reachable);
+
+        runner.frame_age_ms.store(60_000, Ordering::SeqCst);
+        let snap = fx.manager.snapshot("org", Some("orders"));
+        assert!(!node_info(&snap, "l").reachable);
+    }
+
+    /// A peer never heard from (no mesh event, no frame) is not reachable,
+    /// and a heartbeat after a disconnect does not resurrect it past the
+    /// freshness window while the mesh still says it is down.
+    #[tokio::test]
+    async fn snapshot_treats_a_peer_never_heard_from_as_unreachable() {
+        let fx = build("l");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1"],
+                &["l", "f1"],
+                1,
+            ))
+            .await;
+        let info = node_info(&fx.manager.snapshot("org", Some("orders")), "f1");
+        assert!(!info.reachable);
+        assert_eq!(info.last_heartbeat_ms_ago, None);
+        assert!(!fx.manager.node_reachable("f1"));
+        fx.manager.on_peer_connected("f1");
+        assert!(fx.manager.node_reachable("f1"));
+    }
+
+    fn forward_request() -> ProduceForward {
+        ProduceForward {
+            instance_id: "tentabus-00000001".to_string(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org".to_string(),
+            topic: "orders".to_string(),
+            actor: Some("alice".to_string()),
+            actor_kind: "user".to_string(),
+            correlation_id: None,
+            origin: "test".to_string(),
+            broker_dead_letter: false,
+            producer: None,
+            groups: Vec::new(),
+        }
+    }
+
+    async fn forward(
+        manager: &Arc<ReplicationManager>,
+        target: &str,
+    ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+        forward_within(manager, target, Duration::from_secs(2), || true).await
+    }
+
+    async fn forward_within(
+        manager: &Arc<ReplicationManager>,
+        target: &str,
+        deadline: Duration,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+        let manager = Arc::clone(manager);
+        let target = target.to_string();
+        tokio::task::spawn_blocking(move || {
+            manager.forward_publish(&target, forward_request(), deadline, &still_valid)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_publish_returns_the_leaders_reply() {
+        let fx = build("f1");
+        let reply = ProduceForwardReply {
+            result: None,
+            error: Some(frames::ForwardError {
+                code: "bus.not_leader".to_string(),
+                ..Default::default()
+            }),
+        };
+        fx.transport
+            .set_forward_peer("l", ForwardPeer::Reply(reply.clone()));
+        assert_eq!(forward(&fx.manager, "l").await.unwrap(), reply);
+    }
+
+    /// A peer that takes the request and then drops the stream may have
+    /// appended it: that is an unknown outcome, never "not sent", and the
+    /// peer is not written off as unable to forward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_dropped_after_the_request_was_written_is_an_unknown_outcome() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::Old);
+        assert!(matches!(
+            forward(&fx.manager, "l").await,
+            Err(ForwardUnavailable::OutcomeUnknown { .. })
+        ));
+        assert!(!fx.manager.forward_blocked("l"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_peer_is_not_sent_to() {
+        let fx = build("f1");
+        assert!(matches!(
+            forward(&fx.manager, "nobody").await,
+            Err(ForwardUnavailable::NotSent { .. })
+        ));
+        assert!(!fx.manager.forward_blocked("nobody"));
+    }
+
+    /// Dial and exchange are one deadline: a dial that never completes ends
+    /// as "not sent" at the deadline, not after the dial's own timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_covers_the_dial() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::HangsOnDial);
+        let started = Instant::now();
+        let result = forward_within(&fx.manager, "l", Duration::from_millis(300), || true).await;
+        assert!(
+            matches!(result, Err(ForwardUnavailable::NotSent { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_that_never_comes_is_an_unknown_outcome_at_the_deadline() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::Silent);
+        let started = Instant::now();
+        let result = forward_within(&fx.manager, "l", Duration::from_millis(300), || true).await;
+        assert!(
+            matches!(result, Err(ForwardUnavailable::OutcomeUnknown { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The caller stops waiting as soon as the leader it sent to is gone, and
+    /// the round trip it spawned goes with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_that_stops_waiting_ends_the_round_trip() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::Silent);
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = Arc::clone(&polls);
+        let started = Instant::now();
+        let result = forward_within(&fx.manager, "l", Duration::from_secs(30), move || {
+            seen.fetch_add(1, Ordering::SeqCst) < 2
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ForwardUnavailable::OutcomeUnknown { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_hello_lacked_the_feature_is_never_dialed_for_forwarding() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::Old);
+        fx.manager.peer_features.insert("l".to_string(), 0);
+        assert!(matches!(
+            forward(&fx.manager, "l").await,
+            Err(ForwardUnavailable::PeerCannotForward(_))
+        ));
+        assert_eq!(fx.transport.forward_dials("l"), 0);
+    }
+
+    fn age_peer_signal(manager: &ReplicationManager, node_id: &str, by: Duration) {
+        manager
+            .peers
+            .get_mut(node_id)
+            .expect("peer entry")
+            .last_signal = Some(
+            Instant::now()
+                .checked_sub(by)
+                .expect("a long-running clock"),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_the_mesh_holds_a_connection_to_is_reachable_only_while_it_was_heard_from() {
+        let fx = build("l");
+        fx.manager.on_peer_connected("p");
+        assert!(fx.manager.node_reachable("p"));
+        age_peer_signal(&fx.manager, "p", MESH_SIGNAL_FRESH + Duration::from_secs(1));
+        assert!(
+            !fx.manager.node_reachable("p"),
+            "a connected peer that has been silent for longer than the heartbeat window"
+        );
+        fx.manager.note_peer_signal("p");
+        assert!(fx.manager.node_reachable("p"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_seed_does_not_overwrite_what_the_event_loop_recorded() {
+        let fx = build("l");
+        fx.manager.on_peer_disconnected("down");
+        fx.manager
+            .seed_connected_peers(&["down".to_string(), "fresh".to_string()]);
+        assert!(
+            !fx.manager.node_reachable("down"),
+            "the later disconnect stands"
+        );
+        assert!(
+            fx.manager.node_reachable("fresh"),
+            "a peer no event named is seeded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_lagged_events_the_mesh_set_replaces_the_recorded_state() {
+        let fx = build("l");
+        fx.manager.on_peer_connected("gone");
+        fx.manager.on_peer_disconnected("back");
+        fx.manager.reconcile_connected_peers(&["back".to_string()]);
+        assert!(
+            fx.manager.node_reachable("back"),
+            "a missed PeerConnected is recovered"
+        );
+        assert!(
+            !fx.manager.node_reachable("gone"),
+            "a missed PeerDisconnected is recovered"
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakeConn {
+        id: usize,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl FakeConn {
+        fn new(id: usize) -> Self {
+            Self {
+                id,
+                closed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl PoolConnection for FakeConn {
+        fn id(&self) -> usize {
+            self.id
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn close_idle(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_reaper_leaves_a_connection_with_a_stream_in_flight_however_long_it_was_idle() {
+        let pool = ConnectionPool::new();
+        let conn = FakeConn::new(1);
+        let claim = pool.insert("p", conn.clone());
+        assert_eq!(pool.reap_if_idle("p", 1, Duration::ZERO), Reaped::Busy);
+        assert!(!conn.is_closed());
+        drop(claim);
+        assert_eq!(pool.reap_if_idle("p", 1, Duration::ZERO), Reaped::Closed);
+        assert!(conn.is_closed());
+        assert!(pool.checkout("p").is_none());
+    }
+
+    #[test]
+    fn a_connection_that_just_served_a_stream_is_not_idle_yet() {
+        let pool = ConnectionPool::new();
+        let conn = FakeConn::new(1);
+        drop(pool.insert("p", conn.clone()));
+        assert_eq!(
+            pool.reap_if_idle("p", 1, Duration::from_secs(60)),
+            Reaped::Busy
+        );
+        assert!(!conn.is_closed());
+    }
+
+    #[test]
+    fn a_checkout_after_the_reap_pass_started_keeps_the_connection_open() {
+        let pool = ConnectionPool::new();
+        let conn = FakeConn::new(1);
+        drop(pool.insert("p", conn.clone()));
+        let (_, claim) = pool.checkout("p").expect("pooled");
+        assert_eq!(pool.reap_if_idle("p", 1, Duration::ZERO), Reaped::Busy);
+        assert!(!conn.is_closed());
+        drop(claim);
+    }
+
+    /// A caller whose stream failed on connection 1 must not evict
+    /// connection 2, pooled by another caller in the meantime.
+    #[test]
+    fn a_failed_caller_discards_only_its_own_connection() {
+        let pool = ConnectionPool::new();
+        drop(pool.insert("p", FakeConn::new(1)));
+        drop(pool.insert("p", FakeConn::new(2)));
+        pool.discard("p", 1);
+        let (conn, _claim) = pool.checkout("p").expect("the newer connection stays");
+        assert_eq!(conn.id(), 2);
+        pool.discard("p", 2);
+        assert!(pool.checkout("p").is_none());
+    }
+
+    #[test]
+    fn a_reaper_watching_a_replaced_connection_stands_down() {
+        let pool = ConnectionPool::new();
+        drop(pool.insert("p", FakeConn::new(1)));
+        drop(pool.insert("p", FakeConn::new(2)));
+        assert_eq!(pool.reap_if_idle("p", 1, Duration::ZERO), Reaped::Gone);
+    }
+
+    #[derive(Default)]
+    struct RecordingForwardHandler {
+        calls: Mutex<Vec<(String, ProduceForward)>>,
+    }
+
+    impl ForwardedPublishHandler for RecordingForwardHandler {
+        fn publish_forwarded(&self, from: &str, request: ProduceForward) -> ProduceForwardReply {
+            self.calls.lock().push((from.to_string(), request));
+            ProduceForwardReply {
+                result: Some(frames::ForwardResult {
+                    duplicate: false,
+                    accepted: 1,
+                    deduplicated: 0,
+                    partitions: Vec::new(),
+                    schema_rejected: 0,
+                    schema_dropped: 0,
+                }),
+                error: None,
+            }
+        }
+    }
+
+    fn grouped_request(partition: u32) -> ProduceForward {
+        ProduceForward {
+            groups: vec![frames::ForwardGroup {
+                partition,
+                records: Vec::new(),
+            }],
+            ..forward_request()
+        }
+    }
+
+    fn refusal_reason(reply: &ProduceForwardReply) -> Option<String> {
+        reply
+            .error
+            .as_ref()
+            .filter(|e| e.code == forward::CODE_FORWARD_REFUSED)
+            .and_then(|e| e.texts.first().cloned())
+    }
+
+    async fn leader_with_forward_handler() -> (Fixture, Arc<RecordingForwardHandler>) {
+        let fx = build("l");
+        let handler = Arc::new(RecordingForwardHandler::default());
+        fx.manager
+            .set_forward_handler(Arc::downgrade(&handler) as Weak<dyn ForwardedPublishHandler>);
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1", "f2"],
+                &["l", "f1", "f2"],
+                1,
+            ))
+            .await;
+        (fx, handler)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_publish_from_a_replica_reaches_the_handler_with_the_senders_identity() {
+        let (fx, handler) = leader_with_forward_handler().await;
+        let reply = fx
+            .manager
+            .answer_produce_forward("f1", grouped_request(0))
+            .await;
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        let calls = handler.calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "f1");
+        assert_eq!(calls[0].1.topic, "orders");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_publish_from_a_node_that_holds_no_replica_is_served() {
+        // A node outside the replica set (a one-replica topic written from
+        // every node, `__bus.metrics`) is a trusted peer like any other: the
+        // original actor is authorized by the handler, not by membership.
+        let (fx, handler) = leader_with_forward_handler().await;
+        let reply = fx
+            .manager
+            .answer_produce_forward("stranger", grouped_request(0))
+            .await;
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(handler.calls.lock().len(), 1);
+        assert_eq!(handler.calls.lock()[0].0, "stranger");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_publish_from_another_environment_is_refused() {
+        let (fx, handler) = leader_with_forward_handler().await;
+        let mut request = grouped_request(0);
+        request.environment = NodeEnvironment::Dev;
+        let reply = fx.manager.answer_produce_forward("f1", request).await;
+        assert_eq!(
+            refusal_reason(&reply).as_deref(),
+            Some("environment_mismatch")
+        );
+        assert!(handler.calls.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_publish_for_a_partition_without_an_assignment_answers_not_leader() {
+        let (fx, handler) = leader_with_forward_handler().await;
+        let reply = fx
+            .manager
+            .answer_produce_forward("f1", grouped_request(5))
+            .await;
+        let error = reply.error.expect("refused");
+        assert_eq!(error.code, "bus.not_leader");
+        assert!(handler.calls.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_publish_is_refused_while_no_handler_is_installed() {
+        let fx = build("l");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1"],
+                &["l", "f1"],
+                1,
+            ))
+            .await;
+        let reply = fx
+            .manager
+            .answer_produce_forward("f1", grouped_request(0))
+            .await;
+        assert_eq!(
+            refusal_reason(&reply).as_deref(),
+            Some("forwarding_disabled")
+        );
+    }
+
     /// An epoch bump that keeps this node as leader rebuilds the leader
     /// handle, and stopping the old one ends its quorum wait at once. The
     /// record is in this node's log either way, so a publish in flight must
@@ -5582,6 +6940,7 @@ mod tests {
             replicas: vec!["l".into(), "f1".into()],
             environment: NodeEnvironment::Prod,
             topic_generation: Some(0),
+            bus_features: 0,
         });
         let (server_recv, server_send) = split(server);
         tokio::spawn(async move {
@@ -5760,6 +7119,7 @@ mod tests {
             replicas: a.replicas.clone(),
             environment: NodeEnvironment::Prod,
             topic_generation: Some(a.topic_generation),
+            bus_features: 0,
         }
     }
 
@@ -8107,6 +9467,7 @@ mod tests {
             committed: AtomicU64::new(0),
             disconnected: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            frame_age_ms: AtomicU64::new(u64::MAX),
         });
         fx.manager.registry.get_mut(&key).unwrap().follower = Some(Box::new(FakeFollowerRunner {
             shared: Arc::clone(&runner),

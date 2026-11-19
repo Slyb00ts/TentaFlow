@@ -57,7 +57,7 @@ use tokio::time::Instant;
 use super::election::{availability_quorum, min_isr_required, LogPosition};
 use super::frames::{
     write_frame, FrameReader, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplHeartbeat,
-    ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate,
+    ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate, LOCAL_BUS_FEATURES,
 };
 use super::metrics::LeaderMetrics;
 use crate::bus::topics::Acks;
@@ -1055,6 +1055,8 @@ pub(crate) fn frame_kind_name(frame: &ReplFrame) -> &'static str {
         ReplFrame::LeoQuery(_) => "LeoQuery",
         ReplFrame::LeoReply(_) => "LeoReply",
         ReplFrame::Offsets(_) => "Offsets",
+        ReplFrame::ProduceForward(_) => "ProduceForward",
+        ReplFrame::ProduceForwardReply(_) => "ProduceForwardReply",
     }
 }
 
@@ -1212,6 +1214,7 @@ where
         replicas: leader.replicas().to_vec(),
         environment: leader.environment(),
         topic_generation: Some(leader.topic_generation()),
+        bus_features: LOCAL_BUS_FEATURES,
     };
     write_frame(&mut writer, &ReplFrame::Hello(hello)).await?;
 
@@ -1605,6 +1608,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -1646,6 +1650,7 @@ mod tests {
                 reject: Some(ReplReject::StaleEpoch { have: TEST_EPOCH }),
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -1694,6 +1699,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -1756,6 +1762,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: Some(TEST_EPOCH - 1),
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -1817,6 +1824,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: Some(TEST_EPOCH - 2),
                 follower_committed: Some(0),
+                bus_features: 0,
             }),
         )
         .await
@@ -2139,6 +2147,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -2214,6 +2223,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -2723,6 +2733,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -2776,6 +2787,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -2848,6 +2860,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -2929,6 +2942,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -3004,6 +3018,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -3066,6 +3081,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -3113,6 +3129,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await
@@ -3164,6 +3181,7 @@ mod tests {
                 reject: None,
                 follower_log_epoch: None,
                 follower_committed: None,
+                bus_features: 0,
             }),
         )
         .await

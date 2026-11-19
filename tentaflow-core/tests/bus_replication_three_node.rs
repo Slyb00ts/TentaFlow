@@ -117,7 +117,7 @@
 //!
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -131,6 +131,7 @@ use tentaflow_protocol::environment::NodeEnvironment;
 use tentaflow_core::bus::replication::assignment::PartitionAssignment;
 use tentaflow_core::bus::replication::election::LogPosition;
 use tentaflow_core::bus::replication::follower::FollowerConfig;
+use tentaflow_core::bus::replication::forward::ForwardedPublishHandler;
 use tentaflow_core::bus::replication::frames::{self, ReplFrame, ReplHello, ReplReject};
 use tentaflow_core::bus::replication::glue::{
     AuditLogReplAudit, GlueFollowerFactory, GlueLeaderFactory, PartitionProvider,
@@ -158,15 +159,26 @@ const TEST_INSTANCE_ID: &str = "tentabus-00000001";
 
 // ===== Allow-all authorizer (mirrors tests/bus_demo_seed.rs) ===============
 
-struct AllowAllAuthorizer;
+/// Allows everything, except `Produce` while `deny_produce` is set: the
+/// switch a scenario flips on the node that LEADS a partition to see its
+/// refusal reach a publisher on another node.
+struct AllowAllAuthorizer {
+    deny_produce: Arc<AtomicBool>,
+}
 
 impl tentaflow_core::bus::BusAuthorizer for AllowAllAuthorizer {
     fn authorize(
         &self,
         _ctx: &BusCallContext,
-        _action: BusAction,
-        _topic: &str,
+        action: BusAction,
+        topic: &str,
     ) -> Result<(), BusServiceError> {
+        if action == BusAction::Produce && self.deny_produce.load(Ordering::SeqCst) {
+            return Err(BusServiceError::PermissionDenied {
+                action: action.as_str(),
+                topic: topic.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -482,6 +494,11 @@ struct TransportRegistry {
     /// already open are not severed — the scenarios cut links before any
     /// stream between the pair exists.
     cut: Mutex<Vec<(String, String)>>,
+    /// Directed `(from, to)` pairs: `from` cannot dial `to`, while `to` can
+    /// still dial `from`.
+    blocked: Mutex<Vec<(String, String)>>,
+    /// Every stream opened for a forwarded publish, as (from, to), in order.
+    forward_streams: Mutex<Vec<(String, String)>>,
 }
 
 impl TransportRegistry {
@@ -490,15 +507,26 @@ impl TransportRegistry {
             peers: Mutex::new(HashMap::new()),
             env_gate_rejections: AtomicU32::new(0),
             cut: Mutex::new(Vec::new()),
+            blocked: Mutex::new(Vec::new()),
+            forward_streams: Mutex::new(Vec::new()),
         })
+    }
+
+    fn forwards(&self) -> Vec<(String, String)> {
+        self.forward_streams.lock().clone()
     }
 
     fn cut(&self, a: &str, b: &str) {
         self.cut.lock().push((a.to_string(), b.to_string()));
     }
 
+    fn block_dials(&self, from: &str, to: &str) {
+        self.blocked.lock().push((from.to_string(), to.to_string()));
+    }
+
     fn heal(&self) {
         self.cut.lock().clear();
+        self.blocked.lock().clear();
     }
 
     fn is_cut(&self, a: &str, b: &str) -> bool {
@@ -538,8 +566,26 @@ struct DuplexTransport {
 
 #[async_trait::async_trait]
 impl Transport for DuplexTransport {
+    /// The same path a replication stream takes — the target's
+    /// `accept_stream` demuxes `ProduceForward` — recorded so a scenario can
+    /// say how many forwarded publishes went where.
+    async fn open_forward_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        self.registry
+            .forward_streams
+            .lock()
+            .push((self.local_node_id.clone(), node_id.to_string()));
+        self.open_stream(node_id).await
+    }
+
     async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
-        if self.registry.is_cut(&self.local_node_id, node_id) {
+        if self.registry.is_cut(&self.local_node_id, node_id)
+            || self
+                .registry
+                .blocked
+                .lock()
+                .iter()
+                .any(|(from, to)| from == &self.local_node_id && to == node_id)
+        {
             return Err(ReplError::Internal(format!(
                 "network partition between '{}' and '{node_id}'",
                 self.local_node_id
@@ -582,6 +628,8 @@ struct TestNode {
     svc: Arc<BusService>,
     manager: Arc<ReplicationManager>,
     ledger: Arc<NodeLedger>,
+    /// While set, this node's authorizer refuses `Produce`.
+    deny_produce: Arc<AtomicBool>,
     _bus_dir: TempDir,
     _db_dir: TempDir,
 }
@@ -627,6 +675,7 @@ fn build_node(
     let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
     tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
+    let deny_produce = Arc::new(AtomicBool::new(false));
     let svc = Arc::new(
         BusService::new(BusInitConfig {
             instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(TEST_INSTANCE_ID)
@@ -634,12 +683,16 @@ fn build_node(
             local_db,
             bus_dir: bus_dir.path().to_path_buf(),
             db: db.clone(),
-            authorizer: Arc::new(AllowAllAuthorizer),
+            authorizer: Arc::new(AllowAllAuthorizer {
+                deny_produce: Arc::clone(&deny_produce),
+            }),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: Duration::from_secs(5),
-            settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("BusService::new"),
     );
@@ -686,6 +739,7 @@ fn build_node(
     });
 
     svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
+    manager.set_forward_handler(Arc::downgrade(&svc) as Weak<dyn ForwardedPublishHandler>);
     registry.register(id, Arc::clone(&manager), env);
 
     TestNode {
@@ -694,6 +748,7 @@ fn build_node(
         svc,
         manager,
         ledger,
+        deny_produce,
         _bus_dir: bus_dir,
         _db_dir: db_dir,
     }
@@ -814,6 +869,16 @@ async fn build_cluster_placed(
     replicas: &[&str],
     leader: &str,
 ) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
+    build_cluster_led_by(partitions, acks, replicas, |_| leader.to_string()).await
+}
+
+/// `build_cluster_placed` with the epoch-1 leader chosen per partition.
+async fn build_cluster_led_by(
+    partitions: u32,
+    acks: Acks,
+    replicas: &[&str],
+    leader_of: impl Fn(u32) -> String,
+) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
     init_tracing();
     let ledger = SharedLedger::new();
     let registry = TransportRegistry::new();
@@ -863,7 +928,7 @@ async fn build_cluster_placed(
     let generation = row.generation;
 
     for p in 0..partitions {
-        let a0 = assignment(generation, replicas, leader, 1, p);
+        let a0 = assignment(generation, replicas, &leader_of(p), 1, p);
         ledger.seed(a0.clone());
         for node in &nodes {
             node.manager.apply_assignment(a0.clone()).await;
@@ -1102,8 +1167,13 @@ async fn publish_and_open_consumer_on_a_follower_return_not_leader() {
     // `Acks::Leader` — this scenario only needs B's ROLE to be `Follower`
     // (set synchronously by `apply_assignment`), so no Hello handshake is
     // required here and no replication has to be live.
-    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Leader).await;
+    let (nodes, _ledger, registry) = build_cluster(1, Acks::Leader).await;
     let b = find_node(&nodes, "B");
+    // A publish on a follower is forwarded to the leader; with the leader
+    // out of reach the forwarding cannot be done and the caller is left with
+    // the `NotLeader` it always got (the forwarded path has its own
+    // scenarios below).
+    registry.cut("B", "A");
 
     // `publish` on a follower and the consume side below must report the
     // SAME error for the SAME condition: `map_repl_error` re-queries
@@ -1135,6 +1205,396 @@ async fn publish_and_open_consumer_on_a_follower_return_not_leader() {
         "expected NotLeader from open_consumer, got {err:?}"
     );
 
+    shutdown_all(&nodes);
+}
+
+// ===== Forwarding a write to the partition leader ==========================
+
+/// The records `node` holds for `partition` — key, payload and the headers
+/// the producer set (the broker's own `tf.*` stamps are left out).
+fn read_all_records(
+    node: &TestNode,
+    partition: u32,
+) -> Vec<(Option<Vec<u8>>, Vec<u8>, Vec<(String, Vec<u8>)>)> {
+    node.svc
+        .local_partition(&ctx(), TOPIC, partition)
+        .expect("partition handle")
+        .open_reader()
+        .fetch_from_offset(0, 16 * 1024 * 1024)
+        .expect("fetch_from_offset")
+        .into_iter()
+        .flat_map(|b| {
+            b.records()
+                .map(|r| {
+                    let r = r.unwrap();
+                    let headers = r
+                        .headers
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with(b"tf."))
+                        .map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.to_vec()))
+                        .collect();
+                    (r.key.map(|k| k.to_vec()), r.payload.to_vec(), headers)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn binary_record(key: &str, payload: Vec<u8>) -> PublishRecord {
+    PublishRecord {
+        key: Some(Bytes::from(key.to_string())),
+        headers: vec![("trace".to_string(), Bytes::from_static(&[0xFF, 0x00, 0x7F]))],
+        payload: Bytes::from(payload),
+        timestamp_ms: 1_700_000_000_000,
+        schema_id: 0,
+    }
+}
+
+async fn publish_records(
+    node: &TestNode,
+    partition: Option<u32>,
+    records: Vec<PublishRecord>,
+) -> Result<tentaflow_core::bus::PublishResult, BusServiceError> {
+    publish_records_as(node, &ctx(), partition, records).await
+}
+
+async fn publish_records_as(
+    node: &TestNode,
+    ctx: &BusCallContext,
+    partition: Option<u32>,
+    records: Vec<PublishRecord>,
+) -> Result<tentaflow_core::bus::PublishResult, BusServiceError> {
+    node.svc
+        .publish_async(
+            ctx,
+            TOPIC,
+            PublishBatch {
+                partition,
+                producer: None,
+                records,
+            },
+        )
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_on_a_follower_lands_on_the_leader_byte_for_byte() {
+    let (nodes, _ledger, registry) = build_cluster(1, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let c = find_node(&nodes, "C");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+
+    let every_byte: Vec<u8> = (0..=255u8).collect();
+    let result = publish_records(b, Some(0), vec![binary_record("k-1", every_byte.clone())])
+        .await
+        .unwrap_or_else(|e| panic!("publish on a follower failed: {e:?}"));
+    assert_eq!(result.accepted, 1);
+    assert_eq!(result.partitions.len(), 1);
+    assert_eq!(result.partitions[0].base_offset, 0);
+
+    let expected = vec![(
+        Some(b"k-1".to_vec()),
+        every_byte,
+        vec![("trace".to_string(), vec![0xFF, 0x00, 0x7F])],
+    )];
+    assert_eq!(
+        read_all_records(a, 0),
+        expected,
+        "the leader holds the record"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || log_end_offset(b, 0) >= 1
+            && log_end_offset(c, 0) >= 1)
+        .await,
+        "the record never replicated onward"
+    );
+    assert_eq!(read_all_records(c, 0), expected);
+    assert_eq!(
+        read_all_records(b, 0),
+        expected,
+        "the forwarding node follows the leader like any replica"
+    );
+    assert_eq!(
+        registry.forwards(),
+        vec![("B".to_string(), "A".to_string())],
+        "one forwarded request"
+    );
+    shutdown_all(&nodes);
+}
+
+/// A node outside the replica set (a one-replica topic written from every
+/// node, as `__bus.metrics` is) hands its publish to the leader the
+/// assignment names at once, instead of waiting for a role it will never get.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_from_a_node_that_holds_no_replica_lands_on_the_leader_without_a_stall() {
+    let (nodes, _ledger, registry) = build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let a = find_node(&nodes, "A");
+    let c = find_node(&nodes, "C");
+    // C shares no replication stream with A, so the mesh is its only sign of
+    // life from A; the in-process transport has no mesh to say so.
+    c.manager.on_peer_connected("A");
+
+    // Retried only until the first handshake is through; the call that
+    // succeeds is the one timed.
+    let give_up = std::time::Instant::now() + Duration::from_secs(15);
+    let took = loop {
+        let started = std::time::Instant::now();
+        match publish_text(c, Some(0), "from-c").await {
+            Ok(_) => break started.elapsed(),
+            Err(e) if std::time::Instant::now() >= give_up => {
+                panic!("the publish from the non-replica never landed: {e:?}")
+            }
+            Err(e) => {
+                eprintln!("non-replica publish attempt failed: {e:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+        }
+    };
+    assert!(
+        took < Duration::from_secs(2),
+        "a node with no replica must not wait for a leader: {took:?}"
+    );
+    assert_eq!(log_end_offset(a, 0), 1);
+    assert_eq!(
+        registry.forwards().last(),
+        Some(&("C".to_string(), "A".to_string()))
+    );
+    shutdown_all(&nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_with_partitions_on_two_leaders_is_split_one_request_per_leader() {
+    let (nodes, _ledger, registry) = build_cluster_led_by(2, Acks::Quorum, &["A", "B", "C"], |p| {
+        if p == 0 { "A" } else { "B" }.to_string()
+    })
+    .await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let c = find_node(&nodes, "C");
+    let leaders_have_their_isr = || {
+        let full = |node: &TestNode, partition: u32| {
+            node.manager
+                .snapshot(ORG, Some(TOPIC))
+                .partitions
+                .iter()
+                .any(|p| p.partition == partition && p.isr.len() == 3)
+        };
+        full(a, 0) && full(b, 1)
+    };
+    assert!(
+        wait_until(Duration::from_secs(15), leaders_have_their_isr).await,
+        "the replicas never joined both leaders' ISR"
+    );
+
+    let sent: Vec<Vec<u8>> = (0..40)
+        .map(|i| format!("payload-{i}").into_bytes())
+        .collect();
+    let records = sent
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| binary_record(&format!("key-{i}"), payload.clone()))
+        .collect();
+    let result = publish_records(c, None, records)
+        .await
+        .unwrap_or_else(|e| panic!("publish across two leaders failed: {e:?}"));
+    assert_eq!(result.accepted, 40);
+    let mut acked: Vec<u32> = result.partitions.iter().map(|p| p.partition).collect();
+    acked.sort();
+    assert_eq!(acked, vec![0, 1]);
+
+    let on_a = read_all_records(a, 0);
+    let on_b = read_all_records(b, 1);
+    assert!(
+        !on_a.is_empty() && !on_b.is_empty(),
+        "keys must spread over both partitions"
+    );
+    let mut landed: Vec<Vec<u8>> = on_a.iter().chain(&on_b).map(|r| r.1.clone()).collect();
+    landed.sort();
+    let mut want = sent;
+    want.sort();
+    assert_eq!(
+        landed, want,
+        "every record landed once, on its own partition's leader"
+    );
+
+    let mut forwards = registry.forwards();
+    forwards.sort();
+    assert_eq!(
+        forwards,
+        vec![
+            ("C".to_string(), "A".to_string()),
+            ("C".to_string(), "B".to_string())
+        ]
+    );
+    shutdown_all(&nodes);
+}
+
+/// The leader moves while a write is on its way: the publisher's view still
+/// names the old leader, which refuses; once the publisher learns the new
+/// assignment the write is sent again — once — and lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_that_moved_mid_flight_gets_exactly_one_retry_at_the_new_leader() {
+    // No background loops: nothing elects, and each node learns the move
+    // only when this test applies it.
+    let (nodes, _ledger, registry) =
+        build_cluster_placed(1, Acks::Quorum, &["A", "B", "C"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let c = find_node(&nodes, "C");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+
+    let generation = topic_generation(a);
+    let moved = assignment(generation, &["A", "B", "C"], "B", 2, 0);
+    // The new leader's Hello would tell C about the move on its own; C is to
+    // learn of it only when this test says so.
+    registry.block_dials("B", "C");
+    a.manager.apply_assignment(moved.clone()).await;
+    b.manager.apply_assignment(moved.clone()).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            b.manager
+                .snapshot(ORG, Some(TOPIC))
+                .partitions
+                .iter()
+                .any(|p| p.isr.len() >= 2)
+        })
+        .await,
+        "the new leader never gathered a quorum"
+    );
+
+    let publisher = Arc::clone(&c.svc);
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish_async(
+                &ctx(),
+                TOPIC,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![binary_record("k", b"moved".to_vec())],
+                },
+            )
+            .await
+    });
+    // C still believes A leads: the request goes to A, which refuses, and C
+    // waits for an assignment change.
+    assert!(
+        wait_until(Duration::from_secs(5), || registry.forwards().len() == 1).await,
+        "the first forward never happened"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if publish.is_finished() {
+        panic!(
+            "the publish must wait for the new leader, but ended: {:?}",
+            publish.await
+        );
+    }
+    c.manager.apply_assignment(moved).await;
+
+    let result = publish
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the retried publish failed: {e:?}"));
+    assert_eq!(result.accepted, 1);
+    assert_eq!(
+        registry.forwards(),
+        vec![
+            ("C".to_string(), "A".to_string()),
+            ("C".to_string(), "B".to_string())
+        ],
+        "exactly one retry, at the new leader, and none from A"
+    );
+    assert_eq!(read_all_records(b, 0).len(), 1);
+    shutdown_all(&nodes);
+}
+
+/// Two nodes that each believe the other leads: the receiver of a forwarded
+/// publish answers `NotLeader` instead of forwarding it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_publish_is_never_sent_back_to_its_sender() {
+    let (nodes, _ledger, registry) =
+        build_cluster_placed(1, Acks::Quorum, &["A", "B", "C"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    let generation = topic_generation(a);
+    a.manager
+        .apply_assignment(assignment(generation, &["A", "B", "C"], "B", 2, 0))
+        .await;
+    b.manager
+        .apply_assignment(assignment(generation, &["A", "B", "C"], "A", 2, 0))
+        .await;
+
+    let err = publish_text(a, Some(0), "loop").await.unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
+    assert_eq!(
+        registry.forwards(),
+        vec![("A".to_string(), "B".to_string())],
+        "B must not hand the request back to A, and A asks it only once"
+    );
+    shutdown_all(&nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authorization_refusal_on_the_leader_reaches_the_publisher() {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    a.deny_produce.store(true, Ordering::SeqCst);
+
+    let err = publish_text(b, Some(0), "forbidden").await.unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::PermissionDenied { .. }),
+        "the leader's refusal must arrive as itself, got {err:?}"
+    );
+    assert_eq!(log_end_offset(a, 0), 0, "nothing was written");
+    shutdown_all(&nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_system_actor_is_refused_on_a_forwarded_publish_to_an_ordinary_topic() {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    let mut system = ctx();
+    system.actor = Some(tentaflow_core::services::bus_authorizer::SYSTEM_ACTOR.to_string());
+    system.actor_kind = tentaflow_core::auth::actor::ActorKind::System;
+
+    let err = publish_records_as(b, &system, Some(0), vec![binary_record("k", b"x".to_vec())])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(log_end_offset(a, 0), 0, "nothing was written");
     shutdown_all(&nodes);
 }
 
@@ -1291,6 +1751,7 @@ async fn z12_environment_mismatch_is_rejected_by_the_transport_gate_and_by_hello
             replicas: vec!["PROD".to_string(), "TEST".to_string()],
             environment: NodeEnvironment::Prod, // mismatches TEST's own local_env
             topic_generation: Some(0),
+            bus_features: 0,
         }),
     )
     .await
@@ -2345,6 +2806,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
         topic_generation: Some(0),
+        bus_features: 0,
     })
     .await;
     assert!(!ack.accepted);
@@ -2373,6 +2835,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         replicas: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
         topic_generation: Some(0),
+        bus_features: 0,
     })
     .await;
     assert!(!ack.accepted);
@@ -2396,6 +2859,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
         topic_generation: Some(0),
+        bus_features: 0,
     })
     .await;
     assert!(!ack.accepted);

@@ -1623,6 +1623,7 @@ mod tests {
                     replicas: vec!["l".to_string()],
                     environment: tentaflow_protocol::environment::NodeEnvironment::Prod,
                     topic_generation: Some(0),
+                    bus_features: 0,
                 },
             ),
         )

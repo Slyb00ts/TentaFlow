@@ -50,6 +50,16 @@ const KIND_TRUNCATE: u8 = 5;
 const KIND_LEO_QUERY: u8 = 6;
 const KIND_LEO_REPLY: u8 = 7;
 const KIND_OFFSETS: u8 = 8;
+const KIND_PRODUCE_FORWARD: u8 = 9;
+const KIND_PRODUCE_FORWARD_REPLY: u8 = 10;
+
+/// `ReplHello::bus_features` / `ReplHelloAck::bus_features` bit: this node
+/// accepts `ReplFrame::ProduceForward` on a fresh stream and answers with
+/// `ProduceForwardReply`.
+pub const BUS_FEATURE_PRODUCE_FORWARD: u32 = 1 << 0;
+
+/// Every feature bit this build advertises.
+pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURE_PRODUCE_FORWARD;
 
 /// First frame on a new leader->follower replication stream (PLAN-M2 §1b).
 /// Carries both fencing checks a stream establishment needs (PLAN-M2 §1b
@@ -91,6 +101,10 @@ pub struct ReplHello {
     /// is only fully covered once every node runs a build that sends it.
     #[serde(default)]
     pub topic_generation: Option<u64>,
+    /// `BUS_FEATURE_*` bits the leader supports. Appended: `0` from a peer
+    /// that predates it, which is taken to support none of them.
+    #[serde(default)]
+    pub bus_features: u32,
 }
 
 /// Follower's response to `ReplHello`. `accepted = false` always carries a
@@ -120,6 +134,9 @@ pub struct ReplHelloAck {
     /// predates it, which is judged by `follower_hw`.
     #[serde(default)]
     pub follower_committed: Option<u64>,
+    /// As `ReplHello::bus_features`, for the follower.
+    #[serde(default)]
+    pub bus_features: u32,
 }
 
 /// Why a follower refused a `ReplHello` (PLAN-M2 §1b). `Deserialize` is
@@ -527,6 +544,101 @@ pub struct ReplOffsets {
     pub discarded: Vec<(u32, u64)>,
 }
 
+/// One record of a forwarded publish: the caller's record as it reached the
+/// forwarding node, before any broker-written `tf.*` header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRecord {
+    pub key: Option<serde_bytes::ByteBuf>,
+    pub headers: Vec<(String, serde_bytes::ByteBuf)>,
+    pub payload: serde_bytes::ByteBuf,
+    pub timestamp_ms: i64,
+    pub schema_id: u32,
+}
+
+/// The records the forwarding node routed to one partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardGroup {
+    pub partition: u32,
+    pub records: Vec<ForwardRecord>,
+}
+
+/// `PublishBatch::producer` of a forwarded publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardProducer {
+    pub producer_id: String,
+    pub epoch: u32,
+    pub base_seq: u64,
+}
+
+/// A publish a follower hands to the leader of the partitions it targets,
+/// the first frame of a fresh stream. The leader runs the whole publish
+/// pipeline on it, so the caller identity travels with it; the leader never
+/// forwards it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProduceForward {
+    pub instance_id: String,
+    /// The sender's environment: the frame-level half of the environment
+    /// fence, next to the mesh accept gate (as in `ReplHello`).
+    pub environment: NodeEnvironment,
+    pub org_id: String,
+    pub topic: String,
+    pub actor: Option<String>,
+    /// `auth::actor::ActorKind::as_str` of the caller.
+    pub actor_kind: String,
+    pub correlation_id: Option<String>,
+    pub origin: String,
+    /// The write is the broker's own dead letter (`publish_dead_letter`);
+    /// honored by the receiver for `__dlq.*` topics only.
+    pub broker_dead_letter: bool,
+    pub producer: Option<ForwardProducer>,
+    pub groups: Vec<ForwardGroup>,
+}
+
+/// One partition a publish landed on (`PartitionAck`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardAck {
+    pub partition: u32,
+    pub base_offset: u64,
+    pub accepted: u32,
+}
+
+/// `PublishResult` of a forwarded publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardResult {
+    pub duplicate: bool,
+    pub accepted: u32,
+    pub deduplicated: u32,
+    pub partitions: Vec<ForwardAck>,
+    pub schema_rejected: u32,
+    pub schema_dropped: u32,
+}
+
+/// A refused or failed forwarded publish. `code` is the stable
+/// `bus.<snake_case>` code `dispatch::bus::map_bus_error` uses for the same
+/// error, which is what lets the sender rebuild the `BusServiceError`; the
+/// other fields carry the variant's details positionally per code
+/// (`bus::replication::forward`). Never carries record content, keys or
+/// payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ForwardError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub texts: Vec<String>,
+    #[serde(default)]
+    pub numbers: Vec<u64>,
+    /// Partitions that landed before the failure (`PartialPublish`).
+    #[serde(default)]
+    pub acked: Vec<ForwardAck>,
+}
+
+/// The leader's answer to `ProduceForward`: exactly one of the two is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProduceForwardReply {
+    pub result: Option<ForwardResult>,
+    pub error: Option<ForwardError>,
+}
+
 /// One frame on a replication stream (PLAN-M2 §1b). `Batch` is the only
 /// variant whose payload spans both wire sections: `header` is CBOR, the
 /// batch bytes are `raw`. No `Serialize`/`Deserialize` here — `ReplFrame`
@@ -549,6 +661,8 @@ pub enum ReplFrame {
     LeoQuery(ReplLeoQuery),
     LeoReply(ReplLeoReply),
     Offsets(ReplOffsets),
+    ProduceForward(ProduceForward),
+    ProduceForwardReply(ProduceForwardReply),
 }
 
 /// Errors from `read_frame`/`write_frame`. Distinct from
@@ -593,6 +707,8 @@ fn encode_parts(frame: &ReplFrame) -> Result<(u8, Vec<u8>, &[u8]), ReplCodecErro
         ReplFrame::LeoQuery(v) => (KIND_LEO_QUERY, encode_cbor(v)?, &[][..]),
         ReplFrame::LeoReply(v) => (KIND_LEO_REPLY, encode_cbor(v)?, &[][..]),
         ReplFrame::Offsets(v) => (KIND_OFFSETS, encode_cbor(v)?, &[][..]),
+        ReplFrame::ProduceForward(v) => (KIND_PRODUCE_FORWARD, encode_cbor(v)?, &[][..]),
+        ReplFrame::ProduceForwardReply(v) => (KIND_PRODUCE_FORWARD_REPLY, encode_cbor(v)?, &[][..]),
     })
 }
 
@@ -656,6 +772,8 @@ fn decode_frame(kind: u8, cbor: &[u8], raw: Bytes) -> Result<ReplFrame, ReplCode
         KIND_LEO_QUERY => ReplFrame::LeoQuery(decode_cbor(cbor)?),
         KIND_LEO_REPLY => ReplFrame::LeoReply(decode_cbor(cbor)?),
         KIND_OFFSETS => ReplFrame::Offsets(decode_cbor(cbor)?),
+        KIND_PRODUCE_FORWARD => ReplFrame::ProduceForward(decode_cbor(cbor)?),
+        KIND_PRODUCE_FORWARD_REPLY => ReplFrame::ProduceForwardReply(decode_cbor(cbor)?),
         other => return Err(ReplCodecError::UnknownKind(other)),
     })
 }
@@ -828,6 +946,7 @@ mod tests {
             replicas: vec!["node-a".into(), "node-b".into(), "node-c".into()],
             environment: NodeEnvironment::Prod,
             topic_generation: Some(42),
+            bus_features: 0,
         }
     }
 
@@ -841,6 +960,7 @@ mod tests {
             reject,
             follower_log_epoch: None,
             follower_committed: None,
+            bus_features: 0,
         }
     }
 
@@ -968,6 +1088,163 @@ mod tests {
             ),
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    /// `bus_features` crosses a mixed fleet both ways: a Hello or HelloAck
+    /// from a build that predates it decodes as "no features", and that build
+    /// decodes ours, ignoring the key.
+    #[test]
+    fn bus_features_decode_across_versions() {
+        #[derive(Serialize, Deserialize)]
+        struct HelloBefore {
+            instance_id: String,
+            org_id: String,
+            topic: String,
+            partition: u32,
+            leader_node_id: String,
+            leader_epoch: u32,
+            replicas: Vec<String>,
+            environment: NodeEnvironment,
+            topic_generation: Option<u64>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct HelloAckBefore {
+            accepted: bool,
+            follower_leo: u64,
+            follower_hw: u64,
+            follower_epoch: u32,
+            environment: NodeEnvironment,
+            reject: Option<ReplReject>,
+            follower_log_epoch: Option<u32>,
+            follower_committed: Option<u64>,
+        }
+        let current = hello();
+        let old_hello = HelloBefore {
+            instance_id: current.instance_id.clone(),
+            org_id: current.org_id.clone(),
+            topic: current.topic.clone(),
+            partition: current.partition,
+            leader_node_id: current.leader_node_id.clone(),
+            leader_epoch: current.leader_epoch,
+            replicas: current.replicas.clone(),
+            environment: current.environment,
+            topic_generation: current.topic_generation,
+        };
+        match decode_frame(KIND_HELLO, &encode_cbor(&old_hello).unwrap(), Bytes::new()).unwrap() {
+            ReplFrame::Hello(h) => assert_eq!(h, current),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let old_ack = HelloAckBefore {
+            accepted: true,
+            follower_leo: 1,
+            follower_hw: 1,
+            follower_epoch: 7,
+            environment: NodeEnvironment::Prod,
+            reject: None,
+            follower_log_epoch: None,
+            follower_committed: None,
+        };
+        match decode_frame(
+            KIND_HELLO_ACK,
+            &encode_cbor(&old_ack).unwrap(),
+            Bytes::new(),
+        )
+        .unwrap()
+        {
+            ReplFrame::HelloAck(a) => assert_eq!(a.bus_features, 0),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        let mut featured = hello();
+        featured.bus_features = BUS_FEATURE_PRODUCE_FORWARD;
+        let bytes = encode_cbor(&featured).unwrap();
+        assert!(decode_cbor::<HelloBefore>(&bytes).is_ok());
+        match decode_frame(KIND_HELLO, &bytes, Bytes::new()).unwrap() {
+            ReplFrame::Hello(h) => assert_eq!(h.bus_features, BUS_FEATURE_PRODUCE_FORWARD),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let mut featured_ack = hello_ack(None);
+        featured_ack.bus_features = BUS_FEATURE_PRODUCE_FORWARD;
+        assert!(decode_cbor::<HelloAckBefore>(&encode_cbor(&featured_ack).unwrap()).is_ok());
+    }
+
+    fn forward_request() -> ProduceForward {
+        ProduceForward {
+            instance_id: "tentabus-00000001".into(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org-1".into(),
+            topic: "orders".into(),
+            actor: Some("alice".into()),
+            actor_kind: "user".into(),
+            correlation_id: Some("corr".into()),
+            origin: "rest".into(),
+            broker_dead_letter: false,
+            producer: None,
+            groups: vec![ForwardGroup {
+                partition: 2,
+                records: vec![ForwardRecord {
+                    key: Some(serde_bytes::ByteBuf::from(vec![1, 2, 3])),
+                    headers: vec![("h".into(), serde_bytes::ByteBuf::from(vec![0xFF, 0x00]))],
+                    payload: serde_bytes::ByteBuf::from(vec![0u8, 255, 7]),
+                    timestamp_ms: -5,
+                    schema_id: 9,
+                }],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_forward_frames_round_trip() {
+        let request = forward_request();
+        assert_eq!(
+            roundtrip(ReplFrame::ProduceForward(request.clone())).await,
+            ReplFrame::ProduceForward(request)
+        );
+        let reply = ProduceForwardReply {
+            result: Some(ForwardResult {
+                duplicate: false,
+                accepted: 1,
+                deduplicated: 0,
+                partitions: vec![ForwardAck {
+                    partition: 2,
+                    base_offset: 10,
+                    accepted: 1,
+                }],
+                schema_rejected: 0,
+                schema_dropped: 0,
+            }),
+            error: None,
+        };
+        assert_eq!(
+            roundtrip(ReplFrame::ProduceForwardReply(reply.clone())).await,
+            ReplFrame::ProduceForwardReply(reply)
+        );
+        let failed = ProduceForwardReply {
+            result: None,
+            error: Some(ForwardError {
+                code: "bus.not_leader".into(),
+                message: "m".into(),
+                texts: vec!["node-b".into()],
+                numbers: vec![3],
+                acked: vec![],
+            }),
+        };
+        assert_eq!(
+            roundtrip(ReplFrame::ProduceForwardReply(failed.clone())).await,
+            ReplFrame::ProduceForwardReply(failed)
+        );
+    }
+
+    /// A build before forwarding answers its frame kinds with `UnknownKind`:
+    /// the sender relies on exactly that failing, never on a half-decode.
+    #[test]
+    fn the_forward_kinds_are_numbered_past_every_older_kind() {
+        assert_eq!(KIND_PRODUCE_FORWARD, 9);
+        assert_eq!(KIND_PRODUCE_FORWARD_REPLY, 10);
+        assert!(matches!(
+            decode_frame(11, &[], Bytes::new()),
+            Err(ReplCodecError::UnknownKind(11))
+        ));
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@
 // partitions it leads, whose followers are the ones dialing nothing.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tentaflow_protocol::environment::NodeEnvironment;
@@ -50,6 +50,7 @@ use tentaflow_protocol::environment::NodeEnvironment;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::replication::assignment::{PartitionAssignment, SqliteLedgerAssignmentStore};
 use crate::bus::replication::follower::FollowerConfig;
+use crate::bus::replication::forward::ForwardedPublishHandler;
 use crate::bus::replication::glue::{
     AuditLogReplAudit, GlueFollowerFactory, GlueLeaderFactory, PartitionProvider,
 };
@@ -247,6 +248,10 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         majority_await_timeout: election::MAJORITY_AWAIT_TIMEOUT,
     });
 
+    // Installed before `router::register`: a `ProduceForward` that reached
+    // the manager earlier would be refused for want of a handler.
+    manager.set_forward_handler(Arc::downgrade(&svc) as Weak<dyn ForwardedPublishHandler>);
+
     // W5 review round 2 finding 1: this fallible read MUST run before
     // `router::register` below, not after — the doc two paragraphs up
     // promises "an error return leaks nothing: no router registration, no
@@ -268,7 +273,12 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
     }
 
     spawn_lease_check_loop(Arc::clone(&manager), cfg.lease_check_interval);
-    spawn_peer_disconnect_loop(Arc::clone(&manager), Arc::clone(&cfg.mesh));
+    spawn_peer_liveness_loop(Arc::clone(&manager), Arc::clone(&cfg.mesh));
+    // The loop above only sees events from now on; the peers the mesh is
+    // already connected to would read as unreachable until their next one.
+    // Seeded after the loop started, and without overwriting what it has
+    // already recorded: an event is newer than this snapshot.
+    manager.seed_connected_peers(&cfg.mesh.connected_peers().await);
     spawn_assignment_poll_loop(
         Arc::clone(&manager),
         Arc::clone(&ledger_store),
@@ -460,11 +470,14 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
 /// `ReplicationManager::on_peer_disconnected` — the lease-expiry
 /// ACCELERATOR (never the only signal; `manager.rs`'s own doc), so a
 /// follower whose leader's mesh connection just dropped does not always
-/// have to wait out the full lease before starting an election. Ends when
+/// have to wait out the full lease before starting an election. The same
+/// loop feeds the manager's view of which peers are reachable
+/// (`on_peer_connected`, `note_peer_signal` for mesh heartbeats), which
+/// `snapshot` reports and topic placement reads. Ends when
 /// `manager.shutdown_token()` is cancelled OR the mesh's own event
 /// broadcaster closes (mesh shutdown already implies replication shutdown
 /// is imminent).
-fn spawn_peer_disconnect_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMeshManager>) {
+fn spawn_peer_liveness_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMeshManager>) {
     let shutdown = manager.shutdown_token();
     let mut rx = mesh.subscribe();
     tokio::spawn(async move {
@@ -475,12 +488,21 @@ fn spawn_peer_disconnect_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMe
                     Ok(IrohMeshEvent::PeerDisconnected { node_id }) => {
                         manager.on_peer_disconnected(&node_id);
                     }
+                    Ok(IrohMeshEvent::PeerConnected { node_id }) => {
+                        manager.on_peer_connected(&node_id);
+                    }
+                    Ok(IrohMeshEvent::HeartbeatReceived { node_id, .. }) => {
+                        manager.note_peer_signal(&node_id);
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // A missed disconnect event only costs the
                         // ACCELERATION this loop provides — the real
                         // `leader_lease_ms` watchdog (`follower.rs`)
-                        // still fires on its own regardless.
+                        // still fires on its own regardless. What
+                        // reachability reports needs the real state back:
+                        // read it again from the mesh.
+                        manager.reconcile_connected_peers(&mesh.connected_peers().await);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },

@@ -34,12 +34,15 @@
 // is this file's supervisor loop re-dialing.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tentaflow_protocol::environment::NodeEnvironment;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
@@ -706,6 +709,13 @@ impl LeaderHandle for GlueLeaderHandle {
         self.0.leader.has_quorum_lease()
     }
 
+    fn replica_ack_age(&self, node_id: &str) -> Option<Duration> {
+        self.0
+            .leader
+            .follower_state(node_id)
+            .map(|state| state.last_ack_at.elapsed())
+    }
+
     fn open_writes(&self) {
         let mut writes = self.0.writes.lock();
         if !writes.stopped && !writes.open {
@@ -994,6 +1004,14 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         let stopped = Arc::new(AtomicBool::new(false));
         let last_reject = Arc::new(Mutex::new(None::<ReplReject>));
 
+        // The accepted `Hello` just arrived on this stream: that is the first
+        // frame of the leader's this runner has seen.
+        let last_frame = Arc::new(Mutex::new(Some(Instant::now())));
+        let leader_recv = StampedReader {
+            inner: leader_recv,
+            last_read: Arc::clone(&last_frame),
+        };
+
         let task_partition = Arc::clone(&partition);
         let task_disconnect_hint = Arc::clone(&disconnect_hint);
         let task_lease_expired = Arc::clone(&lease_expired);
@@ -1074,9 +1092,33 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
             disconnect_hint,
             lease_expired,
             last_reject,
+            last_frame,
             stopped,
             task: Mutex::new(Some(task)),
         }))
+    }
+}
+
+/// A leader stream's reader that notes when bytes last arrived on it, which
+/// is what `FollowerRunner::last_frame_age` reports: the leader is heard from
+/// whenever it sends a batch, a heartbeat or any other frame.
+struct StampedReader<R> {
+    inner: R,
+    last_read: Arc<Mutex<Option<Instant>>>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StampedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            *self.last_read.lock() = Some(Instant::now());
+        }
+        poll
     }
 }
 
@@ -1085,6 +1127,7 @@ struct GlueFollowerRunner {
     disconnect_hint: Arc<Notify>,
     lease_expired: Arc<AtomicBool>,
     last_reject: Arc<Mutex<Option<ReplReject>>>,
+    last_frame: Arc<Mutex<Option<Instant>>>,
     #[allow(dead_code)]
     // reserved: mirrors `GlueLeaderShared::stopped`'s shape for symmetry/future use.
     stopped: Arc<AtomicBool>,
@@ -1118,6 +1161,10 @@ impl FollowerRunner for GlueFollowerRunner {
 
     fn last_hello_reject(&self) -> Option<ReplReject> {
         self.last_reject.lock().clone()
+    }
+
+    fn last_frame_age(&self) -> Option<Duration> {
+        self.last_frame.lock().map(|at| at.elapsed())
     }
 
     fn stop(&self) {
@@ -2255,6 +2302,7 @@ mod tests {
             replicas: a.replicas.clone(),
             environment: NodeEnvironment::Prod,
             topic_generation: Some(0),
+            bus_features: 0,
         };
         let runner = factory
             .spawn(&a, hello, Box::new(recv), Box::new(send))

@@ -995,6 +995,80 @@ fn process_three_node_bus_failover_smoke() {
     );
 }
 
+// ===== Publish on a non-leader node (non-ignored) ============================
+//
+// Real iroh between three processes: a write handed to a node that does not
+// lead the partition is forwarded to the leader over ALPN_BUS and lands in
+// the leader's log, which then replicates it to every replica, the node the
+// write came in on included.
+#[test]
+fn process_three_node_bus_publish_on_a_non_leader_node_reaches_the_leader() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("root");
+
+    let mut a = ChildNode::spawn("a", root.path().join("a"));
+    let mut b = ChildNode::spawn("b", root.path().join("b"));
+    let mut c = ChildNode::spawn("c", root.path().join("c"));
+
+    connect_nodes(&mut a, &mut b);
+    connect_nodes(&mut a, &mut c);
+    connect_nodes(&mut b, &mut c);
+
+    create_topic_everywhere(&mut a, &mut [&mut b, &mut c]);
+
+    let leader_id = a.node_id.clone();
+    let replicas = vec![a.node_id.clone(), b.node_id.clone(), c.node_id.clone()];
+    assign_and_wait(
+        &mut a,
+        &mut [&mut b, &mut c],
+        &leader_id,
+        &replicas,
+        Duration::from_secs(30),
+    );
+    wait_role(&mut b, "Follower", Duration::from_secs(30));
+
+    let line = b
+        .try_command(
+            &format!("PUBLISH_BATCH {ORG_ID} {TOPIC} 100 {RECORD_BYTES}"),
+            Duration::from_secs(20),
+        )
+        .expect("publish on a non-leader node");
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let base_offset: u64 = parts[3].parse().unwrap();
+    let accepted: u32 = parts[4].parse().unwrap();
+    assert_eq!(accepted, 100);
+    let total = base_offset + accepted as u64;
+
+    for node in [&mut a, &mut b, &mut c] {
+        let started = Instant::now();
+        loop {
+            let (_, hw, _) = partition_stats(node);
+            if hw >= total {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "{} did not reach hw={total} within 60s",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let (hash_a, count_a) = hash_log(&mut a, total);
+    let (hash_b, count_b) = hash_log(&mut b, total);
+    let (hash_c, count_c) = hash_log(&mut c, total);
+    assert_eq!(count_a, total, "the leader holds every forwarded record");
+    assert_eq!(count_a, count_b);
+    assert_eq!(count_a, count_c);
+    assert_eq!(
+        hash_a, hash_b,
+        "the node the write came in on follows the leader"
+    );
+    assert_eq!(hash_a, hash_c);
+}
+
 // ===== Topic re-creation across nodes (non-ignored) =========================
 //
 // A topic deleted on one node and created again under the same name is a
@@ -1837,7 +1911,9 @@ async fn child_main() {
         // into "the new leader never replied".
         publish_ack_timeout: Duration::from_millis(1500),
         partition_handle_lru: None,
-        settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[7u8; 32]))),
+        settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+            &[7u8; 32],
+        ))),
     })
     .expect("bus init");
 

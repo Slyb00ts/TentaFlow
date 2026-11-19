@@ -483,6 +483,12 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             ProtocolErrorCode::NotAvailable,
             format!("bus.ack_timeout: acked={acked} required={required}"),
         ),
+        // The request reached the partition leader and no answer came back:
+        // the records may be in the log, so a client must not blindly retry.
+        BusServiceError::ForwardOutcomeUnknown { leader_node_id } => ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            format!("bus.forward_outcome_unknown: leader_node_id={leader_node_id}"),
+        ),
         BusServiceError::PartitionUnavailable { reason } => ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             format!("bus.partition_unavailable: {reason}"),

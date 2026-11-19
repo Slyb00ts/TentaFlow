@@ -125,6 +125,8 @@ use crate::db::DbPool;
 use crate::flow_engine::envelope::FlowValue;
 use crate::flow_engine::expr;
 use instance::BusInstanceId;
+use replication::forward::{ForwardJob, ForwardTotals, ForwardUnavailable, PublishSource};
+use replication::frames::{ProduceForward, ProduceForwardReply};
 
 /// plan-app-platform §7 W4 finding 3: `bus::init`/`bus::global` are a
 /// TEMPORARY single-instance compatibility shim over the `BUS_INSTANCES`
@@ -608,6 +610,10 @@ pub(crate) fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
 struct TopicPlacement {
     local_node_id: String,
     same_env: Vec<String>,
+    /// Same-environment peers this node knows of and left out because they
+    /// are not reachable now: a topic placed without them has fewer replicas
+    /// than the cluster could give it.
+    unreachable: Vec<String>,
 }
 
 /// M2 (PLAN-M2 §1e): `create_topic`'s initial replica set for one
@@ -949,6 +955,14 @@ pub enum BusServiceError {
     /// blind retry may duplicate.
     #[error("timed out waiting for replica acks: acked={acked}, required={required}")]
     AckTimeout { acked: u32, required: u32 },
+    /// A write was handed to the partition leader `leader_node_id` and no
+    /// answer came back (the stream was reset, the reply timed out, or the
+    /// leader was lost while it was working). The leader may or may not have
+    /// appended the records, so — like `AckTimeout` — a blind retry can
+    /// write them twice; a producer that needs exactly-once sets a dedup key
+    /// or producer sequence.
+    #[error("the write was sent to leader '{leader_node_id}' but no answer arrived; it may or may not have been appended")]
+    ForwardOutcomeUnknown { leader_node_id: String },
     /// The partition cannot currently serve the request for a reason that
     /// is neither "not leader" nor "not enough replicas" specifically
     /// (e.g. no assignment yet, mid-reassignment). `reason` is meant to be
@@ -2291,6 +2305,58 @@ pub trait ReplicationCoordinator: Send + Sync {
     /// `replication::ReplicationManager` is the only override.
     fn isr_shrink_total(&self) -> u64 {
         0
+    }
+    /// Whether this coordinator can hand a publish to another node
+    /// (`forward_publish`). `publish` forwards a write for a partition led
+    /// elsewhere only when it can; otherwise it answers `NotLeader`, as a
+    /// build without forwarding does.
+    fn can_forward_publish(&self) -> bool {
+        false
+    }
+    /// Hands `request` to `target`, the leader of its partitions, and waits
+    /// up to `timeout` for the leader's answer. Blocking: the caller is a
+    /// blocking thread, like every `publish` caller. `Err` means no leader
+    /// answered at all, which the caller reports as the `NotLeader` it would
+    /// have returned without forwarding.
+    ///
+    /// `still_valid` says whether `target` still is the leader the caller
+    /// means to reach and still answers; the implementation polls it while
+    /// it waits and ends the wait early once it turns false (a leader that
+    /// crashed must not hold the caller for the whole `timeout`).
+    fn forward_publish(
+        &self,
+        target: &str,
+        request: ProduceForward,
+        timeout: Duration,
+        still_valid: &dyn Fn() -> bool,
+    ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+        let _ = (target, request, timeout, still_valid);
+        Err(ForwardUnavailable::Unsupported)
+    }
+    /// The leader and epoch the cluster-wide assignment of a partition
+    /// names, for a node that holds no replica of it (`role` is then
+    /// `Unavailable` and says nothing about who leads).
+    fn assigned_leader(&self, org_id: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
+        let _ = (org_id, topic, partition);
+        None
+    }
+    /// A counter that moves whenever an assignment or role of this node
+    /// changes; pair with `wait_for_assignment_change`.
+    fn assignment_generation(&self) -> u64 {
+        0
+    }
+    /// Blocks up to `timeout` until `assignment_generation` differs from
+    /// `seen`; `false` when it did not. The default never waits.
+    fn wait_for_assignment_change(&self, seen: u64, timeout: Duration) -> bool {
+        let _ = (seen, timeout);
+        false
+    }
+    /// Whether `node_id` currently answers: a live mesh connection, or a
+    /// replication frame from it recently. Defaulted to `true` for a
+    /// coordinator that has no view of its peers.
+    fn node_reachable(&self, node_id: &str) -> bool {
+        let _ = node_id;
+        true
     }
 }
 
@@ -5087,12 +5153,14 @@ impl BusService {
     /// assignments to report, the snapshot's actual `reachable` signal is
     /// strictly better than trust-pairing's "was reachable at handshake
     /// time" and takes over again on its own (the self-correcting half of
-    /// this doc's previous note still holds).
+    /// this doc's previous note still holds). A node the snapshot reports
+    /// unreachable is never offered, and the fallback skips trusted peers
+    /// the coordinator knows to be down (`ReplicationCoordinator::
+    /// node_reachable`).
     ///
     /// Residual, accepted limitation: a trusted peer is not necessarily
     /// running THIS TentaBus instance (`trusted_nodes` has no instance
-    /// column — platform-wide pairing, not per-app membership) or even
-    /// online right now (pairing-time liveness, not current). Padding
+    /// column — platform-wide pairing, not per-app membership). Padding
     /// `replicas`/`isr` with such a node would normally be a problem
     /// (`election::min_isr_required(rf) = floor(rf/2)+1` computed from the
     /// replica set, permanently raising the write quorum), but
@@ -5110,14 +5178,26 @@ impl BusService {
         let coordinator = self.replication()?;
         let local_node_id = coordinator.local_node_id();
         let snapshot = coordinator.snapshot(org_id, None);
-        let mut same_env: Vec<String> = snapshot
+        let known_peers: Vec<&ReplicaNodeInfo> = snapshot
             .nodes
             .iter()
-            .filter(|n| n.environment == env && n.reachable && n.node_id != local_node_id)
+            .filter(|n| n.environment == env && n.node_id != local_node_id)
+            .collect();
+        let mut same_env: Vec<String> = known_peers
+            .iter()
+            .filter(|n| n.reachable)
             .map(|n| n.node_id.clone())
             .collect();
-        if same_env.is_empty() {
-            same_env = crate::db::repository::list_trusted_nodes(&self.db)
+        let mut unreachable: Vec<String> = known_peers
+            .iter()
+            .filter(|n| !n.reachable)
+            .map(|n| n.node_id.clone())
+            .collect();
+        // Only a snapshot that knows no peer at all falls back to the trust
+        // registry. One whose peers are all down must not: the registry would
+        // name those same dead nodes again.
+        if known_peers.is_empty() {
+            let trusted: Vec<_> = crate::db::repository::list_trusted_nodes(&self.db)
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         org_id, error = %e,
@@ -5137,11 +5217,16 @@ impl BusService {
                 })
                 .map(|n| n.node_id)
                 .collect();
+            (same_env, unreachable) = trusted
+                .into_iter()
+                .partition(|node_id| coordinator.node_reachable(node_id));
         }
         same_env.sort();
+        unreachable.sort();
         Some(TopicPlacement {
             local_node_id,
             same_env,
+            unreachable,
         })
     }
 
@@ -5465,13 +5550,40 @@ impl BusService {
         // `opts.replication_factor` exactly as the caller passed it and
         // proposes nothing, same as "no coordinator" would.
         let mut placement: Option<(String, Vec<String>)> = None;
+        // A known peer that is down when the topic is placed is left out for
+        // good (placement is not revisited), so a shortfall against the
+        // replication factor the cluster could have given is said out loud:
+        // in the audit row and the log, never silently.
+        let mut reduced_detail = String::new();
         if let Some(resolved) = self.resolve_topic_placement(&ctx.org_id, env) {
-            if opts.replication_factor.is_none() {
+            let requested_rf = opts.replication_factor;
+            if requested_rf.is_none() {
                 opts.replication_factor = Some(default_rf_for_nodes(healthy_node_count(
                     resolved.same_env.len(),
                 )));
             }
             if !resolved.local_node_id.is_empty() {
+                if !resolved.unreachable.is_empty() {
+                    let wanted = requested_rf.unwrap_or_else(|| {
+                        default_rf_for_nodes(healthy_node_count(
+                            resolved.same_env.len() + resolved.unreachable.len(),
+                        ))
+                    });
+                    let given = wanted.min(1 + resolved.same_env.len() as u32);
+                    if given < wanted {
+                        tracing::warn!(
+                            org_id = %ctx.org_id, topic = name, wanted, given,
+                            unreachable = ?resolved.unreachable,
+                            "topic placed with fewer replicas than the cluster could give it: \
+                             peers that are not reachable now are left out"
+                        );
+                        reduced_detail = format!(
+                            " replication_reduced wanted_rf={wanted} placed_rf={given} \
+                             unreachable_peers={}",
+                            resolved.unreachable.join(",")
+                        );
+                    }
+                }
                 placement = Some((resolved.local_node_id, resolved.same_env));
             }
         }
@@ -5523,7 +5635,7 @@ impl BusService {
                 &ctx.org_id,
                 Some(&format!(
                     "partitions={} retention_ms={} environment={} durability={} \
-                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail} \
+                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail}{reduced_detail} \
                      acl_entries_removed={} field_policies_removed={}",
                     cfg.partitions,
                     cfg.retention_ms,
@@ -5905,7 +6017,7 @@ impl BusService {
         topic: &str,
         batch: PublishBatch,
     ) -> Result<PublishResult, BusServiceError> {
-        self.publish_routed(ctx, topic, batch, None, false)
+        self.publish_routed(ctx, topic, batch, None, false, PublishSource::Local, None)
     }
 
     /// `publish` for a write the BROKER makes into `__dlq.<topic>` (the
@@ -5918,8 +6030,9 @@ impl BusService {
         ctx: &BusCallContext,
         dlq_topic: &str,
         batch: PublishBatch,
+        source: PublishSource<'_>,
     ) -> Result<PublishResult, BusServiceError> {
-        self.publish_routed(ctx, dlq_topic, batch, None, true)
+        self.publish_routed(ctx, dlq_topic, batch, None, true, source, None)
     }
 
     /// `publish`, with the partition of `__dlq.<topic>` a `validation = dlq`
@@ -5927,6 +6040,15 @@ impl BusService {
     /// keyless write, `Some(p)` pins them to `p` — `dlq_retry` passes the
     /// DLQ partition it already leads, so a record its validation rejects
     /// again cannot fail to land for want of another partition's leader.
+    ///
+    /// `source` says how the call reached this node: records for partitions
+    /// led elsewhere go to their leaders only for `PublishSource::Local`
+    /// (`replication::forward`), and a refusal of a forwarded call names the
+    /// forwarding peer in its audit row.
+    ///
+    /// `preassigned` is the partition of each record of `batch`, in order,
+    /// chosen by the node that forwarded the call; `None` resolves them here.
+    #[allow(clippy::too_many_arguments)]
     fn publish_routed(
         &self,
         ctx: &BusCallContext,
@@ -5934,13 +6056,21 @@ impl BusService {
         mut batch: PublishBatch,
         quarantine_partition: Option<u32>,
         broker_dead_letter: bool,
+        source: PublishSource<'_>,
+        preassigned: Option<Vec<u32>>,
     ) -> Result<PublishResult, BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
+        let refusal_note = source.audit_note();
         self.authorizer
             .authorize(ctx, BusAction::Produce, topic)
             .map_err(|_| {
-                self.audit_windowed(ctx, "bus.produce.denied", Some(topic), None);
+                self.audit_windowed(
+                    ctx,
+                    "bus.produce.denied",
+                    Some(topic),
+                    refusal_note.as_deref(),
+                );
                 deny(BusAction::Produce, topic)
             })?;
         if batch.records.is_empty() {
@@ -5993,7 +6123,12 @@ impl BusService {
             )?
         };
         if write_policy.is_some() && topic.starts_with(dlq::DLQ_TOPIC_PREFIX) {
-            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+            self.audit_windowed(
+                ctx,
+                "bus.field_not_allowed",
+                Some(topic),
+                refusal_note.as_deref(),
+            );
             return Err(deny(BusAction::Produce, topic));
         }
         if let Some(policy) = write_policy {
@@ -6025,7 +6160,12 @@ impl BusService {
                             topic,
                             &mut work,
                         ) {
-                            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+                            self.audit_windowed(
+                                ctx,
+                                "bus.field_not_allowed",
+                                Some(topic),
+                                refusal_note.as_deref(),
+                            );
                             return Err(e);
                         }
                     }
@@ -6039,13 +6179,62 @@ impl BusService {
                         if let Err(e) =
                             field_policies::validate_write(&policy, format, &r.payload, topic)
                         {
-                            self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+                            self.audit_windowed(
+                                ctx,
+                                "bus.field_not_allowed",
+                                Some(topic),
+                                refusal_note.as_deref(),
+                            );
                             return Err(e);
                         }
                     }
                 }
             }
         }
+        // Partitions are chosen on the records as they arrive, and a call that
+        // may be forwarded is split here, BEFORE the per-record checks below:
+        // a record for a partition led elsewhere is checked, counted and
+        // audited by its leader only, never twice. Whole-batch refusals
+        // (authorization, size, field policy) have been made above, so such a
+        // batch is still refused as a whole.
+        let coordinator = self.replication();
+        let mut tags: Option<Vec<u32>> = preassigned;
+        let mut foreign: Vec<(u32, Vec<PublishRecord>)> = Vec::new();
+        if tags.is_none() {
+            if let Some(coordinator) = &coordinator {
+                if source.may_forward() && coordinator.can_forward_publish() {
+                    let assigned = self.resolve_partitions(&ctx.org_id, topic, &cfg, &batch);
+                    let mut led_here: std::collections::HashMap<u32, bool> =
+                        std::collections::HashMap::new();
+                    let mut kept_records = Vec::with_capacity(batch.records.len());
+                    let mut kept_tags = Vec::with_capacity(batch.records.len());
+                    for (record, partition) in std::mem::take(&mut batch.records)
+                        .into_iter()
+                        .zip(assigned)
+                    {
+                        let here = *led_here.entry(partition).or_insert_with(|| {
+                            matches!(
+                                coordinator.role(&ctx.org_id, topic, partition),
+                                PartitionRole::Leader { .. }
+                            )
+                        });
+                        if here {
+                            kept_records.push(record);
+                            kept_tags.push(partition);
+                        } else {
+                            match foreign.iter_mut().find(|(p, _)| *p == partition) {
+                                Some((_, recs)) => recs.push(record),
+                                None => foreign.push((partition, vec![record])),
+                            }
+                        }
+                    }
+                    batch.records = kept_records;
+                    tags = Some(kept_tags);
+                    replication::forward::ensure_forwardable(&foreign)?;
+                }
+            }
+        }
+
         // SUM/tentabus/PLAN-F3.md §4: schema validation. `off` (the
         // default, and every pre-F3 topic's value) is a single enum
         // comparison and touches nothing else — P11/P12 structurally
@@ -6073,6 +6262,8 @@ impl BusService {
             let ops = resolved.schema_type.ops();
             let compiled = &resolved.compiled;
             let mut kept: Vec<PublishRecord> = Vec::with_capacity(batch.records.len());
+            let mut kept_tags: Vec<u32> = Vec::new();
+            let record_tags = tags.take();
             let mut violations: Vec<PublishRecord> = Vec::new();
             // One allowance for the whole batch: per-record budgets would let
             // N hostile records cost N times the per-document cap.
@@ -6080,7 +6271,8 @@ impl BusService {
                 &ctx.org_id,
                 batch.records.iter().map(|r| r.payload.len()).sum(),
             );
-            for mut r in std::mem::take(&mut batch.records) {
+            for (index, mut r) in std::mem::take(&mut batch.records).into_iter().enumerate() {
+                let tag = record_tags.as_ref().map(|t| t[index]);
                 // A document the check gave up on is quarantined or warned
                 // about like a violation, but under its own reason: it is
                 // not known to be invalid.
@@ -6108,6 +6300,7 @@ impl BusService {
                         // (PLAN-F3 §4.6).
                         r.schema_id = resolved.schema_ref_id;
                         kept.push(r);
+                        kept_tags.extend(tag);
                     }
                     Err((reason, detail)) => {
                         // A check that gave up is not a violation: it has
@@ -6140,6 +6333,7 @@ impl BusService {
                                     "schema violation (warn mode): record accepted unchanged"
                                 );
                                 kept.push(r);
+                                kept_tags.extend(tag);
                             }
                             topics::ValidationMode::Dlq => {
                                 tracing::warn!(
@@ -6228,6 +6422,10 @@ impl BusService {
                     }
                 }
                 let dlq_result = dlq_cfg.and_then(|_| {
+                    // The quarantine copy never travels on from a forwarded
+                    // call: a DLQ partition this leader does not lead refuses
+                    // it, and the records are dropped and counted like any
+                    // quarantine that cannot land.
                     self.publish_dead_letter(
                         &quarantine_ctx,
                         &dlq_topic,
@@ -6236,6 +6434,7 @@ impl BusService {
                             producer: None,
                             records: violations,
                         },
+                        source,
                     )
                 });
                 // Counted only once the quarantine copies are written: a
@@ -6267,7 +6466,8 @@ impl BusService {
                 }
             }
             batch.records = kept;
-            if batch.records.is_empty() {
+            tags = record_tags.map(|_| kept_tags);
+            if batch.records.is_empty() && foreign.is_empty() {
                 return Ok(PublishResult {
                     duplicate: false,
                     accepted: 0,
@@ -6295,7 +6495,11 @@ impl BusService {
         // value through every downstream per-partition-group structure
         // below for a feature that is opt-in per topic.
         if let Some(expr_text) = &cfg.idempotency_key {
-            for r in &batch.records {
+            for r in batch
+                .records
+                .iter()
+                .chain(foreign.iter().flat_map(|(_, recs)| recs.iter()))
+            {
                 compute_idempotency_dedup_key(expr_text, r, topic)?;
             }
         }
@@ -6310,7 +6514,10 @@ impl BusService {
         // charging quota for a publish that never touches the engine would
         // be a real (if minor) resource leak for a producer that keeps
         // retrying against a partition it can never reach.
-        let assigned = self.resolve_partitions(&ctx.org_id, topic, &cfg, &batch);
+        let assigned = match tags {
+            Some(tags) => tags,
+            None => self.resolve_partitions(&ctx.org_id, topic, &cfg, &batch),
+        };
         let mut groups: Vec<(u32, Vec<PublishRecord>)> = Vec::new();
         for (record, partition) in batch.records.into_iter().zip(assigned) {
             match groups.iter_mut().find(|(p, _)| *p == partition) {
@@ -6329,7 +6536,6 @@ impl BusService {
         // (`Partition::append_batch_as_leader`): leadership can move during
         // the earlier partitions' quorum waits, and a write admitted in one
         // term must not land in a log that meanwhile belongs to the next.
-        let coordinator = self.replication();
         let mut admitted_epochs: Vec<(u32, u32)> = Vec::new();
         if let Some(coordinator) = &coordinator {
             for (partition, _) in &groups {
@@ -6364,7 +6570,7 @@ impl BusService {
         // publish over framing bytes it cannot show the operator.
         let max_bytes_total = self.quota.max_bytes_total(&ctx.org_id);
         let stored_bytes = self.org_stored_bytes(&ctx.org_id);
-        if stored_bytes.saturating_add(total_bytes) > max_bytes_total {
+        if total_records > 0 && stored_bytes.saturating_add(total_bytes) > max_bytes_total {
             self.audit_windowed(ctx, "bus.quota.exceeded", Some(topic), None);
             self.throttled_total.fetch_add(1, Ordering::Relaxed);
             return Err(BusServiceError::MaxBytesTotalExceeded {
@@ -6695,6 +6901,21 @@ impl BusService {
             }
         }
 
+        // What the other leaders took is counted by them, with their own
+        // rates and totals.
+        let mut forwarded = ForwardTotals::default();
+        if let Some(coordinator) = coordinator.as_ref().filter(|_| !foreign.is_empty()) {
+            let job = ForwardJob {
+                ctx,
+                topic,
+                producer: batch.producer.as_ref(),
+                broker_dead_letter,
+            };
+            forwarded = self
+                .forward_to_leaders(coordinator, &job, foreign, &mut acks)
+                .map_err(|e| wrap_err(&acks, e))?;
+        }
+
         if total_accepted > 0 {
             self.record_publish_rate(
                 &ctx.org_id,
@@ -6715,13 +6936,14 @@ impl BusService {
         self.publish_bytes_total
             .fetch_add(total_bytes, Ordering::Relaxed);
 
+        let accepted = total_accepted + forwarded.accepted;
         Ok(PublishResult {
-            duplicate: any_replay && total_accepted == 0,
-            accepted: total_accepted,
-            deduplicated: total_deduplicated,
+            duplicate: (any_replay || forwarded.duplicate) && accepted == 0,
+            accepted,
+            deduplicated: total_deduplicated + forwarded.deduplicated,
             partitions: acks,
-            schema_rejected,
-            schema_dropped,
+            schema_rejected: schema_rejected + forwarded.schema_rejected,
+            schema_dropped: schema_dropped + forwarded.schema_dropped,
         })
     }
 
@@ -8115,7 +8337,12 @@ impl BusService {
     /// external input path. Best-effort: any failure is logged and
     /// swallowed rather than propagated, since this must never take down
     /// the timer thread or block real traffic.
-    fn publish_metrics_rollup(&self) {
+    ///
+    /// The topic has one partition and one replica, so a node that does not
+    /// lead it hands the record to the leader (`replication::forward`); the
+    /// record's key is this node's id, so the reader can tell the nodes'
+    /// rollups apart.
+    pub fn publish_metrics_rollup(&self) {
         let ctx = BusCallContext {
             instance_id: self.typed_instance_id(),
             org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
@@ -8144,8 +8371,12 @@ impl BusService {
                 return;
             }
         };
+        let node_id = self
+            .replication()
+            .map(|c| c.local_node_id())
+            .filter(|id| !id.is_empty());
         let record = PublishRecord {
-            key: None,
+            key: node_id.map(Bytes::from),
             headers: Vec::new(),
             payload: Bytes::from(payload),
             timestamp_ms: now_ms(),
@@ -8382,6 +8613,7 @@ impl BusService {
                 producer: None,
                 records: vec![dlq_record],
             },
+            PublishSource::Local,
         )?;
         let _ = crate::db::repository::log_audit(
             &self.db,
@@ -8609,6 +8841,10 @@ impl BusService {
             },
             Some(dlq_partition),
             false,
+            // This node leads the source partition (checked above); the
+            // retry is never handed to another node.
+            PublishSource::LocalOnly,
+            None,
         )?;
         if !dlq_retry_settled(&result) {
             let (topic, partition, offset) = (dlq_topic.to_string(), dlq_partition, dlq_offset);
@@ -10632,6 +10868,10 @@ mod tests {
     }
 
     fn test_service() -> (tempfile::TempDir, BusService) {
+        test_service_with(Arc::new(AllowAllAuthorizer))
+    }
+
+    fn test_service_with(authorizer: Arc<dyn BusAuthorizer>) -> (tempfile::TempDir, BusService) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let bus_dir = dir.path().join("bus");
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
@@ -10642,7 +10882,7 @@ mod tests {
             local_db: test_local_db(),
             bus_dir,
             db,
-            authorizer: Arc::new(AllowAllAuthorizer),
+            authorizer,
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
@@ -17792,6 +18032,26 @@ mod tests {
         /// topic; wins over the other overrides.
         topic_partition_roles:
             parking_lot::Mutex<std::collections::HashMap<(String, u32), PartitionRole>>,
+        /// Nodes `node_reachable` reports as down.
+        down_nodes: parking_lot::Mutex<std::collections::HashSet<String>>,
+        /// Whether `can_forward_publish` is true.
+        forwarding: std::sync::atomic::AtomicBool,
+        /// What `forward_publish` answers, in call order; `Unsupported` once
+        /// empty.
+        forward_script: parking_lot::Mutex<std::collections::VecDeque<ForwardStep>>,
+        /// Every `forward_publish` call: target and request.
+        forward_calls: parking_lot::Mutex<Vec<(String, ProduceForward)>>,
+        assignment_gen: std::sync::atomic::AtomicU64,
+        /// What `assigned_leader` names, per (topic, partition).
+        assigned_leaders:
+            parking_lot::Mutex<std::collections::HashMap<(String, u32), (String, u32)>>,
+    }
+
+    /// One scripted `forward_publish` answer, plus the role changes (and the
+    /// assignment-change wake-up) that follow it, as a leader move would.
+    struct ForwardStep {
+        reply: Result<ProduceForwardReply, ForwardUnavailable>,
+        then_roles: Vec<(u32, PartitionRole)>,
     }
 
     impl FakeCoordinator {
@@ -17812,7 +18072,31 @@ mod tests {
                 snapshot: parking_lot::Mutex::new(ReplicationSnapshot::default()),
                 reassign_calls: parking_lot::Mutex::new(Vec::new()),
                 local_node_id: parking_lot::Mutex::new(String::new()),
+                down_nodes: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                forwarding: std::sync::atomic::AtomicBool::new(false),
+                forward_script: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+                forward_calls: parking_lot::Mutex::new(Vec::new()),
+                assignment_gen: std::sync::atomic::AtomicU64::new(0),
+                assigned_leaders: parking_lot::Mutex::new(std::collections::HashMap::new()),
             })
+        }
+        fn set_node_down(&self, node_id: &str) {
+            self.down_nodes.lock().insert(node_id.to_string());
+        }
+        /// Turns forwarding on and queues the answers `forward_publish` gives.
+        fn script_forwarding(&self, steps: Vec<ForwardStep>) {
+            self.forwarding
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.forward_script.lock().extend(steps);
+        }
+        fn set_assigned_leader(&self, topic: &str, partition: u32, leader: &str, epoch: u32) {
+            self.assigned_leaders
+                .lock()
+                .insert((topic.to_string(), partition), (leader.to_string(), epoch));
+        }
+        fn bump_assignments(&self) {
+            self.assignment_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         fn set_role(&self, role: PartitionRole) {
             *self.role.lock() = role;
@@ -17963,6 +18247,53 @@ mod tests {
         }
         fn local_node_id(&self) -> String {
             self.local_node_id.lock().clone()
+        }
+        fn node_reachable(&self, node_id: &str) -> bool {
+            !self.down_nodes.lock().contains(node_id)
+        }
+        fn can_forward_publish(&self) -> bool {
+            self.forwarding.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn assigned_leader(&self, _org: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
+            self.assigned_leaders
+                .lock()
+                .get(&(topic.to_string(), partition))
+                .cloned()
+        }
+        fn forward_publish(
+            &self,
+            target: &str,
+            request: ProduceForward,
+            _timeout: Duration,
+            _still_valid: &dyn Fn() -> bool,
+        ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+            self.forward_calls
+                .lock()
+                .push((target.to_string(), request));
+            let Some(step) = self.forward_script.lock().pop_front() else {
+                return Err(ForwardUnavailable::Unsupported);
+            };
+            if !step.then_roles.is_empty() {
+                for (partition, role) in step.then_roles {
+                    self.set_partition_role(partition, role);
+                }
+                self.bump_assignments();
+            }
+            step.reply
+        }
+        fn assignment_generation(&self) -> u64 {
+            self.assignment_gen
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn wait_for_assignment_change(&self, seen: u64, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if self.assignment_generation() != seen {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
         }
     }
 
@@ -19118,6 +19449,981 @@ mod tests {
             .resolve_topic_placement("org-1", NodeEnvironment::Prod)
             .expect("placement");
         assert_eq!(placement.same_env, vec!["node-from-snapshot".to_string()]);
+    }
+
+    fn snapshot_peer(node_id: &str, reachable: bool) -> ReplicaNodeInfo {
+        ReplicaNodeInfo {
+            node_id: node_id.to_string(),
+            label: node_id.to_string(),
+            environment: NodeEnvironment::Prod,
+            is_local: false,
+            reachable,
+            last_heartbeat_ms_ago: None,
+            leader_count: 0,
+            follower_count: 0,
+            isr_count: 0,
+        }
+    }
+
+    fn trust_prod_peer(svc: &BusService, node_id: &str) {
+        crate::db::repository::add_trusted_node(
+            &svc.db,
+            node_id,
+            &format!("pk-{node_id}"),
+            "host",
+            "admin",
+            None,
+        )
+        .unwrap();
+        crate::db::repository::set_trusted_node_environment(
+            &svc.db,
+            node_id,
+            NodeEnvironment::Prod,
+        )
+        .unwrap();
+    }
+
+    /// K1: a node the snapshot reports unreachable is never offered for
+    /// placement, and the trust registry does not bring it back.
+    #[test]
+    fn resolve_topic_placement_skips_a_dead_snapshot_peer_even_when_it_is_trusted() {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("local-node");
+        coord.set_snapshot(ReplicationSnapshot {
+            nodes: vec![snapshot_peer("dead", false), snapshot_peer("alive", true)],
+            partitions: vec![],
+            failovers: vec![],
+        });
+        svc.set_replication(coord);
+        trust_prod_peer(&svc, "dead");
+
+        let placement = svc
+            .resolve_topic_placement("org-1", NodeEnvironment::Prod)
+            .expect("placement");
+        assert_eq!(placement.same_env, vec!["alive".to_string()]);
+    }
+
+    #[test]
+    fn resolve_topic_placement_does_not_fall_back_to_the_trust_list_when_every_snapshot_peer_is_dead(
+    ) {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("local-node");
+        coord.set_snapshot(ReplicationSnapshot {
+            nodes: vec![snapshot_peer("dead", false)],
+            partitions: vec![],
+            failovers: vec![],
+        });
+        svc.set_replication(coord);
+        trust_prod_peer(&svc, "dead");
+
+        let placement = svc
+            .resolve_topic_placement("org-1", NodeEnvironment::Prod)
+            .expect("placement");
+        assert!(
+            placement.same_env.is_empty(),
+            "a dead node must not come back through the trust list: {:?}",
+            placement.same_env
+        );
+    }
+
+    #[test]
+    fn resolve_topic_placement_trust_fallback_skips_a_node_the_coordinator_knows_is_down() {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("local-node");
+        coord.set_node_down("peer-down");
+        svc.set_replication(coord);
+        trust_prod_peer(&svc, "peer-up");
+        trust_prod_peer(&svc, "peer-down");
+
+        let placement = svc
+            .resolve_topic_placement("org-1", NodeEnvironment::Prod)
+            .expect("placement");
+        assert_eq!(placement.same_env, vec!["peer-up".to_string()]);
+    }
+
+    // ---- K2: forwarding a write to the partition leader --------------------
+
+    use replication::forward::ForwardedPublishHandler as _;
+
+    fn follower_of(node: &str, epoch: u32) -> PartitionRole {
+        PartitionRole::Follower {
+            leader_node_id: node.to_string(),
+            epoch,
+        }
+    }
+
+    fn landed(partition: u32, base_offset: u64, accepted: u32) -> ForwardStep {
+        ForwardStep {
+            reply: Ok(ProduceForwardReply {
+                result: Some(replication::frames::ForwardResult {
+                    duplicate: false,
+                    accepted,
+                    deduplicated: 0,
+                    partitions: vec![replication::frames::ForwardAck {
+                        partition,
+                        base_offset,
+                        accepted,
+                    }],
+                    schema_rejected: 0,
+                    schema_dropped: 0,
+                }),
+                error: None,
+            }),
+            then_roles: Vec::new(),
+        }
+    }
+
+    fn answered_with(error: &BusServiceError) -> ForwardStep {
+        ForwardStep {
+            reply: Ok(ProduceForwardReply {
+                result: None,
+                error: Some(replication::forward::error_to_wire(error)),
+            }),
+            then_roles: Vec::new(),
+        }
+    }
+
+    fn key_for_partition(partition: u32, partitions: u32) -> String {
+        (0..10_000)
+            .map(|i| format!("key-{i}"))
+            .find(|k| partition_for_key(k.as_bytes(), partitions) == partition)
+            .expect("a key for every partition")
+    }
+
+    fn forwarding_service(topic: &str, partitions: u32) -> (tempfile::TempDir, BusService) {
+        let (tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(partitions),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (tmp, svc)
+    }
+
+    fn fwd_publish(
+        svc: &BusService,
+        topic: &str,
+        partition: Option<u32>,
+        records: Vec<PublishRecord>,
+    ) -> Result<PublishResult, BusServiceError> {
+        svc.publish(
+            &test_ctx("org-1"),
+            topic,
+            PublishBatch {
+                partition,
+                producer: None,
+                records,
+            },
+        )
+    }
+
+    #[test]
+    fn publish_on_a_follower_hands_the_records_to_the_leader_and_returns_its_acks() {
+        let topic = "orders.fwd-basic";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 4));
+        coord.script_forwarding(vec![landed(0, 17, 2)]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("one"), record("two")]).unwrap();
+        assert_eq!(result.accepted, 2);
+        assert_eq!(result.partitions.len(), 1);
+        assert_eq!(result.partitions[0].base_offset, 17);
+
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1, "one request per leader");
+        let (target, request) = &calls[0];
+        assert_eq!(target, "node-b");
+        assert_eq!(request.topic, topic);
+        assert_eq!(request.org_id, "org-1");
+        assert_eq!(request.actor.as_deref(), Some("tester"));
+        assert_eq!(request.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(request.groups.len(), 1);
+        assert_eq!(request.groups[0].partition, 0);
+        let payloads: Vec<&[u8]> = request.groups[0]
+            .records
+            .iter()
+            .map(|r| r.payload.as_ref())
+            .collect();
+        assert_eq!(payloads, vec![b"one".as_ref(), b"two".as_ref()]);
+        let local = svc.local_partition(&test_ctx("org-1"), topic, 0).unwrap();
+        assert_eq!(
+            local.log_end_offset(),
+            0,
+            "nothing is written on the follower"
+        );
+    }
+
+    #[test]
+    fn a_batch_across_two_leaders_sends_one_request_per_leader_and_merges_the_acks() {
+        let topic = "orders.fwd-two-leaders";
+        let (_tmp, svc) = forwarding_service(topic, 3);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(1, follower_of("node-b", 2));
+        coord.set_partition_role(2, follower_of("node-c", 2));
+        coord.script_forwarding(vec![landed(1, 5, 1), landed(2, 9, 1)]);
+        svc.set_replication(coord.clone());
+        open_leader_writes(&svc, &test_ctx("org-1"), topic, 0);
+
+        let records = (0..3)
+            .map(|p| record_with_key(&format!("v{p}"), &key_for_partition(p, 3)))
+            .collect();
+        let result = fwd_publish(&svc, topic, None, records).unwrap();
+        assert_eq!(result.accepted, 3);
+        let mut acked: Vec<u32> = result.partitions.iter().map(|a| a.partition).collect();
+        acked.sort();
+        assert_eq!(acked, vec![0, 1, 2]);
+
+        let calls = coord.forward_calls.lock();
+        let mut targets: Vec<&str> = calls.iter().map(|(t, _)| t.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, vec!["node-b", "node-c"]);
+    }
+
+    #[test]
+    fn a_failing_second_leader_leaves_a_partial_publish_with_what_already_landed() {
+        let topic = "orders.fwd-partial";
+        let (_tmp, svc) = forwarding_service(topic, 3);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(1, follower_of("node-b", 2));
+        coord.set_partition_role(2, follower_of("node-c", 2));
+        coord.script_forwarding(vec![
+            landed(1, 5, 1),
+            answered_with(&BusServiceError::NotEnoughReplicas {
+                isr: 1,
+                required: 2,
+            }),
+        ]);
+        svc.set_replication(coord);
+
+        let records = (1..3)
+            .map(|p| record_with_key(&format!("v{p}"), &key_for_partition(p, 3)))
+            .collect();
+        match fwd_publish(&svc, topic, None, records) {
+            Err(BusServiceError::PartialPublish { acked, source }) => {
+                assert_eq!(acked.len(), 1);
+                assert_eq!(acked[0].partition, 1);
+                assert!(
+                    matches!(
+                        *source,
+                        BusServiceError::NotEnoughReplicas { required: 2, .. }
+                    ),
+                    "{source:?}"
+                );
+            }
+            other => panic!("expected PartialPublish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_leader_that_moved_mid_flight_gets_exactly_one_retry_at_the_new_leader() {
+        let topic = "orders.fwd-moved";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        let mut refused = answered_with(&BusServiceError::NotLeader {
+            leader_node_id: Some("node-c".to_string()),
+            leader_epoch: 3,
+        });
+        refused.then_roles = vec![(0, follower_of("node-c", 3))];
+        coord.script_forwarding(vec![refused, landed(0, 40, 1)]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        let calls = coord.forward_calls.lock();
+        let targets: Vec<&str> = calls.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(targets, vec!["node-b", "node-c"]);
+    }
+
+    #[test]
+    fn a_second_not_leader_is_returned_instead_of_a_second_retry() {
+        let topic = "orders.fwd-flapping";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        let not_leader = |leader: &str, epoch| {
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some(leader.to_string()),
+                leader_epoch: epoch,
+            })
+        };
+        let mut first = not_leader("node-c", 3);
+        first.then_roles = vec![(0, follower_of("node-c", 3))];
+        let mut second = not_leader("node-b", 4);
+        second.then_roles = vec![(0, follower_of("node-b", 4))];
+        coord.script_forwarding(vec![first, second, landed(0, 1, 1)]);
+        svc.set_replication(coord.clone());
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert_eq!(
+            coord.forward_calls.lock().len(),
+            2,
+            "one send and one retry"
+        );
+    }
+
+    #[test]
+    fn an_unknown_leader_is_waited_for_and_the_publish_goes_through_once_it_is_named() {
+        let topic = "orders.fwd-unknown-leader";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("", 2));
+        coord.script_forwarding(vec![landed(0, 3, 1)]);
+        svc.set_replication(coord.clone());
+
+        let waker = {
+            let coord = coord.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                coord.set_partition_role(0, follower_of("node-b", 3));
+                coord.bump_assignments();
+            })
+        };
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        waker.join().unwrap();
+        assert_eq!(result.accepted, 1);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(coord.forward_calls.lock()[0].0, "node-b");
+    }
+
+    #[test]
+    fn an_unknown_leader_that_never_appears_ends_in_not_leader_after_the_wait() {
+        let topic = "orders.fwd-no-leader";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("", 2));
+        coord.script_forwarding(vec![]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::NotLeader {
+                    leader_node_id: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(2_500),
+            "must wait for a leader, waited {:?}",
+            started.elapsed()
+        );
+        assert!(coord.forward_calls.lock().is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_cannot_forward_leaves_the_original_not_leader() {
+        let topic = "orders.fwd-old-peer";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 7));
+        coord.script_forwarding(vec![ForwardStep {
+            reply: Err(ForwardUnavailable::PeerCannotForward("node-b".to_string())),
+            then_roles: Vec::new(),
+        }]);
+        svc.set_replication(coord.clone());
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::NotLeader {
+                    leader_node_id: Some(ref n),
+                    leader_epoch: 7,
+                } if n == "node-b"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            coord.forward_calls.lock().len(),
+            1,
+            "the leader was asked once before falling back"
+        );
+    }
+
+    #[test]
+    fn an_authorization_refusal_on_the_leader_reaches_the_sender() {
+        let topic = "orders.fwd-denied";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 1));
+        coord.script_forwarding(vec![answered_with(&deny(BusAction::Produce, topic))]);
+        svc.set_replication(coord);
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::PermissionDenied { .. }),
+            "the leader's refusal must not be downgraded to NotLeader: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_publish_forwarded_here_is_never_forwarded_again() {
+        let topic = "orders.fwd-no-loop";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("node-a");
+        coord.set_role(follower_of("node-c", 9));
+        coord.set_preflight_err(Some(ReplError::NoAssignment {
+            topic: topic.to_string(),
+            partition: 0,
+        }));
+        coord.script_forwarding(vec![landed(0, 1, 1)]);
+        svc.set_replication(coord.clone());
+
+        let reply = svc.publish_forwarded("node-b", forward_request_for(&svc, topic, "tester"));
+        let error = reply.error.expect("the receiver is not the leader");
+        assert!(
+            matches!(
+                replication::forward::error_from_wire(error),
+                BusServiceError::NotLeader { .. }
+            ),
+            "must answer NotLeader"
+        );
+        assert!(coord.forward_calls.lock().is_empty(), "no second hop");
+    }
+
+    fn forward_request_for(svc: &BusService, topic: &str, actor: &str) -> ProduceForward {
+        ProduceForward {
+            instance_id: svc.instance_id().to_string(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org-1".to_string(),
+            topic: topic.to_string(),
+            actor: Some(actor.to_string()),
+            actor_kind: "user".to_string(),
+            correlation_id: None,
+            origin: "test".to_string(),
+            broker_dead_letter: false,
+            producer: None,
+            groups: vec![replication::frames::ForwardGroup {
+                partition: 0,
+                records: vec![replication::frames::ForwardRecord {
+                    key: None,
+                    headers: Vec::new(),
+                    payload: serde_bytes::ByteBuf::from(b"x".to_vec()),
+                    timestamp_ms: 1,
+                    schema_id: 0,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn the_system_actor_is_refused_on_a_forwarded_publish_outside_reserved_topics() {
+        let topic = "orders.fwd-system";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord);
+        open_leader_writes(&svc, &test_ctx("org-1"), topic, 0);
+
+        let reply = svc.publish_forwarded(
+            "node-b",
+            forward_request_for(&svc, topic, crate::services::bus_authorizer::SYSTEM_ACTOR),
+        );
+        let error = reply.error.expect("refused");
+        assert!(
+            matches!(
+                replication::forward::error_from_wire(error),
+                BusServiceError::PermissionDenied { .. }
+            ),
+            "SYSTEM_ACTOR must not be honored for an ordinary topic"
+        );
+        assert_eq!(
+            svc.local_partition(&test_ctx("org-1"), topic, 0)
+                .unwrap()
+                .log_end_offset(),
+            0
+        );
+    }
+
+    /// Allows everything, but `Produce` only to `allowed`: what a leader
+    /// whose rules name the original actor looks like.
+    struct ProduceOnlyFor {
+        allowed: &'static str,
+    }
+
+    impl BusAuthorizer for ProduceOnlyFor {
+        fn authorize(
+            &self,
+            ctx: &BusCallContext,
+            action: BusAction,
+            topic: &str,
+        ) -> Result<(), BusServiceError> {
+            if action == BusAction::Produce && ctx.actor.as_deref() != Some(self.allowed) {
+                return Err(deny(action, topic));
+            }
+            Ok(())
+        }
+        fn authorize_group(
+            &self,
+            _ctx: &BusCallContext,
+            _action: BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> Result<(), BusServiceError> {
+            Ok(())
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    fn leader_that_allows_only(
+        topic: &str,
+        actor: &'static str,
+    ) -> (tempfile::TempDir, BusService) {
+        let (tmp, svc) = test_service_with(Arc::new(ProduceOnlyFor { allowed: actor }));
+        svc.create_topic(
+            &test_ctx("org-1"),
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        svc.set_replication(FakeCoordinator::leader(1));
+        open_leader_writes(&svc, &test_ctx("org-1"), topic, 0);
+        (tmp, svc)
+    }
+
+    #[test]
+    fn a_forwarded_publish_is_authorized_as_the_original_actor_not_the_forwarding_node() {
+        let topic = "orders.fwd-actor";
+        let (_tmp, svc) = leader_that_allows_only(topic, "alice");
+        let log_end = || {
+            svc.local_partition(&test_ctx("org-1"), topic, 0)
+                .unwrap()
+                .log_end_offset()
+        };
+
+        // The identity of the forwarding node, and the broker's own, are not
+        // the caller: the leader's rule names alice only.
+        for impostor in ["node-b", crate::services::bus_authorizer::SYSTEM_ACTOR, "bob"] {
+            let reply = svc.publish_forwarded("node-b", forward_request_for(&svc, topic, impostor));
+            let error = reply.error.expect("refused");
+            assert!(
+                matches!(
+                    replication::forward::error_from_wire(error),
+                    BusServiceError::PermissionDenied { .. }
+                ),
+                "{impostor} must be judged on its own"
+            );
+        }
+        assert_eq!(log_end(), 0);
+
+        let reply = svc.publish_forwarded("node-b", forward_request_for(&svc, topic, "alice"));
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(reply.result.expect("result").accepted, 1);
+        assert_eq!(log_end(), 1);
+    }
+
+    /// A system component names itself by id (`ActorKind::System`, actor =
+    /// its own id): a local publish of it is decided by the authorizer, and
+    /// so is a forwarded one. Only the `SYSTEM_ACTOR` sentinel is refused
+    /// outside `__*` topics.
+    #[test]
+    fn a_system_component_is_judged_by_the_authorizer_when_forwarded_like_when_local() {
+        let topic = "orders.fwd-component";
+        let (_tmp, svc) = leader_that_allows_only(topic, "camera-7");
+        let mut request = forward_request_for(&svc, topic, "camera-7");
+        request.actor_kind = "system".to_string();
+        let reply = svc.publish_forwarded("node-b", request.clone());
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+
+        request.actor = Some("camera-8".to_string());
+        let reply = svc.publish_forwarded("node-b", request);
+        assert!(matches!(
+            replication::forward::error_from_wire(reply.error.expect("refused")),
+            BusServiceError::PermissionDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn a_publish_from_a_node_with_no_replica_goes_to_the_leader_the_assignment_names() {
+        let topic = "orders.fwd-non-replica";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("node-a");
+        coord.set_role(PartitionRole::Unavailable {
+            reason: UnavailableReason::NoAssignment,
+        });
+        coord.set_assigned_leader(topic, 0, "node-b", 4);
+        coord.script_forwarding(vec![landed(0, 11, 1)]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait for a leader");
+        assert_eq!(coord.forward_calls.lock()[0].0, "node-b");
+    }
+
+    #[test]
+    fn a_node_with_no_replica_and_no_assignment_row_waits_a_bounded_time() {
+        let topic = "orders.fwd-no-row";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(PartitionRole::Unavailable {
+            reason: UnavailableReason::NoAssignment,
+        });
+        coord.script_forwarding(vec![]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert!(started.elapsed() >= Duration::from_millis(2_500));
+        assert!(coord.forward_calls.lock().is_empty());
+    }
+
+    /// The metrics rollup of a node that holds no replica of `__bus.metrics`
+    /// reaches the leader at once, keyed by the node's id.
+    #[test]
+    fn the_metrics_rollup_of_a_node_with_no_replica_is_forwarded_keyed_by_its_node_id() {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("node-c");
+        coord.set_role(PartitionRole::Unavailable {
+            reason: UnavailableReason::NoAssignment,
+        });
+        coord.set_assigned_leader(topics::METRICS_TOPIC_NAME, 0, "node-a", 2);
+        coord.script_forwarding(vec![landed(0, 0, 1)]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        svc.publish_metrics_rollup();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the rollup must not wait for a leader: {:?}",
+            started.elapsed()
+        );
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1);
+        let (target, request) = &calls[0];
+        assert_eq!(target, "node-a");
+        assert_eq!(request.topic, topics::METRICS_TOPIC_NAME);
+        let key = request.groups[0].records[0].key.as_ref().expect("a key");
+        assert_eq!(key.as_ref(), b"node-c");
+        assert_eq!(
+            request.actor.as_deref(),
+            Some(crate::services::bus_authorizer::SYSTEM_ACTOR)
+        );
+    }
+
+    /// The request left, the answer did not come: the leader may have
+    /// appended the records, so the publish says so and sends nothing again
+    /// even though the assignment moves meanwhile.
+    #[test]
+    fn a_reply_lost_after_the_request_was_sent_is_an_unknown_outcome_and_is_not_retried() {
+        let topic = "orders.fwd-unknown-outcome";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.script_forwarding(vec![
+            ForwardStep {
+                reply: Err(ForwardUnavailable::OutcomeUnknown {
+                    node: "node-b".to_string(),
+                    reason: "stream reset".to_string(),
+                }),
+                then_roles: vec![(0, follower_of("node-c", 3))],
+            },
+            landed(0, 1, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::ForwardOutcomeUnknown { ref leader_node_id } if leader_node_id == "node-b"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(coord.forward_calls.lock().len(), 1, "never sent a second time");
+    }
+
+    #[test]
+    fn an_unknown_outcome_after_one_leader_landed_keeps_what_landed() {
+        let topic = "orders.fwd-unknown-partial";
+        let (_tmp, svc) = forwarding_service(topic, 3);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(1, follower_of("node-b", 2));
+        coord.set_partition_role(2, follower_of("node-c", 2));
+        coord.script_forwarding(vec![
+            landed(1, 5, 1),
+            ForwardStep {
+                reply: Err(ForwardUnavailable::OutcomeUnknown {
+                    node: "node-c".to_string(),
+                    reason: "reset".to_string(),
+                }),
+                then_roles: Vec::new(),
+            },
+        ]);
+        svc.set_replication(coord);
+
+        let records = (1..3)
+            .map(|p| record_with_key(&format!("v{p}"), &key_for_partition(p, 3)))
+            .collect();
+        match fwd_publish(&svc, topic, None, records) {
+            Err(BusServiceError::PartialPublish { acked, source }) => {
+                assert_eq!(acked.len(), 1);
+                assert!(
+                    matches!(*source, BusServiceError::ForwardOutcomeUnknown { .. }),
+                    "{source:?}"
+                );
+            }
+            other => panic!("expected PartialPublish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_leader_that_moved_before_anything_was_sent_is_retried_at_the_new_leader() {
+        let topic = "orders.fwd-moved-unsent";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.script_forwarding(vec![
+            ForwardStep {
+                reply: Err(ForwardUnavailable::NotSent {
+                    node: "node-b".to_string(),
+                    reason: "no connection".to_string(),
+                }),
+                then_roles: vec![(0, follower_of("node-c", 3))],
+            },
+            landed(0, 8, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        let targets: Vec<String> = coord
+            .forward_calls
+            .lock()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(targets, vec!["node-b".to_string(), "node-c".to_string()]);
+    }
+
+    #[test]
+    fn nothing_sent_and_the_leader_unchanged_leaves_not_leader() {
+        let topic = "orders.fwd-unsent";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 6));
+        coord.script_forwarding(vec![ForwardStep {
+            reply: Err(ForwardUnavailable::NotSent {
+                node: "node-b".to_string(),
+                reason: "no connection".to_string(),
+            }),
+            then_roles: Vec::new(),
+        }]);
+        svc.set_replication(coord.clone());
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::NotLeader { leader_node_id: Some(ref n), leader_epoch: 6 } if n == "node-b"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(coord.forward_calls.lock().len(), 1);
+    }
+
+    #[test]
+    fn a_leader_failing_part_way_through_several_groups_leaves_what_landed_before_it() {
+        let topic = "orders.fwd-three-groups";
+        let (_tmp, svc) = forwarding_service(topic, 3);
+        let coord = FakeCoordinator::leader(1);
+        // One leader for partitions 1 and 2: its single request is answered
+        // with a partial failure naming partition 1 as landed.
+        coord.set_partition_role(1, follower_of("node-b", 2));
+        coord.set_partition_role(2, follower_of("node-b", 2));
+        coord.script_forwarding(vec![ForwardStep {
+            reply: Ok(ProduceForwardReply {
+                result: None,
+                error: Some(replication::frames::ForwardError {
+                    acked: vec![replication::frames::ForwardAck {
+                        partition: 1,
+                        base_offset: 7,
+                        accepted: 1,
+                    }],
+                    ..replication::forward::error_to_wire(&BusServiceError::NotEnoughReplicas {
+                        isr: 1,
+                        required: 2,
+                    })
+                }),
+            }),
+            then_roles: Vec::new(),
+        }]);
+        svc.set_replication(coord.clone());
+
+        let records = (1..3)
+            .map(|p| record_with_key(&format!("v{p}"), &key_for_partition(p, 3)))
+            .collect();
+        match fwd_publish(&svc, topic, None, records) {
+            Err(BusServiceError::PartialPublish { acked, source }) => {
+                assert_eq!(acked.len(), 1);
+                assert_eq!(acked[0].partition, 1);
+                assert_eq!(acked[0].base_offset, 7);
+                assert!(matches!(*source, BusServiceError::NotEnoughReplicas { .. }));
+            }
+            other => panic!("expected PartialPublish, got {other:?}"),
+        }
+        assert_eq!(coord.forward_calls.lock().len(), 1, "one request for one leader");
+    }
+
+    fn big_record(key: &str) -> PublishRecord {
+        PublishRecord {
+            key: Some(Bytes::from(key.to_string())),
+            headers: vec![],
+            payload: Bytes::from(vec![7u8; 900_000]),
+            timestamp_ms: now_ms(),
+            schema_id: 0,
+        }
+    }
+
+    #[test]
+    fn a_group_too_big_for_one_frame_is_refused_before_anything_is_sent() {
+        let topic = "orders.fwd-too-big";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.script_forwarding(vec![landed(0, 0, 20)]);
+        svc.set_replication(coord.clone());
+
+        let records = (0..20).map(|i| big_record(&format!("k{i}"))).collect();
+        let err = fwd_publish(&svc, topic, Some(0), records).unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidArgument(_)), "{err:?}");
+        assert!(coord.forward_calls.lock().is_empty());
+    }
+
+    #[test]
+    fn groups_that_do_not_fit_one_frame_together_go_in_separate_requests() {
+        let topic = "orders.fwd-split";
+        let (_tmp, svc) = forwarding_service(topic, 3);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(1, follower_of("node-b", 2));
+        coord.set_partition_role(2, follower_of("node-b", 2));
+        coord.script_forwarding(vec![landed(1, 0, 10), landed(2, 0, 10)]);
+        svc.set_replication(coord.clone());
+
+        let mut records = Vec::new();
+        for p in 1..3 {
+            let key = key_for_partition(p, 3);
+            records.extend((0..10).map(|_| big_record(&key)));
+        }
+        let result = fwd_publish(&svc, topic, None, records).unwrap();
+        assert_eq!(result.accepted, 20);
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 2, "9 MB + 9 MB do not fit one 16 MiB frame");
+        assert!(calls.iter().all(|(t, r)| t == "node-b" && r.groups.len() == 1));
+    }
+
+    /// Quota is charged, and the checks before partitioning are made, once
+    /// for the whole forwarded request: a request that exceeds the quota
+    /// lands nowhere, instead of landing its first partitions only.
+    #[test]
+    fn a_forwarded_request_over_quota_lands_on_no_partition() {
+        let topic = "orders.fwd-quota";
+        let (_tmp, svc) = forwarding_service(topic, 2);
+        svc.set_replication(FakeCoordinator::leader(1));
+        for p in 0..2 {
+            open_leader_writes(&svc, &test_ctx("org-1"), topic, p);
+        }
+        svc.quota.configure_org(
+            "org-1",
+            quota::QuotaConfig {
+                produce_msgs_per_sec: 3,
+                ..Default::default()
+            },
+        );
+
+        let mut request = forward_request_for(&svc, topic, "tester");
+        let one = request.groups[0].records[0].clone();
+        request.groups = (0..2)
+            .map(|p| replication::frames::ForwardGroup {
+                partition: p,
+                records: vec![one.clone(), one.clone()],
+            })
+            .collect();
+        let reply = svc.publish_forwarded("node-b", request);
+        let error = reply.error.expect("4 messages exceed a budget of 3");
+        assert!(error.acked.is_empty(), "no partial publish: {error:?}");
+        for p in 0..2 {
+            assert_eq!(
+                svc.local_partition(&test_ctx("org-1"), topic, p)
+                    .unwrap()
+                    .log_end_offset(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaders_internal_error_reaches_the_sender_without_its_detail() {
+        let wire = replication::forward::error_to_wire(&BusServiceError::Db(
+            "no such table: bus_secret_table".to_string(),
+        ));
+        assert!(!wire.message.contains("bus_secret_table"), "{wire:?}");
+        let err = replication::forward::error_from_wire(wire);
+        assert!(!err.to_string().contains("bus_secret_table"), "{err}");
+        assert!(matches!(err, BusServiceError::PartitionUnavailable { .. }));
+    }
+
+    /// A violating record is checked and counted once, on the leader: the
+    /// node a publish arrived on does not validate the records it hands on.
+    #[test]
+    fn records_for_a_partition_led_elsewhere_are_not_schema_checked_on_the_sender() {
+        let topic = "orders.fwd-schema-once";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        // A validating topic whose bound subject does not exist would fail
+        // the sender's own check; a forwarded record never reaches it.
+        topics::update_topic(
+            &svc.db,
+            &svc.instance_id,
+            "org-1",
+            topic,
+            topics::TopicOptions {
+                validation: Some(topics::ValidationMode::Warn),
+                schema_id: Some("no-such-subject".to_string()),
+                ..Default::default()
+            },
+            now_ms(),
+        )
+        .ok();
+        svc.invalidate_topic_config_cache("org-1", topic);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.script_forwarding(vec![landed(0, 0, 1)]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("not checked here")]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            svc.schema_violations_total.load(Ordering::Relaxed),
+            0,
+            "nothing was counted on the sender"
+        );
+        assert_eq!(coord.forward_calls.lock().len(), 1);
     }
 
     /// P9: create RF=1 (no coordinator, M1 path) stays fast — a loose ×3

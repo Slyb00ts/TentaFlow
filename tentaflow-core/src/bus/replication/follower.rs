@@ -32,7 +32,7 @@ use tokio::time::Instant;
 
 use super::frames::{
     read_frame, write_frame, FrameReader, ReplAck, ReplCodecError, ReplFrame, ReplHello,
-    ReplHelloAck, ReplLeoReply, ReplOffsets, ReplReject,
+    ReplHelloAck, ReplLeoReply, ReplOffsets, ReplReject, LOCAL_BUS_FEATURES,
 };
 use crate::bus::dlq::DiscardStore;
 use crate::bus::groups::GroupOffsetStore;
@@ -226,6 +226,8 @@ fn frame_kind_name(frame: &ReplFrame) -> &'static str {
         ReplFrame::LeoQuery(_) => "LeoQuery",
         ReplFrame::LeoReply(_) => "LeoReply",
         ReplFrame::Offsets(_) => "Offsets",
+        ReplFrame::ProduceForward(_) => "ProduceForward",
+        ReplFrame::ProduceForwardReply(_) => "ProduceForwardReply",
     }
 }
 
@@ -401,6 +403,7 @@ where
         reject: None,
         follower_log_epoch: Some(partition.record_epoch()),
         follower_committed: Some(partition.committed_offset()),
+        bus_features: LOCAL_BUS_FEATURES,
     };
     write_frame(&mut writer, &ReplFrame::HelloAck(ack)).await?;
 
@@ -725,6 +728,7 @@ async fn reject_hello<W: AsyncWrite + Unpin>(
         reject: Some(reject.clone()),
         follower_log_epoch: None,
         follower_committed: None,
+        bus_features: LOCAL_BUS_FEATURES,
     };
     write_frame(writer, &ReplFrame::HelloAck(ack)).await?;
     Ok(FollowerExit::HelloRejected {
@@ -880,6 +884,7 @@ mod tests {
             replicas: vec![LEADER_NODE.to_string(), LOCAL_NODE.to_string()],
             environment,
             topic_generation: Some(0),
+            bus_features: 0,
         }
     }
 
