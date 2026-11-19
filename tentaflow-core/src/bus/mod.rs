@@ -126,7 +126,9 @@ use crate::flow_engine::envelope::FlowValue;
 use crate::flow_engine::expr;
 use instance::BusInstanceId;
 use replication::forward::{ForwardJob, ForwardTotals, ForwardUnavailable, PublishSource};
-use replication::frames::{ProduceForward, ProduceForwardReply};
+use replication::frames::{
+    ConsumeForward, ConsumeForwardReply, ProduceForward, ProduceForwardReply,
+};
 
 /// plan-app-platform §7 W4 finding 3: `bus::init`/`bus::global` are a
 /// TEMPORARY single-instance compatibility shim over the `BUS_INSTANCES`
@@ -961,7 +963,7 @@ pub enum BusServiceError {
     /// appended the records, so — like `AckTimeout` — a blind retry can
     /// write them twice; a producer that needs exactly-once sets a dedup key
     /// or producer sequence.
-    #[error("the write was sent to leader '{leader_node_id}' but no answer arrived; it may or may not have been appended")]
+    #[error("the request was sent to leader '{leader_node_id}' but no answer arrived; it may or may not have taken effect")]
     ForwardOutcomeUnknown { leader_node_id: String },
     /// The partition cannot currently serve the request for a reason that
     /// is neither "not leader" nor "not enough replicas" specifically
@@ -969,6 +971,13 @@ pub enum BusServiceError {
     /// shown directly in the UI (PLAN-M2 §1e: "partycja niedostępna — …").
     #[error("partition unavailable: {reason}")]
     PartitionUnavailable { reason: String },
+    /// The partition leader failed on its own side (storage, engine) while
+    /// serving a forwarded request. The leader's message can name tables or
+    /// paths and stays in its log, so nothing of it is carried here; unlike
+    /// `PartitionUnavailable` this is not a state that passes, and a caller
+    /// must not retry it as if it were.
+    #[error("the partition leader failed while serving the request")]
+    RemoteFailure,
     /// A write-direction field policy (SUM/tentabus/POLITYKI-POL.md) rejects
     /// the whole batch: at least one record carries a top-level JSON field
     /// not in the resolved policy's allow-list (`mode=reject`, the only
@@ -1355,6 +1364,16 @@ fn max_groups_exceeded(org_id: &str, max: u32, current: u32) -> BusServiceError 
 /// `Throttled` keeps its existing translation (dropping the returned batch
 /// bytes, which every caller of this function already owns a copy of).
 /// Every other variant passes through as `Engine`.
+/// Whether a failed write may nevertheless be in the log: a forwarded write
+/// that got no answer, or one whose replicas did not acknowledge in time.
+fn write_may_have_landed(e: &BusServiceError) -> bool {
+    match e {
+        BusServiceError::ForwardOutcomeUnknown { .. } | BusServiceError::AckTimeout { .. } => true,
+        BusServiceError::PartialPublish { source, .. } => write_may_have_landed(source),
+        _ => false,
+    }
+}
+
 /// Whether a `dlq_retry` put the record back into its source topic: appended
 /// now, or found already appended by an earlier attempt (`duplicate` — the
 /// record's producer identity, `dlq::retry_producer_id`). A record the
@@ -2330,6 +2349,20 @@ pub trait ReplicationCoordinator: Send + Sync {
         timeout: Duration,
         still_valid: &dyn Fn() -> bool,
     ) -> Result<ProduceForwardReply, ForwardUnavailable> {
+        let _ = (target, request, timeout, still_valid);
+        Err(ForwardUnavailable::Unsupported)
+    }
+    /// Hands the stateless read `request` to `target`, the leader of its
+    /// topic, and waits up to `timeout` for the leader's answer (the records
+    /// it fetched and committed). Same contract as `forward_publish`,
+    /// including `still_valid`; `Err` means nothing usable came back.
+    fn forward_consume(
+        &self,
+        target: &str,
+        request: ConsumeForward,
+        timeout: Duration,
+        still_valid: &dyn Fn() -> bool,
+    ) -> Result<ConsumeForwardReply, ForwardUnavailable> {
         let _ = (target, request, timeout, still_valid);
         Err(ForwardUnavailable::Unsupported)
     }
@@ -6245,6 +6278,7 @@ impl BusService {
         // above (§3 rule 6: field policy first, schema second).
         let mut schema_rejected: u32 = 0;
         let mut schema_dropped: u32 = 0;
+        let mut pending_quarantine: Vec<PublishRecord> = Vec::new();
         if cfg.validation != topics::ValidationMode::Off {
             let subject = cfg
                 .schema_id
@@ -6356,118 +6390,21 @@ impl BusService {
                     }
                 }
             }
-            if !violations.is_empty() {
-                // Quarantine per record (PLAN-F3 §4.3), NOT an all-or-
-                // nothing batch reject like the field-policy check above —
-                // this is a data-quality decision, not an authorization
-                // one. Reuses the same internal path `note_delivery_failure`
-                // sends a consume-time DLQ copy through: a plain nested
-                // `self.publish` call to `__dlq.<topic>`, auto-created on
-                // first use. Safe against infinite recursion: the DLQ
-                // topic's OWN `validation` is `Off` (nothing ever binds a
-                // schema to a broker-internal `__dlq.*` topic — `topics`'
-                // binding guard rejects that outright), so this
-                // schema-validation block is a no-op the moment that nested
-                // call re-enters `publish` for the DLQ topic itself.
-                //
-                // The nested call runs under a BROKER context, not the
-                // producer's own: `resolve_check` in `bus_authorizer` maps
-                // Produce on `__dlq.<topic>` to Consume on `<topic>`, so a
-                // write-only producer's own `ctx` would get
-                // `PermissionDenied` here — and because this whole block
-                // runs before `kept` is committed to `batch.records`, that
-                // would fail the ENTIRE batch, including records that
-                // already passed validation. `SYSTEM_ACTOR` is exactly the
-                // documented bypass for broker-internal writes to a `__`
-                // reserved topic (see its doc in `services::bus_authorizer`,
-                // the `__bus.metrics` precedent above).
-                //
-                // A DLQ-write failure (topic creation, `PermissionDenied`
-                // despite the bypass, `PayloadTooLarge` against the DLQ
-                // topic's own `max_inline_bytes`, quota, ...) is deliberately
-                // NON-FATAL for this batch: the violating records are
-                // dropped (logged + counted + audited) but every record in
-                // `kept` still publishes. A schema-quality quarantine
-                // mechanism failing must never be able to take down
-                // already-valid traffic.
-                let quarantine_ctx = BusCallContext {
-                    actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
-                    actor_kind: crate::auth::actor::ActorKind::System,
-                    ..ctx.clone()
-                };
-                let dlq_topic = dlq::dlq_topic_name(topic);
-                let violation_count = violations.len();
-                // `ensure_dlq_topic` only PROPOSES the DLQ partitions'
-                // assignments; the coordinator applies them asynchronously.
-                // On a fresh topic the first quarantine write would meet
-                // `NotLeader (leader_node_id=None)` and the record be lost,
-                // so wait (bounded) for the assignments first. A DLQ
-                // partition still unassigned after the wait fails the
-                // publish — the caller retries, nothing is dropped. Any
-                // other DLQ failure (a partition another node leads, too few
-                // replicas, ...) keeps the non-fatal drop below, or every
-                // batch with an invalid record would fail for good.
-                let dlq_cfg = self.ensure_dlq_topic(ctx, topic, &cfg);
-                if let Ok(dlq_cfg) = &dlq_cfg {
-                    if let Err(e) = self.await_dlq_placement(&ctx.org_id, dlq_cfg) {
-                        self.schema_dlq_write_failures_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
-                            violation_count, error = %e,
-                            "the DLQ has no partition assignment; failing the \
-                             publish instead of dropping the schema-violating records"
-                        );
-                        return Err(e);
-                    }
-                }
-                let dlq_result = dlq_cfg.and_then(|_| {
-                    // The quarantine copy never travels on from a forwarded
-                    // call: a DLQ partition this leader does not lead refuses
-                    // it, and the records are dropped and counted like any
-                    // quarantine that cannot land.
-                    self.publish_dead_letter(
-                        &quarantine_ctx,
-                        &dlq_topic,
-                        PublishBatch {
-                            partition: quarantine_partition,
-                            producer: None,
-                            records: violations,
-                        },
-                        source,
-                    )
-                });
-                // Counted only once the quarantine copies are written: a
-                // record whose copy failed was dropped, not diverted, and a
-                // caller (`dlq_retry`) must be able to tell the two apart.
-                if dlq_result.is_ok() {
-                    schema_rejected = violation_count as u32;
-                } else {
-                    schema_dropped = violation_count as u32;
-                }
-                if let Err(e) = dlq_result {
-                    self.schema_dlq_write_failures_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
-                        violation_count, error = %e,
-                        "failed to write schema-violation records to DLQ; the \
-                         violating records are dropped, valid records in this \
-                         batch still publish"
-                    );
-                    self.audit_windowed(
-                        ctx,
-                        "bus.schema.dlq_write_failed",
-                        Some(topic),
-                        Some(&format!(
-                            "dlq_topic={dlq_topic} violation_count={violation_count} error={e}"
-                        )),
-                    );
-                }
-            }
+            pending_quarantine = violations;
             batch.records = kept;
             tags = record_tags.map(|_| kept_tags);
             if batch.records.is_empty() && foreign.is_empty() {
+                // Nothing is left to append, so nothing to wait for first.
+                if !pending_quarantine.is_empty() {
+                    (schema_rejected, schema_dropped) = self.quarantine_violations(
+                        ctx,
+                        topic,
+                        &cfg,
+                        std::mem::take(&mut pending_quarantine),
+                        quarantine_partition,
+                        source,
+                    )?;
+                }
                 return Ok(PublishResult {
                     duplicate: false,
                     accepted: 0,
@@ -6592,6 +6529,21 @@ impl BusService {
             self.audit_windowed(ctx, "bus.quota.exceeded", Some(topic), None);
             self.throttled_total.fetch_add(1, Ordering::Relaxed);
             return Err(e);
+        }
+
+        // The append is admitted: the leader and the ISR are there and the
+        // quota is paid. Only now do the violating records go to the DLQ, so
+        // a call refused above never leaves quarantine copies behind that its
+        // retry would write again.
+        if !pending_quarantine.is_empty() {
+            (schema_rejected, schema_dropped) = self.quarantine_violations(
+                ctx,
+                topic,
+                &cfg,
+                std::mem::take(&mut pending_quarantine),
+                quarantine_partition,
+                source,
+            )?;
         }
 
         // Layer 2's persistent store is per-topic, not per-partition, so it
@@ -6910,6 +6862,7 @@ impl BusService {
                 topic,
                 producer: batch.producer.as_ref(),
                 broker_dead_letter,
+                deadline: source.deadline(),
             };
             forwarded = self
                 .forward_to_leaders(coordinator, &job, foreign, &mut acks)
@@ -8257,33 +8210,193 @@ impl BusService {
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
 
+    /// Writes the quarantine copies of the records the schema of `topic`
+    /// rejected (`validation = dlq`) to its dead-letter topic, and returns
+    /// how many were diverted and how many were dropped.
+    ///
+    /// Called once the append of the valid records is admitted
+    /// (`preflight`, quota), not before: a publish refused for its leader or
+    /// its quota would otherwise leave copies behind that the retry writes
+    /// again. An `Err` is the publish failing, with nothing else written.
+    fn quarantine_violations(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        cfg: &topics::TopicConfig,
+        violations: Vec<PublishRecord>,
+        quarantine_partition: Option<u32>,
+        source: PublishSource<'_>,
+    ) -> Result<(u32, u32), BusServiceError> {
+        // Quarantine per record (PLAN-F3 §4.3), NOT an all-or-
+        // nothing batch reject like the field-policy check above —
+        // this is a data-quality decision, not an authorization
+        // one. Reuses the same internal path `note_delivery_failure`
+        // sends a consume-time DLQ copy through: a plain nested
+        // `self.publish` call to `__dlq.<topic>`, auto-created on
+        // first use. Safe against infinite recursion: the DLQ
+        // topic's OWN `validation` is `Off` (nothing ever binds a
+        // schema to a broker-internal `__dlq.*` topic — `topics`'
+        // binding guard rejects that outright), so this
+        // schema-validation block is a no-op the moment that nested
+        // call re-enters `publish` for the DLQ topic itself.
+        //
+        // The nested call runs under a BROKER context, not the
+        // producer's own: `resolve_check` in `bus_authorizer` maps
+        // Produce on `__dlq.<topic>` to Consume on `<topic>`, so a
+        // write-only producer's own `ctx` would get
+        // `PermissionDenied` here — and because this whole block
+        // runs before the valid records are appended, that would fail
+        // the ENTIRE batch, including records that already passed
+        // validation. `SYSTEM_ACTOR` is exactly the
+        // documented bypass for broker-internal writes to a `__`
+        // reserved topic (see its doc in `services::bus_authorizer`,
+        // the `__bus.metrics` precedent above).
+        //
+        // A DLQ-write failure (topic creation, `PermissionDenied`
+        // despite the bypass, `PayloadTooLarge` against the DLQ
+        // topic's own `max_inline_bytes`, quota, ...) is deliberately
+        // NON-FATAL for this batch: the violating records are
+        // dropped (logged + counted + audited) but every valid record
+        // still publishes. A schema-quality quarantine
+        // mechanism failing must never be able to take down
+        // already-valid traffic.
+        let quarantine_ctx = BusCallContext {
+            actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
+            ..ctx.clone()
+        };
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        let violation_count = violations.len();
+        // The copy is a write of its own, made by the broker: it goes to
+        // the leader of the DLQ partition, which may be a third node, and
+        // for a request forwarded here it is bound by the sender's own
+        // deadline (`PublishSource::for_quarantine`).
+        let quarantine_source = source.for_quarantine();
+        // `ensure_dlq_topic` only PROPOSES the DLQ partitions'
+        // assignments; the coordinator applies them asynchronously.
+        // On a fresh topic the first quarantine write would meet
+        // `NotLeader (leader_node_id=None)` and the record be lost,
+        // so wait (bounded) for the assignments first. A DLQ
+        // partition still unassigned after the wait fails the
+        // publish — the caller retries, nothing is dropped. Any
+        // other DLQ failure (a partition another node leads, too few
+        // replicas, ...) keeps the non-fatal drop below, or every
+        // batch with an invalid record would fail for good.
+        let dlq_cfg = self.ensure_dlq_topic(ctx, topic, cfg);
+        if let Ok(dlq_cfg) = &dlq_cfg {
+            if let Err(e) =
+                self.await_dlq_placement(&ctx.org_id, dlq_cfg, quarantine_source.deadline())
+            {
+                self.schema_dlq_write_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                    violation_count, error = %e,
+                    "the DLQ has no partition assignment; failing the \
+                     publish instead of dropping the schema-violating records"
+                );
+                return Err(e);
+            }
+        }
+        let dlq_result = dlq_cfg.and_then(|_| {
+            self.publish_dead_letter(
+                &quarantine_ctx,
+                &dlq_topic,
+                PublishBatch {
+                    partition: quarantine_partition,
+                    producer: None,
+                    records: violations,
+                },
+                quarantine_source,
+            )
+        });
+        match dlq_result {
+            // Counted only once the quarantine copies are written: a
+            // record whose copy failed was dropped, not diverted, and a
+            // caller (`dlq_retry`) must be able to tell the two apart.
+            Ok(_) => Ok((violation_count as u32, 0)),
+            // The copy may have landed: counting it as dropped would
+            // have the caller resend what is already there, and counting
+            // it as diverted would have `dlq_retry` settle a record that
+            // may exist nowhere. The publish fails, with nothing else
+            // written yet, and says so.
+            Err(e) if write_may_have_landed(&e) => {
+                tracing::error!(
+                    org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                    violation_count, error = %e,
+                    "the quarantine copy of schema-violating records may or may not \
+                     have been written; failing the publish"
+                );
+                self.audit_windowed(
+                    ctx,
+                    "bus.schema.dlq_write_unconfirmed",
+                    Some(topic),
+                    Some(&format!(
+                        "dlq_topic={dlq_topic} violation_count={violation_count} error={e}"
+                    )),
+                );
+                Err(e)
+            }
+            Err(e) => {
+                self.schema_dlq_write_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                    violation_count, error = %e,
+                    "failed to write schema-violation records to DLQ; the \
+                     violating records are dropped, valid records in this \
+                     batch still publish"
+                );
+                self.audit_windowed(
+                    ctx,
+                    "bus.schema.dlq_write_failed",
+                    Some(topic),
+                    Some(&format!(
+                        "dlq_topic={dlq_topic} violation_count={violation_count} error={e}"
+                    )),
+                );
+                Ok((0, violation_count as u32))
+            }
+        }
+    }
+
     /// Waits, up to `DLQ_PLACEMENT_WAIT`, until every partition of the DLQ
     /// topic has an assignment this node has applied. Only the "no
     /// assignment yet" state is waited out: a partition another node leads
     /// (or one without enough ISR) is not going to change within the wait.
     /// Returns the `NotLeader` error `publish` would have produced when a
     /// partition is still unassigned at the deadline; the only DLQ state
-    /// that fails the publish itself.
+    /// that fails the publish itself. `limit` ends the wait earlier when the
+    /// request this serves is only waited for so long.
     fn await_dlq_placement(
         &self,
         org_id: &str,
         dlq_cfg: &topics::TopicConfig,
+        limit: Option<Instant>,
     ) -> Result<(), BusServiceError> {
         const DLQ_PLACEMENT_WAIT: Duration = Duration::from_secs(2);
         const DLQ_PLACEMENT_POLL: Duration = Duration::from_millis(10);
         let Some(coordinator) = self.replication() else {
             return Ok(());
         };
-        let deadline = Instant::now() + DLQ_PLACEMENT_WAIT;
+        let mut deadline = Instant::now() + DLQ_PLACEMENT_WAIT;
+        if let Some(limit) = limit {
+            deadline = deadline.min(limit);
+        }
         for partition in 0..dlq_cfg.partitions {
             loop {
                 let role = coordinator.role(org_id, &dlq_cfg.name, partition);
+                // A node that holds no replica of the partition has no role
+                // for it, but the cluster-wide assignment still names the
+                // leader the write is forwarded to: that is placed.
                 let unassigned = matches!(
                     role,
                     PartitionRole::Unavailable {
                         reason: UnavailableReason::NoAssignment
                     }
-                );
+                ) && coordinator
+                    .assigned_leader(org_id, &dlq_cfg.name, partition)
+                    .is_none();
                 if !unassigned {
                     break;
                 }
@@ -19921,6 +20034,7 @@ mod tests {
                     schema_id: 0,
                 }],
             }],
+            reply_within_ms: 0,
         }
     }
 
@@ -20386,7 +20500,10 @@ mod tests {
         assert!(!wire.message.contains("bus_secret_table"), "{wire:?}");
         let err = replication::forward::error_from_wire(wire);
         assert!(!err.to_string().contains("bus_secret_table"), "{err}");
-        assert!(matches!(err, BusServiceError::PartitionUnavailable { .. }));
+        assert!(
+            matches!(err, BusServiceError::RemoteFailure),
+            "a failure on the leader is not a partition that is unavailable: {err:?}"
+        );
     }
 
     /// A violating record is checked and counted once, on the leader: the
@@ -22655,6 +22772,243 @@ mod tests {
         assert_eq!(result.schema_rejected, 0);
         assert_eq!(result.schema_dropped, 1);
         assert_eq!(svc.schema_dlq_write_failures_total(), 1);
+    }
+
+    /// Every DLQ partition is led by `node-b`, and this node holds no
+    /// replica of it: no role, but an assignment that names the leader.
+    fn dlq_led_by_node_b_without_a_local_replica(coord: &FakeCoordinator, dlq_topic: &str) {
+        for partition in 0..8 {
+            coord.set_assigned_leader(dlq_topic, partition, "node-b", 2);
+        }
+        coord.script_forwarding(vec![landed(0, 0, 1)]);
+    }
+
+    /// The quarantine copy goes to the assigned leader at once, neither
+    /// waited for as if the partition were unplaced nor dropped.
+    #[test]
+    fn the_quarantine_copy_of_a_local_publish_goes_to_a_dlq_leader_holding_no_local_replica() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        dlq_led_by_node_b_without_a_local_replica(&coord, &dlq_topic);
+
+        let started = Instant::now();
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an assigned leader is not waited for: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            (
+                result.accepted,
+                result.schema_rejected,
+                result.schema_dropped
+            ),
+            (1, 1, 0)
+        );
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "node-b");
+        assert_eq!(calls[0].1.topic, dlq_topic);
+        assert!(calls[0].1.broker_dead_letter);
+    }
+
+    /// The leader of a source topic that received the violating record from
+    /// a peer still quarantines it: the copy is forwarded to the DLQ leader.
+    #[test]
+    fn the_quarantine_copy_of_a_forwarded_publish_is_forwarded_to_the_dlq_leader() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        dlq_led_by_node_b_without_a_local_replica(&coord, &dlq_topic);
+
+        let mut request = forward_request_for(&svc, "orders.events", "u-forwarder");
+        request.groups[0].records[0].payload =
+            serde_bytes::ByteBuf::from(br#"{"status":"missing-required-id"}"#.to_vec());
+        let reply = svc.publish_forwarded("node-c", request);
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        let result = reply.result.expect("a result");
+        assert_eq!((result.schema_rejected, result.schema_dropped), (1, 0));
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1, "the quarantine copy is one forwarded write");
+        assert_eq!(calls[0].0, "node-b");
+        assert_eq!(calls[0].1.topic, dlq_topic);
+        assert!(calls[0].1.broker_dead_letter);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 0);
+    }
+
+    /// Pinned to partition 0, the one `open_leader_writes` opened: a refused
+    /// attempt advances the round-robin, and a retry would land elsewhere.
+    fn one_valid_one_violating_batch() -> PublishBatch {
+        PublishBatch {
+            partition: Some(0),
+            producer: None,
+            records: vec![
+                record(r#"{"id":"ok-1"}"#),
+                record(r#"{"status":"missing-required-id"}"#),
+            ],
+        }
+    }
+
+    /// The quarantine copy is written only once the append is admitted: a
+    /// stale leader that refuses the call leaves no copy behind, so the
+    /// retry at the new leader does not leave the DLQ with two.
+    #[test]
+    fn a_publish_refused_for_its_leader_writes_no_quarantine_copy_and_its_retry_writes_one() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        dlq_led_by_node_b_without_a_local_replica(&coord, &dlq_topic);
+
+        coord.set_preflight_err(Some(ReplError::NoAssignment {
+            topic: "orders.events".to_string(),
+            partition: 0,
+        }));
+        let refused = svc
+            .publish(&ctx, "orders.events", one_valid_one_violating_batch())
+            .unwrap_err();
+        assert!(
+            matches!(refused, BusServiceError::NotLeader { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            coord.forward_calls.lock().is_empty(),
+            "a refused call must not have quarantined anything"
+        );
+
+        coord.set_preflight_err(None);
+        let retried = svc
+            .publish(&ctx, "orders.events", one_valid_one_violating_batch())
+            .unwrap();
+        assert_eq!(
+            (
+                retried.accepted,
+                retried.schema_rejected,
+                retried.schema_dropped
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            coord.forward_calls.lock().len(),
+            1,
+            "exactly one quarantine copy over both attempts"
+        );
+    }
+
+    /// A quarantine copy that may have landed is neither a dropped record
+    /// (the caller would resend what is already there) nor a diverted one
+    /// (`dlq_retry` would settle a record that may exist nowhere): the
+    /// publish fails, saying so, and nothing of the valid records was written.
+    #[test]
+    fn a_quarantine_copy_with_an_unknown_outcome_fails_the_publish_instead_of_dropping_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        for partition in 0..8 {
+            coord.set_assigned_leader(&dlq_topic, partition, "node-b", 2);
+        }
+        coord.script_forwarding(vec![ForwardStep {
+            reply: Err(ForwardUnavailable::OutcomeUnknown {
+                node: "node-b".to_string(),
+                reason: "stream reset".to_string(),
+            }),
+            then_roles: Vec::new(),
+        }]);
+
+        let err = svc
+            .publish(&ctx, "orders.events", one_valid_one_violating_batch())
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::ForwardOutcomeUnknown { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            svc.schema_dlq_write_failures_total(),
+            0,
+            "an unknown outcome is not a failed write"
+        );
+        let high_watermark = svc
+            .partition_stats(&ctx, "orders.events", 0)
+            .map(|s| s.high_watermark)
+            .unwrap_or(0);
+        assert_eq!(high_watermark, 0, "the valid record was not appended");
+    }
+
+    /// `LocalOnly` is how records already known to be led here are written;
+    /// the quarantine copy of one is a write to another topic, which goes to
+    /// that topic's leader like any other.
+    #[test]
+    fn the_quarantine_copy_of_a_local_only_publish_is_forwarded_to_the_dlq_leader() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        dlq_led_by_node_b_without_a_local_replica(&coord, &dlq_topic);
+
+        let result = svc
+            .publish_routed(
+                &ctx,
+                "orders.events",
+                one_valid_one_violating_batch(),
+                None,
+                false,
+                PublishSource::LocalOnly,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                result.accepted,
+                result.schema_rejected,
+                result.schema_dropped
+            ),
+            (1, 1, 0)
+        );
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "node-b");
+        assert_eq!(calls[0].1.topic, dlq_topic);
+    }
+
+    /// The sender of a forwarded publish stops waiting at a known time; the
+    /// quarantine copy of a violating record is forwarded only within it, so
+    /// the sender is not left with a 504 for a write that landed. When there
+    /// is no time left the copy is not attempted and the record is dropped,
+    /// counted as such.
+    #[test]
+    fn the_quarantine_copy_of_a_forwarded_publish_stays_within_the_senders_wait() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let (coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
+        dlq_led_by_node_b_without_a_local_replica(&coord, &dlq_topic);
+
+        let mut request = forward_request_for(&svc, "orders.events", "u-forwarder");
+        request.groups[0].records[0].payload =
+            serde_bytes::ByteBuf::from(br#"{"status":"missing-required-id"}"#.to_vec());
+        request.reply_within_ms = 1;
+        let started = Instant::now();
+        let reply = svc.publish_forwarded("node-c", request);
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        let result = reply.result.expect("a result");
+        assert_eq!((result.schema_rejected, result.schema_dropped), (0, 1));
+        assert!(
+            coord.forward_calls.lock().is_empty(),
+            "no time was left to forward the copy"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

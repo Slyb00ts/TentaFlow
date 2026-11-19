@@ -2136,7 +2136,16 @@ Audytowane KAZDE wywolanie (`ok`/`denied`/`error`) — to jest granica
 per-rekord w srodku batcha. Bledy: `NotFound` (2, temat nie istnieje i
 `create_if_missing=false`), `Permission` (1), `PayloadTooLarge` (21,
 >1000 rekordow lub >8 MB), `QuotaExceeded` (11), `Backpressure` (17,
-throttling producenta), `Operation` (5, `instance_id` nierozstrzygniety).
+throttling producenta, a tez partycja, ktora w tej chwili nie ma lidera
+mogacego przyjac zapis: trwajaca elekcja, za malo replik w ISR, brak
+przypisania — nic nie zapisano, mozna powtorzyc po chwili), `Timeout` (4,
+zapis MOGL trafic do logu: wyslany do lidera na innym wezle bez odpowiedzi
+albo repliki nie potwierdzily go w czasie — nie powtarzac bez klucza
+idempotencji tematu lub tozsamosci producenta, bo powtorka moze zapisac
+rekordy drugi raz), `Operation` (5, `instance_id` nierozstrzygniety).
+
+Zapis na wezle, ktory nie prowadzi partycji tematu, jest przekazywany do jej
+lidera (TB-04); addon nie musi wiedziec, ktory wezel prowadzi temat.
 
 ### `bus_consume_open_v1`
 
@@ -2154,6 +2163,14 @@ offset cursor) i rejestruje go w per-addon rejestrze hosta. Limity:
 `next`/`commit` przez 300s — crashniety addon nie zostawia trwale
 otwartego cursora. `Operation` (5) gdy `instance_id` nie da sie
 rozstrzygnac.
+
+Konsument addonu NIE jest przekazywany do lidera (TB-04, P7): jego uchwyt
+zyje na jednym wezle. `open` na wezle, ktory nie prowadzi tematu, odmawia
+kodem `NoAvailableTarget` (3) — nie `Backpressure`, bo powtorzenie tego samego
+wywolania na tym wezle nic nie zmieni — a wiersz audytu `bus.consume.open`
+(`error`) nazywa wezel lidera (`leader_node_id=...`; "not known yet" gdy
+przypisanie jeszcze nie dotarlo). Addon z konsumentem dziala na wezle lidera
+tematu albo ponawia `open` po zmianie przypisania.
 
 ### `bus_consume_next_v1`
 
@@ -2175,6 +2192,13 @@ zakaz audytu per-wiadomosc/per-batch dla busa). Odmowa uprawnienia
 (gdy `bus.subscribe` zostal cofniety w trakcie sesji) JEST audytowana
 za kazdym razem — to jest test bezpieczenstwa bramki P12 ("brak
 uprawnienia = odmowa na `open` i na kazdym `next`").
+
+Uchwyt zyje na wezle, na ktorym zostal otwarty (konsument addonu nie jest
+przekazywany do lidera, TB-04 P7). Gdy ten wezel przestal prowadzic temat
+(zmiana lidera pod otwartym uchwytem) albo partycja nie ma uzywalnego lidera,
+`next` (i `commit`) zwraca `NoAvailableTarget` (3), nie `Backpressure`:
+konsument nie ma tu celu. Addon zamyka uchwyt i otwiera nowy na wezle lidera;
+niezatwierdzone rekordy dostarcza sie ponownie.
 
 ### `bus_consume_commit_v1`
 

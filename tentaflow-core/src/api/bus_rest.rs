@@ -51,17 +51,37 @@
 //
 // A group-bound key (`Principal::Group`) is refused: it has neither a user
 // to act as nor grants of its own.
+//
+// Cluster routing (TB-04): a node that does not lead the topic hands the
+// request to the node that does, so both verbs work on any node.
+//
+// * 503 with `Retry-After: 1` — nothing was written or consumed, repeating in
+//   a moment is safe: `bus_not_leader`, `bus_not_enough_replicas`,
+//   `bus_partition_unavailable` (no leader at the moment, too few in-sync
+//   replicas, no assignment yet; also a topic whose partitions are led by
+//   several nodes, which is transient). The body is fixed text: no node ids,
+//   epochs or reasons.
+// * 504 without `Retry-After` — the request left this node and may have taken
+//   effect: `bus_forward_outcome_unknown` (no answer from the leader) and
+//   `bus_ack_timeout` (replicas did not acknowledge in time). A write may or
+//   may not be in the log: publish with an idempotency key or a producer
+//   identity before repeating it. A read may have consumed and committed
+//   records the caller never saw: a forwarded read is at-most-once when its
+//   reply is lost, a read served on the leader's own node at-least-once.
+// * 502 `bus_leader_failure` — the leader failed on its own side; not a state
+//   that passes, so no `Retry-After`.
+// * 500 `internal_error` with `error.acked` — part of a multi-partition batch
+//   landed before the failure; the listed partitions must not be resent.
 // =============================================================================
 
 use crate::api::openai::server::{OpenAIBody, V1PeerIp};
 use crate::auth::acl::Principal;
 use crate::auth::actor::ActorKind;
-use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::key_audit;
 use crate::bus::{
-    self, BusAction, BusCallContext, BusServiceError, ConsumerConfig, FetchedRecordMeta,
-    PublishBatch, PublishRecord, PublishResult, TopicPartition,
+    self, BusAction, BusCallContext, BusServiceError, FetchedRecordMeta, PublishBatch,
+    PublishRecord, PublishResult,
 };
 use crate::dispatch::app_gate::{self, SoleInstanceError};
 use crate::routing::router::Router;
@@ -322,12 +342,119 @@ pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
             "invalid_request_error",
             e.to_string(),
         ),
+        // TB-04: the partition has no leader that can take the request right
+        // now (election in progress, ISR too small, no assignment yet).
+        // Nothing was written or consumed, so the client may retry shortly.
+        BusServiceError::NotLeader { .. } => retryable_unavailable("bus_not_leader", e),
+        BusServiceError::NotEnoughReplicas { .. } => {
+            retryable_unavailable("bus_not_enough_replicas", e)
+        }
+        BusServiceError::PartitionUnavailable { .. } => {
+            retryable_unavailable("bus_partition_unavailable", e)
+        }
+        // The write left this node for the partition leader and no answer
+        // came back, or the replicas did not acknowledge in time: it may or
+        // may not be in the log. No `Retry-After`: a plain retry can store
+        // the records twice.
+        BusServiceError::ForwardOutcomeUnknown { .. } => {
+            outcome_unknown("bus_forward_outcome_unknown", e)
+        }
+        BusServiceError::AckTimeout { .. } => outcome_unknown("bus_ack_timeout", e),
+        // The leader of the partition failed on its own side. Not a state
+        // that passes, so no `Retry-After`; what failed stays in its log.
+        BusServiceError::RemoteFailure => error_response(
+            StatusCode::BAD_GATEWAY,
+            "bus_leader_failure",
+            client_message(e),
+        ),
+        // Part of a multi-partition batch is already in the log, so the
+        // response names exactly what landed: the client must not resend those
+        // records blindly.
+        BusServiceError::PartialPublish { acked, source } => {
+            let body = serde_json::json!({
+                "error": {
+                    "type": "internal_error",
+                    "message": format!(
+                        "publish partially applied before failing: {}",
+                        client_message(source)
+                    ),
+                    "code": "internal_error",
+                    "acked": acked
+                        .iter()
+                        .map(|a| serde_json::json!({
+                            "partition": a.partition,
+                            "base_offset": a.base_offset,
+                            "accepted": a.accepted,
+                        }))
+                        .collect::<Vec<_>>(),
+                }
+            });
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )
+        }
         _ => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             e.to_string(),
         ),
     }
+}
+
+/// What a client is told of the errors that arise from how the cluster is
+/// laid out: fixed text, with none of the node ids, epochs or reasons the
+/// error carries. Those stay in the logs and the audit trail; a client has no
+/// use for the topology and must not learn it. Any other error is its own
+/// message.
+fn client_message(e: &BusServiceError) -> String {
+    match e {
+        BusServiceError::NotLeader { .. } => {
+            "no partition leader can take the request right now; retry shortly".to_string()
+        }
+        BusServiceError::NotEnoughReplicas { .. } => {
+            "too few in-sync replicas to accept the write right now; retry shortly".to_string()
+        }
+        BusServiceError::PartitionUnavailable { .. } => {
+            "the partition is unavailable right now; retry shortly".to_string()
+        }
+        BusServiceError::ForwardOutcomeUnknown { .. } => {
+            "the request was handed to another node of the cluster and no answer came back. It \
+             may or may not have taken effect"
+                .to_string()
+        }
+        BusServiceError::AckTimeout { .. } => {
+            "the replicas did not acknowledge the write in time. It may or may not have landed"
+                .to_string()
+        }
+        BusServiceError::RemoteFailure => {
+            "the node that owns the partition failed while serving the request".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// 503 with `Retry-After: 1` and the stable `code` of a refusal that wrote
+/// nothing and is worth repeating in a moment.
+fn retryable_unavailable(code: &str, e: &BusServiceError) -> Response<OpenAIBody> {
+    let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE, code, client_message(e));
+    resp.headers_mut()
+        .insert("Retry-After", "1".parse().unwrap());
+    resp
+}
+
+/// 504 for a write that may have landed, with the advice that makes a retry
+/// safe. No `Retry-After`.
+fn outcome_unknown(code: &str, e: &BusServiceError) -> Response<OpenAIBody> {
+    error_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        code,
+        format!(
+            "{}. Before retrying, publish with an idempotency key or a producer identity so a \
+             repeat cannot store it twice",
+            client_message(e)
+        ),
+    )
 }
 
 // ---- Caller resolution and key audit (package K) ---------------------------
@@ -1304,93 +1431,65 @@ fn serve_consume<B>(
         .max(64 * 1024);
 
     let ctx = actor.call_context(instance_id, None);
-    // Blocking too, though not through the `blocking_recv` that `bus::mod`'s
-    // BLOCKING note names for `publish`/`fetch`: `open_consumer` opens a full
-    // `Partition` — writer thread and directory flock included — for every
-    // partition it subscribes to (that module's PARTITION HANDLE LIFETIME
-    // note), so it gets handed off the executor like the `fetch` below.
-    let opened = tokio::task::block_in_place(|| {
-        svc.open_consumer(
+    // Open, fetch and commit are one blocking call: `open_consumer` opens a
+    // full `Partition` (writer thread and directory flock included) per
+    // partition, `fetch` blocks for up to `max_wait_ms` (callers on a Tokio
+    // executor MUST NOT call it directly from an async fn), and a node that
+    // does not lead the topic waits for its leader's answer the same way.
+    // `block_in_place` is the pattern `host_functions/bus.rs`'s
+    // `bus_consume_next_v1` uses for this call. The records are already
+    // projected through the caller's data-hiding rules — for a general key,
+    // the topic-wide rule (`field_policies::resolve`).
+    //
+    // The records are committed once fetched, since this thin endpoint has
+    // no separate commit call (PLAN §6.5 does not define one). Served on this
+    // node that is at-least-once: a commit that fails lets them be read
+    // again. Served by a leader on another node it is at-most-once when the
+    // reply is lost: the leader commits before it answers, and a reply that
+    // never arrives leaves the records consumed and not delivered (504, below).
+    // A caller that needs exactly-once or explicit ack should consume through
+    // the mesh/addon path instead.
+    let consumed = tokio::task::block_in_place(|| {
+        svc.consume_once(
             &ctx,
             &group,
-            &[topic.to_string()],
-            ConsumerConfig {
-                commit_mode: CommitMode::Explicit,
-            },
+            topic,
+            max_bytes,
+            max_records as usize,
+            max_wait_ms,
         )
     });
-    let handle = match opened {
-        Ok(h) => h,
+    let records = match consumed {
+        Ok(records) => records,
+        Err(BusServiceError::ForwardOutcomeUnknown { leader_node_id }) => {
+            // The read went to the leader and no answer came back: it may
+            // have fetched and committed records this caller never saw, so
+            // this is neither an empty read nor a plain timeout. The leader
+            // is named in the log only.
+            tracing::warn!(
+                leader = %leader_node_id, topic, group = %group,
+                "bus read: a forwarded read got no answer"
+            );
+            facts.reason = Some("bus:ForwardOutcomeUnknown".to_string());
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "bus_forward_outcome_unknown",
+                format!(
+                    "the read was handed to another node of the cluster and no answer came \
+                     back; it may have consumed and committed records for group '{group}' \
+                     that were not delivered. Check the group's offsets before relying on \
+                     the next read"
+                ),
+            );
+        }
         Err(e) => {
             facts.reason = Some(bus_error_reason(&e));
             return map_bus_error(&e);
         }
     };
+    facts.records = Some(records.len());
 
-    // `ConsumerHandle::fetch` blocks the calling thread for up to
-    // `max_wait_ms` (its own doc: callers on a Tokio executor MUST NOT call
-    // it directly from an async fn) — `block_in_place` is the same pattern
-    // `host_functions/bus.rs`'s `bus_consume_next_v1` already uses for this
-    // exact call. The records it returns are already projected through the
-    // caller's data-hiding rules (`ConsumerHandle::fetch`) — for a general
-    // key, the topic-wide rule (`field_policies::resolve`).
-    let fetched = tokio::task::block_in_place(|| handle.fetch(max_bytes, max_wait_ms));
-    let batch = match fetched {
-        Ok(b) => b,
-        Err(e) => {
-            facts.reason = Some(bus_error_reason(&e));
-            return map_bus_error(&e);
-        }
-    };
-    facts.records = Some(batch.records.len());
-
-    if batch.records.is_empty() {
-        let body = serde_json::json!({ "records": [] });
-        return json_response(
-            StatusCode::OK,
-            serde_json::to_vec(&body).unwrap_or_default(),
-        );
-    }
-
-    // At-least-once: commit right after a successful HTTP response is built,
-    // to the offset one past the highest fetched per partition. This thin
-    // endpoint has no separate commit call (PLAN §6.5 does not define one),
-    // so auto-commit-on-delivery is the only complete, non-half-finished
-    // contract available here — a caller that needs exactly-once or
-    // explicit ack should consume through the mesh/addon path instead.
-    let mut max_offset: HashMap<u32, u64> = HashMap::new();
-    for r in &batch.records {
-        max_offset
-            .entry(r.partition)
-            .and_modify(|o| *o = (*o).max(r.offset))
-            .or_insert(r.offset);
-    }
-    let commit_offsets: Vec<(TopicPartition, u64)> = max_offset
-        .into_iter()
-        .map(|(partition, offset)| {
-            (
-                TopicPartition {
-                    topic: topic.to_string(),
-                    partition,
-                },
-                offset + 1,
-            )
-        })
-        .collect();
-
-    let records_json: Vec<serde_json::Value> =
-        batch.records.into_iter().map(record_to_json).collect();
-    // Blocking as well — `bus/reactor.rs`'s `commit_offsets` hands this same
-    // call off the async runtime for the same reason.
-    if let Err(e) = tokio::task::block_in_place(|| handle.commit(&commit_offsets)) {
-        // The records were already fetched and are about to be returned to
-        // the caller — a commit failure here must not silently drop them,
-        // but it does mean a redelivery is possible on the next poll (the
-        // same at-least-once trade-off `note_delivery_failure`'s retry path
-        // already makes elsewhere in this codebase).
-        tracing::warn!(topic = %topic, group = %group, error = %e, "v1 bus REST: post-fetch commit failed, records already returned to caller");
-    }
-
+    let records_json: Vec<serde_json::Value> = records.into_iter().map(record_to_json).collect();
     let body = serde_json::json!({ "records": records_json });
     json_response(
         StatusCode::OK,
@@ -1522,6 +1621,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::groups::CommitMode;
+    use crate::bus::ConsumerConfig;
     // Only the tests still provision topics explicitly; the handler's own
     // auto-create path goes through `BusService::autocreate_topic`, which
     // picks the options itself.
@@ -2081,6 +2182,11 @@ mod tests {
                     .get("x-correlation-id")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let bytes = resp
                     .into_body()
                     .collect()
@@ -2091,6 +2197,7 @@ mod tests {
                     status,
                     json: serde_json::from_slice(&bytes).expect("json body"),
                     correlation_header,
+                    retry_after,
                 }
             })
         }
@@ -2114,6 +2221,8 @@ mod tests {
         json: serde_json::Value,
         /// The `X-Correlation-Id` response header.
         correlation_header: Option<String>,
+        /// The `Retry-After` response header.
+        retry_after: Option<String>,
     }
 
     fn key_principal(uid: &str) -> Option<Principal> {
@@ -2684,6 +2793,7 @@ mod tests {
                     status,
                     json: serde_json::from_slice(&bytes).expect("json body"),
                     correlation_header: None,
+                    retry_after: None,
                 }
             })
         };
@@ -3438,5 +3548,727 @@ mod tests {
             .expect("the admin reads the key group's lag");
         assert_eq!(lag.len(), 1);
         assert!(fx.audit_rows("bus.consume.denied").is_empty());
+    }
+
+    // ---- Forwarding to the partition leader (TB-04 K3) ----------------------
+
+    /// How the link from the node under test to the leader behaves.
+    #[derive(Clone, Copy)]
+    enum Link {
+        /// A forwarded request reaches the leader's engine and its answer
+        /// comes back.
+        Up,
+        /// Nothing can be sent to the leader.
+        Down,
+        /// The leader carries the request out and the answer is lost on the
+        /// way back.
+        LostReply,
+    }
+
+    /// The replication side of a node that follows every partition of a
+    /// topic: forwarded requests go straight to `leader`, another engine
+    /// standing for the node that leads it.
+    struct LoopbackCoordinator {
+        leader: Arc<bus::BusService>,
+        leader_instance: String,
+        roles: Vec<bus::PartitionRole>,
+        link: Link,
+        publish_calls: std::sync::atomic::AtomicU32,
+        consume_calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl LoopbackCoordinator {
+        fn new(
+            leader: Arc<bus::BusService>,
+            roles: Vec<bus::PartitionRole>,
+            link: Link,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                leader_instance: leader.instance_id().to_string(),
+                leader,
+                roles,
+                link,
+                publish_calls: std::sync::atomic::AtomicU32::new(0),
+                consume_calls: std::sync::atomic::AtomicU32::new(0),
+            })
+        }
+
+        /// Follows the one partition of a topic led by `node-a`.
+        fn following(leader: Arc<bus::BusService>, link: Link) -> Arc<Self> {
+            Self::new(
+                leader,
+                vec![bus::PartitionRole::Follower {
+                    leader_node_id: "node-a".to_string(),
+                    epoch: 3,
+                }],
+                link,
+            )
+        }
+
+        fn calls(counter: &std::sync::atomic::AtomicU32) -> u32 {
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn lost(link: Link, what: &str) -> bus::replication::forward::ForwardUnavailable {
+            use bus::replication::forward::ForwardUnavailable;
+            match link {
+                Link::Down => ForwardUnavailable::NotSent {
+                    node: "node-a".to_string(),
+                    reason: format!("{what}: no connection"),
+                },
+                _ => ForwardUnavailable::OutcomeUnknown {
+                    node: "node-a".to_string(),
+                    reason: format!("{what}: stream reset"),
+                },
+            }
+        }
+    }
+
+    impl bus::ReplicationCoordinator for LoopbackCoordinator {
+        fn role(&self, _org: &str, _topic: &str, partition: u32) -> bus::PartitionRole {
+            self.roles[partition as usize].clone()
+        }
+        fn preflight(
+            &self,
+            _org: &str,
+            topic: &str,
+            partition: u32,
+            _acks: bus::topics::Acks,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            match self.roles[partition as usize] {
+                bus::PartitionRole::Leader { epoch } => Ok(epoch),
+                _ => Err(bus::ReplError::NotAReplica {
+                    topic: topic.to_string(),
+                    partition,
+                    node_id: "node-b".to_string(),
+                }),
+            }
+        }
+        fn await_acks(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _next_offset: u64,
+            _acks: bus::topics::Acks,
+            _timeout: std::time::Duration,
+        ) -> std::result::Result<bus::AckOutcome, bus::ReplError> {
+            Ok(bus::AckOutcome {
+                acked_nodes: 1,
+                required: 1,
+                hw: 0,
+            })
+        }
+        fn note_offset_commit(&self, _: &str, _: &str, _: &str, _: u32, _: u64, _: u32) {}
+        fn note_dlq_handled(&self, _: &str, _: &str, _: u32, _: u64) {}
+        fn evict_node_from_replica_sets(
+            &self,
+            _: &str,
+            _: &'static str,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn transfer_leader(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: &str,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn reassign(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u32>,
+            _: &[String],
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn snapshot(&self, _: &str, _: Option<&str>) -> bus::ReplicationSnapshot {
+            bus::ReplicationSnapshot::default()
+        }
+        fn local_node_id(&self) -> String {
+            "node-b".to_string()
+        }
+        fn can_forward_publish(&self) -> bool {
+            true
+        }
+        fn forward_publish(
+            &self,
+            _target: &str,
+            mut request: bus::replication::frames::ProduceForward,
+            _timeout: std::time::Duration,
+            _still_valid: &dyn Fn() -> bool,
+        ) -> std::result::Result<
+            bus::replication::frames::ProduceForwardReply,
+            bus::replication::forward::ForwardUnavailable,
+        > {
+            use bus::replication::forward::ForwardedPublishHandler;
+            self.publish_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let link = self.link;
+            match link {
+                Link::Up | Link::LostReply => {
+                    request.instance_id = self.leader_instance.clone();
+                    let reply = self.leader.publish_forwarded("node-b", request);
+                    match link {
+                        Link::Up => Ok(reply),
+                        _ => Err(Self::lost(link, "publish")),
+                    }
+                }
+                Link::Down => Err(Self::lost(link, "publish")),
+            }
+        }
+        fn forward_consume(
+            &self,
+            _target: &str,
+            mut request: bus::replication::frames::ConsumeForward,
+            _timeout: std::time::Duration,
+            _still_valid: &dyn Fn() -> bool,
+        ) -> std::result::Result<
+            bus::replication::frames::ConsumeForwardReply,
+            bus::replication::forward::ForwardUnavailable,
+        > {
+            use bus::replication::forward::ForwardedPublishHandler;
+            self.consume_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let link = self.link;
+            match link {
+                Link::Up | Link::LostReply => {
+                    request.instance_id = self.leader_instance.clone();
+                    let reply = self.leader.consume_forwarded("node-b", request);
+                    match link {
+                        Link::Up => Ok(reply),
+                        _ => Err(Self::lost(link, "consume")),
+                    }
+                }
+                Link::Down => Err(Self::lost(link, "consume")),
+            }
+        }
+    }
+
+    /// A node whose `orders` follows `node-a`, and the engine standing for
+    /// `node-a`, which holds the same topic and leads it.
+    fn follower_fixture(
+        suffix: &str,
+        leader_suffix: &str,
+        link: Link,
+    ) -> (
+        KeyFixture,
+        Arc<bus::BusService>,
+        Arc<LoopbackCoordinator>,
+        tempfile::TempDir,
+    ) {
+        let fx = key_fixture(suffix);
+        let (dir, leader_id, leader) = start_test_instance(&fx.state, leader_suffix);
+        leader
+            .create_topic(
+                &BusCallContext {
+                    instance_id: leader_id,
+                    ..fx.user_ctx("u-admin")
+                },
+                TOPIC,
+                TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/json".to_string()),
+                    ..TopicOptions::default()
+                },
+            )
+            .expect("the leader's topic");
+        let coordinator = LoopbackCoordinator::following(Arc::clone(&leader), link);
+        fx.svc.set_replication(coordinator.clone());
+        (fx, leader, coordinator, dir)
+    }
+
+    /// A node that does not lead the topic accepts the write and serves the
+    /// read: both reach the leader, and the leader commits the read.
+    #[test]
+    fn rest_on_a_follower_publishes_and_consumes_through_the_leader() {
+        let (fx, leader, _coordinator, _dir) = follower_fixture("cccc4101", "dddd4101", Link::Up);
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert_eq!(published.json["published"], 1);
+        assert_eq!(
+            leader
+                .partition_stats(
+                    &BusCallContext {
+                        instance_id: BusInstanceId::parse(leader.instance_id()).unwrap(),
+                        ..fx.user_ctx("u-admin")
+                    },
+                    TOPIC,
+                    0,
+                )
+                .map(|s| s.high_watermark)
+                .ok(),
+            Some(1),
+            "the record is on the leader"
+        );
+
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+        assert_eq!(payloads(&read), vec![serde_json::json!({"id": 1})]);
+        let again = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(again.status, StatusCode::OK, "{}", again.json);
+        assert!(
+            payloads(&again).is_empty(),
+            "the leader committed what the first read returned"
+        );
+    }
+
+    /// `max_records` bounds a read served by the leader as it does one served
+    /// here, and the leader commits only what it returns: the rest is read by
+    /// the next request, in order, each record once.
+    #[test]
+    fn max_records_bounds_a_read_through_the_leader() {
+        let (fx, _leader, _coordinator, _dir) = follower_fixture("cccc4107", "dddd4107", Link::Up);
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+        let body = (1..=5)
+            .map(|n| ndjson(&format!(r#"{{"id":{n}}}"#)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &body);
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert_eq!(published.json["published"], 5);
+
+        let query = format!("{}&max_records=2", own_group_query(&reader));
+        let mut seen = Vec::new();
+        for expected in [2usize, 2, 1, 0] {
+            let read = fx.consume_as(key_principal(&reader), &query);
+            assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+            let got = payloads(&read);
+            assert_eq!(got.len(), expected, "{got:?}");
+            seen.extend(got);
+        }
+        let ids: Vec<u64> = seen.iter().map(|p| p["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// With no leader that can be asked, the caller is told to come back,
+    /// not that the server broke.
+    #[test]
+    fn rest_answers_503_with_retry_after_while_no_leader_can_take_the_call() {
+        let (fx, _leader, coordinator, _dir) = follower_fixture("cccc4102", "dddd4102", Link::Down);
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(
+            published.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            published.json
+        );
+        assert_eq!(published.retry_after.as_deref(), Some("1"));
+        assert_eq!(published.json["error"]["code"], "bus_not_leader");
+        assert_no_topology(&published);
+
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(
+            read.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            read.json
+        );
+        assert_eq!(read.retry_after.as_deref(), Some("1"));
+        assert_eq!(read.json["error"]["code"], "bus_not_leader");
+        assert_no_topology(&read);
+        assert_eq!(LoopbackCoordinator::calls(&coordinator.consume_calls), 1);
+    }
+
+    /// A client is told nothing of how the cluster is laid out: the leader the
+    /// request was handed to, or that it was handed anywhere, is in the logs.
+    fn assert_no_topology(reply: &Reply) {
+        let message = reply.json["error"]["message"].as_str().unwrap_or_default();
+        for leak in [
+            "node-a",
+            "node-b",
+            "node-c",
+            "leader_node_id",
+            "Some(",
+            "epoch",
+        ] {
+            assert!(!message.contains(leak), "'{leak}' leaked: {message}");
+        }
+    }
+
+    /// A partition with no leader at all (an election in progress) is the
+    /// same 503, once the bounded wait for one has run out.
+    #[test]
+    fn rest_answers_503_while_the_partition_has_no_leader_at_all() {
+        let fx = key_fixture("cccc4103");
+        let coordinator = Arc::new(NoLeaderCoordinator);
+        fx.svc.set_replication(coordinator);
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(
+            published.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            published.json
+        );
+        assert_eq!(published.retry_after.as_deref(), Some("1"));
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(
+            read.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            read.json
+        );
+        assert_eq!(read.retry_after.as_deref(), Some("1"));
+    }
+
+    /// The same as `LoopbackCoordinator`, for a partition nobody leads yet.
+    struct NoLeaderCoordinator;
+
+    impl bus::ReplicationCoordinator for NoLeaderCoordinator {
+        fn role(&self, _: &str, _: &str, _: u32) -> bus::PartitionRole {
+            bus::PartitionRole::Unavailable {
+                reason: bus::UnavailableReason::NoAssignment,
+            }
+        }
+        fn preflight(
+            &self,
+            _: &str,
+            topic: &str,
+            partition: u32,
+            _: bus::topics::Acks,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Err(bus::ReplError::NoAssignment {
+                topic: topic.to_string(),
+                partition,
+            })
+        }
+        fn await_acks(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: u64,
+            _: bus::topics::Acks,
+            _: std::time::Duration,
+        ) -> std::result::Result<bus::AckOutcome, bus::ReplError> {
+            Err(bus::ReplError::Internal("no leader".to_string()))
+        }
+        fn note_offset_commit(&self, _: &str, _: &str, _: &str, _: u32, _: u64, _: u32) {}
+        fn note_dlq_handled(&self, _: &str, _: &str, _: u32, _: u64) {}
+        fn evict_node_from_replica_sets(
+            &self,
+            _: &str,
+            _: &'static str,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn transfer_leader(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: &str,
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn reassign(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u32>,
+            _: &[String],
+        ) -> std::result::Result<u32, bus::ReplError> {
+            Ok(0)
+        }
+        fn snapshot(&self, _: &str, _: Option<&str>) -> bus::ReplicationSnapshot {
+            bus::ReplicationSnapshot::default()
+        }
+        fn local_node_id(&self) -> String {
+            "node-b".to_string()
+        }
+        fn can_forward_publish(&self) -> bool {
+            true
+        }
+    }
+
+    /// A write sent to the leader whose answer never came back may be in the
+    /// log: 504, no `Retry-After`, and a message that says to use an
+    /// idempotency key or producer identity before trying again. A read that
+    /// went the same way was carried out and committed by the leader, so the
+    /// records are gone for the group and never reached the caller; the 504
+    /// says so, which is what makes the loss visible.
+    #[test]
+    fn rest_answers_504_when_the_outcome_of_a_forwarded_call_is_unknown() {
+        let (fx, leader, coordinator, _dir) =
+            follower_fixture("cccc4104", "dddd4104", Link::LostReply);
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(
+            published.status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "{}",
+            published.json
+        );
+        assert_eq!(
+            published.retry_after, None,
+            "a blind retry may store it twice"
+        );
+        assert_eq!(
+            published.json["error"]["code"],
+            "bus_forward_outcome_unknown"
+        );
+        let message = published.json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("may or may not have"), "{message}");
+        assert!(message.contains("idempotency key"), "{message}");
+        assert_no_topology(&published);
+        assert_eq!(
+            LoopbackCoordinator::calls(&coordinator.publish_calls),
+            1,
+            "an unknown outcome is never retried"
+        );
+        let leader_ctx = BusCallContext {
+            instance_id: BusInstanceId::parse(leader.instance_id()).unwrap(),
+            ..fx.user_ctx("u-admin")
+        };
+        assert_eq!(
+            leader
+                .partition_stats(&leader_ctx, TOPIC, 0)
+                .map(|s| s.high_watermark)
+                .ok(),
+            Some(1),
+            "the write the 504 speaks of did land on the leader"
+        );
+
+        let group = format!("k:{reader}");
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(read.status, StatusCode::GATEWAY_TIMEOUT, "{}", read.json);
+        assert_eq!(read.retry_after, None);
+        assert_eq!(read.json["error"]["code"], "bus_forward_outcome_unknown");
+        let message = read.json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("committed records"), "{message}");
+        assert_no_topology(&read);
+        assert_eq!(LoopbackCoordinator::calls(&coordinator.consume_calls), 1);
+        let handle = leader
+            .open_consumer(
+                &leader_ctx,
+                &group,
+                &[TOPIC.to_string()],
+                ConsumerConfig {
+                    commit_mode: CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            handle.committed_offset(TOPIC, 0).unwrap(),
+            1,
+            "the leader committed the record the lost reply carried"
+        );
+    }
+
+    /// The replicas not acknowledging in time is the same kind of answer as
+    /// no answer from the leader: the write may be in the log.
+    #[test]
+    fn an_unacknowledged_write_is_a_504_like_an_unknown_outcome() {
+        let resp = map_bus_error(&BusServiceError::AckTimeout {
+            acked: 1,
+            required: 2,
+        });
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(resp.headers().get("Retry-After").is_none());
+        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
+        assert_eq!(body["error"]["code"], "bus_ack_timeout");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("may or may not have"), "{message}");
+        assert!(message.contains("idempotency key"), "{message}");
+        assert!(!message.contains("acked="), "{message}");
+    }
+
+    /// A failure of the leader's own storage is neither a passing state nor
+    /// the caller's doing: a 502 without `Retry-After`, with no detail.
+    #[test]
+    fn a_leader_failure_is_a_502_without_retry_after() {
+        let resp = map_bus_error(&BusServiceError::RemoteFailure);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(resp.headers().get("Retry-After").is_none());
+        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
+        assert_eq!(body["error"]["code"], "bus_leader_failure");
+    }
+
+    /// What the leader's own read says about a group that fell behind
+    /// retention reaches the caller as itself: the same error a read served
+    /// here gives, not a leader that "is unavailable for a moment" to be
+    /// retried for ever.
+    #[test]
+    fn a_read_past_retention_on_the_leader_reaches_the_caller_as_the_same_error() {
+        let (fx, _leader, _coordinator, dir) = follower_fixture("cccc4108", "dddd4108", Link::Up);
+        let reader = fx.key(&["read"]);
+        let partition = bus::topics::partition_dir(dir.path(), ORG, TOPIC, 0);
+        {
+            let policy = tentaflow_bus::RollPolicy {
+                max_batches: 1,
+                ..tentaflow_bus::RollPolicy::default()
+            };
+            let raw = tentaflow_bus::Partition::open(
+                &partition,
+                policy,
+                tentaflow_bus::Durability::Os,
+                8,
+            )
+            .expect("raw partition open");
+            for i in 0..6i64 {
+                let mut builder = tentaflow_bus::BatchBuilder::new(0, 0);
+                builder
+                    .push(tentaflow_bus::RecordInput::new(
+                        bytes::Bytes::from(format!("r-{i}")),
+                        1,
+                    ))
+                    .unwrap();
+                raw.append_batch(builder.build().unwrap()).unwrap();
+            }
+            raw.delete_sealed_segment(0).unwrap();
+        }
+
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(
+            read.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the status a read served here gives: {}",
+            read.json
+        );
+        assert_eq!(
+            read.retry_after, None,
+            "a group past retention is not retried"
+        );
+        let message = read.json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("earliest retained offset 1"), "{message}");
+    }
+
+    /// A topic whose partitions are led by different nodes is not handed to
+    /// one of them: the read is refused as before, nothing is sent.
+    #[test]
+    fn a_read_of_a_topic_led_by_several_nodes_is_not_forwarded() {
+        let fx = key_fixture("cccc4105");
+        let (_dir, leader_id, leader) = start_test_instance(&fx.state, "dddd4105");
+        let admin = fx.user_ctx("u-admin");
+        let wide = TopicOptions {
+            partitions: Some(2),
+            ..TopicOptions::default()
+        };
+        fx.svc.create_topic(&admin, "wide", wide.clone()).unwrap();
+        leader
+            .create_topic(
+                &BusCallContext {
+                    instance_id: leader_id,
+                    ..admin.clone()
+                },
+                "wide",
+                wide,
+            )
+            .unwrap();
+        let coordinator = LoopbackCoordinator::new(
+            leader,
+            vec![
+                bus::PartitionRole::Follower {
+                    leader_node_id: "node-a".to_string(),
+                    epoch: 1,
+                },
+                bus::PartitionRole::Follower {
+                    leader_node_id: "node-c".to_string(),
+                    epoch: 1,
+                },
+            ],
+            Link::Up,
+        );
+        fx.svc.set_replication(coordinator.clone());
+        fx.grant("u-admin", "bus.read");
+
+        let err = fx
+            .svc
+            .consume_once(&admin, "reader-group", "wide", 1024, usize::MAX, 0)
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert_eq!(LoopbackCoordinator::calls(&coordinator.consume_calls), 0);
+    }
+
+    /// The caller who may not read the topic is refused on the node it asked,
+    /// before the leader is bothered.
+    #[test]
+    fn a_read_the_caller_may_not_make_is_refused_before_it_is_forwarded() {
+        let (fx, _leader, coordinator, _dir) = follower_fixture("cccc4106", "dddd4106", Link::Up);
+        let writer = fx.key(&["write"]);
+        let denied = fx.consume_as(key_principal(&writer), &own_group_query(&writer));
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.json);
+        assert_eq!(LoopbackCoordinator::calls(&coordinator.consume_calls), 0);
+    }
+
+    #[test]
+    fn a_publish_that_partly_landed_names_the_partitions_that_did() {
+        let partial = BusServiceError::PartialPublish {
+            acked: vec![bus::PartitionAck {
+                partition: 2,
+                base_offset: 40,
+                accepted: 3,
+            }],
+            source: Box::new(BusServiceError::ForwardOutcomeUnknown {
+                leader_node_id: "node-b".to_string(),
+            }),
+        };
+        let resp = map_bus_error(&partial);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("Retry-After").is_none());
+        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
+        assert!(
+            !body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("node-b"),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["acked"],
+            serde_json::json!([{"partition": 2, "base_offset": 40, "accepted": 3}])
+        );
+    }
+
+    #[test]
+    fn leaderless_refusals_are_503_with_their_own_codes() {
+        for (error, code) in [
+            (
+                BusServiceError::NotLeader {
+                    leader_node_id: Some("node-b".to_string()),
+                    leader_epoch: 4,
+                },
+                "bus_not_leader",
+            ),
+            (
+                BusServiceError::NotEnoughReplicas {
+                    isr: 1,
+                    required: 2,
+                },
+                "bus_not_enough_replicas",
+            ),
+            (
+                BusServiceError::PartitionUnavailable {
+                    reason: "no isr".to_string(),
+                },
+                "bus_partition_unavailable",
+            ),
+        ] {
+            let resp = map_bus_error(&error);
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{error:?}");
+            assert_eq!(resp.headers().get("Retry-After").unwrap(), "1");
+            let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            let message = body["error"]["message"].as_str().unwrap();
+            for leak in ["node-b", "leader_node_id", "Some(", "isr", "no isr"] {
+                assert!(!message.contains(leak), "'{leak}' leaked: {message}");
+            }
+        }
     }
 }

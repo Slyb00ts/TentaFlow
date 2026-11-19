@@ -33,10 +33,10 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use crate::bus::instance::BusInstanceId;
-use crate::bus::replication::forward;
 use crate::bus::replication::frames::{self, ReplFrame, ReplHelloAck, ReplLeoReply, ReplReject};
 use crate::bus::replication::leader::frame_kind_name;
 use crate::bus::replication::manager::{BusRecv, BusSend, ReplicationManager};
+use crate::bus::replication::{consume_forward, forward};
 use crate::mesh::iroh_manager::{BusAcceptHandler, IrohMeshManager};
 
 /// Every instance currently running replication on this node, keyed by its
@@ -289,6 +289,8 @@ async fn spawn_routed_stream(
 /// - `ProduceForward` for an unregistered/unparseable instance -> a refused
 ///   `ProduceForwardReply` (`forward::refusal`), logged at `warn!`; for a
 ///   registered one the manager answers it (`accept_produce_forward`);
+/// - `ConsumeForward` likewise, answered with `ConsumeForwardReply`
+///   (`consume_forward::refusal`, `accept_consume_forward`);
 /// - anything else (a frame kind that must never open a stream, or a
 ///   decode error) is dropped silently at the protocol level (matching
 ///   `ReplicationManager::accept_stream`'s own `_ => return` arm), logged
@@ -397,6 +399,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         leader_alive: false,
                         promised_epoch: None,
                         promises: true,
+                        bus_features: 0,
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }
@@ -421,6 +424,26 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 }
             }
         }
+        Ok(ReplFrame::ConsumeForward(request)) => {
+            let target = BusInstanceId::parse(&request.instance_id)
+                .ok()
+                .and_then(|id| managers().get(&id).map(|e| e.value().clone()));
+            match target {
+                Some(mgr) => mgr.accept_consume_forward(&remote_hex, request, send).await,
+                None => {
+                    tracing::warn!(
+                        peer = %remote_hex,
+                        instance_id = %truncate_for_log(&request.instance_id),
+                        "replication::router: ConsumeForward named an unregistered/unparseable \
+                         instance — refusing it"
+                    );
+                    let reply = ReplFrame::ConsumeForwardReply(consume_forward::refusal(
+                        "unknown_instance",
+                    ));
+                    let _ = frames::write_frame(&mut send, &reply).await;
+                }
+            }
+        }
         Ok(other) => {
             // W5 review round 2 finding 2: log the frame KIND only, never
             // `?other` — `ReplFrame::Batch { bytes: Bytes }` can carry up to
@@ -435,7 +458,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 peer = %remote_hex,
                 frame_kind = frame_kind_name(&other),
                 "replication::router: dropped a stream whose first frame is neither \
-                 Hello, LeoQuery nor ProduceForward"
+                 Hello, LeoQuery, ProduceForward nor ConsumeForward"
             );
         }
         Err(e) => {

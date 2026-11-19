@@ -164,6 +164,8 @@ const TEST_INSTANCE_ID: &str = "tentabus-00000001";
 /// refusal reach a publisher on another node.
 struct AllowAllAuthorizer {
     deny_produce: Arc<AtomicBool>,
+    /// While set, `Consume` is refused the way a per-topic ACL row would.
+    deny_consume: Arc<AtomicBool>,
 }
 
 impl tentaflow_core::bus::BusAuthorizer for AllowAllAuthorizer {
@@ -185,10 +187,16 @@ impl tentaflow_core::bus::BusAuthorizer for AllowAllAuthorizer {
     fn authorize_group(
         &self,
         _ctx: &BusCallContext,
-        _action: BusAction,
-        _topic: &str,
+        action: BusAction,
+        topic: &str,
         _group: &str,
     ) -> Result<(), BusServiceError> {
+        if action == BusAction::Consume && self.deny_consume.load(Ordering::SeqCst) {
+            return Err(BusServiceError::PermissionDenied {
+                action: action.as_str(),
+                topic: topic.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -630,6 +638,8 @@ struct TestNode {
     ledger: Arc<NodeLedger>,
     /// While set, this node's authorizer refuses `Produce`.
     deny_produce: Arc<AtomicBool>,
+    /// While set, this node's authorizer refuses `Consume`.
+    deny_consume: Arc<AtomicBool>,
     _bus_dir: TempDir,
     _db_dir: TempDir,
 }
@@ -659,6 +669,27 @@ fn follower_config() -> FollowerConfig {
 const LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Makes `user` a member of the suite's organisation on one node's own
+/// database, as the sync of memberships does on a real cluster: a node that
+/// serves a forwarded read of a user checks it there.
+fn enroll_user(db: &DbPool, user: &str) {
+    let conn = db.write().expect("db write");
+    conn.execute(
+        "INSERT OR IGNORE INTO organizations \
+            (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
+         VALUES (?1, 'three node', 'three-node', NULL, NULL, NULL, 'active', \
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        [ORG],
+    )
+    .expect("organization row");
+    conn.execute(
+        "INSERT OR IGNORE INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+         VALUES (?1, ?2, 'role-org-admin', '2026-01-01T00:00:00Z', 'test')",
+        [ORG, user],
+    )
+    .expect("membership row");
+}
+
 fn build_node(
     id: &str,
     env: NodeEnvironment,
@@ -676,6 +707,8 @@ fn build_node(
     tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     let deny_produce = Arc::new(AtomicBool::new(false));
+    let deny_consume = Arc::new(AtomicBool::new(false));
+    enroll_user(&db, ctx().actor.as_deref().expect("the test actor"));
     let svc = Arc::new(
         BusService::new(BusInitConfig {
             instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(TEST_INSTANCE_ID)
@@ -685,6 +718,7 @@ fn build_node(
             db: db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer {
                 deny_produce: Arc::clone(&deny_produce),
+                deny_consume: Arc::clone(&deny_consume),
             }),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
@@ -749,6 +783,7 @@ fn build_node(
         manager,
         ledger,
         deny_produce,
+        deny_consume,
         _bus_dir: bus_dir,
         _db_dir: db_dir,
     }
@@ -3196,4 +3231,720 @@ async fn an_rf2_split_where_both_replicas_lead_heals_onto_one_chain() {
         ));
     }
     assert!(violated.is_empty(), "{violated:#?}");
+}
+
+// ===== Callers of forwarding (TB-04 K3) ====================================
+
+/// Reads `topic` of `ctx.org_id` the way the REST GET does (`consume_once`),
+/// on a blocking thread.
+async fn consume_once_on(
+    node: &TestNode,
+    group: &str,
+) -> Result<Vec<tentaflow_core::bus::FetchedRecordMeta>, BusServiceError> {
+    let svc = Arc::clone(&node.svc);
+    let group = group.to_string();
+    tokio::task::spawn_blocking(move || {
+        svc.consume_once(&ctx(), &group, TOPIC, 64 * 1024, usize::MAX, 2_000)
+    })
+    .await
+    .expect("consume task")
+}
+
+/// The records of a read on a follower are the leader's, and the commit
+/// happens on the leader: a second read neither repeats them nor skips any.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_on_a_follower_is_served_and_committed_by_the_leader() {
+    let (nodes, _ledger, registry) = build_cluster(1, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    publish_records(
+        a,
+        Some(0),
+        vec![
+            binary_record("k-1", b"first".to_vec()),
+            binary_record("k-2", b"second".to_vec()),
+        ],
+    )
+    .await
+    .expect("publish on the leader");
+
+    let first = consume_once_on(b, "reader")
+        .await
+        .unwrap_or_else(|e| panic!("the read on a follower failed: {e:?}"));
+    let payloads: Vec<&[u8]> = first.iter().map(|r| r.payload.as_ref()).collect();
+    assert_eq!(payloads, vec![&b"first"[..], &b"second"[..]]);
+    assert_eq!(
+        registry.forwards().last(),
+        Some(&("B".to_string(), "A".to_string())),
+        "the read went to the leader"
+    );
+    assert_eq!(
+        committed_group_offset(a, "reader", 0),
+        2,
+        "the leader committed what it returned"
+    );
+
+    publish_records(a, Some(0), vec![binary_record("k-3", b"third".to_vec())])
+        .await
+        .expect("second publish");
+    let second = consume_once_on(b, "reader").await.expect("second read");
+    let payloads: Vec<&[u8]> = second.iter().map(|r| r.payload.as_ref()).collect();
+    assert_eq!(
+        payloads,
+        vec![&b"third"[..]],
+        "nothing repeated, nothing skipped"
+    );
+    shutdown_all(&nodes);
+}
+
+/// Reads like `consume_once_on`, under the given bounds and a short wait.
+async fn consume_bounded(
+    node: &TestNode,
+    ctx: BusCallContext,
+    group: &str,
+    max_bytes: usize,
+    max_records: usize,
+) -> Result<Vec<tentaflow_core::bus::FetchedRecordMeta>, BusServiceError> {
+    let svc = Arc::clone(&node.svc);
+    let group = group.to_string();
+    tokio::task::spawn_blocking(move || {
+        svc.consume_once(&ctx, &group, TOPIC, max_bytes, max_records, 100)
+    })
+    .await
+    .expect("consume task")
+}
+
+/// The `details` of the audit rows of `action` on `node`.
+fn audit_details_of(node: &TestNode, action: &str) -> Vec<String> {
+    let conn = node.db.read().expect("db read");
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(details, '') FROM audit_log WHERE action = ?1")
+        .expect("prepare");
+    let rows = stmt
+        .query_map([action], |row| row.get::<_, String>(0))
+        .expect("query");
+    rows.map(|r| r.expect("row")).collect()
+}
+
+/// A backlog of small records over many partitions, read through a follower
+/// under a byte bound that cuts every reply short: every record arrives
+/// exactly once, in order within its partition, and after each read the
+/// leader's committed offset of every partition is exactly one past the
+/// highest record returned, never ahead of what the caller was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backlog_across_many_partitions_is_read_through_a_follower_exactly_once() {
+    const PARTITIONS: u32 = 6;
+    const RECORDS: usize = 1_200;
+    let (nodes, _ledger, registry) = build_cluster(PARTITIONS, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, PARTITIONS, Duration::from_secs(15)).await,
+        "the Hello handshake never completed"
+    );
+    for chunk in (0..RECORDS).collect::<Vec<_>>().chunks(100) {
+        let records = chunk
+            .iter()
+            .map(|i| {
+                let mut payload = format!("{i:08}").into_bytes();
+                payload.resize(200, b'.');
+                binary_record(&format!("key-{i}"), payload)
+            })
+            .collect();
+        publish_records(a, None, records)
+            .await
+            .expect("publish on the leader");
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(20), || (0..PARTITIONS)
+            .map(|p| high_watermark(a, p))
+            .sum::<u64>()
+            == RECORDS as u64)
+        .await,
+        "the backlog never became readable on the leader"
+    );
+    let mut delivered: std::collections::BTreeMap<(u32, u64), usize> =
+        std::collections::BTreeMap::new();
+    let mut highest: HashMap<u32, u64> = HashMap::new();
+    let mut reads = 0;
+    loop {
+        let got = consume_bounded(b, ctx(), "backlog", 16 * 1024, usize::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("read {reads} failed: {e:?}"));
+        if got.is_empty() {
+            break;
+        }
+        reads += 1;
+        assert!(reads < 200, "the backlog never drains");
+        for r in &got {
+            let index: usize = std::str::from_utf8(&r.payload[..8])
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                delivered.insert((r.partition, r.offset), index).is_none(),
+                "partition {} offset {} was delivered twice",
+                r.partition,
+                r.offset
+            );
+            let top = highest.entry(r.partition).or_insert(0);
+            *top = (*top).max(r.offset + 1);
+        }
+        for partition in 0..PARTITIONS {
+            assert_eq!(
+                committed_group_offset(a, "backlog", partition),
+                highest.get(&partition).copied().unwrap_or(0),
+                "after read {reads} the leader's offset of partition {partition} must be one \
+                 past the highest record returned"
+            );
+        }
+    }
+    assert!(
+        reads >= 5,
+        "the bound must have cut the replies ({reads} reads)"
+    );
+    let mut indices: Vec<usize> = delivered.values().copied().collect();
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (0..RECORDS).collect::<Vec<_>>(),
+        "every record, once"
+    );
+    for partition in 0..PARTITIONS {
+        let offsets: Vec<u64> = delivered
+            .keys()
+            .filter(|(p, _)| *p == partition)
+            .map(|(_, o)| *o)
+            .collect();
+        assert_eq!(
+            offsets,
+            (0..offsets.len() as u64).collect::<Vec<_>>(),
+            "partition {partition} must have been read as a gapless run"
+        );
+    }
+    assert!(
+        registry
+            .forwards()
+            .iter()
+            .any(|f| f == &("B".to_string(), "A".to_string())),
+        "the reads went to the leader"
+    );
+    shutdown_all(&nodes);
+}
+
+/// `max_records` bounds a forwarded read: the leader returns, and commits,
+/// no more than that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_records_bounds_a_forwarded_read_and_its_commit() {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Quorum).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    let records = (0..5)
+        .map(|i| binary_record(&format!("k-{i}"), vec![b'x'; 8]))
+        .collect();
+    publish_records(a, Some(0), records).await.expect("publish");
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(a, 0) == 5).await,
+        "the records never became readable on the leader"
+    );
+    let got = consume_bounded(b, ctx(), "bounded", 1024 * 1024, 2)
+        .await
+        .expect("read");
+    assert_eq!(got.len(), 2);
+    assert_eq!(committed_group_offset(a, "bounded", 0), 2);
+    shutdown_all(&nodes);
+}
+
+/// A node outside the replica set was never dialed by the leader, so it has
+/// not heard from it what it accepts: it asks (a capability probe) before it
+/// hands the read over, and the read is served, not refused as if the leader
+/// could not take it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_from_a_node_that_holds_no_replica_is_probed_and_served() {
+    let (nodes, _ledger, registry) = build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let a = find_node(&nodes, "A");
+    let c = find_node(&nodes, "C");
+    c.manager.on_peer_connected("A");
+    let give_up = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match publish_text(a, Some(0), "from-a").await {
+            Ok(_) => break,
+            Err(e) if std::time::Instant::now() >= give_up => panic!("publish on A: {e:?}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let got = loop {
+        match consume_bounded(c, ctx(), "outsider-group", 64 * 1024, usize::MAX).await {
+            Ok(records) if !records.is_empty() => break records,
+            Ok(_) => {}
+            Err(e) if std::time::Instant::now() >= give_up => {
+                panic!("the read from the non-replica never succeeded: {e:?}")
+            }
+            Err(e) => eprintln!("non-replica read attempt failed: {e:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await
+    };
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].payload.as_ref(), b"from-a");
+    assert_eq!(
+        registry.forwards().last(),
+        Some(&("C".to_string(), "A".to_string()))
+    );
+    assert_eq!(committed_group_offset(a, "outsider-group", 0), 1);
+    shutdown_all(&nodes);
+}
+
+/// A leader with one record on it and a node that forwards reads to it.
+/// (The refusal audit is windowed per organisation, so each refusal below
+/// gets a cluster of its own to be the first in its window.)
+async fn cluster_with_one_record() -> Vec<TestNode> {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Leader).await;
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    publish_records(
+        find_node(&nodes, "A"),
+        Some(0),
+        vec![binary_record("k-1", b"first".to_vec())],
+    )
+    .await
+    .expect("publish");
+    let a = find_node(&nodes, "A");
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(a, 0) == 1).await,
+        "the record never became readable on the leader"
+    );
+    nodes
+}
+
+/// The leader authorizes the original actor again, with its own authorizer,
+/// and writes the refusal down with the peer that forwarded the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_is_authorized_again_by_the_leader() {
+    let nodes = cluster_with_one_record().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    // The topic ACL on the leader refuses what the node asked allowed.
+    a.deny_consume.store(true, Ordering::SeqCst);
+    let err = consume_bounded(b, ctx(), "reader", 1024, usize::MAX)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::PermissionDenied { .. }),
+        "the leader's refusal reaches the caller as itself, got {err:?}"
+    );
+    assert_eq!(
+        committed_group_offset(a, "reader", 0),
+        0,
+        "nothing was read"
+    );
+    let denied = audit_details_of(a, "bus.consume.denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("forwarded_from=B") && d.contains("reason=acl")),
+        "the refusal names the forwarding peer: {denied:?}"
+    );
+    a.deny_consume.store(false, Ordering::SeqCst);
+    let allowed = consume_bounded(b, ctx(), "reader", 1024, usize::MAX)
+        .await
+        .expect("the same read once the leader allows it");
+    assert_eq!(allowed.len(), 1);
+    shutdown_all(&nodes);
+}
+
+/// A user the leader does not know as a member of the organisation is
+/// refused there, whatever the node that forwarded the read checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_of_a_user_who_is_no_member_on_the_leader_is_refused() {
+    let nodes = cluster_with_one_record().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let mut outsider = ctx();
+    outsider.actor = Some("outsider".to_string());
+    let err = consume_bounded(b, outsider, "reader", 1024, usize::MAX)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::PermissionDenied { .. }),
+        "{err:?}"
+    );
+    assert_eq!(committed_group_offset(a, "reader", 0), 0);
+    let denied = audit_details_of(a, "bus.consume.denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("forwarded_from=B") && d.contains("reason=not_an_org_member")),
+        "{denied:?}"
+    );
+    shutdown_all(&nodes);
+}
+
+/// The broker's own actor, and the system and addon kinds, are never
+/// accepted on a forwarded read, whatever the topic: `__*` topics of any
+/// organisation would otherwise be readable by any peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_never_accepts_the_system_actor() {
+    let nodes = cluster_with_one_record().await;
+    let a = find_node(&nodes, "A");
+    let system = tentaflow_core::services::bus_authorizer::SYSTEM_ACTOR;
+    for (actor, kind, topic) in [
+        (system, "system", TOPIC),
+        (system, "user", TOPIC),
+        (system, "user", "__dlq.orders"),
+        (system, "api_key", "__bus.metrics"),
+        ("test", "system", "__dlq.orders"),
+        ("test", "addon", TOPIC),
+    ] {
+        let reply = a.svc.consume_forwarded(
+            "B",
+            frames::ConsumeForward {
+                instance_id: TEST_INSTANCE_ID.to_string(),
+                environment: NodeEnvironment::Prod,
+                org_id: ORG.to_string(),
+                topic: topic.to_string(),
+                group: "reader".to_string(),
+                actor: Some(actor.to_string()),
+                actor_kind: kind.to_string(),
+                correlation_id: None,
+                origin: "test".to_string(),
+                max_bytes: 1024,
+                max_records: None,
+                max_wait_ms: 0,
+            },
+        );
+        let error = reply.error.unwrap_or_else(|| {
+            panic!(
+                "{actor} as {kind} read {topic} through a peer: {:?}",
+                reply.records
+            )
+        });
+        assert_eq!(
+            error.code, "bus.permission_denied",
+            "{actor} as {kind} on {topic}"
+        );
+    }
+    assert_eq!(committed_group_offset(a, "reader", 0), 0);
+    let denied = audit_details_of(a, "bus.consume.denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("forwarded_from=B") && d.contains("reason=actor_not_forwardable")),
+        "{denied:?}"
+    );
+    shutdown_all(&nodes);
+}
+
+/// Two nodes that each believe the other leads: the receiver of a forwarded
+/// read answers `NotLeader` instead of forwarding it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_is_never_sent_back_to_its_sender() {
+    let (nodes, _ledger, registry) =
+        build_cluster_placed(1, Acks::Quorum, &["A", "B", "C"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    let generation = topic_generation(a);
+    a.manager
+        .apply_assignment(assignment(generation, &["A", "B", "C"], "B", 2, 0))
+        .await;
+    b.manager
+        .apply_assignment(assignment(generation, &["A", "B", "C"], "A", 2, 0))
+        .await;
+
+    let err = consume_once_on(a, "reader").await.unwrap_err();
+    assert!(
+        matches!(err, BusServiceError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
+    assert_eq!(
+        registry.forwards(),
+        vec![("A".to_string(), "B".to_string())],
+        "B must not hand the read back to A"
+    );
+    shutdown_all(&nodes);
+}
+
+/// The schema every quarantine scenario below validates against: `id` is
+/// required.
+const ORDERS_SCHEMA: &str = r#"{"type":"object","properties":{"id":{"type":"string"},
+    "status":{"type":"string"}},"required":["id"],"additionalProperties":false}"#;
+
+fn json_record(payload: &str) -> PublishRecord {
+    PublishRecord {
+        key: None,
+        headers: vec![],
+        payload: Bytes::from(payload.to_string()),
+        timestamp_ms: 0,
+        schema_id: 0,
+    }
+}
+
+/// A one-replica topic `topic` of `org`, created on `creator` and copied to
+/// the other nodes the way the ledger replicates a row, led by `leader` for
+/// every node's registry.
+async fn place_internal_topic(
+    nodes: &[TestNode],
+    ledger: &SharedLedger,
+    org: &str,
+    topic: &str,
+    leader: &str,
+) {
+    let creator = find_node(nodes, "A");
+    let row_cfg = tentaflow_core::bus::topics::create_internal_topic(
+        &creator.db,
+        TEST_INSTANCE_ID,
+        org,
+        topic,
+        TopicOptions {
+            partitions: Some(1),
+            replication_factor: Some(1),
+            acks: Some(Acks::Leader),
+            ..Default::default()
+        },
+        NodeEnvironment::Prod,
+        0,
+    )
+    .expect("create the internal topic");
+    let row =
+        tentaflow_core::db::repository::bus_topic_get(&creator.db, TEST_INSTANCE_ID, org, topic)
+            .expect("read topic row")
+            .expect("topic row");
+    for node in nodes.iter().filter(|n| n.id != creator.id) {
+        tentaflow_core::db::repository::bus_topic_create(&node.db, &row)
+            .expect("replicate topic row");
+    }
+    let placed = PartitionAssignment {
+        instance_id: TEST_INSTANCE_ID.to_string(),
+        org_id: org.to_string(),
+        topic: topic.to_string(),
+        partition: 0,
+        leader_node_id: leader.to_string(),
+        replicas: vec![leader.to_string()],
+        isr: vec![leader.to_string()],
+        leader_epoch: 1,
+        updated_at_ms: 0,
+        topic_generation: row_cfg.generation,
+        epoch_slots: Default::default(),
+    };
+    ledger.seed(placed.clone());
+    for node in nodes {
+        node.manager.apply_assignment(placed.clone()).await;
+    }
+}
+
+fn dlq_payloads(node: &TestNode, dlq_topic: &str) -> usize {
+    node.svc
+        .local_partition(&ctx(), dlq_topic, 0)
+        .expect("DLQ partition handle")
+        .open_reader()
+        .fetch_from_offset(0, 16 * 1024 * 1024)
+        .expect("fetch_from_offset")
+        .into_iter()
+        .map(|b| b.records().count())
+        .sum()
+}
+
+/// `orders` is led by A and its DLQ by B. A violating record that reaches A
+/// directly, or that C handed to A, lands in B's DLQ: the quarantine copy of
+/// a forwarded write is forwarded in turn instead of dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quarantine_copy_for_a_dlq_led_by_another_node_loses_no_record() {
+    let (nodes, ledger, registry) = build_cluster_placed(1, Acks::Leader, &["A"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let c = find_node(&nodes, "C");
+    let dlq_topic = "__dlq.orders";
+    tentaflow_core::bus::schema_registry::registry::register(
+        &a.db,
+        TEST_INSTANCE_ID,
+        ORG,
+        "orders",
+        tentaflow_core::bus::schema_registry::SchemaType::JsonSchema,
+        ORDERS_SCHEMA,
+        None,
+        None,
+    )
+    .expect("register the schema");
+    a.svc
+        .update_topic(
+            &ctx(),
+            TOPIC,
+            TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(tentaflow_core::bus::topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .expect("bind the schema to the topic");
+    place_internal_topic(&nodes, &ledger, ORG, dlq_topic, "B").await;
+    // Neither link has a mesh to say it is up.
+    a.manager.on_peer_connected("B");
+    c.manager.on_peer_connected("A");
+
+    // The violation arrives on the leader of the source topic itself.
+    let direct = publish_records(
+        a,
+        Some(0),
+        vec![
+            json_record(r#"{"id":"ok-1"}"#),
+            json_record(r#"{"status":"no-id"}"#),
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the publish on the source leader failed: {e:?}"));
+    assert_eq!(
+        (
+            direct.accepted,
+            direct.schema_rejected,
+            direct.schema_dropped
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        dlq_payloads(b, dlq_topic),
+        1,
+        "the DLQ leader holds the copy"
+    );
+
+    // The violation arrives on a node that leads neither topic.
+    let forwarded = publish_records(
+        c,
+        Some(0),
+        vec![
+            json_record(r#"{"id":"ok-2"}"#),
+            json_record(r#"{"status":"also-no-id"}"#),
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the forwarded publish failed: {e:?}"));
+    assert_eq!(
+        (
+            forwarded.accepted,
+            forwarded.schema_rejected,
+            forwarded.schema_dropped
+        ),
+        (1, 1, 0),
+        "the quarantine copy of a forwarded write must not be dropped"
+    );
+    assert_eq!(
+        dlq_payloads(b, dlq_topic),
+        2,
+        "both violations are in the DLQ"
+    );
+    assert_eq!(
+        registry.forwards(),
+        vec![
+            ("A".to_string(), "B".to_string()),
+            ("C".to_string(), "A".to_string()),
+            ("A".to_string(), "B".to_string()),
+        ]
+    );
+    assert_eq!(
+        log_end_offset(a, 0),
+        2,
+        "the valid records landed on the source"
+    );
+    shutdown_all(&nodes);
+}
+
+/// A `tracing` writer collecting what a scenario logs on its own thread.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `__bus.metrics` has one partition and one replica, led by A. The rollup
+/// of node B (and of C, which holds no replica of anything) reaches that
+/// leader keyed by the sender's node id, and the sender logs no warning:
+/// before forwarding every non-leader node warned once a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_metrics_rollup_of_another_node_lands_on_the_leader_without_a_warning() {
+    let org = tentaflow_core::services::org::DEFAULT_ORG_ID;
+    let (nodes, ledger, registry) = build_cluster_placed(1, Acks::Leader, &["A"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    place_internal_topic(
+        &nodes,
+        &ledger,
+        org,
+        tentaflow_core::bus::topics::METRICS_TOPIC_NAME,
+        "A",
+    )
+    .await;
+    b.manager.on_peer_connected("A");
+
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer({
+            let capture = capture.clone();
+            move || capture.clone()
+        })
+        .finish();
+    let svc = Arc::clone(&b.svc);
+    tokio::task::spawn_blocking(move || {
+        tracing::subscriber::with_default(subscriber, || svc.publish_metrics_rollup())
+    })
+    .await
+    .expect("rollup task");
+
+    let logged = String::from_utf8_lossy(&capture.0.lock()).into_owned();
+    assert!(
+        !logged.contains("WARN"),
+        "a rollup from a non-leader must not warn: {logged}"
+    );
+    assert_eq!(
+        registry.forwards(),
+        vec![("B".to_string(), "A".to_string())]
+    );
+    let mut reader = ctx();
+    reader.org_id = org.to_string();
+    let part = a
+        .svc
+        .local_partition(&reader, tentaflow_core::bus::topics::METRICS_TOPIC_NAME, 0)
+        .expect("metrics partition on the leader");
+    let keys: Vec<Option<Vec<u8>>> = part
+        .open_reader()
+        .fetch_from_offset(0, 16 * 1024 * 1024)
+        .expect("fetch_from_offset")
+        .into_iter()
+        .flat_map(|batch| {
+            batch
+                .records()
+                .map(|r| r.unwrap().key.map(|k| k.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![Some(b"B".to_vec())],
+        "one rollup, keyed by node B"
+    );
+    shutdown_all(&nodes);
 }

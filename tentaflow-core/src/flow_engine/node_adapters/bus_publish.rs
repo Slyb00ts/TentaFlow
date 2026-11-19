@@ -288,6 +288,19 @@ fn publish_failure_reason(error: &bus::BusServiceError, target: &str) -> String 
         bus::BusServiceError::TopicNotFound { name } => format!("topic {name} not found"),
         bus::BusServiceError::QuotaExceeded { .. }
         | bus::BusServiceError::QuotaRequestTooLarge { .. } => "org quota exceeded".to_string(),
+        bus::BusServiceError::NotLeader { .. }
+        | bus::BusServiceError::NotEnoughReplicas { .. }
+        | bus::BusServiceError::PartitionUnavailable { .. } => {
+            format!("partition of topic {target} has no leader at the moment")
+        }
+        bus::BusServiceError::ForwardOutcomeUnknown { .. }
+        | bus::BusServiceError::AckTimeout { .. } => format!(
+            "write to topic {target} got no confirmation in time; \
+             it may or may not have been stored"
+        ),
+        bus::BusServiceError::RemoteFailure => {
+            format!("the node that owns topic {target} failed while serving the write")
+        }
         _ => format!("publish to topic {target} failed"),
     }
 }
@@ -358,6 +371,42 @@ mod tests {
             publish_failure_reason(&engine, "cel"),
             "publish to topic cel failed"
         );
+    }
+
+    #[test]
+    fn a_leaderless_partition_and_an_unknown_outcome_get_their_own_reasons() {
+        let leaderless = bus::BusServiceError::NotLeader {
+            leader_node_id: None,
+            leader_epoch: 0,
+        };
+        assert_eq!(
+            publish_failure_reason(&leaderless, "cel"),
+            "partition of topic cel has no leader at the moment"
+        );
+        let unknown = bus::BusServiceError::ForwardOutcomeUnknown {
+            leader_node_id: "node-b".into(),
+        };
+        let reason = publish_failure_reason(&unknown, "cel");
+        assert!(
+            reason.contains("may or may not have been stored"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("node-b"),
+            "no node ids in the reason: {reason}"
+        );
+        let unacked = bus::BusServiceError::AckTimeout {
+            acked: 1,
+            required: 2,
+        };
+        assert_eq!(
+            publish_failure_reason(&unacked, "cel"),
+            reason,
+            "an unacknowledged write may have landed too"
+        );
+        // A leader's disk failure is not "no leader at the moment".
+        let failed = publish_failure_reason(&bus::BusServiceError::RemoteFailure, "cel");
+        assert!(!failed.contains("no leader"), "{failed}");
     }
 
     #[test]

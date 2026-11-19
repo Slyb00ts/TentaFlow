@@ -228,6 +228,8 @@ fn frame_kind_name(frame: &ReplFrame) -> &'static str {
         ReplFrame::Offsets(_) => "Offsets",
         ReplFrame::ProduceForward(_) => "ProduceForward",
         ReplFrame::ProduceForwardReply(_) => "ProduceForwardReply",
+        ReplFrame::ConsumeForward(_) => "ConsumeForward",
+        ReplFrame::ConsumeForwardReply(_) => "ConsumeForwardReply",
     }
 }
 
@@ -639,6 +641,7 @@ where
                             leader_alive: true,
                             promised_epoch: None,
                             promises: true,
+                            bus_features: 0,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }

@@ -357,6 +357,20 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         | BusServiceError::MaxPartitionsExceeded { .. }
         | BusServiceError::MaxBytesTotalExceeded { .. } => AbiError::QuotaExceeded,
         BusServiceError::Throttled { .. } => AbiError::Backpressure,
+        // TB-04, publish: the partition has no leader that can take the call
+        // right now. Nothing was written, so the addon may retry shortly:
+        // `Backpressure` is the ABI's "try again later". The consumer calls
+        // do not use it (`map_consume_error`).
+        BusServiceError::NotLeader { .. }
+        | BusServiceError::NotEnoughReplicas { .. }
+        | BusServiceError::PartitionUnavailable { .. } => AbiError::Backpressure,
+        // The write went to the leader and no answer came back, or the
+        // replicas did not acknowledge it in time: it MAY ALREADY BE IN THE
+        // LOG. `Timeout` keeps it apart from the retryable refusal above: a
+        // blind retry can store the records twice.
+        BusServiceError::ForwardOutcomeUnknown { .. } | BusServiceError::AckTimeout { .. } => {
+            AbiError::Timeout
+        }
         BusServiceError::PayloadTooLarge { .. } => AbiError::PayloadTooLarge,
         // SUM/tentabus/POLITYKI-POL.md: a field policy blocked this
         // publish/consume — `GateNotSatisfied` is the existing ABI code for
@@ -387,6 +401,24 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         | BusServiceError::SchemaCompareTooComplex { .. }
         | BusServiceError::SchemaRefIdCollision { .. } => AbiError::Conflict,
         _ => AbiError::Operation,
+    }
+}
+
+/// `map_bus_error` for the consumer calls (`open`, `next`, `commit`). A
+/// consumer lives on the node that leads its topic (TB-04 P7: it is never
+/// forwarded), so a node that does not lead it, a leadership that moved under
+/// an open handle, or a partition with no usable leader is not "back off and
+/// retry the same call" as it is for a publish, which this node forwards: the
+/// consumer has no target here. `NoAvailableTarget` is the ABI's "nothing can
+/// serve this" and tells the addon apart from the generic `Operation`; the
+/// leader is named in the audit row of `bus_consume_open_v1`
+/// (`open_refusal_detail`).
+fn map_consume_error(e: &BusServiceError) -> AbiError {
+    match e {
+        BusServiceError::NotLeader { .. }
+        | BusServiceError::NotEnoughReplicas { .. }
+        | BusServiceError::PartitionUnavailable { .. } => AbiError::NoAvailableTarget,
+        other => map_bus_error(other),
     }
 }
 
@@ -718,10 +750,33 @@ pub fn bus_consume_open_v1(
                 "bus.consume.open",
                 Some(&group),
                 "error",
-                Some(&e.to_string()),
+                Some(&open_refusal_detail(&e)),
             );
-            map_bus_error(&e).as_i32()
+            map_consume_error(&e).as_i32()
         }
+    }
+}
+
+/// Why `open_consumer` refused, for the audit row. An addon's consumer is a
+/// stateful handle that lives on one node and is not forwarded (TB-04 P7): on
+/// a node that does not lead the topic it is refused, and the row names the
+/// node that does, so the addon (or its operator) can run the consumer there.
+fn open_refusal_detail(e: &BusServiceError) -> String {
+    match e {
+        BusServiceError::NotLeader {
+            leader_node_id: Some(leader),
+            ..
+        } => format!(
+            "not_leader: an addon consumer runs on the node that leads the topic, \
+             leader_node_id={leader}"
+        ),
+        BusServiceError::NotLeader {
+            leader_node_id: None,
+            ..
+        } => "not_leader: an addon consumer runs on the node that leads the topic, \
+              which is not known yet"
+            .to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -853,7 +908,7 @@ pub fn bus_consume_next_v1(
         // permission denial, and auditing it would put an audit-log write
         // back on the per-poll hot path the "never per message" rule exists
         // to keep clear.
-        Err(e) => map_bus_error(&e).as_i32(),
+        Err(e) => map_consume_error(&e).as_i32(),
     }
 }
 
@@ -955,7 +1010,7 @@ pub fn bus_consume_commit_v1(
                 PayloadKind::ServiceCall,
             )
         }
-        Err(e) => map_bus_error(&e).as_i32(),
+        Err(e) => map_consume_error(&e).as_i32(),
     }
 }
 
@@ -1264,6 +1319,93 @@ mod tests {
         );
         assert_eq!(
             map_bus_error(&BusServiceError::Throttled { retry_after_ms: 10 }),
+            AbiError::Backpressure
+        );
+    }
+
+    #[test]
+    fn an_addon_consumer_refused_on_a_follower_names_the_leader_node() {
+        let detail = open_refusal_detail(&BusServiceError::NotLeader {
+            leader_node_id: Some("node-b".into()),
+            leader_epoch: 2,
+        });
+        assert!(detail.contains("leader_node_id=node-b"), "{detail}");
+        let unknown = open_refusal_detail(&BusServiceError::NotLeader {
+            leader_node_id: None,
+            leader_epoch: 0,
+        });
+        assert!(unknown.contains("not known yet"), "{unknown}");
+        assert_eq!(
+            open_refusal_detail(&BusServiceError::TopicNotFound { name: "t".into() }),
+            BusServiceError::TopicNotFound { name: "t".into() }.to_string()
+        );
+    }
+
+    #[test]
+    fn map_bus_error_keeps_a_retryable_refusal_apart_from_an_unknown_outcome() {
+        for refusal in [
+            BusServiceError::NotLeader {
+                leader_node_id: Some("node-b".into()),
+                leader_epoch: 2,
+            },
+            BusServiceError::NotEnoughReplicas {
+                isr: 1,
+                required: 2,
+            },
+            BusServiceError::PartitionUnavailable {
+                reason: "no isr".into(),
+            },
+        ] {
+            assert_eq!(map_bus_error(&refusal), AbiError::Backpressure, "{refusal}");
+        }
+        assert_eq!(
+            map_bus_error(&BusServiceError::ForwardOutcomeUnknown {
+                leader_node_id: "node-b".into()
+            }),
+            AbiError::Timeout
+        );
+        // A write the replicas did not acknowledge in time may be in the log
+        // as well.
+        assert_eq!(
+            map_bus_error(&BusServiceError::AckTimeout {
+                acked: 1,
+                required: 2
+            }),
+            AbiError::Timeout
+        );
+    }
+
+    #[test]
+    fn the_consumer_calls_report_a_node_that_does_not_lead_as_no_target_not_as_backpressure() {
+        for refusal in [
+            BusServiceError::NotLeader {
+                leader_node_id: Some("node-b".into()),
+                leader_epoch: 2,
+            },
+            BusServiceError::NotEnoughReplicas {
+                isr: 1,
+                required: 2,
+            },
+            BusServiceError::PartitionUnavailable {
+                reason: "no isr".into(),
+            },
+        ] {
+            assert_eq!(
+                map_consume_error(&refusal),
+                AbiError::NoAvailableTarget,
+                "{refusal}"
+            );
+        }
+        // Everything else is judged as for any bus call.
+        assert_eq!(
+            map_consume_error(&BusServiceError::PermissionDenied {
+                action: "consume",
+                topic: "t".into()
+            }),
+            AbiError::Permission
+        );
+        assert_eq!(
+            map_consume_error(&BusServiceError::Throttled { retry_after_ms: 10 }),
             AbiError::Backpressure
         );
     }

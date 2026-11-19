@@ -57,13 +57,14 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::replication::assignment::{PartitionAssignment, SqliteLedgerAssignmentStore};
+use crate::bus::replication::consume_forward;
 use crate::bus::replication::election::{
     self, AbandonReason, LocalRole, LogPosition, PromotionAction, PromotionEvent, PromotionState,
 };
 use crate::bus::replication::forward::{self, ForwardUnavailable, ForwardedPublishHandler};
 use crate::bus::replication::frames::{
-    self, ProduceForward, ProduceForwardReply, ReplFrame, ReplHello, ReplHelloAck, ReplLeoQuery,
-    ReplLeoReply, ReplReject,
+    self, ConsumeForward, ConsumeForwardReply, ProduceForward, ProduceForwardReply, ReplFrame,
+    ReplHello, ReplHelloAck, ReplLeoQuery, ReplLeoReply, ReplReject,
 };
 use crate::bus::topics::Acks;
 use crate::bus::{
@@ -795,8 +796,9 @@ pub struct ReplicationManager {
     forward_handler: parking_lot::RwLock<Option<Weak<dyn ForwardedPublishHandler>>>,
     /// What this node knows about each peer's liveness (`PeerLiveness`).
     peers: DashMap<String, PeerLiveness>,
-    /// `ReplHello::bus_features` of the leaders that dialed this node.
-    peer_features: DashMap<String, u32>,
+    /// The `BUS_FEATURE_*` bits of the peers: from the `Hello` of a leader
+    /// that dialed this node, or from a probe (`probe_features`).
+    peer_features: Arc<DashMap<String, u32>>,
     /// The synchronous twin of `assignments_changed`, for the blocking
     /// callers of `wait_for_assignment_change`.
     assignment_changes: AssignmentChanges,
@@ -922,7 +924,7 @@ impl ReplicationManager {
             runtime: tokio::runtime::Handle::try_current().ok(),
             forward_handler: parking_lot::RwLock::new(None),
             peers: DashMap::new(),
-            peer_features: DashMap::new(),
+            peer_features: Arc::new(DashMap::new()),
             assignment_changes: AssignmentChanges::new(),
         })
     }
@@ -1028,6 +1030,10 @@ impl ReplicationManager {
                 self.accept_produce_forward(&remote_hex, request, send)
                     .await;
             }
+            Ok(ReplFrame::ConsumeForward(request)) => {
+                self.accept_consume_forward(&remote_hex, request, send)
+                    .await;
+            }
             _ => return,
         }
     }
@@ -1050,7 +1056,13 @@ impl ReplicationManager {
         mut send: BusSend,
     ) {
         let reply = self.answer_produce_forward(remote_node_id, request).await;
-        let _ = frames::write_frame(&mut send, &ReplFrame::ProduceForwardReply(reply)).await;
+        if let Err(e) = frames::write_frame(&mut send, &ReplFrame::ProduceForwardReply(reply)).await
+        {
+            tracing::warn!(
+                forwarded_from = %remote_node_id, error = %e,
+                "replication: the reply to a forwarded request could not be written"
+            );
+        }
         let _ = send.shutdown().await;
     }
 
@@ -1103,6 +1115,67 @@ impl ReplicationManager {
                     "replication: the forwarded publish handler failed"
                 );
                 forward::refusal("handler_failed")
+            }
+        }
+    }
+
+    /// Answers one inbound `ConsumeForward`: another node handing over a
+    /// stateless read of a topic this node leads. Refused unless the request
+    /// names this instance and environment; authorization of the original
+    /// actor and the leadership check are the leader's own consume path,
+    /// run on a blocking thread because it waits for records. One request,
+    /// one reply, then the stream is finished.
+    ///
+    /// `pub(crate)`: `replication::router` calls it for a `ConsumeForward`
+    /// it has already matched to this manager's instance.
+    pub(crate) async fn accept_consume_forward(
+        &self,
+        remote_node_id: &str,
+        request: ConsumeForward,
+        mut send: BusSend,
+    ) {
+        let reply = self.answer_consume_forward(remote_node_id, request).await;
+        // The records of a read are committed before this reply is written:
+        // a reply that cannot be delivered leaves them consumed, so the
+        // failure is the one thing the operator can still see.
+        if let Err(e) = frames::write_frame(&mut send, &ReplFrame::ConsumeForwardReply(reply)).await
+        {
+            tracing::warn!(
+                forwarded_from = %remote_node_id, error = %e,
+                "replication: the reply to a forwarded request could not be written"
+            );
+        }
+        let _ = send.shutdown().await;
+    }
+
+    async fn answer_consume_forward(
+        &self,
+        remote_node_id: &str,
+        request: ConsumeForward,
+    ) -> ConsumeForwardReply {
+        if request.instance_id != self.instance_id || self.shutdown.is_cancelled() {
+            return consume_forward::refusal("unknown_instance");
+        }
+        if request.environment != self.local_env {
+            tracing::warn!(
+                forwarded_from = %remote_node_id,
+                theirs = ?request.environment, ours = ?self.local_env,
+                "replication: refused a forwarded read from another environment"
+            );
+            return consume_forward::refusal("environment_mismatch");
+        }
+        let Some(handler) = self.forward_handler.read().as_ref().and_then(Weak::upgrade) else {
+            return consume_forward::refusal("forwarding_disabled");
+        };
+        let from = remote_node_id.to_string();
+        match tokio::task::spawn_blocking(move || handler.consume_forwarded(&from, request)).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                tracing::error!(
+                    forwarded_from = %remote_node_id, error = %e,
+                    "replication: the forwarded read handler failed"
+                );
+                consume_forward::refusal("handler_failed")
             }
         }
     }
@@ -1194,6 +1267,7 @@ impl ReplicationManager {
                 leader_alive,
                 promised_epoch: None,
                 promises: true,
+                bus_features: 0,
             };
             election_deferral(&seen, query.known_epoch)
                 .is_none()
@@ -1223,6 +1297,7 @@ impl ReplicationManager {
             leader_alive: false,
             promised_epoch: None,
             promises: true,
+            bus_features: 0,
         };
         // Read from the local log outside the registry guard: that opens
         // the partition, which may touch the disk.
@@ -1311,6 +1386,7 @@ impl ReplicationManager {
         if let Some(asked) = query.candidate_epoch {
             reply.promised_epoch = promised.or(reply.promised_epoch.filter(|p| *p > asked));
         }
+        reply.bus_features = frames::LOCAL_BUS_FEATURES;
         let _ = frames::write_frame(&mut send, &ReplFrame::LeoReply(reply)).await;
     }
 
@@ -4006,71 +4082,37 @@ impl ReplicationCoordinator for ReplicationManager {
         timeout: Duration,
         still_valid: &dyn Fn() -> bool,
     ) -> Result<ProduceForwardReply, ForwardUnavailable> {
-        let Some(runtime) = self.runtime.clone() else {
-            return Err(ForwardUnavailable::Unsupported);
-        };
-        if self.forward_blocked(target) {
-            return Err(ForwardUnavailable::PeerCannotForward(target.to_string()));
-        }
-        let not_sent = |reason: String| ForwardUnavailable::NotSent {
-            node: target.to_string(),
-            reason,
-        };
-        let unknown = |reason: String| ForwardUnavailable::OutcomeUnknown {
-            node: target.to_string(),
-            reason,
-        };
-        // Whether any byte of the request may have left this node: from then
-        // on the leader may append it, and a missing answer is not a refusal.
-        let sent = Arc::new(AtomicBool::new(false));
-        let ended_without_answer = |sent: &AtomicBool, reason: &str| {
-            if sent.load(Ordering::SeqCst) {
-                unknown(reason.to_string())
-            } else {
-                not_sent(reason.to_string())
-            }
-        };
-        // The round trip runs on the runtime and this blocking thread waits
-        // on a std channel: `block_on` would panic on a worker thread and a
-        // `Runtime` handle must never be blocked on from one. Dial, stream
-        // and exchange share the one deadline `timeout`; the caller waits a
-        // second longer, so the round trip reports its own expiry exactly.
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let transport = Arc::clone(&self.transport);
-        let node = target.to_string();
-        let task_sent = Arc::clone(&sent);
-        let task = runtime.spawn(async move {
-            let outcome =
-                forward_round_trip(transport.as_ref(), &node, request, timeout, &task_sent).await;
-            let _ = tx.send(outcome);
-        });
-        let give_up_at = Instant::now() + timeout + Duration::from_secs(1);
-        loop {
-            match rx.recv_timeout(FORWARD_POLL) {
-                Ok(Ok(reply)) => return Ok(reply),
-                Ok(Err(RoundTripError::NotSent(reason))) => return Err(not_sent(reason)),
-                Ok(Err(RoundTripError::NoAnswer(reason))) => return Err(unknown(reason)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if !still_valid() {
-                        task.abort();
-                        return Err(ended_without_answer(
-                            &sent,
-                            "the leader changed or was lost while the write was in flight",
-                        ));
-                    }
-                    if Instant::now() >= give_up_at {
-                        task.abort();
-                        return Err(ended_without_answer(&sent, "no reply in time"));
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ended_without_answer(
-                        &sent,
-                        "the forwarding task ended without a result",
-                    ));
-                }
-            }
-        }
+        self.forward_request(
+            target,
+            frames::BUS_FEATURE_PRODUCE_FORWARD,
+            ReplFrame::ProduceForward(request),
+            timeout,
+            still_valid,
+            |frame| match frame {
+                ReplFrame::ProduceForwardReply(reply) => Ok(reply),
+                other => Err(crate::bus::replication::leader::frame_kind_name(&other)),
+            },
+        )
+    }
+
+    fn forward_consume(
+        &self,
+        target: &str,
+        request: ConsumeForward,
+        timeout: Duration,
+        still_valid: &dyn Fn() -> bool,
+    ) -> Result<ConsumeForwardReply, ForwardUnavailable> {
+        self.forward_request(
+            target,
+            frames::BUS_FEATURE_CONSUME_FORWARD,
+            ReplFrame::ConsumeForward(request),
+            timeout,
+            still_valid,
+            |frame| match frame {
+                ReplFrame::ConsumeForwardReply(reply) => Ok(reply),
+                other => Err(crate::bus::replication::leader::frame_kind_name(&other)),
+            },
+        )
     }
 
     fn assigned_leader(&self, org_id: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
@@ -4102,18 +4144,60 @@ enum RoundTripError {
     /// The request left and no reply came: the stream ended, reset or
     /// garbled, or the deadline passed.
     NoAnswer(String),
+    /// The peer does not take this kind of request; nothing was sent to it.
+    Unsupported,
 }
 
-/// One forwarded publish on a fresh stream: the request out, the reply back,
-/// all under the one deadline `timeout`. `sent` is set before the first byte
-/// is written.
-async fn forward_round_trip(
+/// What `node` accepts, asked with a `LeoQuery` for no partition: the reply
+/// of a node that knows the field carries its `bus_features`, and one that
+/// predates it (or does not answer) reads as `0`, so a peer never heard from
+/// is not sent a request it would drop in silence. Nothing in the query
+/// changes anything on the peer.
+async fn probe_features(
     transport: &dyn Transport,
     node: &str,
-    request: ProduceForward,
+    instance_id: &str,
+    timeout: Duration,
+) -> Result<u32, String> {
+    let exchange = async {
+        let (mut recv, mut send) = transport
+            .open_stream(node)
+            .await
+            .map_err(|e| e.to_string())?;
+        let query = ReplFrame::LeoQuery(ReplLeoQuery {
+            instance_id: instance_id.to_string(),
+            org_id: String::new(),
+            topic: String::new(),
+            partition: 0,
+            known_epoch: 0,
+            candidate_epoch: None,
+        });
+        frames::write_frame(&mut send, &query)
+            .await
+            .map_err(|e| e.to_string())?;
+        match frames::read_frame(&mut recv).await {
+            Ok(ReplFrame::LeoReply(reply)) => Ok(reply.bus_features),
+            Ok(_) => Ok(0),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    tokio::time::timeout(timeout.min(FORWARD_CONNECT_TIMEOUT), exchange)
+        .await
+        .map_err(|_| "no answer to the capability probe in time".to_string())?
+}
+
+/// One forwarded request on a fresh stream: the request out, the reply back,
+/// all under the one deadline `timeout`. `sent` is set before the first byte
+/// is written. `reply_of` takes the reply out of the frame that came back, or
+/// names the kind of the frame when it is not the expected one.
+async fn forward_round_trip<T>(
+    transport: &dyn Transport,
+    node: &str,
+    request: ReplFrame,
     timeout: Duration,
     sent: &AtomicBool,
-) -> Result<ProduceForwardReply, RoundTripError> {
+    reply_of: fn(ReplFrame) -> Result<T, &'static str>,
+) -> Result<T, RoundTripError> {
     let exchange = async {
         let (mut recv, mut send) = match tokio::time::timeout(
             FORWARD_CONNECT_TIMEOUT,
@@ -4132,8 +4216,7 @@ async fn forward_round_trip(
         // Encoded, and its size checked, before any byte goes out: a request
         // this node cannot send is not a peer that cannot receive it.
         let mut encoded = Vec::new();
-        if let Err(e) = frames::write_frame(&mut encoded, &ReplFrame::ProduceForward(request)).await
-        {
+        if let Err(e) = frames::write_frame(&mut encoded, &request).await {
             return Err(RoundTripError::NotSent(format!(
                 "the request cannot be encoded: {e}"
             )));
@@ -4144,11 +4227,11 @@ async fn forward_round_trip(
             .map_err(|e| RoundTripError::NoAnswer(e.to_string()))?;
         let _ = send.shutdown().await;
         match frames::read_frame(&mut recv).await {
-            Ok(ReplFrame::ProduceForwardReply(reply)) => Ok(reply),
-            Ok(other) => Err(RoundTripError::NoAnswer(format!(
-                "unexpected {} frame in answer to a forwarded publish",
-                crate::bus::replication::leader::frame_kind_name(&other)
-            ))),
+            Ok(frame) => reply_of(frame).map_err(|kind| {
+                RoundTripError::NoAnswer(format!(
+                    "unexpected {kind} frame in answer to a forwarded request"
+                ))
+            }),
             Err(e) => Err(RoundTripError::NoAnswer(e.to_string())),
         }
     };
@@ -4164,16 +4247,133 @@ async fn forward_round_trip(
 }
 
 impl ReplicationManager {
-    /// Whether `node` is known not to take a forwarded publish: its `Hello`
-    /// did not advertise the feature (a build from before forwarding).
+    /// Hands `request` to `target` and waits for the reply `reply_of` takes
+    /// out of its answer: the common half of `forward_publish` and
+    /// `forward_consume`. `feature` is the `bus_features` bit `target` must
+    /// not be known to lack.
+    fn forward_request<T: Send + 'static>(
+        &self,
+        target: &str,
+        feature: u32,
+        request: ReplFrame,
+        timeout: Duration,
+        still_valid: &dyn Fn() -> bool,
+        reply_of: fn(ReplFrame) -> Result<T, &'static str>,
+    ) -> Result<T, ForwardUnavailable> {
+        let Some(runtime) = self.runtime.clone() else {
+            return Err(ForwardUnavailable::Unsupported);
+        };
+        if self.forward_blocked(target, feature) {
+            return Err(ForwardUnavailable::PeerCannotForward(target.to_string()));
+        }
+        let not_sent = |reason: String| ForwardUnavailable::NotSent {
+            node: target.to_string(),
+            reason,
+        };
+        let unknown = |reason: String| ForwardUnavailable::OutcomeUnknown {
+            node: target.to_string(),
+            reason,
+        };
+        // Whether any byte of the request may have left this node: from then
+        // on the leader may act on it, and a missing answer is not a refusal.
+        let sent = Arc::new(AtomicBool::new(false));
+        let ended_without_answer = |sent: &AtomicBool, reason: &str| {
+            if sent.load(Ordering::SeqCst) {
+                unknown(reason.to_string())
+            } else {
+                not_sent(reason.to_string())
+            }
+        };
+        // The round trip runs on the runtime and this blocking thread waits
+        // on a std channel: `block_on` would panic on a worker thread and a
+        // `Runtime` handle must never be blocked on from one. Dial, stream
+        // and exchange share the one deadline `timeout`; the caller waits a
+        // second longer, so the round trip reports its own expiry exactly.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let transport = Arc::clone(&self.transport);
+        let node = target.to_string();
+        let task_sent = Arc::clone(&sent);
+        let known_features = Arc::clone(&self.peer_features);
+        let instance_id = self.instance_id.clone();
+        let task = runtime.spawn(async move {
+            let started = Instant::now();
+            // A peer never heard from is asked what it accepts before it is
+            // sent anything: a build that predates the request kind drops it
+            // in silence, which would read as an unknown outcome.
+            if !known_features.contains_key(&node) {
+                match probe_features(transport.as_ref(), &node, &instance_id, timeout).await {
+                    Ok(0) => {
+                        let _ = tx.send(Err(RoundTripError::Unsupported));
+                        return;
+                    }
+                    Ok(features) => {
+                        known_features.insert(node.clone(), features);
+                    }
+                    Err(reason) => {
+                        let _ = tx.send(Err(RoundTripError::NotSent(reason)));
+                        return;
+                    }
+                }
+            }
+            if known_features.get(&node).is_some_and(|f| *f & feature == 0) {
+                let _ = tx.send(Err(RoundTripError::Unsupported));
+                return;
+            }
+            let outcome = forward_round_trip(
+                transport.as_ref(),
+                &node,
+                request,
+                timeout.saturating_sub(started.elapsed()),
+                &task_sent,
+                reply_of,
+            )
+            .await;
+            let _ = tx.send(outcome);
+        });
+        let give_up_at = Instant::now() + timeout + Duration::from_secs(1);
+        loop {
+            match rx.recv_timeout(FORWARD_POLL) {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(RoundTripError::NotSent(reason))) => return Err(not_sent(reason)),
+                Ok(Err(RoundTripError::NoAnswer(reason))) => return Err(unknown(reason)),
+                Ok(Err(RoundTripError::Unsupported)) => {
+                    return Err(ForwardUnavailable::PeerCannotForward(target.to_string()))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !still_valid() {
+                        task.abort();
+                        return Err(ended_without_answer(
+                            &sent,
+                            "the leader changed or was lost while the request was in flight",
+                        ));
+                    }
+                    if Instant::now() >= give_up_at {
+                        task.abort();
+                        return Err(ended_without_answer(&sent, "no reply in time"));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ended_without_answer(
+                        &sent,
+                        "the forwarding task ended without a result",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Whether `node` is known not to take the forwarded request `feature`
+    /// stands for: its `Hello` did not advertise the bit (a build from before
+    /// that kind of forwarding).
     ///
-    /// A peer that advertised it, or one never heard from, is dialed; one
-    /// that then gives no answer is an unknown outcome, not an unsupported
-    /// peer: the request may have been processed.
-    fn forward_blocked(&self, node: &str) -> bool {
+    /// A peer that advertised it is dialed. One never heard from is probed
+    /// first (`probe_features`) by `forward_request`; once it has been sent a
+    /// request, no answer is an unknown outcome, not an unsupported peer: the
+    /// request may have been processed.
+    fn forward_blocked(&self, node: &str, feature: u32) -> bool {
         self.peer_features
             .get(node)
-            .is_some_and(|features| *features & frames::BUS_FEATURE_PRODUCE_FORWARD == 0)
+            .is_some_and(|features| *features & feature == 0)
     }
 }
 
@@ -4592,10 +4792,13 @@ mod tests {
     /// How a peer answers a forwarded publish stream.
     #[derive(Clone)]
     enum ForwardPeer {
-        /// Reads the request, then drops the stream: what a build that does
-        /// not know `ProduceForward` does, and what a leader that crashed
-        /// after appending looks like to the sender.
+        /// Reads the request, then drops the stream: what a leader that
+        /// crashed after appending looks like to the sender. It answers the
+        /// capability probe as a current build does.
         Old,
+        /// A build from before forwarded requests: it answers the capability
+        /// probe without features and drops any request it does not know.
+        Predates,
         /// Reads the request and never answers.
         Silent,
         /// Never completes the dial.
@@ -4635,6 +4838,38 @@ mod tests {
         fn dials(&self, node_id: &str) -> u32 {
             self.dial_count.get(node_id).map(|v| *v).unwrap_or(0)
         }
+
+        /// The far end of a capability probe: one `LeoQuery` in, one
+        /// `LeoReply` out, with the feature bits of a current build or none.
+        fn answer_probe(knows_forwarding: bool) -> (BusRecv, BusSend) {
+            let (ours, theirs) = tokio::io::duplex(16 * 1024);
+            tokio::spawn(async move {
+                let (mut peer_recv, mut peer_send) = split(theirs);
+                if let Ok(ReplFrame::LeoQuery(query)) = frames::read_frame(&mut peer_recv).await {
+                    let reply = ReplLeoReply {
+                        leo: 0,
+                        hw: 0,
+                        leader_epoch: query.known_epoch,
+                        in_isr: false,
+                        log_epoch: None,
+                        leading: false,
+                        ineligible: true,
+                        committed: None,
+                        leader_alive: false,
+                        promised_epoch: None,
+                        promises: true,
+                        bus_features: if knows_forwarding {
+                            frames::LOCAL_BUS_FEATURES
+                        } else {
+                            0
+                        },
+                    };
+                    let _ = frames::write_frame(&mut peer_send, &ReplFrame::LeoReply(reply)).await;
+                }
+            });
+            let (our_recv, our_send) = split(ours);
+            (Box::new(our_recv), Box::new(our_send))
+        }
     }
 
     #[async_trait::async_trait]
@@ -4655,11 +4890,10 @@ mod tests {
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
                 let (mut peer_recv, mut peer_send) = split(theirs);
-                if !matches!(
-                    frames::read_frame(&mut peer_recv).await,
-                    Ok(ReplFrame::ProduceForward(_))
-                ) {
-                    return;
+                match frames::read_frame(&mut peer_recv).await {
+                    Ok(ReplFrame::ProduceForward(_)) | Ok(ReplFrame::ConsumeForward(_))
+                        if !matches!(peer, ForwardPeer::Predates) => {}
+                    _ => return,
                 }
                 if matches!(peer, ForwardPeer::Silent) {
                     std::future::pending::<()>().await;
@@ -4676,6 +4910,13 @@ mod tests {
 
         async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
             *self.dial_count.entry(node_id.to_string()).or_insert(0) += 1;
+            // A peer set up only for forwarding answers the capability probe
+            // the way a current build does, or, for `Predates`, without any.
+            if !self.scripts.contains_key(node_id) {
+                if let Some(peer) = self.forward_peers.get(node_id).map(|p| p.clone()) {
+                    return Ok(Self::answer_probe(!matches!(peer, ForwardPeer::Predates)));
+                }
+            }
             let script = self
                 .scripts
                 .get(node_id)
@@ -4704,6 +4945,7 @@ mod tests {
                             leader_alive: false,
                             promised_epoch: query.candidate_epoch,
                             promises: true,
+                            bus_features: 0,
                         },
                         PeerScript::Reply(reply) => ReplLeoReply {
                             promised_epoch: reply.promised_epoch.or(query.candidate_epoch),
@@ -6038,6 +6280,7 @@ mod tests {
             broker_dead_letter: false,
             producer: None,
             groups: Vec::new(),
+            reply_within_ms: 0,
         }
     }
 
@@ -6089,7 +6332,9 @@ mod tests {
             forward(&fx.manager, "l").await,
             Err(ForwardUnavailable::OutcomeUnknown { .. })
         ));
-        assert!(!fx.manager.forward_blocked("l"));
+        assert!(!fx
+            .manager
+            .forward_blocked("l", frames::BUS_FEATURE_PRODUCE_FORWARD));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6099,7 +6344,9 @@ mod tests {
             forward(&fx.manager, "nobody").await,
             Err(ForwardUnavailable::NotSent { .. })
         ));
-        assert!(!fx.manager.forward_blocked("nobody"));
+        assert!(!fx
+            .manager
+            .forward_blocked("nobody", frames::BUS_FEATURE_PRODUCE_FORWARD));
     }
 
     /// Dial and exchange are one deadline: a dial that never completes ends
@@ -6320,6 +6567,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingForwardHandler {
         calls: Mutex<Vec<(String, ProduceForward)>>,
+        consume_calls: Mutex<Vec<(String, ConsumeForward)>>,
     }
 
     impl ForwardedPublishHandler for RecordingForwardHandler {
@@ -6337,6 +6585,156 @@ mod tests {
                 error: None,
             }
         }
+
+        fn consume_forwarded(&self, from: &str, request: ConsumeForward) -> ConsumeForwardReply {
+            self.consume_calls.lock().push((from.to_string(), request));
+            ConsumeForwardReply {
+                records: Some(Vec::new()),
+                error: None,
+            }
+        }
+    }
+
+    fn consume_request() -> ConsumeForward {
+        ConsumeForward {
+            instance_id: "tentabus-00000001".to_string(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org".to_string(),
+            topic: "orders".to_string(),
+            group: "g".to_string(),
+            actor: Some("alice".to_string()),
+            actor_kind: "user".to_string(),
+            correlation_id: None,
+            origin: "test".to_string(),
+            max_bytes: 1024,
+            max_records: None,
+            max_wait_ms: 10,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_read_reaches_the_handler_with_the_senders_identity() {
+        let (fx, handler) = leader_with_forward_handler().await;
+        let reply = fx
+            .manager
+            .answer_consume_forward("f1", consume_request())
+            .await;
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        let calls = handler.consume_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "f1");
+        assert_eq!(calls[0].1.group, "g");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarded_read_from_another_environment_or_instance_is_refused() {
+        let (fx, handler) = leader_with_forward_handler().await;
+        let mut other_env = consume_request();
+        other_env.environment = NodeEnvironment::Dev;
+        let reply = fx.manager.answer_consume_forward("f1", other_env).await;
+        assert_eq!(
+            reply
+                .error
+                .as_ref()
+                .and_then(|e| e.texts.first())
+                .map(String::as_str),
+            Some("environment_mismatch")
+        );
+        let mut other_instance = consume_request();
+        other_instance.instance_id = "tentabus-00000002".to_string();
+        let reply = fx
+            .manager
+            .answer_consume_forward("f1", other_instance)
+            .await;
+        assert_eq!(
+            reply
+                .error
+                .as_ref()
+                .and_then(|e| e.texts.first())
+                .map(String::as_str),
+            Some("unknown_instance")
+        );
+        assert!(handler.consume_calls.lock().is_empty());
+    }
+
+    /// A peer that advertised forwarded writes but not forwarded reads (a
+    /// build from before consume forwarding) is never sent a `ConsumeForward`
+    /// it would drop without an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_without_the_consume_bit_is_never_dialed_for_a_forwarded_read() {
+        let fx = build("f1");
+        fx.manager
+            .peer_features
+            .insert("l".to_string(), frames::BUS_FEATURE_PRODUCE_FORWARD);
+        let manager = Arc::clone(&fx.manager);
+        let result = tokio::task::spawn_blocking(move || {
+            manager.forward_consume("l", consume_request(), Duration::from_secs(2), &|| true)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(ForwardUnavailable::PeerCannotForward(_))),
+            "{result:?}"
+        );
+        assert_eq!(fx.transport.forward_dials("l"), 0);
+    }
+
+    /// A peer never heard from that turns out to predate forwarded requests
+    /// is not sent one: it would drop it in silence, which reads as an
+    /// unknown outcome. It is asked what it accepts first, and refused as a
+    /// peer that cannot forward, for reads and writes alike. The answer is not
+    /// remembered, so a peer upgraded later is asked again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_never_heard_from_that_predates_forwarding_is_refused_not_given_a_504() {
+        let fx = build("f1");
+        fx.transport.set_forward_peer("l", ForwardPeer::Predates);
+        let manager = Arc::clone(&fx.manager);
+        let (read, write) = tokio::task::spawn_blocking(move || {
+            (
+                manager.forward_consume("l", consume_request(), Duration::from_secs(2), &|| true),
+                manager.forward_publish("l", forward_request(), Duration::from_secs(2), &|| true),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(read, Err(ForwardUnavailable::PeerCannotForward(_))),
+            "{read:?}"
+        );
+        assert!(
+            matches!(write, Err(ForwardUnavailable::PeerCannotForward(_))),
+            "{write:?}"
+        );
+        assert!(
+            fx.manager.peer_features.get("l").is_none(),
+            "an answer of 'nothing' is not remembered"
+        );
+    }
+
+    /// A peer never heard from that does forward is probed once; the answer
+    /// is remembered, so the next request goes straight out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_never_heard_from_is_probed_once_and_then_remembered() {
+        let fx = build("f1");
+        let reply = ProduceForwardReply {
+            result: None,
+            error: Some(frames::ForwardError {
+                code: "bus.not_leader".to_string(),
+                ..Default::default()
+            }),
+        };
+        fx.transport
+            .set_forward_peer("l", ForwardPeer::Reply(reply.clone()));
+        assert_eq!(forward(&fx.manager, "l").await.unwrap(), reply);
+        assert_eq!(
+            fx.manager.peer_features.get("l").map(|f| *f),
+            Some(frames::LOCAL_BUS_FEATURES)
+        );
+        assert_eq!(fx.transport.dials("l"), 1, "the probe");
+        assert_eq!(fx.transport.forward_dials("l"), 1, "and the request");
+        assert_eq!(forward(&fx.manager, "l").await.unwrap(), reply);
+        assert_eq!(fx.transport.dials("l"), 1, "no second probe");
+        assert_eq!(fx.transport.forward_dials("l"), 2);
     }
 
     fn grouped_request(partition: u32) -> ProduceForward {
@@ -8593,6 +8991,7 @@ mod tests {
             leader_alive: false,
             promised_epoch: None,
             promises: true,
+            bus_features: 0,
         })
     }
 
@@ -8837,6 +9236,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: None,
                 promises: true,
+                bus_features: 0,
             }),
         );
         for raw in 1u8..=8 {
@@ -9024,6 +9424,7 @@ mod tests {
                 leader_alive: true,
                 promised_epoch: None,
                 promises: true,
+                bus_features: 0,
             }),
         );
         for raw in 1u8..=8 {
@@ -9617,6 +10018,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: Some(65),
                 promises: true,
+                bus_features: 0,
             }),
         );
 
@@ -10037,6 +10439,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: Some(65),
                 promises: true,
+                bus_features: 0,
             }),
         );
         *fx.follower_factory.stagger.lock() = Duration::from_secs(10);

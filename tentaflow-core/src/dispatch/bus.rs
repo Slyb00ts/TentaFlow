@@ -493,6 +493,9 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             ProtocolErrorCode::NotAvailable,
             format!("bus.partition_unavailable: {reason}"),
         ),
+        BusServiceError::RemoteFailure => ProtocolError::internal(
+            "bus.remote_error: the partition leader failed while serving the request",
+        ),
         // SUM/tentabus/POLITYKI-POL.md: a field policy rejected this
         // request/payload — a client input error, same shape as
         // `InvalidArgument` above.

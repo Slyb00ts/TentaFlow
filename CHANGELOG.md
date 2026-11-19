@@ -6,6 +6,78 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Przekazywanie zapisu i odczytu do lidera partycji (TB-04)
+
+- REST rekordów działa na każdym węźle, także na tym, który nie prowadzi
+  topiku. `POST .../records` przekazuje zapis do lidera partycji, a `GET
+  .../records` przekazuje cały odczyt (otwarcie konsumenta, pobranie i commit)
+  do węzła prowadzącego topik. Lider autoryzuje oryginalnego wywołującego
+  jeszcze raz (własnym autoryzatorem i własną kopią członkostw w organizacji;
+  aktora systemowego brokera nie przyjmuje nigdy) i niczego nie przekazuje
+  dalej. Każda odmowa na liderze trafia do audytu razem z węzłem, który
+  przekazał odczyt (`forwarded_from`). Odczyt jest przekazywany tylko wtedy,
+  gdy jeden węzeł prowadzi wszystkie partycje topiku; gdy partycje prowadzi
+  kilka węzłów, odpowiedź to 503 `bus_not_leader` z `Retry-After` (stan
+  przejściowy: przenosiny liderów obejmują cały topik).
+- `max_records` obowiązuje także odczyt przekazany do lidera, a odpowiedź lidera
+  jest przycinana tak, by mieściła się w jednej ramce (klucze, nagłówki i narzut
+  też się liczą) i w `max_bytes` wywołującego. Lider zatwierdza offset tylko
+  rekordów, które faktycznie zwraca; reszta zostaje na następny odczyt.
+- Nowe odpowiedzi REST zamiast 500 `internal_error`:
+  - 503 z nagłówkiem `Retry-After: 1` i kodem `bus_not_leader`,
+    `bus_not_enough_replicas` albo `bus_partition_unavailable`: partycja
+    chwilowo nie ma lidera, który przyjąłby wywołanie. Nic nie zostało
+    zapisane (ani odczytane), więc ponowienie jest bezpieczne.
+  - 504 z kodem `bus_forward_outcome_unknown` albo `bus_ack_timeout` i bez
+    `Retry-After`: żądanie wyszło do lidera i nie wróciła odpowiedź albo repliki
+    nie potwierdziły zapisu w czasie. Zapis mógł trafić do logu albo nie; przed
+    ponowieniem trzeba użyć klucza idempotencji albo tożsamości producenta.
+    Odczyt przekazany do lidera jest at-most-once, gdy odpowiedź zginie: lider
+    zatwierdza offset przed jej wysłaniem, więc rekordy mogły zostać
+    zatwierdzone dla grupy, choć wywołujący ich nie zobaczył (odczyt obsłużony
+    na własnym węźle pozostaje at-least-once). Przed kolejnym odczytem warto
+    sprawdzić offsety grupy.
+  - 502 z kodem `bus_leader_failure` i bez `Retry-After`: lider partycji zawiódł
+    po swojej stronie (dysk, silnik). Wcześniej taki błąd byłby przedstawiony
+    jako chwilowy brak lidera; szczegóły zostają w logu lidera.
+  - Treść 503 i 504 jest stała: nie zawiera identyfikatorów węzłów, epok ani
+    powodów. Węzeł, do którego trafiło żądanie, jest tylko w logu. Błędy odczytu
+    lidera (np. `OffsetOutOfRange`) docierają do wywołującego jako ten sam
+    błąd, jaki dałby odczyt na własnym węźle.
+- Zapis obejmujący partycje prowadzone przez kilka węzłów może się częściowo
+  udać. Odpowiedź 500 `internal_error` zawiera wtedy w `error.acked` listę
+  partycji, które już przyjęły rekordy (`partition`, `base_offset`,
+  `accepted`); tych rekordów nie wolno wysyłać ponownie bez klucza
+  idempotencji.
+- Addon: odmowa „partycja bez lidera” przy `bus_publish_v1` dostaje kod ABI
+  `Backpressure` (ponów za chwilę), a nieznany wynik zapisu przekazanego do
+  lidera albo brak potwierdzenia replik kod `Timeout` (zapis mógł się udać).
+  Konsument addonu jest stanowy i nie jest przekazywany: `bus_consume_open_v1`
+  na węźle, który nie prowadzi topiku (i `next`/`commit` na uchwycie, którego
+  temat zmienił lidera) zwraca `NoAvailableTarget`, a wpis audytu
+  `bus.consume.open` nazywa węzeł prowadzący.
+- Blok `bus_publish` podaje w powodzie błędu „partition of topic … has no
+  leader at the moment”, „… got no confirmation in time; it may or may not
+  have been stored” albo „the node that owns topic … failed while serving the
+  write”.
+- Kopia kwarantanny rekordu odrzuconego przez schemat trafia do lidera
+  partycji `__dlq.*`, także gdy rekord przyszedł od innego węzła albo węzeł nie
+  ma repliki tej partycji; wcześniej taki rekord był po cichu odrzucany.
+  Kopia jest zapisywana dopiero po przyjęciu właściwego zapisu (lider, ISR,
+  limity), więc odmowa `NotLeader` nie zostawia kopii, które ponowienie zapisze
+  drugi raz. Zapis kopii przy publikacji przekazanej od innego węzła mieści się
+  w czasie, który ten węzeł czeka na odpowiedź. Kopia o nieznanym wyniku (brak
+  odpowiedzi lidera DLQ albo brak potwierdzenia replik) nie jest liczona jako
+  `schema_dropped`: publikacja kończy się błędem `ForwardOutcomeUnknown` /
+  `AckTimeout`, a nic poza ewentualną kopią nie zostało zapisane.
+- Ramki `ConsumeForward`/`ConsumeForwardReply` (rodzaje 11 i 12) są ogłaszane
+  osobnym bitem `bus_features`; węzeł bez tego bitu dostaje odczyt jako
+  odmowę `bus_not_leader`, jak dotąd. Węzeł, od którego nie przyszedł jeszcze
+  żaden `Hello` (np. nie ma repliki), jest przed pierwszym żądaniem pytany o
+  swoje bity (`LeoQuery` bez partycji, odpowiedź niesie `bus_features`);
+  wynik niezerowy jest zapamiętywany. Węzeł, który nie odpowiada na pytanie
+  albo nie zna bitów, nie dostaje żądania i wywołujący widzi 503, nie 504.
+
 ### Limity i SLA usług (TB-03)
 
 - Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,

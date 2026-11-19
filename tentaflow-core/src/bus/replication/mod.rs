@@ -25,6 +25,7 @@
 // a whole) is unaffected by wave-1's in-progress work landing later.
 
 pub mod assignment;
+pub mod consume_forward;
 pub mod election;
 pub mod follower;
 pub mod forward;

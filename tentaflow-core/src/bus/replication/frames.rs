@@ -52,14 +52,22 @@ const KIND_LEO_REPLY: u8 = 7;
 const KIND_OFFSETS: u8 = 8;
 const KIND_PRODUCE_FORWARD: u8 = 9;
 const KIND_PRODUCE_FORWARD_REPLY: u8 = 10;
+const KIND_CONSUME_FORWARD: u8 = 11;
+const KIND_CONSUME_FORWARD_REPLY: u8 = 12;
 
 /// `ReplHello::bus_features` / `ReplHelloAck::bus_features` bit: this node
 /// accepts `ReplFrame::ProduceForward` on a fresh stream and answers with
 /// `ProduceForwardReply`.
 pub const BUS_FEATURE_PRODUCE_FORWARD: u32 = 1 << 0;
 
+/// `bus_features` bit: this node accepts `ReplFrame::ConsumeForward` on a
+/// fresh stream and answers with `ConsumeForwardReply`. A separate bit from
+/// `BUS_FEATURE_PRODUCE_FORWARD`: a build that forwards writes but predates
+/// consume forwarding would drop the new frame without an answer.
+pub const BUS_FEATURE_CONSUME_FORWARD: u32 = 1 << 1;
+
 /// Every feature bit this build advertises.
-pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURE_PRODUCE_FORWARD;
+pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD;
 
 /// First frame on a new leader->follower replication stream (PLAN-M2 §1b).
 /// Carries both fencing checks a stream establishment needs (PLAN-M2 §1b
@@ -529,6 +537,12 @@ pub struct ReplLeoReply {
     /// the CHANGELOG upgrade note.
     #[serde(default)]
     pub promises: bool,
+    /// The `BUS_FEATURE_*` bits the replying node accepts: how a node that
+    /// has never been dialed by a peer learns, without sending it anything
+    /// that matters, whether the peer takes forwarded requests. Appended:
+    /// `0` from a peer that predates it, which then takes none.
+    #[serde(default)]
+    pub bus_features: u32,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -592,6 +606,12 @@ pub struct ProduceForward {
     pub broker_dead_letter: bool,
     pub producer: Option<ForwardProducer>,
     pub groups: Vec<ForwardGroup>,
+    /// How long the sender waits for the reply, in milliseconds (`0`: not
+    /// stated). Work the leader does besides the append, such as writing a
+    /// quarantine copy to the dead-letter topic, must end well inside it, or
+    /// the sender gives up on a write that landed.
+    #[serde(default)]
+    pub reply_within_ms: u32,
 }
 
 /// One partition a publish landed on (`PartitionAck`).
@@ -639,6 +659,57 @@ pub struct ProduceForwardReply {
     pub error: Option<ForwardError>,
 }
 
+/// A stateless read (open, fetch, commit) a node hands to the leader of the
+/// topic it asked for, the first frame of a fresh stream: the REST `GET
+/// .../records` of a node that does not lead the topic. The leader
+/// authorizes the ORIGINAL actor again and never forwards it further.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumeForward {
+    pub instance_id: String,
+    /// The sender's environment: the frame-level half of the environment
+    /// fence, as in `ProduceForward`.
+    pub environment: NodeEnvironment,
+    pub org_id: String,
+    pub topic: String,
+    pub group: String,
+    pub actor: Option<String>,
+    /// `auth::actor::ActorKind::as_str` of the caller.
+    pub actor_kind: String,
+    pub correlation_id: Option<String>,
+    pub origin: String,
+    pub max_bytes: u64,
+    /// At most this many records (`None`: no bound beyond `max_bytes`).
+    #[serde(default)]
+    pub max_records: Option<u64>,
+    pub max_wait_ms: u32,
+}
+
+/// One record a forwarded read returns, already projected through the
+/// caller's read rules by the leader (`FetchedRecordMeta` of the request's
+/// topic).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardFetched {
+    pub partition: u32,
+    pub offset: u64,
+    pub timestamp_ms: i64,
+    pub key: Option<serde_bytes::ByteBuf>,
+    pub headers: Vec<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>,
+    pub payload: serde_bytes::ByteBuf,
+    pub schema_id: u32,
+}
+
+/// The leader's answer to `ConsumeForward`: exactly one of the two is set.
+/// `records` are committed on the leader before the reply is sent, and the
+/// leader sizes the reply to fit one frame first, so a commit never covers
+/// records the frame cannot carry. A reply that is lost on the way (the
+/// stream breaks after the commit) still leaves them committed: delivery of a
+/// forwarded read is at-most-once when the reply is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumeForwardReply {
+    pub records: Option<Vec<ForwardFetched>>,
+    pub error: Option<ForwardError>,
+}
+
 /// One frame on a replication stream (PLAN-M2 §1b). `Batch` is the only
 /// variant whose payload spans both wire sections: `header` is CBOR, the
 /// batch bytes are `raw`. No `Serialize`/`Deserialize` here — `ReplFrame`
@@ -663,6 +734,8 @@ pub enum ReplFrame {
     Offsets(ReplOffsets),
     ProduceForward(ProduceForward),
     ProduceForwardReply(ProduceForwardReply),
+    ConsumeForward(ConsumeForward),
+    ConsumeForwardReply(ConsumeForwardReply),
 }
 
 /// Errors from `read_frame`/`write_frame`. Distinct from
@@ -709,6 +782,8 @@ fn encode_parts(frame: &ReplFrame) -> Result<(u8, Vec<u8>, &[u8]), ReplCodecErro
         ReplFrame::Offsets(v) => (KIND_OFFSETS, encode_cbor(v)?, &[][..]),
         ReplFrame::ProduceForward(v) => (KIND_PRODUCE_FORWARD, encode_cbor(v)?, &[][..]),
         ReplFrame::ProduceForwardReply(v) => (KIND_PRODUCE_FORWARD_REPLY, encode_cbor(v)?, &[][..]),
+        ReplFrame::ConsumeForward(v) => (KIND_CONSUME_FORWARD, encode_cbor(v)?, &[][..]),
+        ReplFrame::ConsumeForwardReply(v) => (KIND_CONSUME_FORWARD_REPLY, encode_cbor(v)?, &[][..]),
     })
 }
 
@@ -774,6 +849,8 @@ fn decode_frame(kind: u8, cbor: &[u8], raw: Bytes) -> Result<ReplFrame, ReplCode
         KIND_OFFSETS => ReplFrame::Offsets(decode_cbor(cbor)?),
         KIND_PRODUCE_FORWARD => ReplFrame::ProduceForward(decode_cbor(cbor)?),
         KIND_PRODUCE_FORWARD_REPLY => ReplFrame::ProduceForwardReply(decode_cbor(cbor)?),
+        KIND_CONSUME_FORWARD => ReplFrame::ConsumeForward(decode_cbor(cbor)?),
+        KIND_CONSUME_FORWARD_REPLY => ReplFrame::ConsumeForwardReply(decode_cbor(cbor)?),
         other => return Err(ReplCodecError::UnknownKind(other)),
     })
 }
@@ -1190,6 +1267,7 @@ mod tests {
                     schema_id: 9,
                 }],
             }],
+            reply_within_ms: 7_000,
         }
     }
 
@@ -1241,10 +1319,53 @@ mod tests {
     fn the_forward_kinds_are_numbered_past_every_older_kind() {
         assert_eq!(KIND_PRODUCE_FORWARD, 9);
         assert_eq!(KIND_PRODUCE_FORWARD_REPLY, 10);
+        assert_eq!(KIND_CONSUME_FORWARD, 11);
+        assert_eq!(KIND_CONSUME_FORWARD_REPLY, 12);
         assert!(matches!(
-            decode_frame(11, &[], Bytes::new()),
-            Err(ReplCodecError::UnknownKind(11))
+            decode_frame(13, &[], Bytes::new()),
+            Err(ReplCodecError::UnknownKind(13))
         ));
+    }
+
+    #[tokio::test]
+    async fn consume_forward_frames_round_trip() {
+        let request = ConsumeForward {
+            instance_id: "tentabus-00000001".into(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org-1".into(),
+            topic: "orders".into(),
+            group: "rest-reader".into(),
+            actor: Some("alice".into()),
+            actor_kind: "user".into(),
+            correlation_id: None,
+            origin: "rest".into(),
+            max_bytes: 65_536,
+            max_records: Some(50),
+            max_wait_ms: 250,
+        };
+        assert_eq!(
+            roundtrip(ReplFrame::ConsumeForward(request.clone())).await,
+            ReplFrame::ConsumeForward(request)
+        );
+        let reply = ConsumeForwardReply {
+            records: Some(vec![ForwardFetched {
+                partition: 1,
+                offset: 7,
+                timestamp_ms: -3,
+                key: Some(serde_bytes::ByteBuf::from(vec![0, 1])),
+                headers: vec![(
+                    serde_bytes::ByteBuf::from(vec![0xFF, 0x00]),
+                    serde_bytes::ByteBuf::from(vec![9]),
+                )],
+                payload: serde_bytes::ByteBuf::from(vec![0u8, 255, 7]),
+                schema_id: 4,
+            }]),
+            error: None,
+        };
+        assert_eq!(
+            roundtrip(ReplFrame::ConsumeForwardReply(reply.clone())).await,
+            ReplFrame::ConsumeForwardReply(reply)
+        );
     }
 
     #[tokio::test]
@@ -1387,6 +1508,7 @@ mod tests {
             leader_alive: false,
             promised_epoch: Some(8),
             promises: true,
+            bus_features: 0,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
 
@@ -1790,6 +1912,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: None,
                 promises: false,
+                bus_features: 0,
             }
         );
     }

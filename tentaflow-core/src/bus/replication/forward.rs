@@ -15,6 +15,10 @@
 // the records to partitions and (as for any publish) validated the batch up
 // front. A forwarded request is never forwarded again: a receiver that no
 // longer leads answers `NotLeader`, so a request cannot loop between nodes.
+// The one write a leader makes on behalf of a forwarded request is the
+// quarantine copy of a record its schema rejected: that is a broker write of
+// its own and goes to the leader of the `__dlq.*` partition, whichever node
+// that is, rather than being dropped.
 //
 // SENDER: `BusService::forward_to_leaders` (below) — one request per leader,
 // one retry after `NotLeader` once the assignment moved, a bounded wait while
@@ -39,8 +43,8 @@ use serde_bytes::ByteBuf;
 use crate::auth::actor::ActorKind;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::replication::frames::{
-    ForwardAck, ForwardError, ForwardGroup, ForwardProducer, ForwardRecord, ForwardResult,
-    ProduceForward, ProduceForwardReply,
+    ConsumeForward, ConsumeForwardReply, ForwardAck, ForwardError, ForwardGroup, ForwardProducer,
+    ForwardRecord, ForwardResult, ProduceForward, ProduceForwardReply,
 };
 use crate::bus::topics::RESERVED_PREFIX;
 use crate::bus::{
@@ -57,6 +61,10 @@ const LEADER_WAIT: Duration = Duration::from_secs(3);
 /// Slack added to the leader's own publish deadline before the sender stops
 /// waiting for the reply.
 const REPLY_MARGIN: Duration = Duration::from_secs(5);
+
+/// What the leader keeps back from the time a sender waits, for the
+/// reply itself and the scheduling around the work.
+const REPLY_RESERVE: Duration = Duration::from_secs(1);
 
 /// `ForwardError::code` of a refusal made by the forwarding layer itself (not
 /// by the publish pipeline): wrong instance or environment, a sender that is
@@ -85,10 +93,11 @@ pub enum ForwardUnavailable {
     OutcomeUnknown { node: String, reason: String },
 }
 
-/// The leader's half: runs one forwarded publish. Blocking; implemented by
-/// `BusService`.
+/// The leader's half of forwarding: runs one forwarded publish or read.
+/// Blocking; implemented by `BusService`.
 pub trait ForwardedPublishHandler: Send + Sync {
     fn publish_forwarded(&self, from: &str, request: ProduceForward) -> ProduceForwardReply;
+    fn consume_forwarded(&self, from: &str, request: ConsumeForward) -> ConsumeForwardReply;
 }
 
 /// How a publish reached this node, as far as routing and trust go.
@@ -97,22 +106,58 @@ pub(in crate::bus) enum PublishSource<'a> {
     /// A caller on this node: records for partitions led elsewhere are
     /// forwarded to their leaders.
     Local,
+    /// `Local`, with the instant the forwarding has to be over by: a write
+    /// made on behalf of a request whose sender stops waiting then
+    /// (`quarantine_by`).
+    LocalWithin { deadline: Instant },
     /// Records for partitions that turned out to be led here after a
     /// forwarding attempt: never forwarded.
     LocalOnly,
-    /// Forwarded here by `from`: never forwarded again.
-    Forwarded { from: &'a str },
+    /// Forwarded here by `from`: never forwarded again. `quarantine_by` is
+    /// the instant the work besides the append (the quarantine copy of a
+    /// record the schema rejects) has to be over by, so the sender is
+    /// answered before it gives up on a write that landed.
+    Forwarded {
+        from: &'a str,
+        quarantine_by: Option<Instant>,
+    },
 }
 
 impl PublishSource<'_> {
     pub(in crate::bus) fn may_forward(self) -> bool {
-        matches!(self, PublishSource::Local)
+        matches!(
+            self,
+            PublishSource::Local | PublishSource::LocalWithin { .. }
+        )
+    }
+
+    /// The source of the quarantine copy a publish of this source makes into
+    /// the dead-letter topic: a write of its own, made by the broker, which
+    /// goes to the DLQ partition's leader whoever sent the records and is
+    /// bound by the request's own deadline. It cannot loop: the DLQ topic is
+    /// never validated.
+    pub(in crate::bus) fn for_quarantine(self) -> PublishSource<'static> {
+        match self {
+            PublishSource::Forwarded {
+                quarantine_by: Some(deadline),
+                ..
+            } => PublishSource::LocalWithin { deadline },
+            _ => PublishSource::Local,
+        }
+    }
+
+    /// The instant forwarding must be over by, when there is one.
+    pub(in crate::bus) fn deadline(self) -> Option<Instant> {
+        match self {
+            PublishSource::LocalWithin { deadline } => Some(deadline),
+            _ => None,
+        }
     }
 
     /// The audit detail naming the forwarding peer of a refusal.
     pub(in crate::bus) fn audit_note(self) -> Option<String> {
         match self {
-            PublishSource::Forwarded { from } => Some(format!("forwarded_from={from}")),
+            PublishSource::Forwarded { from, .. } => Some(format!("forwarded_from={from}")),
             _ => None,
         }
     }
@@ -400,12 +445,43 @@ pub(crate) fn error_to_wire(err: &BusServiceError) -> ForwardError {
             vec![topic.clone()],
             vec![*partition as u64],
         ),
+        E::OffsetOutOfRange {
+            topic,
+            partition,
+            requested,
+            earliest,
+            latest,
+        } => with(
+            "bus.offset_out_of_range",
+            vec![topic.clone()],
+            vec![*partition as u64, *requested, *earliest, *latest],
+        ),
+        E::GroupNotFound { group, topic } => with(
+            "bus.group_not_found",
+            vec![group.clone(), topic.clone()],
+            vec![],
+        ),
+        E::RemoteFailure => with("bus.remote_error", vec![], vec![]),
+        E::GroupPaused { group, topic } => with(
+            "bus.group_paused",
+            vec![group.clone(), topic.clone()],
+            vec![],
+        ),
+        E::MaxGroupsExceeded {
+            org_id,
+            max,
+            current,
+        } => with(
+            "bus.max_groups_exceeded",
+            vec![org_id.clone()],
+            vec![*max as u64, *current as u64],
+        ),
         // Storage and engine failures of the leader: nothing the sender can
         // act on beyond "the partition cannot serve this right now". The
         // detail (it can name tables, paths or SQL) stays in the leader's
         // log and never reaches a caller on another node.
         other => {
-            tracing::warn!(error = %other, "a forwarded publish failed on this leader");
+            tracing::warn!(error = %other, "a forwarded request failed on this leader");
             ForwardError {
                 texts: vec![],
                 numbers: vec![],
@@ -419,9 +495,9 @@ pub(crate) fn error_to_wire(err: &BusServiceError) -> ForwardError {
 }
 
 /// The `BusServiceError` a `ForwardError` stands for. Codes this build does
-/// not know, and failures internal to the leader, become
-/// `PartitionUnavailable` naming only the code: the leader's own message may
-/// hold internal detail. A `CODE_FORWARD_REFUSED`
+/// not know, and failures internal to the leader, become `RemoteFailure`: the
+/// leader's own message may hold internal detail, and neither is a state that
+/// passes. A `CODE_FORWARD_REFUSED`
 /// error never reaches here: `forward_to_leaders` separates it first.
 pub(crate) fn error_from_wire(e: ForwardError) -> BusServiceError {
     use BusServiceError as E;
@@ -511,9 +587,37 @@ pub(crate) fn error_from_wire(e: ForwardError) -> BusServiceError {
             topic: text(&e, 0),
             partition: number(&e, 0) as u32,
         },
-        other => E::PartitionUnavailable {
-            reason: format!("the partition leader could not serve the forwarded publish ({other})"),
+        "bus.offset_out_of_range" => E::OffsetOutOfRange {
+            topic: text(&e, 0),
+            partition: number(&e, 0) as u32,
+            requested: number(&e, 1),
+            earliest: number(&e, 2),
+            latest: number(&e, 3),
         },
+        "bus.group_not_found" => E::GroupNotFound {
+            group: text(&e, 0),
+            topic: text(&e, 1),
+        },
+        "bus.group_paused" => E::GroupPaused {
+            group: text(&e, 0),
+            topic: text(&e, 1),
+        },
+        "bus.max_groups_exceeded" => E::MaxGroupsExceeded {
+            org_id: text(&e, 0),
+            max: number(&e, 0) as u32,
+            current: number(&e, 1) as u32,
+        },
+        // `bus.remote_error`, and a code a newer build sent: the leader
+        // failed in a way this node cannot name. Not a state that passes.
+        other => {
+            if other != "bus.remote_error" {
+                tracing::warn!(
+                    code = other,
+                    "a forwarded request failed with an unknown code"
+                );
+            }
+            E::RemoteFailure
+        }
     };
     if e.acked.is_empty() {
         source
@@ -540,6 +644,10 @@ impl ForwardedPublishHandler for BusService {
             },
         }
     }
+
+    fn consume_forwarded(&self, from: &str, request: ConsumeForward) -> ConsumeForwardReply {
+        self.run_forwarded_consume(from, request)
+    }
 }
 
 impl BusService {
@@ -562,7 +670,20 @@ impl BusService {
             origin: request.origin,
         };
         let topic = request.topic;
-        let source = PublishSource::Forwarded { from };
+        // The sender waits `reply_within_ms` for the answer. Besides the
+        // append of its own groups, the quarantine copy of a record the
+        // schema rejects must be over before then.
+        let quarantine_by = (request.reply_within_ms > 0).then(|| {
+            let waits = Duration::from_millis(u64::from(request.reply_within_ms));
+            let append = self.publish_ack_timeout * request.groups.len().max(1) as u32;
+            (Instant::now() + waits)
+                .checked_sub(append + REPLY_RESERVE)
+                .unwrap_or_else(Instant::now)
+        });
+        let source = PublishSource::Forwarded {
+            from,
+            quarantine_by,
+        };
 
         // The `SYSTEM_ACTOR` sentinel is the broker's own writer of `__*`
         // topics: the authorizer lets it through there without asking. A peer
@@ -640,6 +761,9 @@ pub(in crate::bus) struct ForwardJob<'a> {
     pub topic: &'a str,
     pub producer: Option<&'a ProducerIdentity>,
     pub broker_dead_letter: bool,
+    /// The instant the forwarding has to be over by, when the publish serves
+    /// a request that is only waited for so long.
+    pub deadline: Option<Instant>,
 }
 
 /// The totals the forwarded groups add to the publish's own.
@@ -670,7 +794,7 @@ enum Reply {
 }
 
 /// Where the records of one partition go.
-enum Route {
+pub(super) enum Route {
     Here,
     Remote { leader: String, epoch: u32 },
     Unknown,
@@ -768,7 +892,10 @@ impl BusService {
         foreign: Vec<(u32, Vec<PublishRecord>)>,
         acks: &mut Vec<PartitionAck>,
     ) -> Result<ForwardTotals, BusServiceError> {
-        let deadline = Instant::now() + LEADER_WAIT;
+        let mut deadline = Instant::now() + LEADER_WAIT;
+        if let Some(limit) = job.deadline {
+            deadline = deadline.min(limit);
+        }
         let local_node = coordinator.local_node_id();
         let mut totals = ForwardTotals::default();
         let mut pending: Vec<PendingGroup> = foreign
@@ -789,7 +916,13 @@ impl BusService {
             let mut by_leader: BTreeMap<String, (u32, Vec<PendingGroup>)> = BTreeMap::new();
             let mut waiting: Vec<PendingGroup> = Vec::new();
             for group in std::mem::take(&mut pending) {
-                match route(coordinator, &local_node, job, group.partition) {
+                match route(
+                    coordinator,
+                    &local_node,
+                    &job.ctx.org_id,
+                    job.topic,
+                    group.partition,
+                ) {
                     Route::Here => {
                         let outcome = self.publish_routed(
                             job.ctx,
@@ -875,19 +1008,37 @@ impl BusService {
             leader_node_id: Some(leader.to_string()),
             leader_epoch: epoch,
         };
-        let request = self.forward_request(job, &groups);
-        let timeout = self.publish_ack_timeout * groups.len().max(1) as u32 + REPLY_MARGIN;
+        let mut timeout = self.publish_ack_timeout * groups.len().max(1) as u32 + REPLY_MARGIN;
+        if let Some(limit) = job.deadline {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::debug!(
+                    leader,
+                    topic = job.topic,
+                    "publish: no time left to forward, answering NotLeader"
+                );
+                return Err(fallback);
+            }
+            timeout = timeout.min(left);
+        }
+        let request = self.forward_request(job, &groups, timeout);
         // The wait for the reply ends early once the partitions have moved to
         // another leader or this one is gone: a leader that crashed must not
         // hold a producer for the whole ack timeout.
         let led_by_target = || {
-            groups
-                .iter()
-                .all(|g| match route(coordinator, local_node, job, g.partition) {
+            groups.iter().all(|g| {
+                match route(
+                    coordinator,
+                    local_node,
+                    &job.ctx.org_id,
+                    job.topic,
+                    g.partition,
+                ) {
                     Route::Remote { leader: l, .. } => l == leader,
                     Route::Here => false,
                     Route::Unknown => true,
-                })
+                }
+            })
         };
         let still_led_by_target = || led_by_target() && coordinator.node_reachable(leader);
         let reply =
@@ -956,7 +1107,12 @@ impl BusService {
         }
     }
 
-    fn forward_request(&self, job: &ForwardJob<'_>, groups: &[PendingGroup]) -> ProduceForward {
+    fn forward_request(
+        &self,
+        job: &ForwardJob<'_>,
+        groups: &[PendingGroup],
+        timeout: Duration,
+    ) -> ProduceForward {
         ProduceForward {
             instance_id: job.ctx.instance_id.as_str().to_string(),
             environment: self.cached_environment(),
@@ -968,6 +1124,7 @@ impl BusService {
             origin: job.ctx.origin.clone(),
             broker_dead_letter: job.broker_dead_letter,
             producer: job.producer.map(producer_to_wire),
+            reply_within_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
             groups: groups
                 .iter()
                 .map(|g| ForwardGroup {
@@ -982,13 +1139,14 @@ impl BusService {
 /// Where the records of `partition` go, as this node knows it. A node that
 /// holds no replica of the partition has no role for it; the cluster-wide
 /// assignment still names the leader.
-fn route(
+pub(super) fn route(
     coordinator: &Arc<dyn ReplicationCoordinator>,
     local_node: &str,
-    job: &ForwardJob<'_>,
+    org_id: &str,
+    topic: &str,
     partition: u32,
 ) -> Route {
-    match coordinator.role(&job.ctx.org_id, job.topic, partition) {
+    match coordinator.role(org_id, topic, partition) {
         PartitionRole::Leader { .. } => Route::Here,
         PartitionRole::Follower {
             leader_node_id,
@@ -998,7 +1156,7 @@ fn route(
             epoch,
         },
         PartitionRole::Unavailable { .. } => {
-            match coordinator.assigned_leader(&job.ctx.org_id, job.topic, partition) {
+            match coordinator.assigned_leader(org_id, topic, partition) {
                 Some((leader, epoch)) if leader != local_node => Route::Remote { leader, epoch },
                 _ => Route::Unknown,
             }
@@ -1154,6 +1312,27 @@ mod tests {
                 topic: "orders".into(),
                 partition: 3,
             },
+            BusServiceError::GroupPaused {
+                group: "g".into(),
+                topic: "orders".into(),
+            },
+            BusServiceError::MaxGroupsExceeded {
+                org_id: "org-1".into(),
+                max: 4,
+                current: 4,
+            },
+            BusServiceError::OffsetOutOfRange {
+                topic: "orders".into(),
+                partition: 2,
+                requested: 10,
+                earliest: 500,
+                latest: 900,
+            },
+            BusServiceError::GroupNotFound {
+                group: "g".into(),
+                topic: "orders".into(),
+            },
+            BusServiceError::RemoteFailure,
         ];
         for case in cases {
             let expected = format!("{case:?}");
@@ -1198,34 +1377,33 @@ mod tests {
     }
 
     /// A leader on a newer build may answer with a code this one has never
-    /// heard of: the sender still gets a retryable error naming it, never a
-    /// panic or a silent success.
+    /// heard of: the sender still gets an error, never a panic or a silent
+    /// success, and one that does not invite a retry loop.
     #[test]
-    fn an_unknown_error_code_degrades_to_partition_unavailable() {
+    fn an_unknown_error_code_degrades_to_a_remote_failure() {
         let err = error_from_wire(ForwardError {
             code: "bus.from_the_future".into(),
             message: "the leader is unhappy".into(),
             ..ForwardError::default()
         });
-        match err {
-            BusServiceError::PartitionUnavailable { reason } => {
-                assert!(reason.contains("bus.from_the_future"), "{reason}");
-                assert!(
-                    !reason.contains("the leader is unhappy"),
-                    "the leader's own text is not passed on: {reason}"
-                );
-            }
-            other => panic!("expected PartitionUnavailable, got {other:?}"),
-        }
+        assert!(matches!(err, BusServiceError::RemoteFailure), "{err:?}");
+        assert!(
+            !err.to_string().contains("the leader is unhappy"),
+            "the leader's own text is not passed on: {err}"
+        );
     }
 
+    /// A storage failure of the leader is not a partition that is
+    /// unavailable for a moment: the sender must not take it for one and
+    /// retry for ever.
     #[test]
-    fn an_engine_failure_of_the_leader_is_reported_as_unavailable() {
+    fn an_engine_failure_of_the_leader_is_a_remote_failure_not_an_unavailable_partition() {
         let wire = error_to_wire(&BusServiceError::Db("disk on fire".into()));
         assert_eq!(wire.code, "bus.remote_error");
+        assert!(wire.message.find("disk").is_none());
         assert!(matches!(
             error_from_wire(wire),
-            BusServiceError::PartitionUnavailable { .. }
+            BusServiceError::RemoteFailure
         ));
     }
 
