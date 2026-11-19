@@ -30,6 +30,24 @@ let currentModalEl = null;
 let vramPollHandle = null;
 let recommendDebounceHandle = null;
 
+// Escape closes this modal. Listened for in the capture phase on window so it
+// runs before the document-level TfWindow handlers and stops there: a window the
+// services screen itself lives in must not close along with the modal. A modal
+// TfWindow opened from here (the save confirmation) sits on top and owns Escape.
+function onModalKeyDown(e) {
+  if (e.key !== 'Escape' || !currentModalEl) return;
+  if (document.querySelector('tf-window[modal]')) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  closeModal();
+}
+
+function showModal(overlay) {
+  document.body.appendChild(overlay);
+  currentModalEl = overlay;
+  window.addEventListener('keydown', onModalKeyDown, true);
+}
+
 export async function openEditModal(svc, opts = {}) {
   closeModal();
   // External cloud providers don't expose a model/VRAM config — editing them
@@ -60,8 +78,7 @@ export async function openEditModal(svc, opts = {}) {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRepo, presets);
-  document.body.appendChild(overlay);
-  currentModalEl = overlay;
+  showModal(overlay);
 
   // Close handlers
   overlay.querySelector('[data-close]').addEventListener('click', closeModal);
@@ -207,8 +224,7 @@ async function openExternalModelPicker(svc, opts = {}) {
         <tf-button variant="primary" icon="check" data-save>${escapeHtml(I18n.t('external.add_to_models'))}</tf-button>
       </div>
     </div>`;
-  document.body.appendChild(overlay);
-  currentModalEl = overlay;
+  showModal(overlay);
 
   overlay.querySelector('[data-close]').addEventListener('click', closeModal);
   overlay.querySelector('[data-cancel]').addEventListener('click', closeModal);
@@ -357,6 +373,7 @@ function closeModal() {
     currentModalEl.remove();
     currentModalEl = null;
   }
+  window.removeEventListener('keydown', onModalKeyDown, true);
 }
 
 // Debounced refresh kalkulatora VRAM. Po zmianie modelu / ctx / utilization

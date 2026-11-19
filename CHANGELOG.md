@@ -139,6 +139,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Kafel „Równoległość” odświeża się co 5 s. Nagłówek historii wykonań
   mówi „ostatnie 100 wykonań”, gdy lista jest pełna.
 - Dokumentacja administratora: `docs/SLA_POLITYKI_ADMIN.md`.
+- Okno „Edytuj serwis” zamyka się klawiszem Escape. Okno potwierdzenia
+  otwarte nad nim samo obsługuje Escape. Ekran usług ma 64 brakujące
+  tłumaczenia po niemiecku, hiszpańsku i francusku (kolumny, przyciski
+  w wierszu, statusy, aliasy, aktualizacja serwisu), które wcześniej
+  pokazywały się po angielsku.
 
 ### Zdarzenia i konta usługowe (TB-02)
 
