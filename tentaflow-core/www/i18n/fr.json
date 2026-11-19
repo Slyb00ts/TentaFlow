@@ -11125,7 +11125,8 @@
         "description_placeholder": "p. ex. Résultats du service de radiologie pour le système de l’hôpital",
         "description_hint": "Une ou deux phrases sur l’usage du topic. Elles s’affichent sous son nom. Au plus {max} caractères.",
         "description_too_long": "La description peut compter au plus {max} caractères.",
-        "summary_description": "Description"
+        "summary_description": "Description",
+        "kind_flow_note": "Les flux ne lisent que du JSON depuis le bus. Un message dans ce format reçu par le bloc « Consommation du bus » va dans « Non traités »."
       },
       "delete": {
         "title": "Supprimer le topic {name}",

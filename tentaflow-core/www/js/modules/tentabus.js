@@ -25,7 +25,7 @@ import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
-import { fmtCount, fmtElapsed, loadErrorKind } from '/js/modules/tentabus/format.js';
+import { fmtCount, fmtElapsed, loadErrorKind, consumerLabel } from '/js/modules/tentabus/format.js';
 import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams, carriedParams } from '/js/modules/tentabus/routes.js';
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
@@ -650,7 +650,8 @@ function paintCrumbs() {
       items.push({ label: state.view.name });
     } else if (state.view?.kind === 'consumer-detail') {
       items.push({ label: tabLabel, act: 'groups', href: href({ tab: 'groups' }) });
-      items.push({ label: state.view.group });
+      // The page's own title once loaded: a key's group by its key, not its raw `k:<id>` name.
+      items.push({ label: state.consumer?.detail ? consumerLabel(state.consumer.detail) : state.view.group });
     } else if (state.view?.kind === 'schema-detail') {
       items.push({ label: tabLabel, act: 'schemas', href: href({ tab: 'schemas' }) });
       items.push({ label: state.view.subject });
@@ -1962,6 +1963,7 @@ const loadConsumer = topicDetailLoader({
     if (!error) {
       state.consumer = detail;
       state.consumerError = null;
+      paintCrumbs();
     } else {
       const missing = busErrorCode(error?.message) === 'group_not_found';
       if (state.consumer && !missing) return;
@@ -2737,6 +2739,6 @@ function openSchemaDeleteWindow(name) {
 }
 
 // What the page tests reach into: the screen's state and the contexts its two detail pages are drawn from.
-export const pageInternals = { state, detailContext, consumerContext, consumerLoaderContext };
+export const pageInternals = { state, detailContext, consumerContext, consumerLoaderContext, paintCrumbs };
 
 export default TentaBusScreen;

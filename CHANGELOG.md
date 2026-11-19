@@ -144,6 +144,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   tłumaczenia po niemiecku, hiszpańsku i francusku (kolumny, przyciski
   w wierszu, statusy, aliasy, aktualizacja serwisu), które wcześniej
   pokazywały się po angielsku.
+- TentaBus: okruszki strony odbiorcy nazywają grupę klucza tak samo jak
+  tytuł strony („Klucz Portal”), a nie technicznym `k:<id>`. Kreator
+  tematu przy formacie innym niż JSON ostrzega, że przepływ czyta
+  z magistrali tylko JSON, a wiadomość w innym formacie trafi do
+  „Nieprzetworzone”.
 
 ### Zdarzenia i konta usługowe (TB-02)
 

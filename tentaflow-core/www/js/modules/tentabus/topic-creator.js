@@ -246,6 +246,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
         <tf-choice-group id="tb-cr-kind" value="${escapeAttr(draft.contentType)}" columns="${kinds.length}" aria-label="${escapeAttr(T('topics.creator.kind_label'))}">
           ${kinds.map((k) => `<tf-choice-card value="${escapeAttr(k.contentType)}" icon="${CONTENT_ICONS[k.kind]}" heading="${escapeAttr(contentTypeLabel(k.contentType))}" description="${escapeAttr(T(`topics.creator.kind_desc.${k.kind}`))}"></tf-choice-card>`).join('')}
         </tf-choice-group>
+        <p class="form-hint" id="tb-cr-kind-note"${contentKind(draft.contentType) === 'json' ? ' hidden' : ''}>${escapeHtml(T('topics.creator.kind_flow_note'))}</p>
       </div>` : ''}`;
 
   const copiesBox = () => `
@@ -411,6 +412,9 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
     }
     win.querySelector('#tb-cr-kind')?.addEventListener('change', (e) => {
       draft.contentType = e.detail.value;
+      // A flow decodes every record as JSON; anything else goes to the DLQ.
+      const note = win.querySelector('#tb-cr-kind-note');
+      if (note) note.hidden = contentKind(draft.contentType) === 'json';
       // A pattern picked for another content kind no longer fits; with no
       // pattern for the new kind there is nothing to check against either.
       if (!schemasFor().some((s) => s.subject === draft.schemaId)) draft.schemaId = '';

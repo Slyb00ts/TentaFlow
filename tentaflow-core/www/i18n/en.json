@@ -12199,7 +12199,8 @@
         "description_placeholder": "e.g. X-ray lab results for the hospital system",
         "description_hint": "One or two sentences on what the topic is for. It is shown under the topic name. At most {max} characters.",
         "description_too_long": "The description can have at most {max} characters.",
-        "summary_description": "Description"
+        "summary_description": "Description",
+        "kind_flow_note": "Flows read only JSON from the bus. A message in this format received by the “Bus consume” block goes to “Unprocessed”."
       },
       "delete": {
         "title": "Delete topic {name}",

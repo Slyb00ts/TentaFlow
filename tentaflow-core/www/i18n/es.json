@@ -11125,7 +11125,8 @@
         "description_placeholder": "p. ej. Resultados del laboratorio de rayos X para el sistema del hospital",
         "description_hint": "Una o dos frases sobre para qué sirve el topic. Se muestra bajo su nombre. Como máximo {max} caracteres.",
         "description_too_long": "La descripción puede tener como máximo {max} caracteres.",
-        "summary_description": "Descripción"
+        "summary_description": "Descripción",
+        "kind_flow_note": "Los flujos solo leen JSON del bus. Un mensaje en este formato recibido por el bloque «Consumo del bus» va a «Sin procesar»."
       },
       "delete": {
         "title": "Eliminar el tópico {name}",

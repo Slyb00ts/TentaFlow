@@ -12199,7 +12199,8 @@
         "description_placeholder": "np. Wyniki badań z pracowni RTG dla systemu szpitalnego",
         "description_hint": "Jedno lub dwa zdania o tym, do czego służy topik. Widać je pod nazwą topiku. Najwyżej {max} znaków.",
         "description_too_long": "Opis może mieć najwyżej {max} znaków.",
-        "summary_description": "Opis"
+        "summary_description": "Opis",
+        "kind_flow_note": "Przepływ czyta z magistrali tylko JSON. Wiadomość w tym formacie odebrana blokiem „Odbiór z magistrali” trafi do „Nieprzetworzone”."
       },
       "delete": {
         "title": "Usuń topik {name}",

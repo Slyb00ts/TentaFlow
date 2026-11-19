@@ -11125,7 +11125,8 @@
         "description_placeholder": "z. B. Befunde aus der Röntgenabteilung für das Kliniksystem",
         "description_hint": "Ein oder zwei Sätze dazu, wofür das Topic dient. Sie erscheinen unter dem Namen des Topics. Höchstens {max} Zeichen.",
         "description_too_long": "Die Beschreibung darf höchstens {max} Zeichen haben.",
-        "summary_description": "Beschreibung"
+        "summary_description": "Beschreibung",
+        "kind_flow_note": "Flows lesen vom Bus nur JSON. Eine Nachricht in diesem Format, die der Block „Bus-Konsum“ empfängt, landet unter „Unverarbeitet“."
       },
       "delete": {
         "title": "Topic {name} löschen",

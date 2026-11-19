@@ -376,3 +376,15 @@ test('a binary topic: the card says what it is for, and the pattern list names t
   nextBtn(win).click();
   assert.equal(win.querySelector('#tb-cr-schema').getAttribute('hint'), 'Na liście są tylko wzory pasujące do treści binarnej: Avro, Protobuf, Thrift.');
 });
+
+test('a kind other than JSON says a flow reads JSON only; switching back to JSON hides it', () => {
+  const { win } = open();
+  const note = win.querySelector('#tb-cr-kind-note');
+  assert.equal(note.hidden, true, 'JSON is the default kind');
+  const pick = (value) => win.querySelector('#tb-cr-kind').dispatchEvent(new CustomEvent('change', { detail: { value } }));
+  pick('application/hl7-v2');
+  assert.equal(note.hidden, false);
+  assert.match(norm(note.textContent), /Przepływ czyta z magistrali tylko JSON\. .*„Odbiór z magistrali” trafi do „Nieprzetworzone”\./);
+  pick('application/json');
+  assert.equal(note.hidden, true);
+});

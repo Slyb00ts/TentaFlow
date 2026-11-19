@@ -10,7 +10,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 const { pageInternals } = await import('../tentabus.js');
 const { drawTopicDetail } = await import('./topic-detail.js');
 const { drawConsumerDetail } = await import('./consumer-detail.js');
-const { state, detailContext, consumerContext, consumerLoaderContext } = pageInternals;
+const { state, detailContext, consumerContext, consumerLoaderContext, paintCrumbs } = pageInternals;
 
 const INSTANCE = 'tentabus-a1b2c3d4';
 const topicDetail = {
@@ -52,4 +52,23 @@ test('the consumer page and its loader context carry the instance, and the page 
   document.body.append(body);
   drawConsumerDetail(body, { view: () => view, go() {} });
   assert.match(body.textContent, /orders/);
+});
+
+test('the consumer crumb names a key group by its key once loaded, the raw group before', () => {
+  const bar = document.createElement('tf-breadcrumb');
+  bar.id = 'tb-crumbs';
+  document.body.append(bar);
+  const crumbs = () => [...bar.querySelectorAll('tf-breadcrumb-item')].map((i) => i.textContent.trim());
+  const group = 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c';
+  state.instanceId = INSTANCE;
+  state.instanceLabel = 'Produkcja';
+  state.tab = 'groups';
+  state.view = { kind: 'consumer-detail', group, topic: 'orders', section: 'state' };
+  state.consumer = null;
+  paintCrumbs();
+  assert.equal(crumbs().at(-1), group);
+  state.consumer = { detail: { group, topic: 'orders', keyName: 'Portal', partitions: [] }, topicDetail, dlq: null, samples: [], sla: null };
+  paintCrumbs();
+  assert.equal(crumbs().at(-1), 'Klucz Portal');
+  bar.remove();
 });
