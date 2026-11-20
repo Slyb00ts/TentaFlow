@@ -642,6 +642,7 @@ where
                             promised_epoch: None,
                             promises: true,
                             bus_features: 0,
+                            instance_unhosted: false,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }

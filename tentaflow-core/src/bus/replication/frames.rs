@@ -66,6 +66,11 @@ pub const BUS_FEATURE_PRODUCE_FORWARD: u32 = 1 << 0;
 /// consume forwarding would drop the new frame without an answer.
 pub const BUS_FEATURE_CONSUME_FORWARD: u32 = 1 << 1;
 
+/// What a node must advertise to lead a topic of a spread (`BusService::
+/// create_topic`): the nodes that do not lead it hand it their writes and
+/// stateless reads, so both kinds of forwarding have to be understood.
+pub const BUS_FEATURES_FORWARDING: u32 = BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD;
+
 /// Every feature bit this build advertises.
 pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD;
 
@@ -543,6 +548,12 @@ pub struct ReplLeoReply {
     /// `0` from a peer that predates it, which then takes none.
     #[serde(default)]
     pub bus_features: u32,
+    /// The replying node hosts no instance under the asked id (the router
+    /// found none registered): it is no member of it, which is not the same
+    /// as a build that predates the features. Appended: `false` from a peer
+    /// that predates it, so only a current build can say so.
+    #[serde(default)]
+    pub instance_unhosted: bool,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -612,6 +623,18 @@ pub struct ProduceForward {
     /// the sender gives up on a write that landed.
     #[serde(default)]
     pub reply_within_ms: u32,
+    /// The incarnation (`TopicConfig::generation`) of the topic as the sender
+    /// knows it; `0`: not stated (a sender that predates the field). A
+    /// receiver on an older incarnation has not caught up yet, and one on a
+    /// newer incarnation must not take the write: it is for a topic that has
+    /// been deleted since.
+    #[serde(default)]
+    pub topic_generation: u64,
+    /// The partition count of the topic as the sender knows it; `0`: not
+    /// stated. A receiver that knows fewer has not applied an `update_topic`
+    /// yet.
+    #[serde(default)]
+    pub partitions: u32,
 }
 
 /// One partition a publish landed on (`PartitionAck`).
@@ -682,6 +705,14 @@ pub struct ConsumeForward {
     #[serde(default)]
     pub max_records: Option<u64>,
     pub max_wait_ms: u32,
+    /// The incarnation of the topic as the sender knows it (`0`: not stated);
+    /// see `ProduceForward::topic_generation`.
+    #[serde(default)]
+    pub topic_generation: u64,
+    /// The partition count of the topic as the sender knows it (`0`: not
+    /// stated); see `ProduceForward::partitions`.
+    #[serde(default)]
+    pub partitions: u32,
 }
 
 /// One record a forwarded read returns, already projected through the
@@ -1268,6 +1299,8 @@ mod tests {
                 }],
             }],
             reply_within_ms: 7_000,
+            topic_generation: 41,
+            partitions: 3,
         }
     }
 
@@ -1342,6 +1375,8 @@ mod tests {
             max_bytes: 65_536,
             max_records: Some(50),
             max_wait_ms: 250,
+            topic_generation: 41,
+            partitions: 3,
         };
         assert_eq!(
             roundtrip(ReplFrame::ConsumeForward(request.clone())).await,
@@ -1508,6 +1543,7 @@ mod tests {
             leader_alive: false,
             promised_epoch: Some(8),
             promises: true,
+            instance_unhosted: false,
             bus_features: 0,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
@@ -1912,6 +1948,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: None,
                 promises: false,
+                instance_unhosted: false,
                 bus_features: 0,
             }
         );

@@ -146,6 +146,7 @@ use tentaflow_core::bus::topics::{Acks, TopicOptions};
 use tentaflow_core::bus::{
     BusAction, BusCallContext, BusInitConfig, BusService, BusServiceError, ConsumerConfig,
     PartitionRole, PublishBatch, PublishRecord, ReplError, ReplicationCoordinator, TopicPartition,
+    UnavailableReason,
 };
 use tentaflow_core::db::DbPool;
 use tentaflow_core::sync::ledger::OperationId;
@@ -461,6 +462,21 @@ impl AssignmentStore for NodeLedger {
             .into_values()
             .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
             .collect())
+    }
+
+    fn preferred_leader_counts(
+        &self,
+        instance_id: &str,
+    ) -> Result<HashMap<String, u32>, ReplError> {
+        let mut counts = HashMap::new();
+        for row in self.shared.rows_seen_by(&self.node).into_values() {
+            if row.instance_id == instance_id {
+                if let Some(preferred) = row.replicas.first() {
+                    *counts.entry(preferred.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
@@ -914,6 +930,38 @@ async fn build_cluster_led_by(
     replicas: &[&str],
     leader_of: impl Fn(u32) -> String,
 ) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
+    let (nodes, ledger, registry) = build_unplaced_cluster(partitions, acks, replicas.len()).await;
+    let generation = topic_generation(&nodes[0]);
+    for p in 0..partitions {
+        let a0 = assignment(generation, replicas, &leader_of(p), 1, p);
+        ledger.seed(a0.clone());
+        for node in &nodes {
+            node.manager.apply_assignment(a0.clone()).await;
+        }
+    }
+
+    (nodes, ledger, registry)
+}
+
+/// A 3-node cluster (A/B/C, all `Prod`) with the topic `t` created on A and
+/// its row copied to B and C the way the ledger replicates it: one
+/// incarnation, the one every placement names. Nothing is placed yet.
+async fn build_unplaced_cluster(
+    partitions: u32,
+    acks: Acks,
+    replication_factor: usize,
+) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
+    build_unplaced_cluster_withholding(partitions, acks, replication_factor, &[]).await
+}
+
+/// `build_unplaced_cluster`, but the topic row is not copied to the nodes
+/// named in `withhold_from` (the test copies it later).
+async fn build_unplaced_cluster_withholding(
+    partitions: u32,
+    acks: Acks,
+    replication_factor: usize,
+    withhold_from: &[&str],
+) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
     init_tracing();
     let ledger = SharedLedger::new();
     let registry = TransportRegistry::new();
@@ -937,8 +985,6 @@ async fn build_cluster_led_by(
     );
     let nodes = vec![a, b, c];
 
-    // Created once, on A, and its row copied to B and C the way the ledger
-    // replicates it: one incarnation, the one every placement names.
     nodes[0]
         .svc
         .create_topic(
@@ -946,7 +992,7 @@ async fn build_cluster_led_by(
             TOPIC,
             TopicOptions {
                 partitions: Some(partitions),
-                replication_factor: Some(replicas.len() as u32),
+                replication_factor: Some(replication_factor as u32),
                 acks: Some(acks),
                 ..Default::default()
             },
@@ -957,17 +1003,11 @@ async fn build_cluster_led_by(
             .expect("read topic row")
             .expect("topic row");
     for node in &nodes[1..] {
+        if withhold_from.contains(&node.id.as_str()) {
+            continue;
+        }
         tentaflow_core::db::repository::bus_topic_create(&node.db, &row)
             .expect("replicate topic row");
-    }
-    let generation = row.generation;
-
-    for p in 0..partitions {
-        let a0 = assignment(generation, replicas, &leader_of(p), 1, p);
-        ledger.seed(a0.clone());
-        for node in &nodes {
-            node.manager.apply_assignment(a0.clone()).await;
-        }
     }
 
     (nodes, ledger, registry)
@@ -1401,6 +1441,214 @@ async fn a_publish_from_a_node_that_holds_no_replica_lands_on_the_leader_without
         registry.forwards().last(),
         Some(&("C".to_string(), "A".to_string()))
     );
+    shutdown_all(&nodes);
+}
+
+/// What `BusService::create_topic` does when the placement picks a node other
+/// than the creator: the genesis (epoch 1) row of every partition is proposed
+/// by the creator, through its own ledger handle, naming `leader` first in
+/// `replicas`, followed by the other nodes up to `replication_factor`. Nothing
+/// is applied by hand; the nodes pick the rows up the way a real node does,
+/// from their assignment poll.
+fn propose_genesis_led_by(
+    creator: &TestNode,
+    leader: &str,
+    partitions: u32,
+    replication_factor: usize,
+) {
+    let generation = topic_generation(creator);
+    let replicas: Vec<&str> = std::iter::once(leader)
+        .chain(["A", "B", "C"].into_iter().filter(|node| *node != leader))
+        .take(replication_factor)
+        .collect();
+    for p in 0..partitions {
+        creator
+            .ledger
+            .propose(assignment(generation, &replicas, leader, 1, p))
+            .expect("propose genesis");
+    }
+}
+
+/// TB-04 K4: a topic whose genesis (epoch 1) is led by a node that did not
+/// create it comes up on its own: the leader materializes the row, takes the
+/// role, the followers (the creator among them) answer its Hello, the ISR
+/// fills, and a publish by the creator lands on the leader and replicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genesis_led_by_a_node_other_than_the_creator_comes_up_and_takes_writes() {
+    let (nodes, _ledger, _registry) = build_unplaced_cluster(2, Acks::Quorum, 3).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let c = find_node(&nodes, "C");
+    propose_genesis_led_by(a, "B", 2, 3);
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+
+    let handshake = wait_until(Duration::from_secs(15), || {
+        let leader_isr = b.manager.snapshot(ORG, Some(TOPIC)).partitions;
+        (0..2).all(|p| {
+            [a, c].iter().all(|follower| {
+                follower
+                    .svc
+                    .local_partition(&ctx(), TOPIC, p)
+                    .map(|part| part.leader_epoch() == 1)
+                    .unwrap_or(false)
+            }) && leader_isr.iter().any(|info| {
+                info.partition == p
+                    && ["A", "B", "C"]
+                        .iter()
+                        .all(|member| info.isr.iter().any(|m| m == member))
+            })
+        })
+    })
+    .await;
+    assert!(
+        handshake,
+        "Hello and ISR never completed under the remote leader"
+    );
+    assert_eq!(
+        b.manager.role(ORG, TOPIC, 0),
+        PartitionRole::Leader { epoch: 1 }
+    );
+    assert_eq!(
+        a.manager.role(ORG, TOPIC, 0),
+        PartitionRole::Follower {
+            leader_node_id: "B".to_string(),
+            epoch: 1
+        },
+        "the creator follows the leader it placed"
+    );
+
+    // The creator is a follower, so this write is forwarded to B.
+    let result = publish_records(
+        a,
+        Some(1),
+        vec![binary_record("k", b"from-the-creator".to_vec())],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the creator's publish failed: {e:?}"));
+    assert_eq!(result.accepted, 1);
+    assert_eq!(log_end_offset(b, 1), 1, "the record landed on the leader");
+    assert!(
+        wait_until(Duration::from_secs(10), || log_end_offset(a, 1) >= 1
+            && log_end_offset(c, 1) >= 1
+            && high_watermark(b, 1) >= 1)
+        .await,
+        "the record never replicated to the followers"
+    );
+    assert_eq!(read_all_records(a, 1), read_all_records(b, 1));
+    assert_eq!(read_all_records(c, 1), read_all_records(b, 1));
+    shutdown_all(&nodes);
+}
+
+/// The creator's producer may publish before the leader has materialized the
+/// rows (the ledger reaches it within a poll). The write is refused there and
+/// asked again until the leader takes the role, within the wait for a leader;
+/// it is not lost and does not fail. The topic has one replica, the leader,
+/// so the creator holds none and the write has no ISR to wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_by_the_creator_before_the_remote_leader_has_the_row_lands_once_it_has() {
+    let (nodes, _ledger, registry) = build_unplaced_cluster(1, Acks::Leader, 1).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    propose_genesis_led_by(a, "B", 1, 1);
+    // B is not polling yet: it does not know it leads.
+    spawn_background_loops(a);
+    a.manager.on_peer_connected("B");
+
+    let a_svc = Arc::clone(&a.svc);
+    let publish = tokio::spawn(async move {
+        a_svc
+            .publish_async(
+                &ctx(),
+                TOPIC,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![binary_record("early", b"early-write".to_vec())],
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !publish.is_finished(),
+        "the write waits for the leader, it is not refused"
+    );
+    assert_eq!(
+        b.manager.role(ORG, TOPIC, 0),
+        PartitionRole::Unavailable {
+            reason: UnavailableReason::NoAssignment
+        },
+        "precondition: the leader is unaware of the topic's placement"
+    );
+    spawn_background_loops(b);
+
+    let result = publish
+        .await
+        .expect("publish task")
+        .unwrap_or_else(|e| panic!("the early publish was lost: {e:?}"));
+    assert_eq!(result.accepted, 1);
+    assert_eq!(log_end_offset(b, 0), 1, "exactly one copy on the leader");
+    assert_eq!(
+        registry.forwards().last(),
+        Some(&("A".to_string(), "B".to_string()))
+    );
+    shutdown_all(&nodes);
+}
+
+/// The topic row and the placement reach the leader through the ledger, and
+/// can come later than the creator's first publish: the leader answers "not
+/// ready" (the manager has no entry for the partition yet, which is also what
+/// keeps the request from reaching a bus service that lacks the topic), never
+/// `TopicNotFound`, and the write lands once, after both have arrived. (The
+/// service-side wait for a topic row that is behind the sender's is covered
+/// by the `a_forwarded_publish_*` unit tests in `bus/mod.rs`: the manager's
+/// entry for a partition normally implies the row, so only an update or a
+/// re-creation leaves the two apart.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_before_the_leader_has_the_topic_row_lands_once_it_arrives() {
+    let (nodes, _ledger, _registry) =
+        build_unplaced_cluster_withholding(1, Acks::Leader, 1, &["B"]).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let row = tentaflow_core::db::repository::bus_topic_get(&a.db, TEST_INSTANCE_ID, ORG, TOPIC)
+        .expect("read topic row")
+        .expect("topic row");
+    propose_genesis_led_by(a, "B", 1, 1);
+    // B has neither the topic row nor the placement yet: both come through
+    // the ledger, later than a forwarded write does.
+    spawn_background_loops(a);
+    a.manager.on_peer_connected("B");
+
+    let a_svc = Arc::clone(&a.svc);
+    let publish = tokio::spawn(async move {
+        a_svc
+            .publish_async(
+                &ctx(),
+                TOPIC,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![binary_record("early", b"early-write".to_vec())],
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        !publish.is_finished(),
+        "the write waits for the topic row, it is not refused"
+    );
+    tentaflow_core::db::repository::bus_topic_create(&b.db, &row).expect("topic row arrives");
+    spawn_background_loops(b);
+
+    let result = publish
+        .await
+        .expect("publish task")
+        .unwrap_or_else(|e| panic!("the early publish was lost: {e:?}"));
+    assert_eq!(result.accepted, 1);
+    assert_eq!(log_end_offset(b, 0), 1, "exactly one copy on the leader");
     shutdown_all(&nodes);
 }
 
@@ -2621,6 +2869,12 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         ) -> Result<Vec<PartitionAssignment>, ReplError> {
             Ok(Vec::new())
         }
+        fn preferred_leader_counts(
+            &self,
+            _instance_id: &str,
+        ) -> Result<HashMap<String, u32>, ReplError> {
+            Ok(HashMap::new())
+        }
         fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
             Err(ReplError::Internal(
                 "this test applies assignments directly, never proposes".into(),
@@ -3624,6 +3878,8 @@ async fn a_forwarded_read_never_accepts_the_system_actor() {
                 max_bytes: 1024,
                 max_records: None,
                 max_wait_ms: 0,
+                topic_generation: 0,
+                partitions: 0,
             },
         );
         let error = reply.error.unwrap_or_else(|| {

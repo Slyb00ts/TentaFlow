@@ -3762,21 +3762,23 @@ mod tests {
         tempfile::TempDir,
     ) {
         let fx = key_fixture(suffix);
-        let (dir, leader_id, leader) = start_test_instance(&fx.state, leader_suffix);
+        let (dir, _leader_id, leader) = start_test_instance(&fx.state, leader_suffix);
+        // The leader holds the same incarnation of the topic the follower
+        // does, as a cluster's nodes do (the row is replicated, generation
+        // included): a forwarded write states it and the leader checks it.
+        let mut row = crate::db::repository::bus_topic_get(
+            &fx.db(),
+            fx.svc.instance_id(),
+            ORG,
+            TOPIC,
+        )
+        .expect("read the follower's topic")
+        .expect("the follower's topic");
+        row.instance_id = leader.instance_id().to_string();
+        crate::db::repository::bus_topic_create(&fx.db(), &row).expect("the leader's topic");
         leader
-            .create_topic(
-                &BusCallContext {
-                    instance_id: leader_id,
-                    ..fx.user_ctx("u-admin")
-                },
-                TOPIC,
-                TopicOptions {
-                    partitions: Some(1),
-                    content_type: Some("application/json".to_string()),
-                    ..TopicOptions::default()
-                },
-            )
-            .expect("the leader's topic");
+            .ensure_topic_incarnation(ORG, TOPIC, row.generation)
+            .expect("the leader's incarnation");
         let coordinator = LoopbackCoordinator::following(Arc::clone(&leader), link);
         fx.svc.set_replication(coordinator.clone());
         (fx, leader, coordinator, dir)

@@ -294,6 +294,15 @@ impl SqliteLedgerAssignmentStore {
         .collect())
     }
 
+    /// How many partitions of the instance each node is the preferred leader
+    /// of (`db::repository::bus_assignment_preferred_leader_counts`).
+    pub fn preferred_leader_counts(
+        &self,
+        instance_id: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, u32>> {
+        crate::db::repository::bus_assignment_preferred_leader_counts(&self.pool, instance_id)
+    }
+
     /// Every materialized assignment where `node_id` is the leader OR a
     /// replica-set member (`db::repository::bus_assignment_list_for_node`'s
     /// doc explains the decode-filter choice) — used at startup to rebuild

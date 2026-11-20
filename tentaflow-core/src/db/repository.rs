@@ -32507,6 +32507,32 @@ pub fn bus_assignment_list_for_node(
         .collect())
 }
 
+/// How many partitions of one TentaBus instance each node is the preferred
+/// leader of, across its orgs and topics: the cluster-wide load
+/// `ReplicationCoordinator::leader_counts` reports. The preferred leader is
+/// position 0 of `replicas`, a JSON array in a TEXT column, so SQLite's own
+/// `json_extract` reads it and the rows are counted in the database instead
+/// of all being fetched and decoded here (this runs at every topic
+/// creation); a row with an empty replica set has no preferred node and is
+/// not counted.
+pub fn bus_assignment_preferred_leader_counts(
+    pool: &DbPool,
+    instance_id: &str,
+) -> Result<std::collections::HashMap<String, u32>> {
+    let conn = acquire_read(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(replicas, '$[0]') AS preferred, COUNT(*) \
+         FROM bus_partition_assignments WHERE instance_id = ?1 \
+         GROUP BY preferred HAVING preferred IS NOT NULL",
+    )?;
+    let counts = stmt
+        .query_map(rusqlite::params![instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(counts)
+}
+
 /// Every assignment in the database, across every instance/org/topic — used
 /// once at startup (`ReplicationManager`, wave 1 agent EL) to rebuild the
 /// in-memory replication state from what was last materialized. Stays
@@ -35837,6 +35863,36 @@ mod bus_repository_tests {
         bus_assignment_upsert(&db, &assignment_row(T2, "org-1", "orders.created", 0)).unwrap();
         let all = bus_assignment_list_all(&db).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    /// The load of a node is the partitions it is the PREFERRED leader of
+    /// (`replicas[0]`), not the ones it happens to lead now, and only the
+    /// asked instance's rows count.
+    #[test]
+    fn preferred_leader_counts_count_replicas_first_per_instance() {
+        let db = fresh_db();
+        // `leader_node_id` is node-a on every row of `assignment_row`; the
+        // preferred node is what the replica set names first.
+        let mut moved = assignment_row(T1, "org-1", "orders.created", 1);
+        moved.replicas = vec!["node-b".to_string(), "node-a".to_string()];
+        let mut none = assignment_row(T1, "org-2", "invoices.created", 0);
+        none.replicas = Vec::new();
+        for row in [
+            assignment_row(T1, "org-1", "orders.created", 0),
+            moved,
+            none,
+            assignment_row(T2, "org-1", "orders.created", 0),
+        ] {
+            bus_assignment_upsert(&db, &row).unwrap();
+        }
+        let counts = bus_assignment_preferred_leader_counts(&db, T1).unwrap();
+        assert_eq!(counts.get("node-a"), Some(&1));
+        assert_eq!(counts.get("node-b"), Some(&1));
+        assert_eq!(
+            counts.len(),
+            2,
+            "no entry for an empty replica set: {counts:?}"
+        );
     }
 
     #[test]

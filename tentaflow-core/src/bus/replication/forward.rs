@@ -58,6 +58,14 @@ use crate::bus::{
 /// before giving up with `NotLeader`.
 const LEADER_WAIT: Duration = Duration::from_secs(3);
 
+/// How long a publish first pauses before asking again a leader that knows no
+/// leader for the partition yet (it has not materialized the assignment that
+/// names it), and how far the pause doubles up to. A leader that waits for
+/// the topic rows itself (`BusService::forwarded_topic_config`) usually has
+/// them by the first answer; this is the fallback for one still behind.
+const UNAWARE_LEADER_RETRY_FIRST: Duration = Duration::from_millis(50);
+const UNAWARE_LEADER_RETRY_MAX: Duration = Duration::from_millis(800);
+
 /// Slack added to the leader's own publish deadline before the sender stops
 /// waiting for the reply.
 const REPLY_MARGIN: Duration = Duration::from_secs(5);
@@ -650,7 +658,70 @@ impl ForwardedPublishHandler for BusService {
     }
 }
 
+/// How long a node that took a forwarded request for a topic it has not caught
+/// up with waits for the topic row (or the partitions an update added) to
+/// arrive before it tells the sender it is not ready.
+const TOPIC_ROWS_WAIT: Duration = Duration::from_millis(500);
+
+/// How often that wait looks again.
+const TOPIC_ROWS_POLL: Duration = Duration::from_millis(10);
+
 impl BusService {
+    /// The topic a forwarded request is for, as this node (the leader) holds
+    /// it, checked against the incarnation and partition count the sender
+    /// stated (`0` for either: not stated, nothing to check).
+    ///
+    /// A topic placed on this node a moment ago, or grown by an
+    /// `update_topic`, reaches the leader through the ledger like the
+    /// placement does and can lag the sender, which wrote both itself. This
+    /// node then waits briefly for its own rows; one that is still behind
+    /// answers `NotLeader` naming no leader, which the sender asks again
+    /// after a pause (the same answer a leader gives that has the topic but
+    /// not yet its placement), instead of a `TopicNotFound` or an
+    /// out-of-range partition for a topic that does exist. A sender on an
+    /// OLDER incarnation than this node's is a different matter: its write is
+    /// for a topic that was deleted since, and never lands in the new one.
+    pub(in crate::bus) fn forwarded_topic_config(
+        &self,
+        org_id: &str,
+        topic: &str,
+        sender_generation: u64,
+        sender_partitions: u32,
+    ) -> Result<crate::bus::topics::TopicConfig, BusServiceError> {
+        let deadline = Instant::now() + TOPIC_ROWS_WAIT;
+        loop {
+            let behind = match self.topic_config(org_id, topic) {
+                Ok(cfg) => {
+                    if sender_generation != 0 && cfg.generation > sender_generation {
+                        return Err(BusServiceError::PartitionUnavailable {
+                            reason: format!(
+                                "the forwarded write is for incarnation {sender_generation} \
+                                 of topic '{topic}', which was replaced by {}",
+                                cfg.generation
+                            ),
+                        });
+                    }
+                    let behind = sender_generation != 0
+                        && (cfg.generation < sender_generation
+                            || cfg.partitions < sender_partitions);
+                    if !behind {
+                        return Ok(cfg);
+                    }
+                    behind
+                }
+                Err(BusServiceError::TopicNotFound { .. }) if sender_generation != 0 => true,
+                Err(e) => return Err(e),
+            };
+            if behind && Instant::now() >= deadline {
+                return Err(BusServiceError::NotLeader {
+                    leader_node_id: None,
+                    leader_epoch: 0,
+                });
+            }
+            std::thread::sleep(TOPIC_ROWS_POLL);
+        }
+    }
+
     fn run_forwarded_publish(
         &self,
         from: &str,
@@ -703,7 +774,12 @@ impl BusService {
         }
 
         self.check_instance(&ctx)?;
-        let cfg = self.topic_config(&ctx.org_id, &topic)?;
+        let cfg = self.forwarded_topic_config(
+            &ctx.org_id,
+            &topic,
+            request.topic_generation,
+            request.partitions,
+        )?;
         if request.groups.is_empty() {
             return Err(BusServiceError::InvalidArgument(
                 "forwarded publish has no partition groups".into(),
@@ -764,6 +840,11 @@ pub(in crate::bus) struct ForwardJob<'a> {
     /// The instant the forwarding has to be over by, when the publish serves
     /// a request that is only waited for so long.
     pub deadline: Option<Instant>,
+    /// The incarnation and partition count of the topic as the sender
+    /// knows them, for the leader to check against its own
+    /// (`BusService::forwarded_topic_config`).
+    pub topic_generation: u64,
+    pub partitions: u32,
 }
 
 /// The totals the forwarded groups add to the publish's own.
@@ -786,6 +867,12 @@ struct PendingGroup {
     /// while the partition moved): not asked again until the assignment
     /// names another one.
     refused_by: Option<String>,
+    /// The leader it was last sent to answered `NotLeader` naming no leader
+    /// at all: it has not caught up with the assignment yet (a topic placed
+    /// on it a moment ago) or is in an election. It is asked again after
+    /// a pause that doubles from `UNAWARE_LEADER_RETRY_FIRST`, until the wait
+    /// for a leader runs out.
+    target_unaware: bool,
 }
 
 enum Reply {
@@ -878,7 +965,11 @@ impl BusService {
     /// One request per leader (several when the groups do not fit one
     /// frame). A leader that answers `NotLeader` before writing anything is
     /// asked again once, after the assignment moved; a partition with no
-    /// known leader waits for one up to `LEADER_WAIT`. A request that never
+    /// known leader waits for one up to `LEADER_WAIT`, and so does a leader
+    /// that answers it knows none (it has not materialized the assignment
+    /// yet), which is asked again after a pause doubling from
+    /// `UNAWARE_LEADER_RETRY_FIRST` to `UNAWARE_LEADER_RETRY_MAX`. A request
+    /// that never
     /// left this node (no connection, leader moved meanwhile) falls back to
     /// the `NotLeader` this node would have returned without forwarding, or
     /// is retried at the new leader. A request that left and got no answer
@@ -905,9 +996,11 @@ impl BusService {
                 records,
                 sends: 0,
                 refused_by: None,
+                target_unaware: false,
             })
             .collect();
         let mut last_refusal: Option<BusServiceError> = None;
+        let mut unaware_pause = UNAWARE_LEADER_RETRY_FIRST;
 
         while !pending.is_empty() {
             // Read before the roles it has to explain, so a change landing
@@ -976,7 +1069,16 @@ impl BusService {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || !coordinator.wait_for_assignment_change(generation, remaining)
+            let unaware = pending.iter().any(|g| g.target_unaware);
+            let pause = if unaware {
+                let pause = remaining.min(unaware_pause);
+                unaware_pause = (unaware_pause * 2).min(UNAWARE_LEADER_RETRY_MAX);
+                pause
+            } else {
+                remaining
+            };
+            if remaining.is_zero()
+                || (!coordinator.wait_for_assignment_change(generation, pause) && !unaware)
             {
                 return Err(last_refusal.unwrap_or(BusServiceError::NotLeader {
                     leader_node_id: None,
@@ -1003,6 +1105,7 @@ impl BusService {
     ) -> Result<Sent, BusServiceError> {
         for g in &mut groups {
             g.sends += 1;
+            g.target_unaware = false;
         }
         let fallback = BusServiceError::NotLeader {
             leader_node_id: Some(leader.to_string()),
@@ -1094,6 +1197,25 @@ impl BusService {
                     other => (matches!(other, BusServiceError::NotLeader { .. }), other),
                 };
                 let retryable = not_leader && landed.is_empty();
+                if retryable
+                    && matches!(
+                        source,
+                        BusServiceError::NotLeader {
+                            leader_node_id: None,
+                            ..
+                        }
+                    )
+                {
+                    // Not a leader that moved: the one that was named does
+                    // not know yet that it leads. Asking it again is not a
+                    // second attempt at another leader, so it is not counted.
+                    for g in &mut groups {
+                        g.sends -= 1;
+                        g.target_unaware = true;
+                    }
+                    *last_refusal = Some(source);
+                    return Ok(Sent::Again(groups));
+                }
                 if retryable && groups.iter().all(|g| g.sends < 2) {
                     for g in &mut groups {
                         g.refused_by = Some(leader.to_string());
@@ -1125,6 +1247,8 @@ impl BusService {
             broker_dead_letter: job.broker_dead_letter,
             producer: job.producer.map(producer_to_wire),
             reply_within_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+            topic_generation: job.topic_generation,
+            partitions: job.partitions,
             groups: groups
                 .iter()
                 .map(|g| ForwardGroup {

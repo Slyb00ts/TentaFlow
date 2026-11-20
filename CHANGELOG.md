@@ -77,6 +77,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   swoje bity (`LeoQuery` bez partycji, odpowiedź niesie `bus_features`);
   wynik niezerowy jest zapamiętywany. Węzeł, który nie odpowiada na pytanie
   albo nie zna bitów, nie dostaje żądania i wywołujący widzi 503, nie 504.
+- Nowy topik ma lidera na najmniej obciążonym węźle, a nie na węźle, który go
+  tworzy. Kandydatami są ten węzeł i węzły z tego samego środowiska, które
+  ogłaszają przekazywanie zapisu i odczytu; obciążenie to liczba partycji,
+  których dany węzeł jest preferowanym liderem (pierwsza pozycja `replicas`,
+  nie bieżący lider, więc węzeł, który przejął partycje po awarii, nie dostaje
+  przy tym nowych topików). Remis rozstrzyga pierścień węzłów posortowany po
+  id, zaczynany od `hash(nazwa topiku) mod liczba węzłów`. Wszystkie partycje
+  topiku mają jednego lidera; topiki z RF=1 też są rozkładane. Wybór następuje
+  dopiero po sprawdzeniu nazwy i duplikatu, więc odrzucone utworzenie nie pyta
+  żadnego węzła.
+- Wersje mieszane: dopóki jakikolwiek węzeł z tego samego środowiska nie
+  ogłasza przekazywania, albo nie da się tego stwierdzić, lider zostaje na
+  węźle tworzącym, jak dotąd. Dotyczy to też węzła chwilowo rozłączonego, o
+  którym nie wiadomo, że przekazuje (stary węzeł po powrocie nie mógłby pisać
+  do topiku). Węzły, od których nie przyszedł `Hello`, są pytane równolegle,
+  łącznie nie dłużej niż 1 s; odpowiedź odmowna jest pamiętana przez 60 s.
+  Węzeł, który odpowie, że nie hostuje tej instancji (`instance_unhosted` w
+  odpowiedzi `LeoQuery`), nie jest jej członkiem: nie bywa kandydatem i nie
+  blokuje rozkładu.
+- Pierwszy zapis twórcy do topiku prowadzonego zdalnie nie kończy się już
+  błędem: ramki `ProduceForward` i `ConsumeForward` niosą generację topiku i
+  liczbę partycji nadawcy. Lider, który nie dostał jeszcze wiersza topiku
+  (albo partycji dodanych przez `update_topic`), czeka na nie do 0,5 s, po
+  czym odpowiada `NotLeader` bez lidera, a nadawca ponawia z rosnącą przerwą
+  (50 ms, podwajaną do 800 ms) w granicach czasu oczekiwania na lidera.
+  Zapis nadawcy ze starszą generacją niż ta u lidera (topik w międzyczasie
+  usunięto i utworzono ponownie) jest odrzucany i nigdy nie trafia do nowej
+  inkarnacji topiku.
+- Dodatkowe partycje z `update_topic` dostają lidera i kolejność replik
+  istniejących partycji (większościowy lider i preferowany węzeł), bez
+  względu na to, który węzeł jest akurat osiągalny; martwego lidera odzyskuje
+  zwykła elekcja, a topik nigdy nie ma przez rozkład dwóch liderów.
+- Temat DLQ (`__dlq.*`) idzie za swoim źródłem: partycja DLQ trafia tam, gdzie
+  jest ta sama partycja tematu źródłowego (lider i repliki); partycje bez
+  odpowiednika są układane według partycji tematu źródłowego, nie samych
+  partycji DLQ.
+- Wpis audytu `bus.topic.create` ma w szczegółach
+  `leader=<węzeł> leader_rf=<RF>` przed listą replik.
 
 ### Limity i SLA usług (TB-03)
 

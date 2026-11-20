@@ -143,6 +143,12 @@ impl AssignmentStore for NeverProposedAssignments {
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
     }
+    fn preferred_leader_counts(
+        &self,
+        _instance_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>, ReplError> {
+        Ok(std::collections::HashMap::new())
+    }
     fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
         panic!("bus_replication bench: AssignmentStore::propose should never be called — the initial assignment is applied directly via ReplicationManager::apply_assignment, not proposed through a ledger")
     }
@@ -188,6 +194,12 @@ impl AssignmentStore for FakeAssignmentProposer {
         _node_id: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
+    }
+    fn preferred_leader_counts(
+        &self,
+        _instance_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>, ReplError> {
+        Ok(std::collections::HashMap::new())
     }
     fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
         Ok(OperationId::from_hash([0u8; 32]))

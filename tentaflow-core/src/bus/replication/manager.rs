@@ -68,8 +68,8 @@ use crate::bus::replication::frames::{
 };
 use crate::bus::topics::Acks;
 use crate::bus::{
-    AckOutcome, PartitionReplicaInfo, PartitionRole, ReplError, ReplicaLagInfo, ReplicaNodeInfo,
-    ReplicationCoordinator, ReplicationSnapshot, UnavailableReason,
+    AckOutcome, NodeForwarding, PartitionReplicaInfo, PartitionRole, ReplError, ReplicaLagInfo,
+    ReplicaNodeInfo, ReplicationCoordinator, ReplicationSnapshot, UnavailableReason,
 };
 use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::sync::ledger::{OperationId, SyncLedgerStore};
@@ -247,6 +247,14 @@ pub trait AssignmentStore: Send + Sync {
         instance_id: &str,
         node_id: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError>;
+    /// How many partitions of the instance each node is the PREFERRED leader
+    /// of (position 0 of `replicas`), over every assignment whichever nodes
+    /// hold it; a node preferred nowhere is absent. What
+    /// `ReplicationCoordinator::leader_counts` reports.
+    fn preferred_leader_counts(
+        &self,
+        instance_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>, ReplError>;
     /// Submits `assignment` as a new ledger operation, returning its id for
     /// `LedgerAdmission::admitted_by` polling. Needs no separate instance
     /// parameter — `assignment.instance_id` already carries it.
@@ -799,6 +807,10 @@ pub struct ReplicationManager {
     /// The `BUS_FEATURE_*` bits of the peers: from the `Hello` of a leader
     /// that dialed this node, or from a probe (`probe_features`).
     peer_features: Arc<DashMap<String, u32>>,
+    /// Peers that answered a capability probe without the forwarding
+    /// features (or as no member of the instance), and when: not asked again
+    /// for `PROBE_MISS_TTL`.
+    probe_misses: DashMap<String, (Instant, NodeForwarding)>,
     /// The synchronous twin of `assignments_changed`, for the blocking
     /// callers of `wait_for_assignment_change`.
     assignment_changes: AssignmentChanges,
@@ -925,6 +937,7 @@ impl ReplicationManager {
             forward_handler: parking_lot::RwLock::new(None),
             peers: DashMap::new(),
             peer_features: Arc::new(DashMap::new()),
+            probe_misses: DashMap::new(),
             assignment_changes: AssignmentChanges::new(),
         })
     }
@@ -1268,6 +1281,7 @@ impl ReplicationManager {
                 promised_epoch: None,
                 promises: true,
                 bus_features: 0,
+                instance_unhosted: false,
             };
             election_deferral(&seen, query.known_epoch)
                 .is_none()
@@ -1298,6 +1312,7 @@ impl ReplicationManager {
             promised_epoch: None,
             promises: true,
             bus_features: 0,
+            instance_unhosted: false,
         };
         // Read from the local log outside the registry guard: that opens
         // the partition, which may touch the disk.
@@ -4134,6 +4149,38 @@ impl ReplicationCoordinator for ReplicationManager {
     fn node_reachable(&self, node_id: &str) -> bool {
         self.peer_reachable(node_id)
     }
+
+    fn node_forwarding(&self, nodes: &[String], probe_within: Duration) -> Vec<NodeForwarding> {
+        let mut known: Vec<Option<NodeForwarding>> = nodes
+            .iter()
+            .map(|node| self.cached_forwarding(node))
+            .collect();
+        if !probe_within.is_zero() {
+            let unknown: Vec<(usize, String)> = known
+                .iter()
+                .enumerate()
+                .filter(|(_, answer)| answer.is_none())
+                .map(|(i, _)| (i, nodes[i].clone()))
+                .collect();
+            for (i, answer) in self.probe_peers(unknown, probe_within) {
+                known[i] = Some(answer);
+            }
+        }
+        known
+            .into_iter()
+            .map(|answer| answer.unwrap_or(NodeForwarding::Unknown))
+            .collect()
+    }
+
+    fn leader_counts(&self) -> std::collections::HashMap<String, u32> {
+        match self.assignments.preferred_leader_counts(&self.instance_id) {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot count the preferred leaders of the instance");
+                std::collections::HashMap::new()
+            }
+        }
+    }
 }
 
 /// Why a forwarded publish got no reply.
@@ -4148,6 +4195,26 @@ enum RoundTripError {
     Unsupported,
 }
 
+/// What a capability probe came back with.
+struct ProbeAnswer {
+    /// The `bus_features` bits the peer advertised.
+    features: u32,
+    /// The peer hosts no instance under the asked id.
+    unhosted: bool,
+}
+
+/// How long a negative answer to a capability probe is believed.
+const PROBE_MISS_TTL: Duration = Duration::from_secs(60);
+
+/// The forwarding a peer advertising `features` offers.
+fn forwarding_of(features: u32) -> NodeForwarding {
+    if features & frames::BUS_FEATURES_FORWARDING == frames::BUS_FEATURES_FORWARDING {
+        NodeForwarding::Capable
+    } else {
+        NodeForwarding::Lacking
+    }
+}
+
 /// What `node` accepts, asked with a `LeoQuery` for no partition: the reply
 /// of a node that knows the field carries its `bus_features`, and one that
 /// predates it (or does not answer) reads as `0`, so a peer never heard from
@@ -4158,7 +4225,7 @@ async fn probe_features(
     node: &str,
     instance_id: &str,
     timeout: Duration,
-) -> Result<u32, String> {
+) -> Result<ProbeAnswer, String> {
     let exchange = async {
         let (mut recv, mut send) = transport
             .open_stream(node)
@@ -4176,8 +4243,14 @@ async fn probe_features(
             .await
             .map_err(|e| e.to_string())?;
         match frames::read_frame(&mut recv).await {
-            Ok(ReplFrame::LeoReply(reply)) => Ok(reply.bus_features),
-            Ok(_) => Ok(0),
+            Ok(ReplFrame::LeoReply(reply)) => Ok(ProbeAnswer {
+                features: reply.bus_features,
+                unhosted: reply.instance_unhosted,
+            }),
+            Ok(_) => Ok(ProbeAnswer {
+                features: 0,
+                unhosted: false,
+            }),
             Err(e) => Err(e.to_string()),
         }
     };
@@ -4302,12 +4375,12 @@ impl ReplicationManager {
             // in silence, which would read as an unknown outcome.
             if !known_features.contains_key(&node) {
                 match probe_features(transport.as_ref(), &node, &instance_id, timeout).await {
-                    Ok(0) => {
+                    Ok(answer) if answer.features == 0 => {
                         let _ = tx.send(Err(RoundTripError::Unsupported));
                         return;
                     }
-                    Ok(features) => {
-                        known_features.insert(node.clone(), features);
+                    Ok(answer) => {
+                        known_features.insert(node.clone(), answer.features);
                     }
                     Err(reason) => {
                         let _ = tx.send(Err(RoundTripError::NotSent(reason)));
@@ -4360,6 +4433,74 @@ impl ReplicationManager {
                 }
             }
         }
+    }
+
+    /// What `node` is known to accept without asking it: this node, a peer
+    /// that advertised its features (in a Hello or an earlier probe), or one
+    /// whose negative answer is not older than `PROBE_MISS_TTL`.
+    fn cached_forwarding(&self, node: &str) -> Option<NodeForwarding> {
+        if node == self.local_node_id {
+            return Some(NodeForwarding::Capable);
+        }
+        if let Some(features) = self.peer_features.get(node) {
+            return Some(forwarding_of(*features));
+        }
+        self.probe_misses
+            .get(node)
+            .filter(|miss| miss.0.elapsed() < PROBE_MISS_TTL)
+            .map(|miss| miss.1)
+    }
+
+    /// Asks `nodes` (index, id) what they accept, all at once, and waits for
+    /// the answers no longer than `within` in all. A peer that does not
+    /// answer in time is left out of the result. What a peer answered is
+    /// remembered: the features of one that has any, and for the others the
+    /// negative answer for `PROBE_MISS_TTL`, so that a placement does not ask
+    /// the same old build again and again. Blocking, like `forward_request`.
+    fn probe_peers(
+        &self,
+        nodes: Vec<(usize, String)>,
+        within: Duration,
+    ) -> Vec<(usize, NodeForwarding)> {
+        let Some(runtime) = self.runtime.clone() else {
+            return Vec::new();
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (index, node) in &nodes {
+            let transport = Arc::clone(&self.transport);
+            let instance_id = self.instance_id.clone();
+            let (tx, index, node) = (tx.clone(), *index, node.clone());
+            runtime.spawn(async move {
+                let answer = probe_features(transport.as_ref(), &node, &instance_id, within).await;
+                let _ = tx.send((index, node, answer));
+            });
+        }
+        drop(tx);
+        let give_up_at = Instant::now() + within + Duration::from_millis(500);
+        let mut answers = Vec::new();
+        while answers.len() < nodes.len() {
+            let left = give_up_at.saturating_duration_since(Instant::now());
+            let Ok((index, node, answer)) = rx.recv_timeout(left) else {
+                break;
+            };
+            let Ok(answer) = answer else {
+                continue;
+            };
+            let forwarding = if answer.unhosted {
+                NodeForwarding::NotAMember
+            } else {
+                forwarding_of(answer.features)
+            };
+            if forwarding == NodeForwarding::Capable || (answer.features != 0 && !answer.unhosted) {
+                self.peer_features.insert(node.clone(), answer.features);
+                self.probe_misses.remove(&node);
+            } else {
+                self.probe_misses
+                    .insert(node.clone(), (Instant::now(), forwarding));
+            }
+            answers.push((index, forwarding));
+        }
+        answers
     }
 
     /// Whether `node` is known not to take the forwarded request `feature`
@@ -4712,6 +4853,14 @@ impl AssignmentStore for SqliteLedgerAssignmentStore {
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
+    fn preferred_leader_counts(
+        &self,
+        instance_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>, ReplError> {
+        self.preferred_leader_counts(instance_id)
+            .map_err(|e| ReplError::Internal(e.to_string()))
+    }
+
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
         self.propose(&assignment)
             .map_err(|e| ReplError::Internal(e.to_string()))
@@ -4801,6 +4950,9 @@ mod tests {
         Predates,
         /// Reads the request and never answers.
         Silent,
+        /// Hosts no instance under the asked id: answers the capability
+        /// probe the way the router does for an unregistered one.
+        NotHosted,
         /// Never completes the dial.
         HangsOnDial,
         Reply(ProduceForwardReply),
@@ -4841,7 +4993,7 @@ mod tests {
 
         /// The far end of a capability probe: one `LeoQuery` in, one
         /// `LeoReply` out, with the feature bits of a current build or none.
-        fn answer_probe(knows_forwarding: bool) -> (BusRecv, BusSend) {
+        fn answer_probe(knows_forwarding: bool, unhosted: bool) -> (BusRecv, BusSend) {
             let (ours, theirs) = tokio::io::duplex(16 * 1024);
             tokio::spawn(async move {
                 let (mut peer_recv, mut peer_send) = split(theirs);
@@ -4858,6 +5010,7 @@ mod tests {
                         leader_alive: false,
                         promised_epoch: None,
                         promises: true,
+                        instance_unhosted: unhosted,
                         bus_features: if knows_forwarding {
                             frames::LOCAL_BUS_FEATURES
                         } else {
@@ -4914,7 +5067,10 @@ mod tests {
             // the way a current build does, or, for `Predates`, without any.
             if !self.scripts.contains_key(node_id) {
                 if let Some(peer) = self.forward_peers.get(node_id).map(|p| p.clone()) {
-                    return Ok(Self::answer_probe(!matches!(peer, ForwardPeer::Predates)));
+                    return Ok(Self::answer_probe(
+                        !matches!(peer, ForwardPeer::Predates | ForwardPeer::NotHosted),
+                        matches!(peer, ForwardPeer::NotHosted),
+                    ));
                 }
             }
             let script = self
@@ -4945,6 +5101,7 @@ mod tests {
                             leader_alive: false,
                             promised_epoch: query.candidate_epoch,
                             promises: true,
+                            instance_unhosted: false,
                             bus_features: 0,
                         },
                         PeerScript::Reply(reply) => ReplLeoReply {
@@ -5081,6 +5238,21 @@ mod tests {
                 .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
                 .cloned()
                 .collect())
+        }
+
+        fn preferred_leader_counts(
+            &self,
+            instance_id: &str,
+        ) -> Result<std::collections::HashMap<String, u32>, ReplError> {
+            let mut counts = std::collections::HashMap::new();
+            for row in self.rows.lock().values() {
+                if row.instance_id == instance_id {
+                    if let Some(preferred) = row.replicas.first() {
+                        *counts.entry(preferred.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            Ok(counts)
         }
 
         fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
@@ -6281,6 +6453,8 @@ mod tests {
             producer: None,
             groups: Vec::new(),
             reply_within_ms: 0,
+            topic_generation: 0,
+            partitions: 0,
         }
     }
 
@@ -6609,6 +6783,8 @@ mod tests {
             max_bytes: 1024,
             max_records: None,
             max_wait_ms: 10,
+            topic_generation: 0,
+            partitions: 0,
         }
     }
 
@@ -6735,6 +6911,189 @@ mod tests {
         assert_eq!(forward(&fx.manager, "l").await.unwrap(), reply);
         assert_eq!(fx.transport.dials("l"), 1, "no second probe");
         assert_eq!(fx.transport.forward_dials("l"), 2);
+    }
+
+    async fn forwarding_of_nodes(
+        manager: &Arc<ReplicationManager>,
+        nodes: &[&str],
+        within: Duration,
+    ) -> Vec<NodeForwarding> {
+        let manager = Arc::clone(manager);
+        let nodes: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+        tokio::task::spawn_blocking(move || manager.node_forwarding(&nodes, within))
+            .await
+            .unwrap()
+    }
+
+    /// TB-04 K4: a node leads a topic from the spread only when it
+    /// advertised both kinds of forwarding. What a peer advertised in a Hello
+    /// is believed without a probe, and a budget of zero asks nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_forwarding_reads_the_advertised_bits() {
+        let fx = build("l");
+        fx.manager
+            .peer_features
+            .insert("both".to_string(), frames::BUS_FEATURES_FORWARDING);
+        fx.manager.peer_features.insert(
+            "writes_only".to_string(),
+            frames::BUS_FEATURE_PRODUCE_FORWARD,
+        );
+        fx.manager.peer_features.insert("none".to_string(), 0);
+        fx.transport.set_forward_peer("silent", ForwardPeer::Old);
+        let answers = forwarding_of_nodes(
+            &fx.manager,
+            &["l", "both", "writes_only", "none", "silent"],
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            answers,
+            [
+                NodeForwarding::Capable,
+                NodeForwarding::Capable,
+                NodeForwarding::Lacking,
+                NodeForwarding::Lacking,
+                NodeForwarding::Unknown
+            ]
+        );
+        assert_eq!(fx.transport.dials("both"), 0);
+        assert_eq!(fx.transport.dials("silent"), 0, "a zero budget asks nobody");
+    }
+
+    /// A peer never heard from is asked: a current build answers with its
+    /// features and is remembered; one that predates forwarding reads as
+    /// lacking it; one that hosts no such instance is no member, not an old
+    /// build; and one that cannot be reached is unknown, so a topic is never
+    /// led by a node that may not take writes for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_forwarding_probes_a_peer_never_heard_from() {
+        let fx = build("l");
+        fx.transport.set_forward_peer("new", ForwardPeer::Old);
+        fx.transport.set_forward_peer("old", ForwardPeer::Predates);
+        fx.transport
+            .set_forward_peer("other", ForwardPeer::NotHosted);
+        let answers = forwarding_of_nodes(
+            &fx.manager,
+            &["new", "old", "other", "gone"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            answers,
+            [
+                NodeForwarding::Capable,
+                NodeForwarding::Lacking,
+                NodeForwarding::NotAMember,
+                NodeForwarding::Unknown
+            ]
+        );
+        assert_eq!(
+            fx.manager.peer_features.get("new").map(|f| *f),
+            Some(frames::LOCAL_BUS_FEATURES)
+        );
+    }
+
+    /// A negative answer is believed for a minute (§3.7): the same old build
+    /// is not asked at every topic creation. An unreachable peer is not
+    /// remembered, it may be up the next time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_negative_answer_to_a_probe_is_cached_and_a_missing_one_is_not() {
+        let fx = build("l");
+        fx.transport.set_forward_peer("old", ForwardPeer::Predates);
+        fx.transport
+            .set_forward_peer("other", ForwardPeer::NotHosted);
+        let nodes = ["old", "other", "gone"];
+        let first = forwarding_of_nodes(&fx.manager, &nodes, Duration::from_secs(2)).await;
+        let second = forwarding_of_nodes(&fx.manager, &nodes, Duration::from_secs(2)).await;
+        assert_eq!(first, second);
+        assert_eq!(fx.transport.dials("old"), 1, "asked once");
+        assert_eq!(fx.transport.dials("other"), 1, "asked once");
+        assert_eq!(fx.transport.dials("gone"), 2, "asked again");
+        // Aged past the TTL, the answer is not believed any more.
+        fx.manager.probe_misses.insert(
+            "old".to_string(),
+            (
+                Instant::now() - PROBE_MISS_TTL - Duration::from_secs(1),
+                NodeForwarding::Lacking,
+            ),
+        );
+        forwarding_of_nodes(&fx.manager, &["old"], Duration::from_secs(2)).await;
+        assert_eq!(fx.transport.dials("old"), 2);
+    }
+
+    /// Peers are asked together and the whole placement waits for them no
+    /// longer than the budget, however many do not answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_forwarding_asks_peers_in_parallel_within_the_budget() {
+        let fx = build("l");
+        for node in ["slow1", "slow2", "slow3", "slow4"] {
+            fx.transport.set_script(node, PeerScript::Hang);
+        }
+        fx.transport.set_forward_peer("quick", ForwardPeer::Old);
+        let started = Instant::now();
+        let answers = forwarding_of_nodes(
+            &fx.manager,
+            &["slow1", "slow2", "quick", "slow3", "slow4"],
+            Duration::from_millis(300),
+        )
+        .await;
+        let took = started.elapsed();
+        assert_eq!(
+            answers,
+            [
+                NodeForwarding::Unknown,
+                NodeForwarding::Unknown,
+                NodeForwarding::Capable,
+                NodeForwarding::Unknown,
+                NodeForwarding::Unknown
+            ]
+        );
+        assert!(
+            took < Duration::from_millis(900),
+            "four silent peers took {took:?}, they must share one budget"
+        );
+    }
+
+    /// TB-04 K4, owner decision P5 and its follow-up: the load of a node is
+    /// how many partitions of the instance it is the PREFERRED leader of
+    /// (`replicas[0]`), counted over the cluster-wide assignments (not only
+    /// the ones this node replicates), whatever the org or topic. A node that
+    /// leads partitions after a failover is not charged for them.
+    #[test]
+    fn leader_counts_counts_preferred_leaders_of_the_instance_only() {
+        let fx = build("a");
+        for (org, topic, partition, leader, replicas) in [
+            ("org", "orders", 0, "a", ["a", "b", "c"]),
+            ("org", "orders", 1, "a", ["b", "a", "c"]),
+            ("org", "orders", 2, "b", ["b", "a", "c"]),
+            ("other-org", "audit", 0, "b", ["b", "a", "c"]),
+        ] {
+            fx.assignments.seed(assignment(
+                org,
+                topic,
+                partition,
+                leader,
+                &replicas,
+                &["a"],
+                1,
+            ));
+        }
+        let mut foreign = assignment("org", "orders", 3, "c", &["c", "a"], &["a"], 1);
+        foreign.instance_id = "tentabus-00000002".to_string();
+        fx.assignments.seed(foreign);
+
+        let counts = fx.manager.leader_counts();
+        assert_eq!(
+            counts.get("a"),
+            Some(&1),
+            "partition 1 is led by a, preferred b"
+        );
+        assert_eq!(
+            counts.get("b"),
+            Some(&3),
+            "across orgs, a replica is not preferred"
+        );
+        assert_eq!(counts.get("c"), None, "a node preferred nowhere is absent");
     }
 
     fn grouped_request(partition: u32) -> ProduceForward {
@@ -7315,6 +7674,64 @@ mod tests {
         );
         assert!(!stored.replicas.iter().any(|r| r == "f2"));
         assert_eq!(*fx.audit.evictions.lock(), 1);
+    }
+
+    /// TB-04 K4: position 0 of `replicas` is the preferred leader, the node
+    /// the topic was placed on. The order of the row survives an election, a
+    /// transfer and an eviction, so that the preferred node stays recognizable
+    /// while leadership moves.
+    #[tokio::test]
+    async fn replicas_keep_their_order_through_election_transfer_and_eviction() {
+        let fx = build("f1");
+        // `z` is the preferred leader and sorts last, so an order that was
+        // sorted anywhere would show.
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "z",
+            &["z", "f2", "f1"],
+            &["z", "f2", "f1"],
+            5,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let replicas_now = || fx.assignments.stored(&key).expect("row stored").replicas;
+        let order = vec!["z".to_string(), "f2".to_string(), "f1".to_string()];
+
+        // `z` crashed, f2 ties f1's log and f1 wins on the lowest node id.
+        fx.transport.set_script(
+            "f2",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: true,
+            },
+        );
+        fx.manager.run_election(key.clone()).await;
+        let elected = fx.assignments.stored(&key).expect("row stored");
+        assert_eq!(elected.leader_node_id, "f1", "f1 took over from `z`");
+        assert_eq!(elected.replicas, order, "an election keeps the order");
+
+        for raw in 1u8..=8 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f2".to_string()]);
+        }
+        fx.manager
+            .transfer_leader("org", "orders", 0, "f2")
+            .expect("transfer succeeds");
+        let moved = fx.assignments.stored(&key).expect("row stored");
+        assert_eq!(moved.leader_node_id, "f2");
+        assert_eq!(moved.replicas, order, "a transfer keeps the order");
+
+        fx.manager
+            .evict_node_from_replica_sets("f2", "env_change")
+            .expect("evict succeeds");
+        assert_eq!(
+            replicas_now(),
+            vec!["z".to_string(), "f1".to_string()],
+            "an eviction removes the node and keeps the order of the rest"
+        );
     }
 
     // ---- PeerDisconnected accelerates --------------------------------------
@@ -8991,6 +9408,7 @@ mod tests {
             leader_alive: false,
             promised_epoch: None,
             promises: true,
+            instance_unhosted: false,
             bus_features: 0,
         })
     }
@@ -9236,6 +9654,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: None,
                 promises: true,
+                instance_unhosted: false,
                 bus_features: 0,
             }),
         );
@@ -9424,6 +9843,7 @@ mod tests {
                 leader_alive: true,
                 promised_epoch: None,
                 promises: true,
+                instance_unhosted: false,
                 bus_features: 0,
             }),
         );
@@ -10018,6 +10438,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: Some(65),
                 promises: true,
+                instance_unhosted: false,
                 bus_features: 0,
             }),
         );
@@ -10439,6 +10860,7 @@ mod tests {
                 leader_alive: false,
                 promised_epoch: Some(65),
                 promises: true,
+                instance_unhosted: false,
                 bus_features: 0,
             }),
         );

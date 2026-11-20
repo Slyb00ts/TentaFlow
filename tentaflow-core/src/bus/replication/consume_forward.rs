@@ -344,6 +344,7 @@ impl BusService {
             leader_node_id: Some(leader.to_string()),
             leader_epoch: epoch,
         };
+        let sender_cfg = self.topic_config(&ctx.org_id, topic)?;
         let request = ConsumeForward {
             instance_id: ctx.instance_id.as_str().to_string(),
             environment: self.cached_environment(),
@@ -357,6 +358,8 @@ impl BusService {
             max_bytes: max_bytes as u64,
             max_records: Some(max_records as u64),
             max_wait_ms,
+            topic_generation: sender_cfg.generation,
+            partitions: sender_cfg.partitions,
         };
         let timeout = Duration::from_millis(u64::from(max_wait_ms)) + REPLY_MARGIN;
         let still_led_by_target = || coordinator.node_reachable(leader);
@@ -483,6 +486,15 @@ impl BusService {
             }
             return Err(e);
         }
+        // After the checks, so that a caller who may not read learns nothing
+        // of the topic, and a leader still behind the sender's rows is told
+        // so only to one who may.
+        self.forwarded_topic_config(
+            &ctx.org_id,
+            &topic,
+            request.topic_generation,
+            request.partitions,
+        )?;
         let max_bytes = usize::try_from(request.max_bytes)
             .unwrap_or(usize::MAX)
             .min(MAX_FORWARDED_FETCH_BYTES);

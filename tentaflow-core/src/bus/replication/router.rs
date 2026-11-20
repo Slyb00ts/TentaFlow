@@ -400,6 +400,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         promised_epoch: None,
                         promises: true,
                         bus_features: 0,
+                        instance_unhosted: true,
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }
@@ -551,6 +552,12 @@ mod tests {
             _instance_id: &str,
             _node_id: &str,
         ) -> Result<Vec<PartitionAssignment>, ReplError> {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn preferred_leader_counts(
+            &self,
+            _instance_id: &str,
+        ) -> Result<std::collections::HashMap<String, u32>, ReplError> {
             unimplemented!("decoy fixture: never driven")
         }
         fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
@@ -804,6 +811,11 @@ mod tests {
         {
             ReplFrame::LeoReply(r) => {
                 assert_eq!((r.leo, r.hw, r.leader_epoch, r.in_isr), (0, 0, 0, false));
+                assert!(
+                    r.instance_unhosted,
+                    "the answer must say the instance is not hosted here, so a capability \
+                     probe does not take the node for an old build"
+                );
             }
             other => panic!("expected LeoReply, got {other:?}"),
         }

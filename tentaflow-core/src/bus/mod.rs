@@ -604,8 +604,12 @@ pub(crate) fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
     (u64::from_le_bytes(first8) % partitions as u64) as u32
 }
 
-/// The two halves of a placement decision: who leads (this node) and which
-/// same-environment peers are available to follow. Returned by
+/// How long placing a topic asks peers never heard from what they accept, all
+/// of them together.
+const PLACEMENT_PROBE_BUDGET: Duration = Duration::from_secs(1);
+
+/// The inputs of a placement decision: this node and which same-environment
+/// peers are available to lead or follow. Returned by
 /// `BusService::resolve_topic_placement`; `local_node_id` is empty when the
 /// coordinator has no identity of its own (a test fake), which every caller
 /// treats as "propose nothing".
@@ -619,34 +623,120 @@ struct TopicPlacement {
 }
 
 /// M2 (PLAN-M2 §1e): `create_topic`'s initial replica set for one
-/// partition — always `[local_node_id, ..up to rf-1 nodes from
-/// same_env]`, the local node leading every partition at creation time
-/// (a later election/`transfer_leader` can move leadership; this is only
-/// the STARTING placement). `same_env` is spread round-robin across
-/// partitions (offset by `partition`) rather than every partition getting
-/// the identical replica set, so a topic with more partitions than `rf-1`
-/// distributes replication load across the whole same-environment pool
-/// instead of concentrating it on the first `rf-1` nodes alphabetically.
-/// `same_env` must already exclude the local node and be in a STABLE order
-/// (`create_topic` sorts it) — the round-robin offset below is only
-/// reproducible if the pool's order does not change between calls.
+/// partition — always `[leader, ..up to rf-1 nodes from others]`. The leader
+/// is the node the topic's placement chose (`choose_topic_leader`), and its
+/// position 0 is the PREFERRED leader: elections, evictions and
+/// `transfer_leader` keep the order of `replicas`, so the node a topic was
+/// placed on stays recognizable after leadership has moved. A later
+/// election/`transfer_leader` can move leadership; this is only the STARTING
+/// placement. `others` is spread round-robin across partitions (offset by
+/// `partition`) rather than every partition getting the identical replica
+/// set, so a topic with more partitions than `rf-1` distributes replication
+/// load across the whole same-environment pool instead of concentrating it
+/// on the first `rf-1` nodes alphabetically. `others` must exclude the
+/// leader and be in a STABLE order (`placement_pool` sorts it) — the
+/// round-robin offset below is only reproducible if the pool's order does
+/// not change between calls.
 fn build_replica_set(
-    local_node_id: &str,
-    same_env: &[String],
+    leader: &str,
+    others: &[String],
     replication_factor: u32,
     partition: u32,
 ) -> Vec<String> {
-    let mut replicas = vec![local_node_id.to_string()];
-    if replication_factor <= 1 || same_env.is_empty() {
+    let mut replicas = vec![leader.to_string()];
+    if replication_factor <= 1 || others.is_empty() {
         return replicas;
     }
     let need = (replication_factor - 1) as usize;
-    let start = (partition as usize) % same_env.len();
-    for i in 0..need.min(same_env.len()) {
-        let idx = (start + i) % same_env.len();
-        replicas.push(same_env[idx].clone());
+    let start = (partition as usize) % others.len();
+    for i in 0..need.min(others.len()) {
+        let idx = (start + i) % others.len();
+        replicas.push(others[idx].clone());
     }
     replicas
+}
+
+/// The nodes other than `leader` that may hold the topic's replicas: this
+/// node and the same-environment peers, in a stable (sorted) order.
+fn placement_pool(local_node_id: &str, same_env: &[String], leader: &str) -> Vec<String> {
+    let mut pool: Vec<String> = std::iter::once(local_node_id.to_string())
+        .chain(same_env.iter().cloned())
+        .filter(|node| node != leader)
+        .collect();
+    pool.sort();
+    pool
+}
+
+/// The leader of a new topic (TB-04 K4): the node among `local_node_id` and
+/// `peers` that leads the fewest partitions of the instance (`leader_counts`;
+/// a node absent from it leads none). A tie goes to the first of the tied
+/// nodes in the sorted ring, read from the position `hash(topic) mod n`, so
+/// the same cluster state always gives the same answer and different topics
+/// do not all fall on the same node of a tie. `peers` must already be
+/// limited to the nodes allowed to lead from the spread.
+fn choose_topic_leader(
+    topic: &str,
+    local_node_id: &str,
+    peers: &[String],
+    counts: &std::collections::HashMap<String, u32>,
+) -> String {
+    let mut ring: Vec<&str> = std::iter::once(local_node_id)
+        .chain(peers.iter().map(String::as_str))
+        .collect();
+    ring.sort_unstable();
+    ring.dedup();
+    let start = partition_for_key(topic.as_bytes(), ring.len() as u32) as usize;
+    let mut chosen = ring[start];
+    let mut fewest = counts.get(chosen).copied().unwrap_or(0);
+    for offset in 1..ring.len() {
+        let node = ring[(start + offset) % ring.len()];
+        let led = counts.get(node).copied().unwrap_or(0);
+        if led < fewest {
+            chosen = node;
+            fewest = led;
+        }
+    }
+    chosen.to_string()
+}
+
+/// What the partitions a topic gains (`update_topic`), or a dead-letter
+/// topic's partitions without a counterpart, are placed like (TB-04 K4): one
+/// of its existing `rows`, so that the topic has ONE leader however its
+/// partitions are placed. The leader is the node leading most of the rows
+/// NOW, and the replica set is that of the lowest partition it leads whose
+/// preferred node (`replicas[0]`) is the one most of its partitions prefer,
+/// so a node that took partitions over in a failover leads the new ones too
+/// while their preferred node stays the original. Reachability plays no
+/// part: a leader that is down is recovered by the election together with
+/// the rest of the topic, and a topic must not be split by what a node could
+/// reach at the moment. A tie goes to the lower node id. `None` for no rows.
+fn majority_template(
+    rows: &[replication::assignment::PartitionAssignment],
+) -> Option<(String, Vec<String>)> {
+    fn most_common<'a>(nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        let mut counted: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+        for node in nodes {
+            *counted.entry(node).or_insert(0) += 1;
+        }
+        counted
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+            .map(|(node, _)| node)
+    }
+    let leader = most_common(rows.iter().map(|row| row.leader_node_id.as_str()))?;
+    let led: Vec<_> = rows
+        .iter()
+        .filter(|row| row.leader_node_id == leader)
+        .collect();
+    let preferred = most_common(
+        led.iter()
+            .filter_map(|row| row.replicas.first().map(String::as_str)),
+    );
+    let template = led
+        .iter()
+        .filter(|row| row.replicas.first().map(String::as_str) == preferred)
+        .min_by_key(|row| row.partition)?;
+    Some((leader.to_string(), template.replicas.clone()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2217,6 +2307,20 @@ pub struct ReplicationSnapshot {
     pub failovers: Vec<FailoverEventInfo>,
 }
 
+/// What a peer is known to accept (`ReplicationCoordinator::node_forwarding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeForwarding {
+    /// It advertises both kinds of forwarding.
+    Capable,
+    /// It answered, and its build predates forwarding.
+    Lacking,
+    /// It answered that it hosts no such instance: no member of it, which is
+    /// not an old build.
+    NotAMember,
+    /// It did not answer in time, or was not asked.
+    Unknown,
+}
+
 /// Injected replication backend (PLAN-M2 §1e). `BusService` holds at most
 /// one, set via `BusService::set_replication` after mesh startup —
 /// `None` (the default) means M1 behavior: single-node, `hw == leo`,
@@ -2390,6 +2494,29 @@ pub trait ReplicationCoordinator: Send + Sync {
     fn node_reachable(&self, node_id: &str) -> bool {
         let _ = node_id;
         true
+    }
+    /// What each of `nodes` is known to accept: forwarding of writes and
+    /// reads (`frames::BUS_FEATURES_FORWARDING`), lacking it, or no part of
+    /// this instance at all. A node never heard from is asked, all of them at
+    /// once, for at most `probe_within` in all; with a zero budget nothing is
+    /// asked and only what is already known is reported. The answer is in
+    /// the order of `nodes`. Defaulted to `Unknown` for everything, so a
+    /// coordinator with no view of its peers keeps every topic on the node
+    /// that creates it.
+    fn node_forwarding(&self, nodes: &[String], probe_within: Duration) -> Vec<NodeForwarding> {
+        let _ = probe_within;
+        vec![NodeForwarding::Unknown; nodes.len()]
+    }
+    /// How many partitions of this instance each node is the PREFERRED
+    /// leader of (position 0 of `replicas`), according to the cluster-wide
+    /// assignments; a node preferred nowhere is absent. The measure
+    /// `create_topic` balances (owner decision P5). It counts the preferred
+    /// node, not the current leader, so that a node that took partitions over
+    /// in a failover is not also given the new topics, while its own return
+    /// to them is still to come. Defaulted to empty, as `isr_shrink_total`
+    /// defaults to `0`.
+    fn leader_counts(&self) -> std::collections::HashMap<String, u32> {
+        std::collections::HashMap::new()
     }
 }
 
@@ -4236,7 +4363,7 @@ impl BusService {
     /// once the purge really removed the old log. Newer local incarnation
     /// than asked for: refused, with the cached config dropped, since a
     /// stale cached config is how a caller ends up asking for an old one.
-    fn ensure_topic_incarnation(
+    pub(crate) fn ensure_topic_incarnation(
         &self,
         org_id: &str,
         topic: &str,
@@ -5263,8 +5390,9 @@ impl BusService {
         })
     }
 
-    /// Proposes one assignment per entry of `partitions`, leader on this
-    /// node. Returns `(placed, every distinct replica node)`, or `None`
+    /// Proposes one assignment per entry of `partitions`, all led by
+    /// `leader`, the other replicas taken from `others` (`placement_pool`).
+    /// Returns `(placed, every distinct replica node)`, or `None`
     /// when there is no assignment store (M1 behavior: no placement, no
     /// cleanup).
     ///
@@ -5275,59 +5403,114 @@ impl BusService {
     ///
     /// Every placement names the incarnation it is for (`cfg.generation`,
     /// `PartitionAssignment::topic_generation`): replicas admit it only
-    /// against the same incarnation of the topic row.
+    /// against the same incarnation of the topic row. The leader need not be
+    /// this node: it starts leading when the row reaches it, and a write that
+    /// gets there first is forwarded to it.
     fn propose_partition_assignments(
         &self,
         org_id: &str,
         cfg: &topics::TopicConfig,
         partitions: &[u32],
-        local_node_id: &str,
-        same_env: &[String],
+        leader: &str,
+        others: &[String],
     ) -> Option<(u32, Vec<String>)> {
         let store = self.assignment_store()?;
-        let topic = cfg.name.as_str();
-        let replication_factor = cfg.replication_factor;
-        let topic_generation = cfg.generation;
         let mut all_replicas: Vec<String> = Vec::new();
         let mut placed = 0u32;
         for &partition in partitions {
-            let replicas =
-                build_replica_set(local_node_id, same_env, replication_factor, partition);
+            let replicas = build_replica_set(leader, others, cfg.replication_factor, partition);
             for node in &replicas {
                 if !all_replicas.contains(node) {
                     all_replicas.push(node.clone());
                 }
             }
-            let assignment = replication::assignment::PartitionAssignment {
-                instance_id: self.instance_id.clone(),
-                org_id: org_id.to_string(),
-                topic: topic.to_string(),
-                partition,
-                leader_node_id: local_node_id.to_string(),
-                isr: replicas.clone(),
-                replicas,
-                leader_epoch: 1,
-                updated_at_ms: now_ms(),
-                topic_generation,
-                epoch_slots: Default::default(),
-            };
-            match store.propose(&assignment) {
-                Ok(_) => placed += 1,
-                Err(e) => {
-                    // Best-effort: a failed placement does not fail topic
-                    // creation. The partition stays without a leader until
-                    // it is placed again: `update_topic` places every
-                    // unplaced partition, so the topic's next settings
-                    // change does.
-                    tracing::warn!(
-                        org_id, topic, partition, error = %e,
-                        "failed to propose partition assignment"
-                    );
-                }
+            if self.propose_assignment(&store, org_id, cfg, partition, leader, replicas) {
+                placed += 1;
             }
         }
         all_replicas.sort();
         Some((placed, all_replicas))
+    }
+
+    /// Proposes the genesis (epoch 1) assignment of one partition. `false`
+    /// when the proposal failed: best-effort, a failed placement does not
+    /// fail topic creation. The partition stays without a leader until it is
+    /// placed again: `update_topic` places every unplaced partition, so the
+    /// topic's next settings change does.
+    fn propose_assignment(
+        &self,
+        store: &replication::assignment::SqliteLedgerAssignmentStore,
+        org_id: &str,
+        cfg: &topics::TopicConfig,
+        partition: u32,
+        leader: &str,
+        replicas: Vec<String>,
+    ) -> bool {
+        let assignment = replication::assignment::PartitionAssignment {
+            instance_id: self.instance_id.clone(),
+            org_id: org_id.to_string(),
+            topic: cfg.name.clone(),
+            partition,
+            leader_node_id: leader.to_string(),
+            isr: replicas.clone(),
+            replicas,
+            leader_epoch: 1,
+            updated_at_ms: now_ms(),
+            topic_generation: cfg.generation,
+            epoch_slots: Default::default(),
+        };
+        match store.propose(&assignment) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    org_id, topic = %cfg.name, partition, error = %e,
+                    "failed to propose partition assignment"
+                );
+                false
+            }
+        }
+    }
+
+    /// The leader of a topic being created (TB-04 K4): the least-loaded node
+    /// among this one and the same-environment peers that advertise
+    /// forwarding.
+    ///
+    /// A peer that does not (a build from before it) would hand its producers
+    /// a `NotLeader` for a topic led elsewhere, so while any exists, or one
+    /// cannot be told apart from it, this node leads, as it always did. That
+    /// holds for a peer that is down now too, once it is known (from an
+    /// earlier Hello or probe) to lack forwarding, or not known at all: it
+    /// comes back and must not find itself unable to write. A peer that
+    /// answers that it hosts no such instance is no member of it, and counts
+    /// neither as a candidate nor against the rest. Peers never heard from
+    /// are asked in parallel within `PLACEMENT_PROBE_BUDGET` in all.
+    fn pick_topic_leader(&self, topic: &str, placement: &TopicPlacement) -> String {
+        let local = &placement.local_node_id;
+        let Some(coordinator) = self.replication() else {
+            return local.clone();
+        };
+        if placement.same_env.is_empty() {
+            return local.clone();
+        }
+        let down_peers_known_to_forward = || {
+            coordinator
+                .node_forwarding(&placement.unreachable, Duration::ZERO)
+                .iter()
+                .all(|state| matches!(state, NodeForwarding::Capable | NodeForwarding::NotAMember))
+        };
+        let states = coordinator.node_forwarding(&placement.same_env, PLACEMENT_PROBE_BUDGET);
+        let mut candidates = Vec::new();
+        for (node, state) in placement.same_env.iter().zip(&states) {
+            match state {
+                NodeForwarding::Capable => candidates.push(node.clone()),
+                NodeForwarding::NotAMember => {}
+                NodeForwarding::Lacking | NodeForwarding::Unknown => return local.clone(),
+            }
+        }
+        if !down_peers_known_to_forward() {
+            return local.clone();
+        }
+        choose_topic_leader(topic, local, &candidates, &coordinator.leader_counts())
     }
 
     /// Get-or-create for a broker-owned internal topic (`__dlq.<topic>`,
@@ -5378,6 +5561,15 @@ impl BusService {
     /// Proposes assignments for every partition of `cfg` that has none —
     /// a broker-internal topic's, the partitions `update_topic` added, or
     /// one whose proposal failed earlier.
+    ///
+    /// Who leads them follows the topic, not this node (TB-04 K4): the
+    /// partition of a `__dlq.` topic is placed exactly where the same
+    /// partition of its source topic is (leader and replicas), and any other
+    /// partition takes the placement of the topic's own existing ones
+    /// (`majority_template`; for a dead-letter partition with no counterpart,
+    /// the source topic's). A topic is never split by this. Only a topic with
+    /// nothing placed yet, such as a fresh internal topic, is led by this
+    /// node.
     /// Best-effort and silent on success: the caller's own audit row (or,
     /// for an internal topic, none) carries what changed.
     fn place_unplaced_partitions(
@@ -5412,19 +5604,70 @@ impl BusService {
         if missing.is_empty() {
             return;
         }
-        let placed = self.propose_partition_assignments(
-            org_id,
-            cfg,
-            &missing,
-            &placement.local_node_id,
-            &placement.same_env,
-        );
-        if let Some((placed, _)) = placed {
-            tracing::info!(
-                org_id, topic = %cfg.name, placed, missing = missing.len(),
-                "placed partitions that had no assignment"
-            );
+        let source_rows = cfg
+            .name
+            .strip_prefix(dlq::DLQ_TOPIC_PREFIX)
+            .map(|source| store.list_for_topic(&self.instance_id, org_id, source))
+            .transpose()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    org_id, topic = %cfg.name, error = %e,
+                    "topic placement: cannot read the source topic's partition \
+                     assignments; placing the dead-letter topic on its own"
+                );
+                None
+            });
+        let is_dlq = source_rows.is_some();
+        let source_rows = source_rows.unwrap_or_default();
+        let (follow_source, own): (Vec<u32>, Vec<u32>) = missing
+            .iter()
+            .partition(|p| source_rows.iter().any(|a| a.partition == **p));
+        let mut placed = 0u32;
+        for partition in follow_source {
+            if let Some(source) = source_rows.iter().find(|a| a.partition == partition) {
+                placed += u32::from(self.propose_assignment(
+                    &store,
+                    org_id,
+                    cfg,
+                    partition,
+                    &source.leader_node_id,
+                    source.replicas.clone(),
+                ));
+            }
         }
+        if !own.is_empty() {
+            // The rows the rest of the topic is judged by: a dead-letter
+            // topic's partitions without a counterpart follow the SOURCE
+            // topic, not the dead-letter partitions that happen to exist.
+            let template_rows = if is_dlq { &source_rows } else { &existing };
+            match majority_template(template_rows) {
+                Some((leader, replicas)) => {
+                    for partition in own {
+                        placed += u32::from(self.propose_assignment(
+                            &store,
+                            org_id,
+                            cfg,
+                            partition,
+                            &leader,
+                            replicas.clone(),
+                        ));
+                    }
+                }
+                None => {
+                    let leader = &placement.local_node_id;
+                    let others = placement_pool(leader, &placement.same_env, leader);
+                    if let Some((own_placed, _)) =
+                        self.propose_partition_assignments(org_id, cfg, &own, leader, &others)
+                    {
+                        placed += own_placed;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            org_id, topic = %cfg.name, placed, missing = missing.len(),
+            "placed partitions that had no assignment"
+        );
     }
 
     /// Admin-plane topic creation, audited as `bus.topic.create`. The
@@ -5582,7 +5825,7 @@ impl BusService {
         // never overrides the trait's default, e.g. a test fake) leaves
         // `opts.replication_factor` exactly as the caller passed it and
         // proposes nothing, same as "no coordinator" would.
-        let mut placement: Option<(String, Vec<String>)> = None;
+        let mut placement: Option<TopicPlacement> = None;
         // A known peer that is down when the topic is placed is left out for
         // good (placement is not revisited), so a shortfall against the
         // replication factor the cluster could have given is said out loud:
@@ -5617,7 +5860,7 @@ impl BusService {
                         );
                     }
                 }
-                placement = Some((resolved.local_node_id, resolved.same_env));
+                placement = Some(resolved);
             }
         }
 
@@ -5641,17 +5884,18 @@ impl BusService {
         self.ensure_topic_incarnation(&ctx.org_id, name, cfg.generation)?;
 
         let mut replicas_detail = String::new();
-        if let Some((local_node_id, same_env)) = placement {
+        if let Some(placement) = placement {
+            // Only now: the name was validated and the topic is known not to
+            // exist, so a refused creation has not asked a peer anything.
+            let leader = self.pick_topic_leader(name, &placement);
+            let others = placement_pool(&placement.local_node_id, &placement.same_env, &leader);
             let partitions: Vec<u32> = (0..cfg.partitions).collect();
-            if let Some((placed, all_replicas)) = self.propose_partition_assignments(
-                &ctx.org_id,
-                &cfg,
-                &partitions,
-                &local_node_id,
-                &same_env,
-            ) {
+            if let Some((placed, all_replicas)) =
+                self.propose_partition_assignments(&ctx.org_id, &cfg, &partitions, &leader, &others)
+            {
                 replicas_detail = format!(
-                    " replicas={} partitions_placed={placed}/{}",
+                    " leader={leader} leader_rf={} replicas={} partitions_placed={placed}/{}",
+                    cfg.replication_factor,
                     all_replicas.join(","),
                     cfg.partitions
                 );
@@ -6863,6 +7107,8 @@ impl BusService {
                 producer: batch.producer.as_ref(),
                 broker_dead_letter,
                 deadline: source.deadline(),
+                topic_generation: cfg.generation,
+                partitions: cfg.partitions,
             };
             forwarded = self
                 .forward_to_leaders(coordinator, &job, foreign, &mut acks)
@@ -18158,6 +18404,14 @@ mod tests {
         /// What `assigned_leader` names, per (topic, partition).
         assigned_leaders:
             parking_lot::Mutex<std::collections::HashMap<(String, u32), (String, u32)>>,
+        /// Peers `node_forwarding` reports as advertising forwarding.
+        forwarders: parking_lot::Mutex<std::collections::HashSet<String>>,
+        /// Peers `node_forwarding` reports as hosting no such instance.
+        unhosted: parking_lot::Mutex<std::collections::HashSet<String>>,
+        /// Every `node_forwarding` call: the nodes asked and the budget.
+        forwarding_asks: parking_lot::Mutex<Vec<(Vec<String>, Duration)>>,
+        /// What `leader_counts` answers.
+        led_counts: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
     }
 
     /// One scripted `forward_publish` answer, plus the role changes (and the
@@ -18191,7 +18445,20 @@ mod tests {
                 forward_calls: parking_lot::Mutex::new(Vec::new()),
                 assignment_gen: std::sync::atomic::AtomicU64::new(0),
                 assigned_leaders: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                forwarders: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                unhosted: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                forwarding_asks: parking_lot::Mutex::new(Vec::new()),
+                led_counts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             })
+        }
+        fn set_forwarders(&self, nodes: &[&str]) {
+            *self.forwarders.lock() = nodes.iter().map(|n| n.to_string()).collect();
+        }
+        fn set_unhosted(&self, nodes: &[&str]) {
+            *self.unhosted.lock() = nodes.iter().map(|n| n.to_string()).collect();
+        }
+        fn set_led_counts(&self, counts: &[(&str, u32)]) {
+            *self.led_counts.lock() = counts.iter().map(|(n, c)| (n.to_string(), *c)).collect();
         }
         fn set_node_down(&self, node_id: &str) {
             self.down_nodes.lock().insert(node_id.to_string());
@@ -18363,6 +18630,26 @@ mod tests {
         }
         fn node_reachable(&self, node_id: &str) -> bool {
             !self.down_nodes.lock().contains(node_id)
+        }
+        fn node_forwarding(&self, nodes: &[String], probe_within: Duration) -> Vec<NodeForwarding> {
+            self.forwarding_asks
+                .lock()
+                .push((nodes.to_vec(), probe_within));
+            nodes
+                .iter()
+                .map(|node| {
+                    if self.unhosted.lock().contains(node) {
+                        NodeForwarding::NotAMember
+                    } else if self.forwarders.lock().contains(node) {
+                        NodeForwarding::Capable
+                    } else {
+                        NodeForwarding::Lacking
+                    }
+                })
+                .collect()
+        }
+        fn leader_counts(&self) -> std::collections::HashMap<String, u32> {
+            self.led_counts.lock().clone()
         }
         fn can_forward_publish(&self) -> bool {
             self.forwarding.load(std::sync::atomic::Ordering::SeqCst)
@@ -19344,16 +19631,21 @@ mod tests {
     }
 
     #[test]
-    fn build_replica_set_spreads_round_robin_and_always_leads_with_local() {
+    fn build_replica_set_spreads_round_robin_and_always_leads_with_the_chosen_leader() {
         let pool = vec!["b".to_string(), "c".to_string(), "d".to_string()];
         let r0 = build_replica_set("a", &pool, 3, 0);
         let r1 = build_replica_set("a", &pool, 3, 1);
         assert_eq!(r0, vec!["a", "b", "c"]);
         assert_eq!(r1, vec!["a", "c", "d"], "round-robin offset by partition");
-        // RF=1: local only, pool never consulted.
+        // RF=1: the leader only, pool never consulted.
         assert_eq!(build_replica_set("a", &pool, 1, 0), vec!["a"]);
-        // Empty pool: still returns just the local node, never panics.
+        // Empty pool: still returns just the leader, never panics.
         assert_eq!(build_replica_set("a", &[], 3, 0), vec!["a"]);
+        // TB-04 K4: the leader is whichever node placement chose, not
+        // necessarily this one, and it is the preferred leader at position 0.
+        let others = vec!["a".to_string(), "c".to_string()];
+        assert_eq!(build_replica_set("b", &others, 3, 0), vec!["b", "a", "c"]);
+        assert_eq!(build_replica_set("b", &others, 3, 1), vec!["b", "c", "a"]);
     }
 
     #[test]
@@ -19657,6 +19949,603 @@ mod tests {
         assert_eq!(placement.same_env, vec!["peer-up".to_string()]);
     }
 
+    // ---- K4: placing a topic's leader ---------------------------------------
+
+    fn nodes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn counts(led: &[(&str, u32)]) -> std::collections::HashMap<String, u32> {
+        led.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn choose_topic_leader_picks_the_node_leading_the_fewest_partitions() {
+        let led = counts(&[("a", 8), ("b", 4), ("c", 6)]);
+        assert_eq!(
+            choose_topic_leader("t", "a", &nodes(&["b", "c"]), &led),
+            "b"
+        );
+        // A node absent from the counts leads nothing, so it is the lightest.
+        let led = counts(&[("a", 1), ("b", 1)]);
+        assert_eq!(
+            choose_topic_leader("t", "a", &nodes(&["b", "c"]), &led),
+            "c"
+        );
+        // The local node competes like any other.
+        let led = counts(&[("a", 0), ("b", 3), ("c", 3)]);
+        assert_eq!(
+            choose_topic_leader("t", "a", &nodes(&["b", "c"]), &led),
+            "a"
+        );
+    }
+
+    #[test]
+    fn choose_topic_leader_measures_partitions_not_topics() {
+        // One topic of 16 partitions outweighs three of 1.
+        let led = counts(&[("a", 16), ("b", 3)]);
+        assert_eq!(choose_topic_leader("t", "a", &nodes(&["b"]), &led), "b");
+    }
+
+    #[test]
+    fn choose_topic_leader_is_deterministic_and_breaks_ties_by_topic_hash() {
+        let peers = nodes(&["node-c", "node-b"]);
+        let led = counts(&[]);
+        let first = choose_topic_leader("orders", "node-a", &peers, &led);
+        for _ in 0..5 {
+            assert_eq!(choose_topic_leader("orders", "node-a", &peers, &led), first);
+        }
+        // The order of the peers handed in does not matter.
+        let reordered = nodes(&["node-b", "node-c"]);
+        assert_eq!(
+            choose_topic_leader("orders", "node-a", &reordered, &led),
+            first
+        );
+        // With every node tied, the topics do not all land on one node.
+        let ring = ["node-a", "node-b", "node-c"];
+        let mut chosen = std::collections::BTreeSet::new();
+        for i in 0..30 {
+            let topic = format!("topic.{i}");
+            let leader = choose_topic_leader(&topic, "node-a", &peers, &led);
+            let start = partition_for_key(topic.as_bytes(), 3) as usize;
+            assert_eq!(
+                leader, ring[start],
+                "a full tie starts at hash(topic) mod n"
+            );
+            chosen.insert(leader);
+        }
+        assert_eq!(chosen.len(), 3, "ties spread over every node: {chosen:?}");
+    }
+
+    #[test]
+    fn choose_topic_leader_breaks_a_partial_tie_from_the_hash_position() {
+        // b and c tie for the fewest; the first of them reached from
+        // hash(topic) mod 3 on the ring a, b, c wins.
+        let led = counts(&[("a", 5), ("b", 1), ("c", 1)]);
+        for i in 0..30 {
+            let topic = format!("topic.{i}");
+            let start = partition_for_key(topic.as_bytes(), 3) as usize;
+            let expected = if start == 2 { "c" } else { "b" };
+            assert_eq!(
+                choose_topic_leader(&topic, "a", &nodes(&["b", "c"]), &led),
+                expected,
+                "{topic} starts at ring position {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn choose_topic_leader_without_peers_is_the_local_node() {
+        assert_eq!(
+            choose_topic_leader("t", "a", &[], &counts(&[("a", 9)])),
+            "a"
+        );
+    }
+
+    fn row(partition: u32, leader: &str) -> replication::assignment::PartitionAssignment {
+        replication::assignment::PartitionAssignment {
+            instance_id: "tentabus-00000001".to_string(),
+            org_id: "org-1".to_string(),
+            topic: "t".to_string(),
+            partition,
+            leader_node_id: leader.to_string(),
+            replicas: vec![leader.to_string()],
+            isr: vec![leader.to_string()],
+            leader_epoch: 1,
+            updated_at_ms: 0,
+            topic_generation: 0,
+            epoch_slots: Default::default(),
+        }
+    }
+
+    fn row_with(
+        partition: u32,
+        leader: &str,
+        replicas: &[&str],
+    ) -> replication::assignment::PartitionAssignment {
+        let mut r = row(partition, leader);
+        r.replicas = nodes(replicas);
+        r
+    }
+
+    #[test]
+    fn majority_template_is_the_node_leading_most_of_the_existing_partitions() {
+        let existing = vec![row(0, "b"), row(1, "c"), row(2, "c")];
+        assert_eq!(majority_template(&existing).unwrap().0, "c");
+        assert!(majority_template(&[]).is_none());
+    }
+
+    /// A leader that is down is not skipped: the election recovers it with
+    /// the rest of the topic, and new partitions must not form a second
+    /// leader. A tie goes to the lower node id.
+    #[test]
+    fn majority_template_does_not_look_at_reachability_and_breaks_ties_by_node_id() {
+        let existing = vec![row(0, "dead"), row(1, "dead"), row(2, "c"), row(3, "b")];
+        assert_eq!(majority_template(&existing).unwrap().0, "dead");
+        let existing = vec![row(0, "c"), row(1, "b")];
+        assert_eq!(majority_template(&existing).unwrap().0, "b");
+    }
+
+    /// After a failover the majority leader is b while the preferred node of
+    /// every partition is still a: the new partitions take b as leader and
+    /// the original replica order (a first).
+    #[test]
+    fn majority_template_keeps_the_preferred_node_through_a_failover() {
+        let existing = vec![
+            row_with(0, "b", &["a", "b", "c"]),
+            row_with(1, "b", &["a", "b", "c"]),
+            row_with(2, "a", &["a", "b", "c"]),
+        ];
+        let (leader, replicas) = majority_template(&existing).unwrap();
+        assert_eq!(leader, "b");
+        assert_eq!(replicas, nodes(&["a", "b", "c"]));
+    }
+
+    /// A bus service with a real ledger-backed assignment store (so that
+    /// `create_topic` really proposes and materializes rows) whose
+    /// coordinator is a `FakeCoordinator` of the node `local`, with the given
+    /// reachable same-environment peers in its snapshot. The returned guard
+    /// serializes the test against the other ledger-backed ones.
+    fn ledger_placement_service(
+        local: &str,
+        reachable_peers: &[&str],
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+        BusService,
+        Arc<FakeCoordinator>,
+        replication::assignment::SqliteLedgerAssignmentStore,
+    ) {
+        let guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
+        })
+        .expect("bus service");
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id(local);
+        coord.set_snapshot(ReplicationSnapshot {
+            nodes: reachable_peers
+                .iter()
+                .map(|node| snapshot_peer(node, true))
+                .collect(),
+            partitions: vec![],
+            failovers: vec![],
+        });
+        svc.set_replication(coord.clone());
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        (guard, dir, svc, coord, store)
+    }
+
+    fn placed_rows(
+        svc: &BusService,
+        store: &replication::assignment::SqliteLedgerAssignmentStore,
+        org: &str,
+        topic: &str,
+    ) -> Vec<replication::assignment::PartitionAssignment> {
+        let mut rows = store
+            .list_for_topic(svc.instance_id(), org, topic)
+            .expect("list_for_topic");
+        rows.sort_by_key(|a| a.partition);
+        rows
+    }
+
+    fn audit_details_of(svc: &BusService, action: &str, topic: &str) -> String {
+        crate::db::repository::list_audit_logs(
+            &svc.db,
+            &crate::db::models::AuditLogFilters {
+                action: Some(action.to_string()),
+                ..Default::default()
+            },
+            0,
+            50,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|log| log.resource.as_deref() == Some(topic))
+        .and_then(|log| log.details)
+        .unwrap_or_else(|| panic!("no {action} audit row for {topic}"))
+    }
+
+    #[test]
+    fn create_topic_places_the_leader_on_the_least_loaded_forwarding_peer() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 8), ("node-b", 4), ("node-c", 2)]);
+        let ctx = test_ctx("org-k4-spread");
+        svc.create_topic(
+            &ctx,
+            "k4.spread",
+            topics::TopicOptions {
+                partitions: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+
+        let rows = placed_rows(&svc, &store, "org-k4-spread", "k4.spread");
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row.leader_node_id, "node-c",
+                "one leader for the whole topic"
+            );
+            assert_eq!(
+                row.replicas[0], "node-c",
+                "the leader is the preferred node"
+            );
+            assert_eq!(row.replicas.len(), 3, "RF is min(3, nodes)");
+            assert_eq!(row.leader_epoch, 1, "a genesis row");
+        }
+        let details = audit_details_of(&svc, "bus.topic.create", "k4.spread");
+        assert!(details.contains(" leader=node-c leader_rf=3 "), "{details}");
+        assert!(
+            details.contains("replicas=node-a,node-b,node-c"),
+            "{details}"
+        );
+    }
+
+    /// A topic with one replica is spread like any other: its only replica is
+    /// its leader, so where it is placed is the whole decision. The audit row
+    /// names the replication factor the choice was made for.
+    #[test]
+    fn create_topic_spreads_a_topic_with_one_replica_too() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 8), ("node-b", 4), ("node-c", 2)]);
+        let ctx = test_ctx("org-k4-rf1");
+        svc.create_topic(
+            &ctx,
+            "k4.rf1",
+            topics::TopicOptions {
+                replication_factor: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        for row in placed_rows(&svc, &store, "org-k4-rf1", "k4.rf1") {
+            assert_eq!(row.leader_node_id, "node-c");
+            assert_eq!(row.replicas, vec!["node-c".to_string()]);
+        }
+        let details = audit_details_of(&svc, "bus.topic.create", "k4.rf1");
+        assert!(details.contains(" leader=node-c leader_rf=1 "), "{details}");
+    }
+
+    #[test]
+    fn create_topic_keeps_the_leader_local_while_a_peer_does_not_forward() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        // node-c is the idle one, but node-b predates forwarding.
+        coord.set_forwarders(&["node-c"]);
+        coord.set_led_counts(&[("node-a", 8), ("node-b", 4)]);
+        let ctx = test_ctx("org-k4-old-peer");
+        svc.create_topic(&ctx, "k4.old-peer", topics::TopicOptions::default())
+            .expect("create_topic");
+
+        let rows = placed_rows(&svc, &store, "org-k4-old-peer", "k4.old-peer");
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(row.leader_node_id, "node-a");
+            assert_eq!(row.replicas[0], "node-a");
+        }
+        let details = audit_details_of(&svc, "bus.topic.create", "k4.old-peer");
+        assert!(details.contains(" leader=node-a leader_rf="), "{details}");
+    }
+
+    #[test]
+    fn create_topic_never_leads_from_a_peer_that_is_not_reachable() {
+        let (_guard, _dir, svc, coord, store) = ledger_placement_service("node-a", &[]);
+        // The dead peer is idle and forwards, but the snapshot says it is down.
+        let mut snapshot = coord.snapshot.lock().clone();
+        snapshot.nodes.push(snapshot_peer("node-b", false));
+        *coord.snapshot.lock() = snapshot;
+        coord.set_forwarders(&["node-b"]);
+        coord.set_led_counts(&[("node-a", 8)]);
+        let ctx = test_ctx("org-k4-dead-peer");
+        svc.create_topic(&ctx, "k4.dead-peer", topics::TopicOptions::default())
+            .expect("create_topic");
+
+        for row in placed_rows(&svc, &store, "org-k4-dead-peer", "k4.dead-peer") {
+            assert_eq!(row.leader_node_id, "node-a");
+            assert_eq!(row.replicas, vec!["node-a".to_string()]);
+        }
+    }
+
+    #[test]
+    fn create_topic_spreads_successive_topics_over_the_nodes() {
+        // The fake's counts are fed back by hand from what each creation
+        // really placed (the fake has no ledger of its own): four topics of
+        // four partitions each end up two and two on a two-node cluster once
+        // each placement is visible to the next one.
+        let (_guard, _dir, svc, coord, store) = ledger_placement_service("node-a", &["node-b"]);
+        coord.set_forwarders(&["node-b"]);
+        let ctx = test_ctx("org-k4-successive");
+        let mut led_by: std::collections::BTreeMap<String, u32> = Default::default();
+        for i in 0..4 {
+            let counts: std::collections::HashMap<String, u32> = led_by
+                .iter()
+                .map(|(node, partitions)| (node.clone(), *partitions))
+                .collect();
+            *coord.led_counts.lock() = counts;
+            let name = format!("k4.successive.{i}");
+            svc.create_topic(
+                &ctx,
+                &name,
+                topics::TopicOptions {
+                    partitions: Some(4),
+                    ..Default::default()
+                },
+            )
+            .expect("create_topic");
+            for row in placed_rows(&svc, &store, "org-k4-successive", &name) {
+                *led_by.entry(row.leader_node_id).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(led_by.get("node-a"), Some(&8), "{led_by:?}");
+        assert_eq!(led_by.get("node-b"), Some(&8), "{led_by:?}");
+    }
+
+    #[test]
+    fn a_dead_letter_topic_is_placed_with_its_source() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 9), ("node-b", 0), ("node-c", 9)]);
+        let ctx = test_ctx("org-k4-dlq");
+        let source = svc
+            .create_topic(
+                &ctx,
+                "k4.dlq-source",
+                topics::TopicOptions {
+                    partitions: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect("create source");
+        // The loads change before the DLQ is made, and the node that made
+        // it is not the leader: the DLQ follows its source anyway, it is not
+        // placed afresh (which would put it on this node).
+        coord.set_led_counts(&[("node-a", 0), ("node-b", 20), ("node-c", 20)]);
+        svc.ensure_dlq_topic(&ctx, "k4.dlq-source", &source)
+            .expect("ensure dlq");
+
+        let source_rows = placed_rows(&svc, &store, "org-k4-dlq", "k4.dlq-source");
+        let dlq_rows = placed_rows(
+            &svc,
+            &store,
+            "org-k4-dlq",
+            &dlq::dlq_topic_name("k4.dlq-source"),
+        );
+        assert_eq!(dlq_rows.len(), 2);
+        for (dlq_row, source_row) in dlq_rows.iter().zip(&source_rows) {
+            assert_eq!(dlq_row.partition, source_row.partition);
+            assert_eq!(dlq_row.leader_node_id, source_row.leader_node_id);
+            assert_eq!(dlq_row.replicas, source_row.replicas);
+            assert_eq!(dlq_row.leader_epoch, 1);
+        }
+        assert_eq!(source_rows[0].leader_node_id, "node-b");
+    }
+
+    /// A dead-letter partition with no counterpart among the source's rows is
+    /// placed like the source topic, not by the dead-letter topic's own rows
+    /// (which a failover of the dead-letter partitions alone may have moved
+    /// to another node).
+    #[test]
+    fn a_dead_letter_partition_without_a_source_counterpart_follows_the_source_template() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 9), ("node-b", 0), ("node-c", 9)]);
+        let ctx = test_ctx("org-k4-dlq-grow");
+        let source = svc
+            .create_topic(
+                &ctx,
+                "k4.dlq-grow",
+                topics::TopicOptions {
+                    partitions: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect("create source");
+        svc.ensure_dlq_topic(&ctx, "k4.dlq-grow", &source)
+            .expect("ensure dlq");
+        let dlq_name = dlq::dlq_topic_name("k4.dlq-grow");
+        for mut row in placed_rows(&svc, &store, "org-k4-dlq-grow", &dlq_name) {
+            row.leader_node_id = "node-c".to_string();
+            row.leader_epoch = 2;
+            row.updated_at_ms += 1;
+            store.propose(&row).expect("the dead-letter partitions fail over");
+        }
+        let mut dlq_cfg = svc.topic_config(&ctx.org_id, &dlq_name).expect("dlq config");
+        dlq_cfg.partitions = 3;
+        svc.place_unplaced_partitions(&ctx.org_id, &dlq_cfg, NodeEnvironment::Prod);
+
+        let rows = placed_rows(&svc, &store, "org-k4-dlq-grow", &dlq_name);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].leader_node_id, "node-c", "the failover stays");
+        assert_eq!(
+            rows[2].leader_node_id, "node-b",
+            "the new partition is placed like the source topic"
+        );
+    }
+
+    #[test]
+    fn update_topic_places_added_partitions_under_the_leader_of_most_existing_ones() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 8), ("node-b", 4), ("node-c", 0)]);
+        let ctx = test_ctx("org-k4-grow");
+        svc.create_topic(
+            &ctx,
+            "k4.grow",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        // The cluster has changed since: this node is the lightest now, and
+        // the topic still stays whole.
+        coord.set_led_counts(&[("node-a", 0), ("node-b", 9), ("node-c", 9)]);
+        svc.update_topic(
+            &ctx,
+            "k4.grow",
+            topics::TopicOptions {
+                partitions: Some(5),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+
+        let rows = placed_rows(&svc, &store, "org-k4-grow", "k4.grow");
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert_eq!(row.leader_node_id, "node-c", "partition {}", row.partition);
+            assert_eq!(row.replicas[0], "node-c");
+        }
+    }
+
+    /// A leader that is down is not skipped by `update_topic`: the added
+    /// partitions share the leader of the rest, whatever is reachable.
+    #[test]
+    fn update_topic_gives_added_partitions_the_leader_even_while_it_is_unreachable() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-b", "node-c"]);
+        coord.set_led_counts(&[("node-a", 8), ("node-b", 0), ("node-c", 4)]);
+        let ctx = test_ctx("org-k4-grow-dead");
+        svc.create_topic(
+            &ctx,
+            "k4.grow-dead",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        let mut snapshot = coord.snapshot.lock().clone();
+        for node in snapshot.nodes.iter_mut().filter(|n| n.node_id == "node-b") {
+            node.reachable = false;
+        }
+        *coord.snapshot.lock() = snapshot;
+        svc.update_topic(
+            &ctx,
+            "k4.grow-dead",
+            topics::TopicOptions {
+                partitions: Some(4),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+        for row in placed_rows(&svc, &store, "org-k4-grow-dead", "k4.grow-dead") {
+            assert_eq!(row.leader_node_id, "node-b", "partition {}", row.partition);
+            assert_eq!(row.replicas[0], "node-b");
+        }
+    }
+
+    /// An old peer that is briefly disconnected keeps the leader local: it
+    /// is not in the reachable set, but it is not known to forward either.
+    #[test]
+    fn create_topic_keeps_the_leader_local_while_a_disconnected_peer_is_not_known_to_forward() {
+        let (_guard, _dir, svc, coord, store) = ledger_placement_service("node-a", &["node-c"]);
+        let mut snapshot = coord.snapshot.lock().clone();
+        snapshot.nodes.push(snapshot_peer("node-b", false));
+        *coord.snapshot.lock() = snapshot;
+        coord.set_forwarders(&["node-c"]);
+        coord.set_led_counts(&[("node-a", 8)]);
+        let ctx = test_ctx("org-k4-gone-old");
+        svc.create_topic(&ctx, "k4.gone-old", topics::TopicOptions::default())
+            .expect("create_topic");
+        for row in placed_rows(&svc, &store, "org-k4-gone-old", "k4.gone-old") {
+            assert_eq!(row.leader_node_id, "node-a");
+        }
+        // Known to forward, the same peer does not hold the spread back.
+        coord.set_forwarders(&["node-b", "node-c"]);
+        svc.create_topic(&ctx, "k4.gone-new", topics::TopicOptions::default())
+            .expect("create_topic");
+        for row in placed_rows(&svc, &store, "org-k4-gone-old", "k4.gone-new") {
+            assert_eq!(row.leader_node_id, "node-c");
+        }
+    }
+
+    /// A peer that hosts no such instance is no member: it is neither a
+    /// candidate nor a reason to keep the leader local.
+    #[test]
+    fn create_topic_ignores_a_peer_that_hosts_no_such_instance() {
+        let (_guard, _dir, svc, coord, store) =
+            ledger_placement_service("node-a", &["node-b", "node-c"]);
+        coord.set_forwarders(&["node-c"]);
+        coord.set_unhosted(&["node-b"]);
+        coord.set_led_counts(&[("node-a", 8)]);
+        let ctx = test_ctx("org-k4-unhosted");
+        svc.create_topic(&ctx, "k4.unhosted", topics::TopicOptions::default())
+            .expect("create_topic");
+        for row in placed_rows(&svc, &store, "org-k4-unhosted", "k4.unhosted") {
+            assert_eq!(row.leader_node_id, "node-c");
+        }
+    }
+
+    /// Names are validated and a duplicate is refused before any peer is
+    /// asked what it accepts.
+    #[test]
+    fn a_refused_create_topic_probes_no_peer() {
+        let (_guard, _dir, svc, coord, _store) = ledger_placement_service("node-a", &["node-b"]);
+        coord.set_forwarders(&["node-b"]);
+        let ctx = test_ctx("org-k4-refused");
+        assert!(svc
+            .create_topic(&ctx, "bad name!", topics::TopicOptions::default())
+            .is_err());
+        assert!(coord.forwarding_asks.lock().is_empty(), "invalid name");
+        svc.create_topic(&ctx, "k4.refused", topics::TopicOptions::default())
+            .expect("create_topic");
+        let asked = coord.forwarding_asks.lock().len();
+        assert!(asked > 0);
+        assert!(svc
+            .create_topic(&ctx, "k4.refused", topics::TopicOptions::default())
+            .is_err());
+        assert_eq!(coord.forwarding_asks.lock().len(), asked, "duplicate");
+    }
+
     // ---- K2: forwarding a write to the partition leader --------------------
 
     use replication::forward::ForwardedPublishHandler as _;
@@ -19774,6 +20663,40 @@ mod tests {
             0,
             "nothing is written on the follower"
         );
+    }
+
+    /// A leader that answers it knows no leader yet (it has not received the
+    /// topic or its placement) is asked again after a pause that doubles from
+    /// 50 ms, not at a fixed rate and not as a failed send.
+    #[test]
+    fn a_leader_that_knows_no_leader_is_asked_again_with_a_doubling_pause() {
+        let topic = "orders.fwd-backoff";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        let unaware = BusServiceError::NotLeader {
+            leader_node_id: None,
+            leader_epoch: 0,
+        };
+        coord.script_forwarding(vec![
+            answered_with(&unaware),
+            answered_with(&unaware),
+            answered_with(&unaware),
+            answered_with(&unaware),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("late")]).unwrap();
+        let took = started.elapsed();
+        assert_eq!(result.accepted, 1);
+        assert_eq!(coord.forward_calls.lock().len(), 5);
+        assert!(
+            took >= Duration::from_millis(700),
+            "pauses of 50, 100, 200 and 400 ms: took {took:?}"
+        );
+        assert!(took < Duration::from_secs(3), "took {took:?}");
     }
 
     #[test]
@@ -20035,7 +20958,104 @@ mod tests {
                 }],
             }],
             reply_within_ms: 0,
+            topic_generation: 0,
+            partitions: 0,
         }
+    }
+
+    fn forwarded_error(reply: ProduceForwardReply) -> BusServiceError {
+        replication::forward::error_from_wire(reply.error.expect("the request is refused"))
+    }
+
+    /// TB-04 follow-up: a leader that has not yet received the topic row the
+    /// sender created answers `NotLeader` naming no leader (which the sender
+    /// asks again), never `TopicNotFound`, and a request that states no
+    /// incarnation (an older sender) keeps the plain not-found.
+    #[test]
+    fn a_forwarded_publish_for_a_topic_this_node_has_not_received_is_not_ready_not_missing() {
+        let (_tmp, svc) = test_service();
+        svc.set_replication(FakeCoordinator::leader(1));
+        let mut request = forward_request_for(&svc, "orders.not-yet", "tester");
+        request.topic_generation = 77;
+        request.partitions = 1;
+        let started = Instant::now();
+        let error = forwarded_error(svc.publish_forwarded("node-b", request.clone()));
+        assert!(
+            matches!(
+                error,
+                BusServiceError::NotLeader {
+                    leader_node_id: None,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the receiver waits for its own rows first"
+        );
+        request.topic_generation = 0;
+        let error = forwarded_error(svc.publish_forwarded("node-b", request));
+        assert!(
+            matches!(error, BusServiceError::TopicNotFound { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// The sender grew the topic (`update_topic`) and this node has not seen
+    /// the new partitions: not ready, instead of an out-of-range partition.
+    #[test]
+    fn a_forwarded_publish_with_a_newer_partition_count_is_not_ready() {
+        let topic = "orders.fwd-grown";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        svc.set_replication(FakeCoordinator::leader(1));
+        let cfg = svc.topic_config("org-1", topic).unwrap();
+        let mut request = forward_request_for(&svc, topic, "tester");
+        request.topic_generation = cfg.generation;
+        request.partitions = cfg.partitions + 2;
+        let error = forwarded_error(svc.publish_forwarded("node-b", request));
+        assert!(
+            matches!(
+                error,
+                BusServiceError::NotLeader {
+                    leader_node_id: None,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A delete and recreate race: a sender on the old incarnation is refused
+    /// outright and nothing is appended to the new one.
+    #[test]
+    fn a_forwarded_publish_from_an_older_incarnation_is_refused_and_appends_nothing() {
+        let topic = "orders.fwd-recreated";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord);
+        open_leader_writes(&svc, &test_ctx("org-1"), topic, 0);
+        let cfg = svc.topic_config("org-1", topic).unwrap();
+        let mut request = forward_request_for(&svc, topic, "tester");
+        request.topic_generation = cfg.generation - 1;
+        request.partitions = cfg.partitions;
+        let error = forwarded_error(svc.publish_forwarded("node-b", request));
+        assert!(
+            matches!(error, BusServiceError::PartitionUnavailable { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            svc.local_partition(&test_ctx("org-1"), topic, 0)
+                .unwrap()
+                .log_end_offset(),
+            0
+        );
+        // The same request on the current incarnation lands.
+        let mut request = forward_request_for(&svc, topic, "tester");
+        request.topic_generation = cfg.generation;
+        request.partitions = cfg.partitions;
+        let reply = svc.publish_forwarded("node-b", request);
+        assert!(reply.error.is_none(), "{:?}", reply.error);
     }
 
     #[test]

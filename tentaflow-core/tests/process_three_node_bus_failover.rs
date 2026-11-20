@@ -1086,8 +1086,9 @@ fn process_three_node_bus_topic_recreated_after_delete_replicates_on_every_node(
 
 // The same, re-created on a node that learned of the delete only through the
 // ledger: that node still holds the deleted incarnation's log (it followed
-// it), and the new incarnation it leads must start from an empty one — not
-// serve the old records or carry the old persisted leader epoch.
+// it), and the new incarnation it leads or follows (the placement decides
+// who leads) must start from an empty one — not serve the old records or
+// carry the old persisted leader epoch.
 #[test]
 fn process_three_node_bus_topic_recreated_on_another_node_starts_an_empty_log() {
     if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
@@ -1157,35 +1158,65 @@ fn recreate_after_delete(recreator: Recreator) {
     }
 
     // Second incarnation, created on one node only: its epoch-1 placement
-    // must reach and be applied by every replica, with its creator leading.
-    let (creator, others): (&mut ChildNode, [&mut ChildNode; 2]) = match recreator {
-        Recreator::DeletingNode => (&mut a, [&mut b, &mut c]),
-        Recreator::AnotherNode => (&mut b, [&mut a, &mut c]),
+    // must reach and be applied by every replica. Who leads it is the
+    // placement's choice (the least-loaded node, `BusService::create_topic`),
+    // not necessarily the node that creates it: it is read from the roles,
+    // and every node must agree on it.
+    let creator_index = match recreator {
+        Recreator::DeletingNode => 0,
+        Recreator::AnotherNode => 1,
     };
-    let [first, second] = others;
-    create_topic_on(creator, "quorum", "standard");
-    let new_leader = creator.node_id.clone();
+    let mut nodes = [&mut a, &mut b, &mut c];
+    create_topic_on(nodes[creator_index], "quorum", "standard");
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let roles = [role_of(creator), role_of(first), role_of(second)];
-        let converged = roles[0].contains("Leader { epoch: 1 }")
-            && roles[1..].iter().all(|r| {
-                r.contains("Follower {") && r.contains(&new_leader) && r.contains("epoch: 1")
+    let leader_index = loop {
+        let roles = [role_of(nodes[0]), role_of(nodes[1]), role_of(nodes[2])];
+        let leaders: Vec<usize> = (0..3)
+            .filter(|i| roles[*i].contains("Leader { epoch: 1 }"))
+            .collect();
+        if let [leader] = leaders[..] {
+            let leader_id = nodes[leader].node_id.clone();
+            let followers_agree = (0..3).filter(|i| *i != leader).all(|i| {
+                roles[i].contains("Follower {")
+                    && roles[i].contains(&leader_id)
+                    && roles[i].contains("epoch: 1")
             });
-        if converged {
-            break;
+            if followers_agree {
+                break leader;
+            }
         }
         assert!(
             Instant::now() < deadline,
             "the re-created topic's epoch-1 placement did not converge: {roles:?}"
         );
         std::thread::sleep(Duration::from_millis(150));
-    }
-    wait_live_isr(creator, &replicas, Duration::from_secs(20));
+    };
+    eprintln!(
+        "the re-created topic was created on {} and is led by {}",
+        nodes[creator_index].name, nodes[leader_index].name
+    );
+    wait_live_isr(nodes[leader_index], &replicas, Duration::from_secs(20));
+    // The creator's own producer writes first: when it is not the leader the
+    // write is forwarded, over a topic row and a placement the leader may
+    // have received only just now.
+    let (creator_base, creator_accepted, _) =
+        publish_batch(nodes[creator_index], Duration::from_secs(20))
+            .expect("publish from the creator of the new incarnation");
+    assert_eq!(creator_base, 0, "the new incarnation's log starts empty");
+    let [node_a, node_b, node_c] = nodes;
+    let (leader, [first, second]): (&mut ChildNode, [&mut ChildNode; 2]) = match leader_index {
+        0 => (node_a, [node_b, node_c]),
+        1 => (node_b, [node_a, node_c]),
+        _ => (node_c, [node_a, node_b]),
+    };
     let (base, accepted, _) =
-        publish_batch(creator, Duration::from_secs(10)).expect("publish to the new incarnation");
-    assert_eq!(base, 0, "the new incarnation's log starts empty");
-    let total = u64::from(accepted);
+        publish_batch(leader, Duration::from_secs(10)).expect("publish to the new incarnation");
+    assert_eq!(
+        base,
+        u64::from(creator_accepted),
+        "the leader's batch follows the creator's"
+    );
+    let total = u64::from(creator_accepted) + u64::from(accepted);
     let deadline = Instant::now() + Duration::from_secs(20);
     for node in [&mut *first, &mut *second] {
         while partition_stats(node).1 < total {
@@ -1197,13 +1228,13 @@ fn recreate_after_delete(recreator: Recreator) {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let (hash_creator, count_creator) = hash_log(creator, total);
-    assert_eq!(count_creator, total);
+    let (hash_leader, count_leader) = hash_log(leader, total);
+    assert_eq!(count_leader, total);
     for node in [first, second] {
         let (hash, count) = hash_log(node, total);
         assert_eq!(
             (hash, count),
-            (hash_creator.clone(), count_creator),
+            (hash_leader.clone(), count_leader),
             "{} log differs",
             node.name
         );
@@ -1214,10 +1245,10 @@ fn recreate_after_delete(recreator: Recreator) {
             node.name
         );
     }
-    let (_, _, creator_leo) = partition_stats(creator);
+    let (_, _, leader_leo) = partition_stats(leader);
     assert_eq!(
-        creator_leo, total,
-        "the creator kept records of the deleted incarnation"
+        leader_leo, total,
+        "the leader kept records of the deleted incarnation"
     );
 }
 
