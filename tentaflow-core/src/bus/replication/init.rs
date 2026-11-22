@@ -285,6 +285,7 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         instance_id,
         cfg.local_node_id.clone(),
     );
+    spawn_leader_spread_loop(Arc::clone(&manager), Arc::downgrade(&svc));
 
     #[cfg(test)]
     fire_pre_wiring_hook(&cfg.instance_id);
@@ -506,6 +507,89 @@ fn spawn_peer_liveness_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMesh
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
+            }
+        }
+    });
+}
+
+/// How long after start the node first looks at whether the one-off spread of
+/// existing topics is due: the replication streams and the peers' features
+/// need a moment to be known.
+const LEADER_SPREAD_FIRST_LOOK: Duration = Duration::from_secs(60);
+
+/// How often it looks again until the spread has been made (or another node
+/// makes it).
+const LEADER_SPREAD_LOOK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often a node that has nothing to do about the spread looks again: a
+/// single-node install, a node that is not the one that runs it. Cheap, and
+/// rarely changes.
+const LEADER_SPREAD_IDLE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// The pause after a run that left something that may work next time:
+/// doubled from one minute, capped at half an hour.
+const LEADER_SPREAD_RETRY_START: Duration = Duration::from_secs(60);
+const LEADER_SPREAD_RETRY_CAP: Duration = Duration::from_secs(1800);
+
+/// How long to wait after `status`; `None` once the spread is done. `retries`
+/// counts the runs that asked to be repeated so far.
+fn leader_spread_pause(
+    status: &crate::bus::leader_balance::SpreadStatus,
+    retries: u32,
+) -> Option<Duration> {
+    use crate::bus::leader_balance::SpreadStatus;
+    match status {
+        SpreadStatus::Done => None,
+        SpreadStatus::NotTheRunner | SpreadStatus::NotYet("single_node" | "no_replication") => {
+            Some(LEADER_SPREAD_IDLE_INTERVAL)
+        }
+        SpreadStatus::NotYet(_) => Some(LEADER_SPREAD_LOOK_INTERVAL),
+        SpreadStatus::Retry => Some(
+            LEADER_SPREAD_RETRY_START
+                .saturating_mul(1u32 << retries.saturating_sub(1).min(16))
+                .min(LEADER_SPREAD_RETRY_CAP),
+        ),
+    }
+}
+
+/// TB-04 P4: the spread of existing topics after an upgrade
+/// (`BusService::run_post_upgrade_spread`). It is due once every node of the
+/// instance advertises the features moving leaders needs, and runs on the
+/// node with the lowest id; this loop only asks, until the answer is that it
+/// has been done. Ends with the manager, or with the engine.
+fn spawn_leader_spread_loop(manager: Arc<ReplicationManager>, svc: Weak<crate::bus::BusService>) {
+    let shutdown = manager.shutdown_token();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(LEADER_SPREAD_FIRST_LOOK) => {}
+        }
+        let mut retries = 0u32;
+        loop {
+            let Some(engine) = svc.upgrade() else {
+                return;
+            };
+            // Planning and moving block on the ledger and on other nodes.
+            let status =
+                tokio::task::spawn_blocking(move || engine.run_post_upgrade_spread()).await;
+            let pause = match status {
+                Ok(status) => {
+                    if matches!(status, crate::bus::leader_balance::SpreadStatus::Retry) {
+                        retries += 1;
+                    }
+                    match leader_spread_pause(&status, retries) {
+                        Some(pause) => pause,
+                        None => return,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "leader spread: the look failed");
+                    LEADER_SPREAD_LOOK_INTERVAL
+                }
+            };
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(pause) => {}
             }
         }
     });
@@ -854,6 +938,28 @@ mod tests {
         assert!(
             !router::is_registered_for_test(&id),
             "an aborted init must unregister its half-built manager from the router"
+        );
+    }
+
+    /// A run that left something to try again backs off 1, 2, 4 ... minutes up
+    /// to half an hour; a node with nothing to do about the spread looks
+    /// rarely, and one that is done looks no more.
+    #[test]
+    fn the_spread_loop_backs_off_and_idles_where_there_is_nothing_to_do() {
+        use crate::bus::leader_balance::SpreadStatus;
+        let minutes = |status: SpreadStatus, retries: u32| {
+            leader_spread_pause(&status, retries).map(|d| d.as_secs() / 60)
+        };
+        let steps: Vec<_> = (1..=8)
+            .map(|n| minutes(SpreadStatus::Retry, n).unwrap())
+            .collect();
+        assert_eq!(steps, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(minutes(SpreadStatus::Done, 3), None);
+        assert_eq!(minutes(SpreadStatus::NotTheRunner, 0), Some(10));
+        assert_eq!(minutes(SpreadStatus::NotYet("single_node"), 0), Some(10));
+        assert_eq!(
+            leader_spread_pause(&SpreadStatus::NotYet("a_node_lacks_the_feature"), 0),
+            Some(LEADER_SPREAD_LOOK_INTERVAL)
         );
     }
 }

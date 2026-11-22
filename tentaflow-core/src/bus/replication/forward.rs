@@ -106,6 +106,14 @@ pub enum ForwardUnavailable {
 pub trait ForwardedPublishHandler: Send + Sync {
     fn publish_forwarded(&self, from: &str, request: ProduceForward) -> ProduceForwardReply;
     fn consume_forwarded(&self, from: &str, request: ConsumeForward) -> ConsumeForwardReply;
+    /// Why leadership of `topic` must not be moved now, as a stable machine
+    /// value (`consumer_group_paused`); `None` when it may. Asked of the
+    /// leader before it runs a transfer, whoever asked for it: only the node
+    /// that leads a topic knows its paused groups. Defaulted to `None`.
+    fn transfer_blocker(&self, org_id: &str, topic: &str) -> Option<String> {
+        let _ = (org_id, topic);
+        None
+    }
 }
 
 /// How a publish reached this node, as far as routing and trust go.
@@ -655,6 +663,10 @@ impl ForwardedPublishHandler for BusService {
 
     fn consume_forwarded(&self, from: &str, request: ConsumeForward) -> ConsumeForwardReply {
         self.run_forwarded_consume(from, request)
+    }
+
+    fn transfer_blocker(&self, org_id: &str, topic: &str) -> Option<String> {
+        self.leader_move_blocker(org_id, topic)
     }
 }
 

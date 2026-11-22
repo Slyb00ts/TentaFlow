@@ -45,7 +45,7 @@
 // when `LeaderHandleFactory::spawn` is called with the now-current
 // assignment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -63,8 +63,9 @@ use crate::bus::replication::election::{
 };
 use crate::bus::replication::forward::{self, ForwardUnavailable, ForwardedPublishHandler};
 use crate::bus::replication::frames::{
-    self, ConsumeForward, ConsumeForwardReply, ProduceForward, ProduceForwardReply, ReplFrame,
-    ReplHello, ReplHelloAck, ReplLeoQuery, ReplLeoReply, ReplReject,
+    self, ConsumeForward, ConsumeForwardReply, ForwardError, ProduceForward, ProduceForwardReply,
+    ReplFrame, ReplHello, ReplHelloAck, ReplLeoQuery, ReplLeoReply, ReplReject, TransferForward,
+    TransferForwardReply,
 };
 use crate::bus::topics::Acks;
 use crate::bus::{
@@ -122,6 +123,47 @@ pub type BusSend = Box<dyn AsyncWrite + Unpin + Send>;
 /// action, not the hot path) so a merely-slow outbox drain still succeeds
 /// within one call.
 const TRANSFER_MAJORITY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// How long a transfer holds new writes to its partition while the target
+/// catches up, and so the most it waits for the target; beyond it the
+/// transfer is refused with `ReplError::TransferTargetBehind` and the writes
+/// resume. A write held at `preflight` waits at most this long as well, and
+/// is then refused as retryable (`NotLeader` naming no leader): it never goes
+/// through while the transfer is under way.
+const TRANSFER_CATCH_UP_MAX: Duration = Duration::from_millis(2_000);
+
+/// How often the catch-up wait looks at the target's acknowledged offset.
+const TRANSFER_CATCH_UP_POLL: Duration = Duration::from_millis(5);
+
+/// What `check_transfer` takes for a target that can still catch up within
+/// `TRANSFER_CATCH_UP_MAX`: bytes sent to it and not yet acknowledged
+/// (`ReplicaProgress::in_flight_bytes`). The leader cannot predict a link's
+/// speed; this is a rate any replication link of a cluster sustains with
+/// room to spare (about 2 MiB/s over the window).
+const TRANSFER_PRECHECK_MAX_IN_FLIGHT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most records the target may be behind the leader's log end for
+/// `check_transfer` to take it for a target that can catch up. Together with
+/// `TRANSFER_PRECHECK_MAX_IN_FLIGHT_BYTES` this is only a hint: the leader
+/// knows neither the size of the records not yet sent nor the speed of the
+/// link, so the real answer is the catch-up itself.
+const TRANSFER_PRECHECK_MAX_RECORD_GAP: u64 = 50_000;
+
+/// How long, after a transfer's row was not admitted in time, the leader
+/// keeps reading the row for its fate before it reports the outcome as not
+/// known.
+const TRANSFER_RESOLVE_MAX: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_millis(5_000)
+};
+
+/// How long a forwarded transfer may take in all, as seen by its sender: the
+/// catch-up hold, the wait for the row to reach a majority, and the round trip.
+const TRANSFER_FORWARD_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// A dry-run transfer check is quick; its sender waits this long.
+const TRANSFER_CHECK_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long `accept_stream` holds a `ReplHello` for a partition this node's
 /// registry does not know yet, waiting for the ledger-materialized
@@ -255,10 +297,26 @@ pub trait AssignmentStore: Send + Sync {
         &self,
         instance_id: &str,
     ) -> Result<std::collections::HashMap<String, u32>, ReplError>;
+    /// Every assignment of the instance, in a stable order: what the
+    /// planning of leaders reads. Defaulted to none for the stores of tests
+    /// that never plan.
+    fn list_for_instance(&self, instance_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+        let _ = instance_id;
+        Ok(Vec::new())
+    }
     /// Submits `assignment` as a new ledger operation, returning its id for
     /// `LedgerAdmission::admitted_by` polling. Needs no separate instance
     /// parameter — `assignment.instance_id` already carries it.
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError>;
+}
+
+/// What a leader knows of one replica's replication progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaProgress {
+    /// The replica's log end offset as of its last acknowledgement.
+    pub leo: u64,
+    /// Bytes sent to it and not yet acknowledged.
+    pub in_flight_bytes: u64,
 }
 
 /// This node's leader-role state for one partition (RL's `leader.rs`,
@@ -318,6 +376,25 @@ pub trait LeaderHandle: Send + Sync {
         let _ = node_id;
         None
     }
+    /// How far the replica `node_id`, fed by this leader, has acknowledged;
+    /// `None` when this leader has no stream to it, and the default for a
+    /// handle that does not track it. What a leadership transfer judges the
+    /// target's catch-up by.
+    fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
+        let _ = node_id;
+        None
+    }
+    /// Stops this leader's own writes at the partition, for a transfer: when
+    /// this returns, every append that was in progress has either landed
+    /// (and is in `log_end_offset`) or been refused, and none lands after.
+    /// `true` when it closed them (and `reopen_writes_after_transfer` may
+    /// open them again), `false` for a handle with nothing to close.
+    fn close_writes_for_transfer(&self) -> bool {
+        false
+    }
+    /// Opens the writes `close_writes_for_transfer` closed, for a transfer
+    /// that was definitely not admitted.
+    fn reopen_writes_after_transfer(&self) {}
     /// Whether a majority of the replica set (this leader counted) has
     /// acknowledged recently enough for this leader to still be the live
     /// one. What `answer_leo_query` reports as `leading`: a leader that
@@ -814,6 +891,94 @@ pub struct ReplicationManager {
     /// The synchronous twin of `assignments_changed`, for the blocking
     /// callers of `wait_for_assignment_change`.
     assignment_changes: AssignmentChanges,
+    /// Partitions whose writes a leadership transfer holds while the target
+    /// catches up (`transfer_leader_here`); `preflight` waits on it.
+    transfer_holds: TransferHolds,
+    /// This manager as an `Arc`, for the blocking work an inbound request
+    /// spawns (`accept_transfer_forward`).
+    me: Weak<ReplicationManager>,
+}
+
+/// The partitions a leadership transfer currently holds writes for. The hold
+/// is what makes a write wait in `preflight`; the guarantee that none lands
+/// is the closing of the writes at the leader handle, which a write already
+/// past `preflight` meets too.
+struct TransferHolds {
+    held: parking_lot::Mutex<HashSet<PartitionKey>>,
+    released: parking_lot::Condvar,
+    /// `held.len()`, readable without the lock: every write passes through
+    /// `wait_released`, and no transfer is under way almost always.
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl TransferHolds {
+    fn new() -> Self {
+        Self {
+            held: parking_lot::Mutex::new(HashSet::new()),
+            released: parking_lot::Condvar::new(),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Holds writes to `key` until the guard drops.
+    fn hold(&self, key: &PartitionKey) -> TransferHold<'_> {
+        let mut held = self.held.lock();
+        if held.insert(key.clone()) {
+            self.active.store(held.len(), Ordering::Release);
+        }
+        TransferHold {
+            holds: self,
+            key: key.clone(),
+        }
+    }
+
+    /// Waits until `key` is not held, at most `max`; `false` when it still is.
+    fn wait_released(&self, key: &PartitionKey, max: Duration) -> bool {
+        if self.active.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        let mut held = self.held.lock();
+        if !held.contains(key) {
+            return true;
+        }
+        let deadline = Instant::now() + max;
+        while held.contains(key) {
+            if self.released.wait_until(&mut held, deadline).timed_out() {
+                return !held.contains(key);
+            }
+        }
+        true
+    }
+}
+
+struct TransferHold<'a> {
+    holds: &'a TransferHolds,
+    key: PartitionKey,
+}
+
+impl Drop for TransferHold<'_> {
+    fn drop(&mut self) {
+        let mut held = self.holds.held.lock();
+        held.remove(&self.key);
+        self.holds.active.store(held.len(), Ordering::Release);
+        drop(held);
+        self.holds.released.notify_all();
+    }
+}
+
+/// Opens the writes a transfer closed unless it is told the move may have
+/// been admitted.
+struct ReopenWritesUnlessProposed<'a> {
+    handle: &'a Arc<dyn LeaderHandle>,
+    armed: bool,
+}
+
+impl Drop for ReopenWritesUnlessProposed<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.reopen_writes_after_transfer();
+        }
+    }
 }
 
 /// What the mesh and the replication streams have told this node about one
@@ -915,7 +1080,7 @@ fn reject_ack(environment: NodeEnvironment, reject: ReplReject) -> ReplHelloAck 
 
 impl ReplicationManager {
     pub fn new(config: ReplicationManagerConfig) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             instance_id: config.instance_id,
             local_node_id: config.local_node_id,
             local_env: config.local_env,
@@ -939,6 +1104,8 @@ impl ReplicationManager {
             peer_features: Arc::new(DashMap::new()),
             probe_misses: DashMap::new(),
             assignment_changes: AssignmentChanges::new(),
+            transfer_holds: TransferHolds::new(),
+            me: me.clone(),
         })
     }
 
@@ -1045,6 +1212,10 @@ impl ReplicationManager {
             }
             Ok(ReplFrame::ConsumeForward(request)) => {
                 self.accept_consume_forward(&remote_hex, request, send)
+                    .await;
+            }
+            Ok(ReplFrame::TransferForward(request)) => {
+                self.accept_transfer_forward(&remote_hex, request, send)
                     .await;
             }
             _ => return,
@@ -3657,6 +3828,25 @@ impl ReplicationCoordinator for ReplicationManager {
         acks: Acks,
     ) -> Result<u32, ReplError> {
         let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
+        // Before the registry guard: a write held for a transfer waits here
+        // and then sees the role the transfer left behind (not the leader,
+        // so the caller forwards it) or, after a refused transfer, the same
+        // leader as before. One that was already past this point when the
+        // transfer began is stopped by the closed writes of the handle.
+        if !self
+            .transfer_holds
+            .wait_released(&key, TRANSFER_CATCH_UP_MAX)
+        {
+            // The transfer outlasted the wait. The write is not let through
+            // to a leader that is about to hand the partition over: it is
+            // refused as a `NotLeader` that names no leader, which the
+            // producer (or the forwarding path) asks again.
+            return Err(ReplError::NotPartitionLeader {
+                topic: topic.to_string(),
+                partition,
+                leader: String::new(),
+            });
+        }
         let entry = self
             .registry
             .get(&key)
@@ -3860,60 +4050,29 @@ impl ReplicationCoordinator for ReplicationManager {
         partition: u32,
         target: &str,
     ) -> Result<u32, ReplError> {
-        let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
-        let _serial = self.reconfiguring.lock();
-        let assignment = self
-            .current_row(&key)
-            .ok_or_else(|| ReplError::NoAssignment {
-                topic: topic.to_string(),
-                partition,
-            })?;
-        if !assignment.isr.iter().any(|n| n == target) {
-            return Err(ReplError::NotAReplica {
-                topic: topic.to_string(),
-                partition,
-                node_id: target.to_string(),
-            });
-        }
-        let mut proposed = assignment.clone();
-        proposed.leader_node_id = target.to_string();
-        proposed.epoch_slots = assignment.resolved_epoch_slots();
-        proposed.leader_epoch = self.next_term(&key, &proposed, target)?;
-        proposed.updated_at_ms = now_ms();
-        let op_id = self.assignments.propose(proposed.clone())?;
+        self.transfer_on_leader(org, topic, partition, target, false, &[])
+    }
 
-        let start = Instant::now();
-        loop {
-            let acked = self.ledger.admitted_by(op_id);
-            if election::admitted_by_quorum(&acked, &proposed.replicas, &self.local_node_id) {
-                if let Some(mut entry) = self.registry.get_mut(&key) {
-                    if entry.role == LocalRole::Leader {
-                        if let Some(leader) = entry.leader.take() {
-                            leader.stop();
-                        }
-                        // Corrected to `Follower`/`NotReplica` by the next
-                        // `apply_assignment` once the op materializes back.
-                        entry.role = LocalRole::NotReplica;
-                        entry.leadership = self.next_leadership();
-                    }
-                }
-                self.audit.transfer(
-                    org,
-                    topic,
-                    partition,
-                    &assignment.leader_node_id,
-                    target,
-                    proposed.leader_epoch,
-                );
-                return Ok(proposed.leader_epoch);
-            }
-            if start.elapsed() >= TRANSFER_MAJORITY_TIMEOUT {
-                return Err(ReplError::Internal(format!(
-                    "transfer_leader: majority not reached for {org}/{topic}/{partition}"
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    fn transfer_leader_restoring(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        replicas: &[String],
+    ) -> Result<u32, ReplError> {
+        self.transfer_on_leader(org, topic, partition, target, false, replicas)
+    }
+
+    fn check_transfer(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+    ) -> Result<(), ReplError> {
+        self.transfer_on_leader(org, topic, partition, target, true, &[])
+            .map(|_| ())
     }
 
     fn reassign(
@@ -4172,6 +4331,10 @@ impl ReplicationCoordinator for ReplicationManager {
             .collect()
     }
 
+    fn instance_assignments(&self) -> Result<Vec<PartitionAssignment>, ReplError> {
+        self.assignments.list_for_instance(&self.instance_id)
+    }
+
     fn leader_counts(&self) -> std::collections::HashMap<String, u32> {
         match self.assignments.preferred_leader_counts(&self.instance_id) {
             Ok(counts) => counts,
@@ -4181,6 +4344,586 @@ impl ReplicationCoordinator for ReplicationManager {
             }
         }
     }
+}
+
+impl ReplicationManager {
+    /// Runs the transfer (or, `dry_run`, only its checks) of `(org, topic,
+    /// partition)` to `target` on the node that leads the partition: here
+    /// when this node does, otherwise by handing it to the leader
+    /// (`TransferForward`), which alone knows its live ISR and how far the
+    /// target is behind. `restore` is the replica order to leave behind (a
+    /// rollback); empty for the rule.
+    fn transfer_on_leader(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        dry_run: bool,
+        restore: &[String],
+    ) -> Result<u32, ReplError> {
+        let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
+        let row = self
+            .current_row(&key)
+            .ok_or_else(|| ReplError::NoAssignment {
+                topic: topic.to_string(),
+                partition,
+            })?;
+        if row.leader_node_id == self.local_node_id {
+            return self.transfer_leader_here(&key, target, dry_run, restore);
+        }
+        let leader = row.leader_node_id;
+        let request = TransferForward {
+            instance_id: self.instance_id.clone(),
+            environment: self.local_env,
+            org_id: org.to_string(),
+            topic: topic.to_string(),
+            partition,
+            target_node_id: target.to_string(),
+            dry_run,
+            replicas: restore.to_vec(),
+        };
+        let timeout = if dry_run {
+            TRANSFER_CHECK_TIMEOUT
+        } else {
+            TRANSFER_FORWARD_TIMEOUT
+        };
+        let reachable = || self.peer_reachable(&leader);
+        let reply = self
+            .forward_request(
+                &leader,
+                frames::BUS_FEATURE_TRANSFER_FORWARD,
+                ReplFrame::TransferForward(request),
+                timeout,
+                &reachable,
+                |frame| match frame {
+                    ReplFrame::TransferForwardReply(reply) => Ok(reply),
+                    other => Err(crate::bus::replication::leader::frame_kind_name(&other)),
+                },
+            )
+            .map_err(|e| match e {
+                // The request left and no answer came: the leader may have
+                // moved the partition. A dry run changes nothing, so it is
+                // simply a failed check.
+                ForwardUnavailable::OutcomeUnknown { node, reason } if !dry_run => {
+                    tracing::warn!(
+                        %node, %reason, topic, partition,
+                        "replication: no answer to a forwarded transfer"
+                    );
+                    ReplError::TransferOutcomeUnknown {
+                        topic: topic.to_string(),
+                        partition,
+                    }
+                }
+                ForwardUnavailable::PeerCannotForward { .. } => ReplError::NodeWithoutForwarding {
+                    node_id: leader.clone(),
+                },
+                other => ReplError::Internal(format!(
+                    "the leader of '{topic}'/{partition} cannot be asked to move it: {other}"
+                )),
+            })?;
+        match (reply.leader_epoch, reply.error) {
+            (Some(epoch), None) => Ok(epoch),
+            (_, Some(error)) => Err(repl_error_from_wire(error)),
+            (None, None) => Err(ReplError::Internal(
+                "the leader's reply to a transfer carries neither an epoch nor an error"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The transfer as the leader runs it. `dry_run` answers what it would
+    /// refuse on and changes nothing.
+    ///
+    /// The target must replicate the partition, be in the LIVE ISR and have
+    /// acknowledged this leader's whole log. A real run first holds the
+    /// writes of the partition: new ones wait in `preflight`, and the leader
+    /// handle closes its writes at the partition, which returns once every
+    /// append already in progress has landed or been refused. Only then is
+    /// the log end fixed, and the target is waited for (at most
+    /// `TRANSFER_CATCH_UP_MAX`) until it has that whole log: without that a
+    /// target that is behind takes over a log missing records the leader
+    /// acknowledged (`acks=leader`), and the old leader cuts its own tail to
+    /// match (`election::LogPosition::kept_end`). A target that does not catch
+    /// up is refused with `TransferTargetBehind` and the writes are opened
+    /// again, as they are for any failure before the row is proposed.
+    ///
+    /// From the proposal on the writes stay closed. If the row is admitted
+    /// the leader steps down. If admission does not complete in time the row
+    /// is read again for its fate; one that is still not known leaves this
+    /// leader stepped down as well (the assignment poll puts it back as the
+    /// ledger says) and the answer is `TransferOutcomeUnknown`: nothing may
+    /// be written here while the partition may already be led elsewhere.
+    ///
+    /// A move to a node other than the preferred one (`replicas[0]`) makes
+    /// the target the preferred node, so that the return of the preferred
+    /// leader (K6) does not undo it; a return to it changes nothing.
+    /// `restore` (a rollback) names the replica order to leave behind.
+    fn transfer_leader_here(
+        &self,
+        key: &PartitionKey,
+        target: &str,
+        dry_run: bool,
+        restore: &[String],
+    ) -> Result<u32, ReplError> {
+        let (org, topic, partition) = (key.0.as_str(), key.1.as_str(), key.2);
+        let blocker = self
+            .forward_handler
+            .read()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|handler| handler.transfer_blocker(org, topic));
+        if let Some(reason) = blocker {
+            return Err(ReplError::TransferBlocked {
+                topic: topic.to_string(),
+                reason,
+            });
+        }
+        // A dry run changes nothing, so it does not queue behind a
+        // reconfiguration that is waiting for the ledger.
+        let _serial = (!dry_run).then(|| self.reconfiguring.lock());
+        let assignment = self
+            .current_row(key)
+            .ok_or_else(|| ReplError::NoAssignment {
+                topic: topic.to_string(),
+                partition,
+            })?;
+        if assignment.leader_node_id != self.local_node_id {
+            return Err(ReplError::NotPartitionLeader {
+                topic: topic.to_string(),
+                partition,
+                leader: assignment.leader_node_id,
+            });
+        }
+        let handle = self
+            .registry
+            .get(key)
+            .filter(|entry| entry.role == LocalRole::Leader)
+            .and_then(|entry| entry.leader.clone())
+            .ok_or_else(|| ReplError::NoAssignment {
+                topic: topic.to_string(),
+                partition,
+            })?;
+        let not_a_replica = || ReplError::NotAReplica {
+            topic: topic.to_string(),
+            partition,
+            node_id: target.to_string(),
+        };
+        if target == self.local_node_id {
+            return Ok(assignment.leader_epoch);
+        }
+        if !assignment.replicas.iter().any(|n| n == target)
+            || !handle.isr().iter().any(|n| n == target)
+        {
+            return Err(not_a_replica());
+        }
+        let behind = || ReplError::TransferTargetBehind {
+            topic: topic.to_string(),
+            partition,
+            node_id: target.to_string(),
+        };
+        let caught_up = || {
+            handle
+                .replica_progress(target)
+                .is_some_and(|p| p.leo >= handle.log_end_offset())
+        };
+        if dry_run {
+            // A hint: the leader cannot know how many bytes the records it
+            // has not sent yet come to, nor how fast the link is.
+            let can_catch_up = handle.replica_progress(target).is_some_and(|p| {
+                let record_gap = handle.log_end_offset().saturating_sub(p.leo);
+                record_gap == 0
+                    || (p.in_flight_bytes <= TRANSFER_PRECHECK_MAX_IN_FLIGHT_BYTES
+                        && record_gap <= TRANSFER_PRECHECK_MAX_RECORD_GAP)
+            });
+            return if can_catch_up {
+                Ok(assignment.leader_epoch)
+            } else {
+                Err(behind())
+            };
+        }
+
+        let _hold = self.transfer_holds.hold(key);
+        let closed = handle.close_writes_for_transfer();
+        let mut reopen = ReopenWritesUnlessProposed {
+            handle: &handle,
+            armed: closed,
+        };
+        // The writes are closed, so the log end read from here on is final.
+        let catch_up_until = Instant::now() + TRANSFER_CATCH_UP_MAX;
+        while !caught_up() {
+            if !handle.isr().iter().any(|n| n == target) || Instant::now() >= catch_up_until {
+                return Err(behind());
+            }
+            std::thread::sleep(TRANSFER_CATCH_UP_POLL);
+        }
+
+        let mut proposed = assignment.clone();
+        proposed.leader_node_id = target.to_string();
+        proposed.epoch_slots = assignment.resolved_epoch_slots();
+        let same_nodes = |a: &[String], b: &[String]| {
+            let mut a = a.to_vec();
+            let mut b = b.to_vec();
+            a.sort();
+            b.sort();
+            a == b
+        };
+        if !restore.is_empty() && same_nodes(restore, &assignment.replicas) {
+            proposed.replicas = restore.to_vec();
+        } else if assignment.replicas.first().map(String::as_str) != Some(target) {
+            proposed.replicas.retain(|n| n != target);
+            proposed.replicas.insert(0, target.to_string());
+        }
+        proposed.leader_epoch = self.next_term(key, &proposed, target)?;
+        proposed.updated_at_ms = now_ms();
+        let op_id = self.assignments.propose(proposed.clone())?;
+        // Proposed: it may be admitted from here on, so the writes stay closed.
+        reopen.armed = false;
+
+        let start = Instant::now();
+        let admitted = loop {
+            let acked = self.ledger.admitted_by(op_id);
+            if election::admitted_by_quorum(&acked, &proposed.replicas, &self.local_node_id) {
+                break true;
+            }
+            if start.elapsed() >= TRANSFER_MAJORITY_TIMEOUT {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let fate_known = admitted || self.row_shows_move(key, target, proposed.leader_epoch);
+        // Either way this leader stops leading: it was admitted, or it may
+        // have been and nothing may land here until the ledger says.
+        //
+        // Admitted: the move's row reaches this node through the assignment
+        // poll, which makes it a follower of the target. Not known: the row
+        // may yet be admitted (then the same poll applies it), or never be,
+        // and then nothing new reaches the poll (it applies a row only when
+        // it changes) while the other replicas keep taking this node, still
+        // the leader of the old row, for the winner of the next election. So
+        // it steps down the way a leader that lost its quorum lease does:
+        // abdicates the old epoch, becomes a follower with no leader, and
+        // stands in the normal election on the next lease tick (a new term,
+        // from the replica that holds the most, never the old epoch again).
+        if let Some(mut entry) = self.registry.get_mut(key) {
+            if entry.role == LocalRole::Leader {
+                if let Some(leader) = entry.leader.take() {
+                    leader.stop();
+                }
+                entry.leadership = self.next_leadership();
+                if fate_known {
+                    entry.role = LocalRole::NotReplica;
+                } else {
+                    entry.abdicated_epoch = Some(entry.assignment.leader_epoch);
+                    entry.quorum_lost_since = None;
+                    entry.role = LocalRole::Follower;
+                    entry.follower = None;
+                    entry.unfollowed_since = Instant::now()
+                        .checked_sub(self.follower_factory.undialed_lease())
+                        .unwrap_or_else(Instant::now);
+                    entry.promotion = PromotionState::Idle;
+                }
+            }
+        }
+        if !fate_known {
+            self.notify_assignments_changed();
+            return Err(ReplError::TransferOutcomeUnknown {
+                topic: topic.to_string(),
+                partition,
+            });
+        }
+        self.audit.transfer(
+            org,
+            topic,
+            partition,
+            &assignment.leader_node_id,
+            target,
+            proposed.leader_epoch,
+        );
+        Ok(proposed.leader_epoch)
+    }
+
+    /// Whether the row, read again, shows `target` leading at `epoch` or
+    /// later: the proposal was admitted although its acknowledgements were
+    /// not seen in time. Looks for at most `TRANSFER_RESOLVE_MAX`.
+    fn row_shows_move(&self, key: &PartitionKey, target: &str, epoch: u32) -> bool {
+        let until = Instant::now() + TRANSFER_RESOLVE_MAX;
+        loop {
+            if self
+                .current_row(key)
+                .is_some_and(|row| row.leader_node_id == target && row.leader_epoch >= epoch)
+            {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Answers one inbound `TransferForward`: another node asking this one,
+    /// the leader of the partition, to hand it over. Refused unless the
+    /// request names this instance and environment and its sender replicates
+    /// the partition (a node outside the set has nothing to ask of it). The
+    /// transfer waits for the target and for the ledger, so it runs on a
+    /// blocking thread. One request, one reply, then the stream is finished.
+    ///
+    /// `pub(crate)`: `replication::router` calls it for a `TransferForward`
+    /// it has already matched to this manager's instance.
+    pub(crate) async fn accept_transfer_forward(
+        &self,
+        remote_node_id: &str,
+        request: TransferForward,
+        mut send: BusSend,
+    ) {
+        let reply = self.answer_transfer_forward(remote_node_id, request).await;
+        if let Err(e) =
+            frames::write_frame(&mut send, &ReplFrame::TransferForwardReply(reply)).await
+        {
+            tracing::warn!(
+                forwarded_from = %remote_node_id, error = %e,
+                "replication: the reply to a forwarded transfer could not be written"
+            );
+        }
+        let _ = send.shutdown().await;
+    }
+
+    async fn answer_transfer_forward(
+        &self,
+        remote_node_id: &str,
+        request: TransferForward,
+    ) -> TransferForwardReply {
+        let refuse = |reason: &str| TransferForwardReply {
+            leader_epoch: None,
+            error: Some(ForwardError {
+                code: forward::CODE_FORWARD_REFUSED.to_string(),
+                message: format!("forward refused: {reason}"),
+                texts: vec![reason.to_string()],
+                ..ForwardError::default()
+            }),
+        };
+        if request.instance_id != self.instance_id || self.shutdown.is_cancelled() {
+            return refuse("unknown_instance");
+        }
+        if request.environment != self.local_env {
+            tracing::warn!(
+                forwarded_from = %remote_node_id,
+                theirs = ?request.environment, ours = ?self.local_env,
+                "replication: refused a forwarded transfer from another environment"
+            );
+            return refuse("environment_mismatch");
+        }
+        // Any member of this instance and environment may ask, as with a
+        // forwarded publish: the node that took the request from the admin
+        // has authorized it already, and the leader's own checks (live ISR,
+        // catch-up, paused groups) decide whether the move can be made.
+        let key: PartitionKey = (request.org_id, request.topic, request.partition);
+        let Some(me) = self.me.upgrade() else {
+            return refuse("unknown_instance");
+        };
+        let (target, dry_run, restore) =
+            (request.target_node_id, request.dry_run, request.replicas);
+        // This node's own row decides who leads: a transfer is never handed
+        // on, so one that arrives after the leadership moved is refused
+        // (`NotPartitionLeader`) and its sender asks again.
+        let outcome = tokio::task::spawn_blocking(move || {
+            me.transfer_leader_here(&key, &target, dry_run, &restore)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(epoch)) => TransferForwardReply {
+                leader_epoch: Some(epoch),
+                error: None,
+            },
+            Ok(Err(e)) => TransferForwardReply {
+                leader_epoch: None,
+                error: Some(repl_error_to_wire(&e)),
+            },
+            Err(e) => {
+                tracing::error!(
+                    forwarded_from = %remote_node_id, error = %e,
+                    "replication: the forwarded transfer failed"
+                );
+                refuse("handler_failed")
+            }
+        }
+    }
+}
+
+const CODE_PARTITION_UNAVAILABLE: &str = "bus.partition_unavailable";
+const CODE_NOT_ENOUGH_REPLICAS: &str = "bus.not_enough_replicas";
+const CODE_NOT_A_REPLICA: &str = "bus.not_a_replica";
+const CODE_EPOCH_FENCED: &str = "bus.epoch_fenced";
+const CODE_NOT_LEADER: &str = "bus.not_leader";
+const CODE_TRANSFER_TARGET_BEHIND: &str = "bus.transfer_target_behind";
+const CODE_TRANSFER_BLOCKED: &str = "bus.transfer_blocked";
+const CODE_TRANSFER_OUTCOME_UNKNOWN: &str = "bus.transfer_outcome_unknown";
+const CODE_TRANSFER_REFUSED: &str = "bus.transfer_refused";
+const CODE_NODE_WITHOUT_FORWARDING: &str = "bus.node_without_forwarding";
+const CODE_REPLICATION_INTERNAL: &str = "bus.replication_internal_error";
+
+/// A `ReplError` as it crosses the wire in a `TransferForwardReply`: the
+/// stable code, with the variant's fields positionally (texts, then numbers)
+/// as `forward::error_to_wire` does for a `BusServiceError`.
+fn repl_error_to_wire(e: &ReplError) -> ForwardError {
+    let (code, texts, numbers): (&str, Vec<String>, Vec<u64>) = match e {
+        ReplError::NoAssignment { topic, partition } => (
+            CODE_PARTITION_UNAVAILABLE,
+            vec![topic.clone()],
+            vec![u64::from(*partition)],
+        ),
+        ReplError::NotEnoughReplicas {
+            topic,
+            partition,
+            isr,
+            required,
+        } => (
+            CODE_NOT_ENOUGH_REPLICAS,
+            vec![topic.clone()],
+            vec![u64::from(*partition), u64::from(*isr), u64::from(*required)],
+        ),
+        ReplError::NotAReplica {
+            topic,
+            partition,
+            node_id,
+        } => (
+            CODE_NOT_A_REPLICA,
+            vec![topic.clone(), node_id.clone()],
+            vec![u64::from(*partition)],
+        ),
+        ReplError::EpochFenced { have, requested } => (
+            CODE_EPOCH_FENCED,
+            Vec::new(),
+            vec![u64::from(*have), u64::from(*requested)],
+        ),
+        ReplError::NotPartitionLeader {
+            topic,
+            partition,
+            leader,
+        } => (
+            CODE_NOT_LEADER,
+            vec![topic.clone(), leader.clone()],
+            vec![u64::from(*partition)],
+        ),
+        ReplError::TransferTargetBehind {
+            topic,
+            partition,
+            node_id,
+        } => (
+            CODE_TRANSFER_TARGET_BEHIND,
+            vec![topic.clone(), node_id.clone()],
+            vec![u64::from(*partition)],
+        ),
+        ReplError::TransferBlocked { topic, reason } => (
+            CODE_TRANSFER_BLOCKED,
+            vec![topic.clone(), reason.clone()],
+            Vec::new(),
+        ),
+        ReplError::TransferOutcomeUnknown { topic, partition } => (
+            CODE_TRANSFER_OUTCOME_UNKNOWN,
+            vec![topic.clone()],
+            vec![u64::from(*partition)],
+        ),
+        ReplError::TransferRefused { reason } => {
+            (CODE_TRANSFER_REFUSED, vec![reason.clone()], Vec::new())
+        }
+        ReplError::NodeWithoutForwarding { node_id } => (
+            CODE_NODE_WITHOUT_FORWARDING,
+            vec![node_id.clone()],
+            Vec::new(),
+        ),
+        ReplError::Internal(message) => {
+            (CODE_REPLICATION_INTERNAL, vec![message.clone()], Vec::new())
+        }
+    };
+    ForwardError {
+        code: code.to_string(),
+        message: e.to_string(),
+        texts,
+        numbers,
+        acked: Vec::new(),
+    }
+}
+
+/// The `ReplError` a `ForwardError` of `repl_error_to_wire` stands for. A
+/// code or shape this build does not know is an `Internal` carrying the
+/// leader's own message, never a guess at a variant.
+fn repl_error_from_wire(error: ForwardError) -> ReplError {
+    let text = |i: usize| error.texts.get(i).cloned();
+    let number = |i: usize| error.numbers.get(i).and_then(|n| u32::try_from(*n).ok());
+    let decoded = match error.code.as_str() {
+        CODE_PARTITION_UNAVAILABLE => text(0)
+            .zip(number(0))
+            .map(|(topic, partition)| ReplError::NoAssignment { topic, partition }),
+        CODE_NOT_ENOUGH_REPLICAS => text(0).zip(number(0)).zip(number(1)).zip(number(2)).map(
+            |(((topic, partition), isr), required)| ReplError::NotEnoughReplicas {
+                topic,
+                partition,
+                isr,
+                required,
+            },
+        ),
+        CODE_NOT_A_REPLICA => {
+            text(0)
+                .zip(text(1))
+                .zip(number(0))
+                .map(|((topic, node_id), partition)| ReplError::NotAReplica {
+                    topic,
+                    partition,
+                    node_id,
+                })
+        }
+        CODE_EPOCH_FENCED => number(0)
+            .zip(number(1))
+            .map(|(have, requested)| ReplError::EpochFenced { have, requested }),
+        CODE_NOT_LEADER => {
+            text(0)
+                .zip(text(1))
+                .zip(number(0))
+                .map(
+                    |((topic, leader), partition)| ReplError::NotPartitionLeader {
+                        topic,
+                        partition,
+                        leader,
+                    },
+                )
+        }
+        CODE_TRANSFER_TARGET_BEHIND => {
+            text(0)
+                .zip(text(1))
+                .zip(number(0))
+                .map(
+                    |((topic, node_id), partition)| ReplError::TransferTargetBehind {
+                        topic,
+                        partition,
+                        node_id,
+                    },
+                )
+        }
+        CODE_TRANSFER_BLOCKED => text(0)
+            .zip(text(1))
+            .map(|(topic, reason)| ReplError::TransferBlocked { topic, reason }),
+        CODE_TRANSFER_OUTCOME_UNKNOWN => text(0)
+            .zip(number(0))
+            .map(|(topic, partition)| ReplError::TransferOutcomeUnknown { topic, partition }),
+        CODE_TRANSFER_REFUSED => text(0).map(|reason| ReplError::TransferRefused { reason }),
+        CODE_NODE_WITHOUT_FORWARDING => {
+            text(0).map(|node_id| ReplError::NodeWithoutForwarding { node_id })
+        }
+        // The leader refused the request itself (`answer_transfer_forward`):
+        // its first text is the reason.
+        forward::CODE_FORWARD_REFUSED => Some(ReplError::TransferRefused {
+            reason: text(0).unwrap_or_else(|| error.message.clone()),
+        }),
+        _ => None,
+    };
+    decoded.unwrap_or_else(|| {
+        ReplError::Internal(format!(
+            "the leader refused the transfer: {}",
+            error.message
+        ))
+    })
 }
 
 /// Why a forwarded publish got no reply.
@@ -4861,6 +5604,11 @@ impl AssignmentStore for SqliteLedgerAssignmentStore {
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
+    fn list_for_instance(&self, instance_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+        self.list_for_instance(instance_id)
+            .map_err(|e| ReplError::Internal(e.to_string()))
+    }
+
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
         self.propose(&assignment)
             .map_err(|e| ReplError::Internal(e.to_string()))
@@ -5133,6 +5881,10 @@ mod tests {
         fn set_acked(&self, op_id: OperationId, acked: Vec<String>) {
             self.acked.lock().insert(op_id, acked);
         }
+
+        fn clear_acked(&self) {
+            self.acked.lock().clear();
+        }
     }
 
     impl LedgerAdmission for FakeLedger {
@@ -5240,6 +5992,23 @@ mod tests {
                 .collect())
         }
 
+        fn list_for_instance(
+            &self,
+            instance_id: &str,
+        ) -> Result<Vec<PartitionAssignment>, ReplError> {
+            let mut rows: Vec<_> = self
+                .rows
+                .lock()
+                .values()
+                .filter(|a| a.instance_id == instance_id)
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (&a.org_id, &a.topic, a.partition).cmp(&(&b.org_id, &b.topic, b.partition))
+            });
+            Ok(rows)
+        }
+
         fn preferred_leader_counts(
             &self,
             instance_id: &str,
@@ -5334,6 +6103,22 @@ mod tests {
         /// `claim_hook` at spawn, since the manager claims right after it
         /// installs the handle.
         on_claim: Option<ClaimHook>,
+        /// What the replicas' acknowledged progress is reported as, where
+        /// set; any other replica reads as caught up with `leo`.
+        progress: Mutex<BTreeMap<String, ReplicaProgress>>,
+        /// `close_writes_for_transfer` ran and `reopen_writes_after_transfer`
+        /// did not follow.
+        writes_closed: AtomicBool,
+        /// What the handle was asked, in order: `close`, `reopen`, `progress`
+        /// (each look at a replica's progress), `propose` (written by a hook
+        /// of the assignment store).
+        events: Mutex<Vec<&'static str>>,
+        /// Runs inside `close_writes_for_transfer`, after the close: an
+        /// append that was in progress landing, for instance.
+        on_close: Mutex<Option<Box<dyn Fn(&FakeLeaderHandle) + Send>>>,
+        /// Called with the number of `progress` looks so far; its answer, if
+        /// any, replaces what `progress` holds for the replica.
+        progress_script: Mutex<Option<Box<dyn Fn(usize) -> Option<ReplicaProgress> + Send>>>,
     }
 
     impl FakeLeaderHandle {
@@ -5357,7 +6142,24 @@ mod tests {
                 on_stop: Mutex::new(None),
                 claimed: AtomicBool::new(false),
                 on_claim: None,
+                progress: Mutex::new(BTreeMap::new()),
+                writes_closed: AtomicBool::new(false),
+                events: Mutex::new(Vec::new()),
+                on_close: Mutex::new(None),
+                progress_script: Mutex::new(None),
             }
+        }
+
+        /// Makes `node` look `leo` acknowledged with `in_flight_bytes` sent
+        /// and not yet acknowledged.
+        fn set_progress(&self, node: &str, leo: u64, in_flight_bytes: u64) {
+            self.progress.lock().insert(
+                node.to_string(),
+                ReplicaProgress {
+                    leo,
+                    in_flight_bytes,
+                },
+            );
         }
 
         /// Stands in for a peer refusing this leader's outbound `Hello`
@@ -5375,6 +6177,40 @@ mod tests {
     impl LeaderHandle for FakeLeaderHandle {
         fn isr(&self) -> Vec<String> {
             self.isr.lock().clone()
+        }
+        fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
+            let looks = {
+                let mut events = self.events.lock();
+                events.push("progress");
+                events.iter().filter(|e| **e == "progress").count()
+            };
+            if let Some(script) = self.progress_script.lock().as_ref() {
+                if let Some(progress) = script(looks) {
+                    return Some(progress);
+                }
+            }
+            Some(
+                self.progress
+                    .lock()
+                    .get(node_id)
+                    .copied()
+                    .unwrap_or(ReplicaProgress {
+                        leo: self.leo.load(Ordering::SeqCst),
+                        in_flight_bytes: 0,
+                    }),
+            )
+        }
+        fn close_writes_for_transfer(&self) -> bool {
+            self.writes_closed.store(true, Ordering::SeqCst);
+            self.events.lock().push("close");
+            if let Some(hook) = self.on_close.lock().as_ref() {
+                hook(self);
+            }
+            true
+        }
+        fn reopen_writes_after_transfer(&self) {
+            self.writes_closed.store(false, Ordering::SeqCst);
+            self.events.lock().push("reopen");
         }
         fn truncation_count(&self) -> u64 {
             self.truncations.load(Ordering::SeqCst)
@@ -5485,6 +6321,15 @@ mod tests {
     impl LeaderHandle for SharedFakeLeaderHandle {
         fn isr(&self) -> Vec<String> {
             self.0.isr()
+        }
+        fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
+            self.0.replica_progress(node_id)
+        }
+        fn close_writes_for_transfer(&self) -> bool {
+            self.0.close_writes_for_transfer()
+        }
+        fn reopen_writes_after_transfer(&self) {
+            self.0.reopen_writes_after_transfer()
         }
         fn truncation_count(&self) -> u64 {
             self.0.truncation_count()
@@ -7578,6 +8423,393 @@ mod tests {
         assert!(matches!(err, ReplError::NotAReplica { node_id, .. } if node_id == "f2"));
     }
 
+    /// A seeded leader `l` of `orders/0` (replicas l, f1, f2) whose handle
+    /// has `leo` 100 and whose proposals every follower admits.
+    async fn transfer_fixture() -> (Fixture, Arc<FakeLeaderHandle>) {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            4,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        for raw in 1u8..=8 {
+            fx.ledger.set_acked(
+                OperationId::from_hash([raw; 32]),
+                vec!["f1".to_string(), "f2".to_string()],
+            );
+        }
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        handle.leo.store(100, Ordering::SeqCst);
+        (fx, handle)
+    }
+
+    fn stored_orders(fx: &Fixture) -> PartitionAssignment {
+        fx.assignments
+            .stored(&("org".to_string(), "orders".to_string(), 0))
+            .expect("assignment stored")
+    }
+
+    #[tokio::test]
+    async fn transfer_leader_to_a_lagging_follower_fails_and_changes_nothing() {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 40, 10 * 1024 * 1024);
+
+        let manager = fx.manager.clone();
+        let started = Instant::now();
+        let err =
+            tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(
+            matches!(&err, ReplError::TransferTargetBehind { node_id, .. } if node_id == "f1"),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() >= TRANSFER_CATCH_UP_MAX,
+            "the leader must wait for the catch-up before giving up"
+        );
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 4 }
+        );
+        assert_eq!(stored_orders(&fx).leader_node_id, "l");
+        assert_eq!(*fx.audit.transfers.lock(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_leader_waits_for_a_follower_that_catches_up() {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 40, 1024);
+        let catching_up = handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            catching_up.set_progress("f1", 100, 0);
+        });
+
+        let manager = fx.manager.clone();
+        let epoch =
+            tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+                .await
+                .unwrap()
+                .expect("the transfer succeeds once f1 has caught up");
+        assert_eq!(epoch, 64);
+        assert_eq!(stored_orders(&fx).leader_node_id, "f1");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_checks_the_target_without_moving_anything() {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 40, 10 * 1024 * 1024);
+        let manager = fx.manager.clone();
+        let behind =
+            tokio::task::spawn_blocking(move || manager.check_transfer("org", "orders", 0, "f1"))
+                .await
+                .unwrap();
+        assert!(matches!(
+            behind,
+            Err(ReplError::TransferTargetBehind { .. })
+        ));
+        handle.set_progress("f1", 40, 1024);
+        let manager = fx.manager.clone();
+        let fits =
+            tokio::task::spawn_blocking(move || manager.check_transfer("org", "orders", 0, "f1"))
+                .await
+                .unwrap();
+        fits.expect("a small gap fits the wait");
+        assert_eq!(stored_orders(&fx).leader_node_id, "l");
+        assert_eq!(*fx.audit.transfers.lock(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_move_to_another_node_makes_it_the_preferred_leader() {
+        let (fx, _handle) = transfer_fixture().await;
+        let manager = fx.manager.clone();
+        tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+            .await
+            .unwrap()
+            .expect("transfer");
+        let row = stored_orders(&fx);
+        assert_eq!(row.replicas, vec!["f1", "l", "f2"]);
+        assert_eq!(row.leader_node_id, "f1");
+    }
+
+    #[tokio::test]
+    async fn a_return_to_the_preferred_node_leaves_the_replica_order_alone() {
+        let (fx, _handle) = transfer_fixture().await;
+        let manager = fx.manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.transfer_leader_restoring(
+                "org",
+                "orders",
+                0,
+                "f1",
+                &["l".to_string(), "f1".to_string(), "f2".to_string()],
+            )
+        })
+        .await
+        .unwrap()
+        .expect("transfer");
+        let row = stored_orders(&fx);
+        assert_eq!(row.replicas, vec!["l", "f1", "f2"]);
+        assert_eq!(row.leader_node_id, "f1");
+    }
+
+    /// A write that arrives while the leader waits for the target to catch up
+    /// is held, not refused, and goes through once the hold is gone.
+    #[tokio::test]
+    async fn a_write_during_a_transfer_hold_waits_for_it_to_end() {
+        let fx = build("l");
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        let hold = fx.manager.transfer_holds.hold(&key);
+        let holds = &fx.manager.transfer_holds;
+        let waited = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(hold);
+            });
+            let started = Instant::now();
+            assert!(holds.wait_released(&key, Duration::from_secs(2)));
+            started.elapsed()
+        });
+        assert!(
+            waited >= Duration::from_millis(150),
+            "waited only {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    }
+
+    /// Review finding: a write that reaches `preflight` while a transfer is
+    /// under way and outlasts the wait is refused (retryable), not let
+    /// through to a leader that is about to hand the partition over.
+    #[tokio::test]
+    async fn a_write_that_outlasts_the_hold_wait_is_refused_not_let_through() {
+        let (fx, _handle) = transfer_fixture().await;
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        let _hold = fx.manager.transfer_holds.hold(&key);
+
+        let manager = fx.manager.clone();
+        let started = Instant::now();
+        let refused = tokio::task::spawn_blocking(move || {
+            manager.preflight("org", "orders", 0, Acks::Leader)
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= TRANSFER_CATCH_UP_MAX);
+        assert!(
+            matches!(refused, Err(ReplError::NotPartitionLeader { .. })),
+            "got {refused:?}"
+        );
+        // The same write, once the hold is gone, goes through.
+        drop(_hold);
+        assert!(fx
+            .manager
+            .preflight("org", "orders", 0, Acks::Leader)
+            .is_ok());
+    }
+
+    /// The writes of the leader are closed before the log end is read for the
+    /// catch-up check, and the row is proposed only once the target has the
+    /// log end as it stands after the close: an append that was in progress
+    /// when the transfer began (it landed during the close) is in the target's
+    /// log before the row is proposed.
+    #[tokio::test]
+    async fn a_transfer_closes_writes_first_and_proposes_only_after_the_final_log_end_is_replicated(
+    ) {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 100, 0);
+        // An append already past `preflight` lands while the writes close.
+        *handle.on_close.lock() = Some(Box::new(|h| {
+            h.leo.fetch_add(1, Ordering::SeqCst);
+        }));
+        // The target acknowledges the record only on its fourth look.
+        let leo = handle.clone();
+        *handle.progress_script.lock() = Some(Box::new(move |looks| {
+            Some(ReplicaProgress {
+                leo: if looks < 4 {
+                    100
+                } else {
+                    leo.leo.load(Ordering::SeqCst)
+                },
+                in_flight_bytes: 0,
+            })
+        }));
+        let recorder = handle.clone();
+        *fx.assignments.on_propose.lock() = Some(Box::new(move || {
+            recorder.events.lock().push("propose");
+        }));
+
+        let manager = fx.manager.clone();
+        tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+            .await
+            .unwrap()
+            .expect("the transfer succeeds once the target has the record");
+
+        let events = handle.events.lock().clone();
+        assert_eq!(events.first(), Some(&"close"), "events: {events:?}");
+        assert_eq!(events.last(), Some(&"propose"), "events: {events:?}");
+        let looks = events.iter().filter(|e| **e == "progress").count();
+        assert!(
+            looks >= 4,
+            "the proposal came after {looks} looks: before the target had the record"
+        );
+        assert!(!events.contains(&"reopen"), "events: {events:?}");
+    }
+
+    /// A transfer that fails before the row is proposed opens the writes again.
+    #[tokio::test]
+    async fn a_refused_transfer_opens_the_writes_again() {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 40, 10 * 1024 * 1024);
+        let manager = fx.manager.clone();
+        let err =
+            tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(matches!(err, ReplError::TransferTargetBehind { .. }));
+        assert_eq!(handle.events.lock().first(), Some(&"close"));
+        assert!(handle.events.lock().contains(&"reopen"));
+        assert!(!handle.writes_closed.load(Ordering::SeqCst));
+    }
+
+    /// A proposal whose admission is not seen and whose row never shows the
+    /// move is reported as unknown, with the writes still closed and the
+    /// leader stepped down: nothing may land on a partition that may already
+    /// be led by the target.
+    #[tokio::test]
+    async fn a_proposal_that_is_not_admitted_in_time_leaves_the_leader_stopped_and_unknown() {
+        let (fx, handle) = transfer_fixture().await;
+        // No acknowledgement, and the store drops the proposed row.
+        fx.ledger.clear_acked();
+        fx.assignments
+            .deleted_generations
+            .lock()
+            .insert(("org".to_string(), "orders".to_string()), 99);
+
+        let manager = fx.manager.clone();
+        let err =
+            tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(
+            matches!(err, ReplError::TransferOutcomeUnknown { partition: 0, .. }),
+            "got {err:?}"
+        );
+        assert!(
+            handle.writes_closed.load(Ordering::SeqCst),
+            "writes stay closed"
+        );
+        assert!(!handle.events.lock().contains(&"reopen"));
+        assert_ne!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 4 },
+            "the old leader must have stepped down"
+        );
+        assert!(fx.manager.transfer_holds.wait_released(
+            &("org".to_string(), "orders".to_string(), 0),
+            Duration::from_millis(10)
+        ));
+    }
+
+    /// Admission that is slow, not refused: the row shows the move when it is
+    /// read again, so the transfer is a success, not an unknown.
+    #[tokio::test]
+    async fn a_proposal_admitted_after_the_wait_is_found_by_reading_the_row() {
+        let (fx, _handle) = transfer_fixture().await;
+        fx.ledger.clear_acked();
+        let manager = fx.manager.clone();
+        let epoch =
+            tokio::task::spawn_blocking(move || manager.transfer_leader("org", "orders", 0, "f1"))
+                .await
+                .unwrap()
+                .expect("the row shows the move");
+        assert_eq!(stored_orders(&fx).leader_epoch, epoch);
+        assert_eq!(stored_orders(&fx).leader_node_id, "f1");
+    }
+
+    /// A rollback leaves the replica order exactly as given, not as the rule
+    /// would have it.
+    #[tokio::test]
+    async fn a_restoring_transfer_leaves_the_replica_order_it_is_given() {
+        let (fx, _handle) = transfer_fixture().await;
+        let order = vec!["l".to_string(), "f2".to_string(), "f1".to_string()];
+        let manager = fx.manager.clone();
+        let wanted = order.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.transfer_leader_restoring("org", "orders", 0, "f1", &wanted)
+        })
+        .await
+        .unwrap()
+        .expect("transfer");
+        assert_eq!(stored_orders(&fx).replicas, order);
+    }
+
+    fn transfer_forward_request(sender_env: NodeEnvironment, instance: &str) -> TransferForward {
+        TransferForward {
+            instance_id: instance.to_string(),
+            environment: sender_env,
+            org_id: "org".to_string(),
+            topic: "orders".to_string(),
+            partition: 0,
+            target_node_id: "f1".to_string(),
+            dry_run: false,
+            replicas: Vec::new(),
+        }
+    }
+
+    /// Any member of the instance and environment may ask the leader, a node
+    /// that holds no replica included; another environment or instance is
+    /// refused with the stable refusal code, which reads back as
+    /// `TransferRefused`.
+    #[tokio::test]
+    async fn a_forwarded_transfer_is_taken_from_any_member_and_refused_from_a_stranger() {
+        let (fx, _handle) = transfer_fixture().await;
+        let other_env = if fx.manager.local_env == NodeEnvironment::Dev {
+            NodeEnvironment::Prod
+        } else {
+            NodeEnvironment::Dev
+        };
+
+        let reply = fx
+            .manager
+            .answer_transfer_forward(
+                "outsider",
+                transfer_forward_request(fx.manager.local_env, "tentabus-00000001"),
+            )
+            .await;
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(reply.leader_epoch, Some(64));
+        assert_eq!(stored_orders(&fx).leader_node_id, "f1");
+
+        for (env, instance, reason) in [
+            (other_env, "tentabus-00000001", "environment_mismatch"),
+            (
+                fx.manager.local_env,
+                "tentabus-99999999",
+                "unknown_instance",
+            ),
+        ] {
+            let reply = fx
+                .manager
+                .answer_transfer_forward("outsider", transfer_forward_request(env, instance))
+                .await;
+            let error = reply.error.expect("refused");
+            assert_eq!(error.code, forward::CODE_FORWARD_REFUSED);
+            match repl_error_from_wire(error) {
+                ReplError::TransferRefused { reason: got } => assert_eq!(got, reason),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
     // ---- reassign/evict bump the epoch (T1's finding (2)) -----------------
 
     /// `FakeAssignmentStore::propose`'s admission gate mirrors
@@ -7676,10 +8908,10 @@ mod tests {
         assert_eq!(*fx.audit.evictions.lock(), 1);
     }
 
-    /// TB-04 K4: position 0 of `replicas` is the preferred leader, the node
-    /// the topic was placed on. The order of the row survives an election, a
-    /// transfer and an eviction, so that the preferred node stays recognizable
-    /// while leadership moves.
+    /// TB-04 K4: position 0 of `replicas` is the preferred leader. An
+    /// election and an eviction keep the order of the row. A transfer to a
+    /// node other than the preferred one (K5) makes the target the preferred
+    /// node, and the rest keep their order.
     #[tokio::test]
     async fn replicas_keep_their_order_through_election_transfer_and_eviction() {
         let fx = build("f1");
@@ -7712,6 +8944,9 @@ mod tests {
         let elected = fx.assignments.stored(&key).expect("row stored");
         assert_eq!(elected.leader_node_id, "f1", "f1 took over from `z`");
         assert_eq!(elected.replicas, order, "an election keeps the order");
+        // The assignment poll of a real node applies the row it just wrote;
+        // a transfer is made by the node that leads, with its handle.
+        fx.manager.apply_assignment(elected).await;
 
         for raw in 1u8..=8 {
             fx.ledger
@@ -7722,7 +8957,11 @@ mod tests {
             .expect("transfer succeeds");
         let moved = fx.assignments.stored(&key).expect("row stored");
         assert_eq!(moved.leader_node_id, "f2");
-        assert_eq!(moved.replicas, order, "a transfer keeps the order");
+        assert_eq!(
+            moved.replicas,
+            vec!["f2".to_string(), "z".to_string(), "f1".to_string()],
+            "a transfer to another node makes it the preferred leader"
+        );
 
         fx.manager
             .evict_node_from_replica_sets("f2", "env_change")

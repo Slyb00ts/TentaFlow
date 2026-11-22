@@ -54,6 +54,8 @@ const KIND_PRODUCE_FORWARD: u8 = 9;
 const KIND_PRODUCE_FORWARD_REPLY: u8 = 10;
 const KIND_CONSUME_FORWARD: u8 = 11;
 const KIND_CONSUME_FORWARD_REPLY: u8 = 12;
+const KIND_TRANSFER_FORWARD: u8 = 13;
+const KIND_TRANSFER_FORWARD_REPLY: u8 = 14;
 
 /// `ReplHello::bus_features` / `ReplHelloAck::bus_features` bit: this node
 /// accepts `ReplFrame::ProduceForward` on a fresh stream and answers with
@@ -66,13 +68,21 @@ pub const BUS_FEATURE_PRODUCE_FORWARD: u32 = 1 << 0;
 /// consume forwarding would drop the new frame without an answer.
 pub const BUS_FEATURE_CONSUME_FORWARD: u32 = 1 << 1;
 
+/// `bus_features` bit: this node accepts `ReplFrame::TransferForward` on a
+/// fresh stream and answers with `TransferForwardReply`: the leader of a
+/// partition runs a leadership transfer asked of another node.
+pub const BUS_FEATURE_TRANSFER_FORWARD: u32 = 1 << 2;
+
 /// What a node must advertise to lead a topic of a spread (`BusService::
-/// create_topic`): the nodes that do not lead it hand it their writes and
-/// stateless reads, so both kinds of forwarding have to be understood.
-pub const BUS_FEATURES_FORWARDING: u32 = BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD;
+/// create_topic`) and to take part in moving leaders: the nodes that do not
+/// lead a topic hand it their writes, stateless reads and leadership
+/// transfers, so every kind of forwarding of this build has to be understood.
+/// The three kinds arrived together, in the one TB-04 line.
+pub const BUS_FEATURES_FORWARDING: u32 =
+    BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD | BUS_FEATURE_TRANSFER_FORWARD;
 
 /// Every feature bit this build advertises.
-pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURE_PRODUCE_FORWARD | BUS_FEATURE_CONSUME_FORWARD;
+pub const LOCAL_BUS_FEATURES: u32 = BUS_FEATURES_FORWARDING;
 
 /// First frame on a new leader->follower replication stream (PLAN-M2 §1b).
 /// Carries both fencing checks a stream establishment needs (PLAN-M2 §1b
@@ -741,6 +751,42 @@ pub struct ConsumeForwardReply {
     pub error: Option<ForwardError>,
 }
 
+/// A leadership transfer one node asks of the node that leads the partition,
+/// the first frame of a fresh stream. The leader runs it (and decides whether
+/// it may), so the target is checked against the LIVE ISR and the catch-up of
+/// the replica, which only the leader knows. The sender must replicate the
+/// partition. `dry_run` runs the checks and changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferForward {
+    pub instance_id: String,
+    /// The sender's environment: the frame-level half of the environment
+    /// fence, as in `ProduceForward`.
+    pub environment: NodeEnvironment,
+    pub org_id: String,
+    pub topic: String,
+    pub partition: u32,
+    pub target_node_id: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The replica set to leave behind instead of applying the rule (a move
+    /// that is not a return makes the target the preferred node): how a
+    /// rollback restores the order a move had changed. Empty for a plain
+    /// transfer.
+    #[serde(default)]
+    pub replicas: Vec<String>,
+}
+
+/// The leader's answer to `TransferForward`: exactly one of the two is set.
+/// `leader_epoch` is the epoch of the row that made the target the leader;
+/// for a dry run, the epoch the leader stands at now. `error` reuses the
+/// stable `bus.*` codes of `ForwardError`, which the sender maps back to a
+/// `ReplError`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferForwardReply {
+    pub leader_epoch: Option<u32>,
+    pub error: Option<ForwardError>,
+}
+
 /// One frame on a replication stream (PLAN-M2 §1b). `Batch` is the only
 /// variant whose payload spans both wire sections: `header` is CBOR, the
 /// batch bytes are `raw`. No `Serialize`/`Deserialize` here — `ReplFrame`
@@ -767,6 +813,8 @@ pub enum ReplFrame {
     ProduceForwardReply(ProduceForwardReply),
     ConsumeForward(ConsumeForward),
     ConsumeForwardReply(ConsumeForwardReply),
+    TransferForward(TransferForward),
+    TransferForwardReply(TransferForwardReply),
 }
 
 /// Errors from `read_frame`/`write_frame`. Distinct from
@@ -815,6 +863,10 @@ fn encode_parts(frame: &ReplFrame) -> Result<(u8, Vec<u8>, &[u8]), ReplCodecErro
         ReplFrame::ProduceForwardReply(v) => (KIND_PRODUCE_FORWARD_REPLY, encode_cbor(v)?, &[][..]),
         ReplFrame::ConsumeForward(v) => (KIND_CONSUME_FORWARD, encode_cbor(v)?, &[][..]),
         ReplFrame::ConsumeForwardReply(v) => (KIND_CONSUME_FORWARD_REPLY, encode_cbor(v)?, &[][..]),
+        ReplFrame::TransferForward(v) => (KIND_TRANSFER_FORWARD, encode_cbor(v)?, &[][..]),
+        ReplFrame::TransferForwardReply(v) => {
+            (KIND_TRANSFER_FORWARD_REPLY, encode_cbor(v)?, &[][..])
+        }
     })
 }
 
@@ -882,6 +934,8 @@ fn decode_frame(kind: u8, cbor: &[u8], raw: Bytes) -> Result<ReplFrame, ReplCode
         KIND_PRODUCE_FORWARD_REPLY => ReplFrame::ProduceForwardReply(decode_cbor(cbor)?),
         KIND_CONSUME_FORWARD => ReplFrame::ConsumeForward(decode_cbor(cbor)?),
         KIND_CONSUME_FORWARD_REPLY => ReplFrame::ConsumeForwardReply(decode_cbor(cbor)?),
+        KIND_TRANSFER_FORWARD => ReplFrame::TransferForward(decode_cbor(cbor)?),
+        KIND_TRANSFER_FORWARD_REPLY => ReplFrame::TransferForwardReply(decode_cbor(cbor)?),
         other => return Err(ReplCodecError::UnknownKind(other)),
     })
 }
@@ -1354,10 +1408,63 @@ mod tests {
         assert_eq!(KIND_PRODUCE_FORWARD_REPLY, 10);
         assert_eq!(KIND_CONSUME_FORWARD, 11);
         assert_eq!(KIND_CONSUME_FORWARD_REPLY, 12);
+        assert_eq!(KIND_TRANSFER_FORWARD, 13);
+        assert_eq!(KIND_TRANSFER_FORWARD_REPLY, 14);
         assert!(matches!(
-            decode_frame(13, &[], Bytes::new()),
-            Err(ReplCodecError::UnknownKind(13))
+            decode_frame(15, &[], Bytes::new()),
+            Err(ReplCodecError::UnknownKind(15))
         ));
+    }
+
+    #[tokio::test]
+    async fn transfer_forward_frames_round_trip() {
+        let request = TransferForward {
+            instance_id: "tentabus-00000001".into(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org-1".into(),
+            topic: "orders".into(),
+            partition: 3,
+            target_node_id: "node-b".into(),
+            dry_run: true,
+            replicas: vec!["node-a".into(), "node-b".into()],
+        };
+        assert_eq!(
+            roundtrip(ReplFrame::TransferForward(request.clone())).await,
+            ReplFrame::TransferForward(request)
+        );
+        for reply in [
+            TransferForwardReply {
+                leader_epoch: Some(65),
+                error: None,
+            },
+            TransferForwardReply {
+                leader_epoch: None,
+                error: Some(ForwardError {
+                    code: "bus.transfer_target_behind".into(),
+                    message: "behind".into(),
+                    texts: vec!["orders".into(), "node-b".into()],
+                    numbers: vec![3],
+                    acked: vec![],
+                }),
+            },
+        ] {
+            assert_eq!(
+                roundtrip(ReplFrame::TransferForwardReply(reply.clone())).await,
+                ReplFrame::TransferForwardReply(reply)
+            );
+        }
+    }
+
+    /// A leader must advertise the transfer bit too (a build before it would
+    /// drop the frame in silence), and this build advertises all of them.
+    #[test]
+    fn the_transfer_bit_is_part_of_what_a_leader_must_advertise() {
+        assert_eq!(BUS_FEATURE_TRANSFER_FORWARD, 1 << 2);
+        assert_eq!(
+            BUS_FEATURES_FORWARDING & BUS_FEATURE_TRANSFER_FORWARD,
+            BUS_FEATURE_TRANSFER_FORWARD
+        );
+        assert_eq!(LOCAL_BUS_FEATURES, BUS_FEATURES_FORWARDING);
     }
 
     #[tokio::test]

@@ -961,6 +961,11 @@ pub struct BusReplicaNodeWire {
     pub leader_count: u32,
     pub follower_count: u32,
     pub isr_count: u32,
+    /// The node understands the forwarded requests moving leaders needs (a
+    /// build of the TB-04 line); `false` also from a peer that does not
+    /// report it. Appended.
+    #[serde(default)]
+    pub forward_capable: bool,
 }
 
 /// One replica's lag behind the leader (mirrors `bus::ReplicaLagInfo`) —
@@ -988,6 +993,11 @@ pub struct BusPartitionReplicaWire {
     pub high_watermark: u64,
     pub log_end_offset: u64,
     pub unavailable_reason: Option<String>,
+    /// The preferred leader of the partition (position 0 of `replicas`): the
+    /// node it returns to after a failover. `None` for an empty replica set
+    /// and from a peer that does not report it. Appended.
+    #[serde(default)]
+    pub preferred_leader_node_id: Option<String>,
 }
 
 /// One failover event (M06 timeline) — sourced from `audit_log`'s
@@ -1072,6 +1082,65 @@ pub struct BusEnvelope {
 // =============================================================================
 // BusPayload — one MessageBody variant for the whole family
 // =============================================================================
+
+// =============================================================================
+// TB-04 K5 — spreading topic leaders between nodes: the plan ("Rozłóż
+// prowadzenie") and its application.
+// =============================================================================
+
+/// One move of a leader plan: every partition of the topic and of its
+/// dead-letter topic that the target does not lead goes to it.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusLeaderMoveWire {
+    pub topic: String,
+    /// The partitions of `topic`; those of `__dlq.<topic>` go with them.
+    pub partitions: Vec<u32>,
+    /// The node that leads most of the topic now.
+    pub from_node_id: String,
+    pub to_node_id: String,
+    /// The target is the topic's preferred node: a return, which leaves the
+    /// preferred node as it is. Any other move makes the target preferred.
+    #[serde(default)]
+    pub returns_to_preferred: bool,
+}
+
+/// Led partitions of one node before and after a plan.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusLeaderLoadWire {
+    pub node_id: String,
+    pub partitions_before: u32,
+    pub partitions_after: u32,
+}
+
+/// A topic the plan wanted to move and could not.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusLeaderBlockerWire {
+    pub topic: String,
+    /// 'node_unreachable' | 'node_without_forwarding' | 'target_outside_isr'
+    /// | 'target_behind' | 'consumer_group_paused' | 'no_admin_right' |
+    /// 'leader_unavailable'.
+    pub reason: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+/// How one move of an applied plan ended.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusLeaderMoveResultWire {
+    pub topic: String,
+    pub partitions: Vec<u32>,
+    pub from_node_id: String,
+    pub to_node_id: String,
+    /// 'moved' | 'failed' | 'failed_rolled_back' | 'failed_partial' |
+    /// 'not_attempted'. Only 'moved' leaves the topic on the target; after
+    /// 'failed' and 'failed_rolled_back' no partition changed node.
+    pub status: String,
+    /// The stable `bus.*` code of what failed.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum BusPayload {
@@ -1651,6 +1720,31 @@ pub enum BusPayload {
         version: u32,
         /// In the order the pattern declares them.
         fields: Vec<String>,
+    },
+
+    // ===== TB-04 K5 — spreading topic leaders (`bus_dispatch`, org-admin
+    // checked inside the handler like `LeaderTransferRequest`) =====
+    /// The plan that would even out the leaders of the caller's organisation:
+    /// which topics move where, what each node leads before and after, and
+    /// what stops a topic from moving. `topic: Some(name)` plans only that
+    /// topic. Changes nothing.
+    LeaderBalancePlanRequest {
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    LeaderBalancePlanResponse {
+        moves: Vec<BusLeaderMoveWire>,
+        per_node: Vec<BusLeaderLoadWire>,
+        blockers: Vec<BusLeaderBlockerWire>,
+    },
+    /// Runs `moves`, one topic after the other, if they are still the plan;
+    /// otherwise refused with `bus.plan_changed` and nothing moves. The first
+    /// topic that fails stops the rest.
+    LeaderBalanceApplyRequest {
+        moves: Vec<BusLeaderMoveWire>,
+    },
+    LeaderBalanceApplyResponse {
+        results: Vec<BusLeaderMoveResultWire>,
     },
 }
 
@@ -2511,6 +2605,7 @@ mod tests {
             leader_count: 5,
             follower_count: 3,
             isr_count: 8,
+            forward_capable: true,
         }
     }
 
@@ -2534,6 +2629,7 @@ mod tests {
             high_watermark: 100_000,
             log_end_offset: 100_120,
             unavailable_reason: None,
+            preferred_leader_node_id: Some("gczd-edge-02".to_string()),
         }
     }
 
@@ -2645,6 +2741,203 @@ mod tests {
             target_node_id: "gczd-edge-02".to_string(),
         });
         round_trip(BusPayload::LeaderTransferResponse { leader_epoch: 4 });
+    }
+
+    fn sample_leader_move() -> BusLeaderMoveWire {
+        BusLeaderMoveWire {
+            topic: "pacs.badania.nowe".to_string(),
+            partitions: vec![0, 1, 2, 3],
+            from_node_id: "gcm-core-01".to_string(),
+            to_node_id: "gczd-edge-02".to_string(),
+            returns_to_preferred: true,
+        }
+    }
+
+    #[test]
+    fn leader_balance_round_trip() {
+        round_trip(BusPayload::LeaderBalancePlanRequest { topic: None });
+        round_trip(BusPayload::LeaderBalancePlanRequest {
+            topic: Some("pacs.badania.nowe".to_string()),
+        });
+        round_trip(BusPayload::LeaderBalancePlanResponse {
+            moves: vec![sample_leader_move()],
+            per_node: vec![
+                BusLeaderLoadWire {
+                    node_id: "gcm-core-01".to_string(),
+                    partitions_before: 16,
+                    partitions_after: 8,
+                },
+                BusLeaderLoadWire {
+                    node_id: "gczd-edge-02".to_string(),
+                    partitions_before: 0,
+                    partitions_after: 8,
+                },
+            ],
+            blockers: vec![
+                BusLeaderBlockerWire {
+                    topic: "orders".to_string(),
+                    reason: "consumer_group_paused".to_string(),
+                    node_id: None,
+                },
+                BusLeaderBlockerWire {
+                    topic: "invoices".to_string(),
+                    reason: "target_outside_isr".to_string(),
+                    node_id: Some("gczd-edge-02".to_string()),
+                },
+            ],
+        });
+        round_trip(BusPayload::LeaderBalanceApplyRequest {
+            moves: vec![sample_leader_move()],
+        });
+        round_trip(BusPayload::LeaderBalanceApplyResponse {
+            results: vec![
+                BusLeaderMoveResultWire {
+                    topic: "pacs.badania.nowe".to_string(),
+                    partitions: vec![0, 1, 2, 3],
+                    from_node_id: "gcm-core-01".to_string(),
+                    to_node_id: "gczd-edge-02".to_string(),
+                    status: "moved".to_string(),
+                    error_code: None,
+                    detail: None,
+                },
+                BusLeaderMoveResultWire {
+                    topic: "orders".to_string(),
+                    partitions: vec![0],
+                    from_node_id: "gcm-core-01".to_string(),
+                    to_node_id: "gczd-edge-02".to_string(),
+                    status: "failed_rolled_back".to_string(),
+                    error_code: Some("bus.transfer_target_behind".to_string()),
+                    detail: Some("no partition changed node".to_string()),
+                },
+            ],
+        });
+    }
+
+    /// A client from before a field existed omits it; the new payloads and
+    /// fields decode with its default, and a plan request from the
+    /// oldest client of this family (no `topic`) still decodes.
+    #[test]
+    fn leader_balance_fields_default_when_absent() {
+        #[derive(SerdeSerialize)]
+        enum Legacy {
+            LeaderBalancePlanRequest {},
+            LeaderBalancePlanResponse {
+                moves: Vec<LegacyMove>,
+                per_node: Vec<BusLeaderLoadWire>,
+                blockers: Vec<LegacyBlocker>,
+            },
+        }
+        #[derive(SerdeSerialize)]
+        struct LegacyMove {
+            topic: String,
+            partitions: Vec<u32>,
+            from_node_id: String,
+            to_node_id: String,
+        }
+        #[derive(SerdeSerialize)]
+        struct LegacyBlocker {
+            topic: String,
+            reason: String,
+        }
+        let bytes = crate::cbor::encode(&Legacy::LeaderBalancePlanRequest {}).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<BusPayload>(&bytes).expect("decode"),
+            BusPayload::LeaderBalancePlanRequest { topic: None }
+        );
+        let bytes = crate::cbor::encode(&Legacy::LeaderBalancePlanResponse {
+            moves: vec![LegacyMove {
+                topic: "t".into(),
+                partitions: vec![0],
+                from_node_id: "a".into(),
+                to_node_id: "b".into(),
+            }],
+            per_node: Vec::new(),
+            blockers: vec![LegacyBlocker {
+                topic: "u".into(),
+                reason: "node_unreachable".into(),
+            }],
+        })
+        .expect("encode");
+        match crate::cbor::decode::<BusPayload>(&bytes).expect("decode") {
+            BusPayload::LeaderBalancePlanResponse {
+                moves, blockers, ..
+            } => {
+                assert!(!moves[0].returns_to_preferred);
+                assert_eq!(blockers[0].node_id, None);
+            }
+            other => panic!("expected the plan response, got {other:?}"),
+        }
+    }
+
+    /// A node card and a partition row from a build before TB-04's wire
+    /// fields decode with them empty; the fields reach an older peer as
+    /// unknown keys it ignores.
+    #[test]
+    fn replica_wire_fields_of_tb04_default_for_an_old_peer() {
+        #[derive(SerdeSerialize)]
+        struct OldNode {
+            node_id: String,
+            label: String,
+            environment: String,
+            is_local: bool,
+            reachable: bool,
+            last_heartbeat_ms_ago: Option<u64>,
+            leader_count: u32,
+            follower_count: u32,
+            isr_count: u32,
+        }
+        #[derive(SerdeSerialize)]
+        struct OldPartition {
+            partition: u32,
+            leader_node_id: Option<String>,
+            leader_epoch: u32,
+            replicas: Vec<String>,
+            isr: Vec<String>,
+            lagging: Vec<BusReplicaLagWire>,
+            high_watermark: u64,
+            log_end_offset: u64,
+            unavailable_reason: Option<String>,
+        }
+        let node = OldNode {
+            node_id: "n".into(),
+            label: "n".into(),
+            environment: "prod".into(),
+            is_local: true,
+            reachable: true,
+            last_heartbeat_ms_ago: None,
+            leader_count: 1,
+            follower_count: 0,
+            isr_count: 1,
+        };
+        let decoded: BusReplicaNodeWire =
+            crate::cbor::decode(&crate::cbor::encode(&node).expect("encode")).expect("decode");
+        assert!(!decoded.forward_capable);
+        let partition = OldPartition {
+            partition: 0,
+            leader_node_id: Some("n".into()),
+            leader_epoch: 1,
+            replicas: vec!["n".into()],
+            isr: vec!["n".into()],
+            lagging: Vec::new(),
+            high_watermark: 0,
+            log_end_offset: 0,
+            unavailable_reason: None,
+        };
+        let decoded: BusPartitionReplicaWire =
+            crate::cbor::decode(&crate::cbor::encode(&partition).expect("encode")).expect("decode");
+        assert_eq!(decoded.preferred_leader_node_id, None);
+        // And the other way: the old struct reads the new one, ignoring the
+        // keys it does not know.
+        #[derive(SerdeDeserialize)]
+        #[allow(dead_code)]
+        struct OldNodeIn {
+            node_id: String,
+            isr_count: u32,
+        }
+        let decoded: OldNodeIn =
+            crate::cbor::decode(&crate::cbor::encode(&sample_replica_node()).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded.isr_count, 8);
     }
 
     #[test]
@@ -3792,6 +4085,10 @@ mod tests {
             "SchemaForRecordGetResponse",
             "SchemaFieldsGetRequest",
             "SchemaFieldsGetResponse",
+            "LeaderBalancePlanRequest",
+            "LeaderBalancePlanResponse",
+            "LeaderBalanceApplyRequest",
+            "LeaderBalanceApplyResponse",
         ];
         assert_eq!(
             live, pinned,

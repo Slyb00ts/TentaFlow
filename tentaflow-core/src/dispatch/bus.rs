@@ -64,10 +64,11 @@ use tentaflow_protocol::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
     BusDlqRecordWire, BusDlqSampleWire, BusFailoverEventWire, BusFieldActionWire,
     BusFieldHashKeyWire, BusFieldPolicyWire, BusGroupDetailWire, BusGroupLagSeriesWire,
-    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire,
-    BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode,
-    BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload,
-    BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
+    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire,
+    BusHeaderWire, BusLagSampleWire, BusLeaderBlockerWire, BusLeaderLoadWire,
+    BusLeaderMoveResultWire, BusLeaderMoveWire, BusMessagePreviewWire, BusMessagesBrowseResultWire,
+    BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire,
+    BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
     BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire, BusTopicAccessWire,
     BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
     BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
@@ -75,10 +76,13 @@ use tentaflow_protocol::{
 
 use super::HandlerContext;
 use crate::auth::actor::ActorKind;
+use crate::bus::leader_balance::{
+    LeaderBalanceError, MoveStatus, RequestedMove, RunContext, TopicMoveFailure,
+};
 use crate::bus::{
     self, dlq, field_policies, instance::BusInstanceId, quota, schema_registry, topics,
-    BusCallContext, BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo,
-    ReplicaNodeInfo, UnavailableReason,
+    BusCallContext, BusServiceError, NodeForwarding, PartitionReplicaInfo, ReplError,
+    ReplicaLagInfo, ReplicaNodeInfo, UnavailableReason,
 };
 use crate::db::repository;
 use crate::dispatch::app_gate;
@@ -627,6 +631,39 @@ fn map_repl_error(e: ReplError) -> ProtocolError {
             format!(
                 "bus.not_leader: only the leader '{leader}' of '{topic}'/{partition} may add \
                  nodes to its replica set"
+            ),
+        ),
+        ReplError::TransferTargetBehind {
+            topic,
+            partition,
+            node_id,
+        } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "bus.transfer_target_behind: '{node_id}' has not caught up with the leader of \
+                 '{topic}'/{partition}"
+            ),
+        ),
+        ReplError::TransferBlocked { topic, reason } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.transfer_blocked: leadership of '{topic}' cannot be moved now ({reason})"),
+        ),
+        ReplError::TransferOutcomeUnknown { topic, partition } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "bus.transfer_outcome_unknown: the answer to moving '{topic}'/{partition} did \
+                 not come; check where it is led before asking again"
+            ),
+        ),
+        ReplError::TransferRefused { reason } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.transfer_refused: the leader refused the transfer ({reason})"),
+        ),
+        ReplError::NodeWithoutForwarding { node_id } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "bus.node_without_forwarding: '{node_id}' does not take forwarded requests, so \
+                 leadership cannot move to it"
             ),
         ),
         ReplError::Internal(msg) => {
@@ -1630,6 +1667,12 @@ pub async fn bus_dispatch(
             )
             .await?
         }
+        BusPayload::LeaderBalancePlanRequest { topic } => {
+            leader_balance_plan_v1(ctx, instance_id, topic.clone()).await?
+        }
+        BusPayload::LeaderBalanceApplyRequest { moves } => {
+            leader_balance_apply_v1(ctx, instance_id, moves.clone()).await?
+        }
         BusPayload::SchemaSubjectListRequest {} => schema_subject_list_v1(ctx, instance_id).await?,
         BusPayload::SchemaVersionListRequest { subject } => {
             schema_version_list_v1(ctx, instance_id, subject.clone()).await?
@@ -1755,6 +1798,8 @@ pub async fn bus_dispatch(
         | BusPayload::QuotaSetResponse { .. }
         | BusPayload::ReassignResponse { .. }
         | BusPayload::LeaderTransferResponse { .. }
+        | BusPayload::LeaderBalancePlanResponse { .. }
+        | BusPayload::LeaderBalanceApplyResponse { .. }
         | BusPayload::SchemaSubjectListResponse { .. }
         | BusPayload::SchemaVersionListResponse { .. }
         | BusPayload::SchemaGetResponse { .. }
@@ -1859,6 +1904,14 @@ register_bus_variant!(
 register_bus_variant!(
     "BusReplicaListRequest",
     "tentaflow_ws_handler_bus_replica_list"
+);
+register_bus_variant!(
+    "BusLeaderBalancePlanRequest",
+    "tentaflow_ws_handler_bus_leader_balance_plan"
+);
+register_bus_variant!(
+    "BusLeaderBalanceApplyRequest",
+    "tentaflow_ws_handler_bus_leader_balance_apply"
 );
 register_bus_variant!(
     "BusSchemaSubjectListRequest",
@@ -4966,6 +5019,7 @@ fn replica_node_wire(n: &ReplicaNodeInfo) -> BusReplicaNodeWire {
         leader_count: n.leader_count,
         follower_count: n.follower_count,
         isr_count: n.isr_count,
+        forward_capable: false,
     }
 }
 
@@ -5002,6 +5056,7 @@ fn partition_replica_wire(p: &PartitionReplicaInfo) -> BusPartitionReplicaWire {
         unavailable_reason: p
             .unavailable_reason
             .map(|r| unavailable_reason_str(r).to_string()),
+        preferred_leader_node_id: p.replicas.first().cloned(),
     }
 }
 
@@ -5024,7 +5079,7 @@ const BUS_FAILOVER_AUDIT_ACTION: &str = "bus.leader.failover";
 /// Audit action of a manual leader transfer (`leader_transfer_v1`). Its
 /// details: `instance_id=<id> org_id=<org> partition=<u32> from_node=<id|->
 /// from_epoch=<u32> target_node_id=<id> leader_epoch=<u32> duration_ms=<u64>`.
-const BUS_LEADER_TRANSFER_AUDIT_ACTION: &str = "bus.leader.transfer";
+const BUS_LEADER_TRANSFER_AUDIT_ACTION: &str = bus::leader_balance::LEADER_TRANSFER_AUDIT_ACTION;
 
 /// `BusFailoverEventWire::reason` of a manual transfer — failover reasons
 /// come from the replication layer, a transfer has none of its own.
@@ -5242,8 +5297,19 @@ async fn replica_list_v1(
         if let Some(coordinator) = svc.replication() {
             let snapshot =
                 coordinator.snapshot(&org_id_for_snapshot, topic_for_snapshot.as_deref());
-            let nodes: Vec<BusReplicaNodeWire> =
-                snapshot.nodes.iter().map(replica_node_wire).collect();
+            // Only what is already known of the peers: a card must not wait
+            // for a probe.
+            let node_ids: Vec<String> = snapshot.nodes.iter().map(|n| n.node_id.clone()).collect();
+            let capable = coordinator.node_forwarding(&node_ids, std::time::Duration::ZERO);
+            let nodes: Vec<BusReplicaNodeWire> = snapshot
+                .nodes
+                .iter()
+                .zip(capable)
+                .map(|(n, forwarding)| BusReplicaNodeWire {
+                    forward_capable: forwarding == NodeForwarding::Capable,
+                    ..replica_node_wire(n)
+                })
+                .collect();
             let partitions: Vec<BusPartitionReplicaWire> = snapshot
                 .partitions
                 .iter()
@@ -5293,6 +5359,7 @@ async fn replica_list_v1(
                     high_watermark: stats.high_watermark,
                     log_end_offset: stats.high_watermark,
                     unavailable_reason: None,
+                    preferred_leader_node_id: Some(local_node_id_for_snapshot.clone()),
                 });
             }
         }
@@ -5306,6 +5373,7 @@ async fn replica_list_v1(
             leader_count: partition_count,
             follower_count: 0,
             isr_count: partition_count,
+            forward_capable: true,
         };
         Ok((vec![node], partitions_wire))
     })
@@ -5442,7 +5510,6 @@ async fn leader_transfer_v1(
     let org_id = g.org_id.clone();
     let user_id = g.user_id.clone();
     let db = ctx.state.db.clone();
-    let local_node_id = ctx.state.local_node_id.to_string();
 
     if target_node_id.trim().is_empty() {
         return Err(ProtocolError::bad_request(
@@ -5495,58 +5562,225 @@ async fn leader_transfer_v1(
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
     let target_for_call = target_node_id.clone();
+    let user_for_call = user_id.clone();
     let svc = g.svc.clone();
-    let (leader_epoch, from_node, from_epoch, duration_ms) = run_blocking(
-        move || -> Result<(u32, Option<String>, u32, u64), ProtocolError> {
-            let svc = svc;
-            let coordinator = svc.replication().ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::NotAvailable,
-                    "bus.replication_disabled: no replication coordinator installed on this node",
-                )
-            })?;
-            let before = coordinator
-                .snapshot(&org_id_for_call, Some(&topic_for_call))
-                .partitions
-                .into_iter()
-                .find(|p| p.partition == partition);
-            let started = std::time::Instant::now();
-            let leader_epoch = coordinator
-                .transfer_leader(
-                    &org_id_for_call,
-                    &topic_for_call,
-                    partition,
-                    &target_for_call,
-                )
-                .map_err(map_repl_error)?;
-            Ok((
-                leader_epoch,
-                before.as_ref().and_then(|p| p.leader_node_id.clone()),
-                before.map(|p| p.leader_epoch).unwrap_or(0),
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            ))
-        },
-    )
+    let leader_epoch = run_blocking(move || -> Result<u32, ProtocolError> {
+        if svc.replication().is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::NotAvailable,
+                "bus.replication_disabled: no replication coordinator installed on this node",
+            ));
+        }
+        // The whole topic goes, its dead-letter topic with it: a topic led by
+        // two nodes is consumed by neither. One partition's move is audited
+        // as `bus.leader.transfer` by the service, as are its rollbacks.
+        let run = RunContext {
+            actor: Some(&user_for_call),
+            reason: "manual",
+        };
+        let moved = svc
+            .move_topic_leadership(run, &org_id_for_call, &topic_for_call, &target_for_call)
+            .map_err(map_topic_move_failure)?;
+        Ok(moved
+            .moved
+            .iter()
+            .find(|m| m.topic == topic_for_call && m.partition == partition)
+            .map(|m| m.leader_epoch)
+            .or_else(|| {
+                moved
+                    .unchanged
+                    .iter()
+                    .find(|(t, p, _)| *t == topic_for_call && *p == partition)
+                    .map(|(_, _, epoch)| *epoch)
+            })
+            .or_else(|| moved.moved.first().map(|m| m.leader_epoch))
+            .unwrap_or(0))
+    })
     .await?;
 
-    let _ = repository::log_audit(
-        &db,
-        Some(&user_id),
-        None,
-        BUS_LEADER_TRANSFER_AUDIT_ACTION,
-        Some(&topic),
-        Some(&format!(
-            "instance_id={} org_id={org_id} partition={partition} from_node={} \
-             from_epoch={from_epoch} target_node_id={target_node_id} \
-             leader_epoch={leader_epoch} duration_ms={duration_ms}",
-            g.instance.as_str(),
-            from_node.as_deref().unwrap_or("-")
-        )),
-        None,
-        Some(&local_node_id),
-    );
-
     Ok(BusPayload::LeaderTransferResponse { leader_epoch })
+}
+
+/// A failed whole-topic move as the error the client reads: the cause's own
+/// code, and what became of the partitions.
+fn map_topic_move_failure(failure: TopicMoveFailure) -> ProtocolError {
+    let mut error = map_repl_error(failure.cause);
+    match failure.status {
+        MoveStatus::FailedRolledBack => error
+            .message
+            .push_str(" (partitions that had moved were handed back: no partition changed node)"),
+        MoveStatus::FailedPartial => error.message.push_str(&format!(
+            " (these partitions could not be handed back and stay on the target: {}; where \
+             these are led is not known: {})",
+            failure
+                .stranded
+                .iter()
+                .map(|(topic, partition)| format!("{topic}/{partition}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            failure
+                .unresolved
+                .iter()
+                .map(|(topic, partition)| format!("{topic}/{partition}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ if !failure.unresolved.is_empty() => error.message.push_str(&format!(
+            " (where these are led is not known: {})",
+            failure
+                .unresolved
+                .iter()
+                .map(|(topic, partition)| format!("{topic}/{partition}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => error.message.push_str(" (no partition changed node)"),
+    }
+    error
+}
+
+fn map_leader_balance_error(e: LeaderBalanceError) -> ProtocolError {
+    match e {
+        LeaderBalanceError::ReplicationDisabled => ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "bus.replication_disabled: no replication coordinator installed on this node",
+        ),
+        LeaderBalanceError::Busy => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            "bus.rebalance_busy: another leader rebalance is running on this node; try again \
+             when it has finished",
+        ),
+        LeaderBalanceError::PlanChanged => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            "bus.plan_changed: the plan has changed since it was shown; plan again",
+        ),
+        LeaderBalanceError::PermissionDenied(topic) => ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.permission_denied: admin on '{topic}'"),
+        ),
+        LeaderBalanceError::Failed(message) => {
+            tracing::warn!(error = %message, "leader balance failed");
+            ProtocolError::internal("bus.replication_internal_error: the plan could not be made")
+        }
+    }
+}
+
+/// The most moves one apply request may carry: a plan has at most one move
+/// per topic of the organisation.
+const LEADER_BALANCE_MAX_MOVES: usize = 4096;
+
+/// "Rozłóż prowadzenie", the preview: which topics of the caller's
+/// organisation would change leader so that the nodes lead about the same
+/// number of partitions, and what stops the others. Changes nothing. Same
+/// gate as `leader_transfer_v1`.
+async fn leader_balance_plan_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: Option<String>,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(&g);
+    let plan = run_blocking(move || {
+        let access = |name: &str| svc.topic_access(&bctx, name);
+        let own_org = bctx.org_id.clone();
+        let can_admin = |org: &str, name: &str| org == own_org && access(name).2;
+        let plan = svc
+            .leader_balance_plan(Some(&own_org), topic.as_deref(), &can_admin)
+            .map_err(map_leader_balance_error)?;
+        // A topic the caller may not even read is not named to it.
+        let blockers: Vec<BusLeaderBlockerWire> = plan
+            .blockers
+            .iter()
+            .filter(|b| b.org_id == own_org && access(&b.topic).0)
+            .map(|b| BusLeaderBlockerWire {
+                topic: b.topic.clone(),
+                reason: b.reason.clone(),
+                node_id: b.node_id.clone(),
+            })
+            .collect();
+        Ok((plan, blockers))
+    })
+    .await?;
+    let (plan, blockers) = plan;
+    Ok(BusPayload::LeaderBalancePlanResponse {
+        moves: plan
+            .moves
+            .iter()
+            .map(|m| BusLeaderMoveWire {
+                topic: m.topic.clone(),
+                partitions: m.partitions.clone(),
+                from_node_id: m.from.clone(),
+                to_node_id: m.to.clone(),
+                returns_to_preferred: m.returns_to_preferred,
+            })
+            .collect(),
+        per_node: plan
+            .per_node
+            .iter()
+            .map(|n| BusLeaderLoadWire {
+                node_id: n.node_id.clone(),
+                partitions_before: n.before,
+                partitions_after: n.after,
+            })
+            .collect(),
+        blockers,
+    })
+}
+
+/// "Rozłóż prowadzenie", the run: applies `moves` if they are still the plan
+/// (`bus.plan_changed` otherwise, and nothing moves). Needs admin on every
+/// topic it names, as `leader_transfer_v1` does. The moves are audited as
+/// `bus.leader.transfer` per partition and one `bus.leader.rebalance`.
+async fn leader_balance_apply_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    moves: Vec<BusLeaderMoveWire>,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    if moves.len() > LEADER_BALANCE_MAX_MOVES {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: too many moves in one plan",
+        ));
+    }
+    let org_id = g.org_id.clone();
+    let user_id = g.user_id.clone();
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(&g);
+    let requested: Vec<RequestedMove> = moves
+        .into_iter()
+        .map(|m| RequestedMove {
+            topic: m.topic,
+            partitions: m.partitions,
+            from_node_id: m.from_node_id,
+            to_node_id: m.to_node_id,
+        })
+        .collect();
+    let results = run_blocking(move || {
+        let own_org = bctx.org_id.clone();
+        let can_admin = |org: &str, name: &str| org == own_org && svc.topic_access(&bctx, name).2;
+        let run = RunContext {
+            actor: Some(&user_id),
+            reason: "rebalance",
+        };
+        svc.leader_balance_apply(&org_id, run, &requested, &can_admin)
+            .map_err(map_leader_balance_error)
+    })
+    .await?;
+    Ok(BusPayload::LeaderBalanceApplyResponse {
+        results: results
+            .into_iter()
+            .map(|r| BusLeaderMoveResultWire {
+                topic: r.topic,
+                partitions: r.partitions,
+                from_node_id: r.from_node_id,
+                to_node_id: r.to_node_id,
+                status: r.status.as_str().to_string(),
+                error_code: r.error_code,
+                detail: r.detail,
+            })
+            .collect(),
+    })
 }
 
 // =============================================================================
@@ -7500,6 +7734,39 @@ mod tests {
         ) -> Result<u32, ReplError> {
             Ok(self.transfer_epoch)
         }
+        /// Every node takes forwarded requests: a move to it is allowed.
+        fn node_forwarding(
+            &self,
+            nodes: &[String],
+            _probe_within: std::time::Duration,
+        ) -> Vec<bus::NodeForwarding> {
+            vec![bus::NodeForwarding::Capable; nodes.len()]
+        }
+        /// The partitions of `snapshot_topic`, as the ledger would hold
+        /// them: a whole-topic move is made of them.
+        fn instance_assignments(
+            &self,
+        ) -> Result<Vec<bus::replication::assignment::PartitionAssignment>, ReplError> {
+            Ok(self
+                .snapshot
+                .partitions
+                .iter()
+                .filter(|p| p.topic == self.snapshot_topic)
+                .map(|p| bus::replication::assignment::PartitionAssignment {
+                    instance_id: fixture_instance_id().as_str().to_string(),
+                    org_id: self.snapshot_org.clone(),
+                    topic: p.topic.clone(),
+                    partition: p.partition,
+                    leader_node_id: p.leader_node_id.clone().unwrap_or_default(),
+                    replicas: p.replicas.clone(),
+                    isr: p.isr.clone(),
+                    leader_epoch: p.leader_epoch,
+                    updated_at_ms: 0,
+                    topic_generation: 1,
+                    epoch_slots: Default::default(),
+                })
+                .collect())
+        }
         fn reassign(
             &self,
             _org: &str,
@@ -7563,6 +7830,45 @@ mod tests {
                 "bus.not_leader:",
             ),
             (
+                ReplError::TransferTargetBehind {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    node_id: "n1".to_string(),
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.transfer_target_behind:",
+            ),
+            (
+                ReplError::TransferBlocked {
+                    topic: "t".to_string(),
+                    reason: "consumer_group_paused".to_string(),
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.transfer_blocked:",
+            ),
+            (
+                ReplError::TransferOutcomeUnknown {
+                    topic: "t".to_string(),
+                    partition: 1,
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.transfer_outcome_unknown:",
+            ),
+            (
+                ReplError::TransferRefused {
+                    reason: "environment_mismatch".to_string(),
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.transfer_refused:",
+            ),
+            (
+                ReplError::NodeWithoutForwarding {
+                    node_id: "n2".to_string(),
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.node_without_forwarding:",
+            ),
+            (
                 ReplError::Internal("boom".to_string()),
                 ProtocolErrorCode::Internal,
                 "bus.replication_internal_error:",
@@ -7577,6 +7883,13 @@ mod tests {
                 mapped.message
             );
         }
+    }
+
+    #[test]
+    fn a_rebalance_that_is_already_running_reads_as_busy() {
+        let mapped = map_leader_balance_error(LeaderBalanceError::Busy);
+        assert_eq!(mapped.code, ProtocolErrorCode::Conflict);
+        assert!(mapped.message.starts_with("bus.rebalance_busy:"));
     }
 
     /// plan-app-platform §7 W7: the two-tier split this test used to

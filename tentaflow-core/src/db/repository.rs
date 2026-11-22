@@ -32507,6 +32507,24 @@ pub fn bus_assignment_list_for_node(
         .collect())
 }
 
+/// Every assignment of one TentaBus instance, across its orgs and topics,
+/// ordered by org, topic and partition: what the leader planner
+/// (`bus::leader_balance`) reads to see who leads and prefers what.
+pub fn bus_assignment_list_for_instance(
+    pool: &DbPool,
+    instance_id: &str,
+) -> Result<Vec<DbBusPartitionAssignment>> {
+    let conn = acquire_read(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+         WHERE instance_id = ?1 ORDER BY org_id, topic, partition"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![instance_id], map_bus_assignment_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// How many partitions of one TentaBus instance each node is the preferred
 /// leader of, across its orgs and topics: the cluster-wide load
 /// `ReplicationCoordinator::leader_counts` reports. The preferred leader is
@@ -35863,6 +35881,34 @@ mod bus_repository_tests {
         bus_assignment_upsert(&db, &assignment_row(T2, "org-1", "orders.created", 0)).unwrap();
         let all = bus_assignment_list_all(&db).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn assignment_list_for_instance_returns_only_that_instance_in_order() {
+        let db = fresh_db();
+        for row in [
+            assignment_row(T1, "org-2", "b", 0),
+            assignment_row(T1, "org-1", "b", 1),
+            assignment_row(T1, "org-1", "b", 0),
+            assignment_row(T1, "org-1", "a", 0),
+            assignment_row(T2, "org-1", "a", 0),
+        ] {
+            bus_assignment_upsert(&db, &row).unwrap();
+        }
+        let rows = bus_assignment_list_for_instance(&db, T1).unwrap();
+        let keys: Vec<(&str, &str, u32)> = rows
+            .iter()
+            .map(|r| (r.org_id.as_str(), r.topic.as_str(), r.partition))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("org-1", "a", 0),
+                ("org-1", "b", 0),
+                ("org-1", "b", 1),
+                ("org-2", "b", 0),
+            ]
+        );
     }
 
     /// The load of a node is the partitions it is the PREFERRED leader of

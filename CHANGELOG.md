@@ -115,6 +115,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   partycji DLQ.
 - Wpis audytu `bus.topic.create` ma w szczegółach
   `leader=<węzeł> leader_rf=<RF>` przed listą replik.
+- Przenosiny prowadzenia obejmują cały topik razem z jego DLQ (`__dlq.*`), nie
+  pojedynczą partycję: temat prowadzony przez dwa węzły nie byłby czytany przez
+  żaden z nich. `leader_transfer_v1` dla partycji przenosi więc wszystkie
+  partycje topiku. Najpierw sprawdza każdą z nich u jej lidera, potem przenosi
+  po kolei; gdy któraś zawiedzie, te już przeniesione wracają do poprzedniego
+  lidera (wpisy `bus.leader.transfer` z `reason=rollback`), a odpowiedź mówi,
+  że żadna partycja nie zmieniła węzła. Powrót przywraca dokładnie pierwotną
+  listę replik. Jeśli powrót się nie uda w 15 s, wynik to `failed_partial` z
+  listą partycji, które zostały na celu. Cel musi przyjmować przekazywane
+  żądania (`bus.node_without_forwarding`, dotyczy też przenosin ręcznych).
+- Przenosiny wykonuje bieżący lider partycji. Żądanie, które trafi gdzie
+  indziej, jest przekazywane do niego (nowa ramka replikacji, rodzaje 13 i 14,
+  oraz bit `bus_features` `1<<2`); prosić może każdy węzeł tej samej instancji
+  i środowiska, także taki, który nie trzyma repliki. Odmowa lidera dociera do
+  wołającego z własnym kodem (`bus.transfer_refused`), nie jako błąd wewnętrzny.
+  Lider sprawdza, że cel jest w żywym ISR i nadąża. Potem zamyka zapisy w
+  samej partycji (po tym żaden zapis nie ląduje), czeka na dogonienie celu do
+  końca logu (najwyżej ok. 2 s) i dopiero wtedy proponuje wiersz. Gdy cel
+  zostaje w tyle, wynik to `bus.transfer_target_behind`, zapisy są otwierane
+  z powrotem i nic się nie zmienia. Zapis, który trafi w tym czasie na lidera,
+  czeka (do 2 s); jeśli przeniesienie trwa dłużej, jest odrzucany jako
+  `bus.not_leader` (do ponowienia), nigdy przepuszczany. Zapis, który był już
+  za bramką, ląduje w logu przed zamknięciem albo jest odrzucony. Gdy odpowiedź
+  o przyjęciu wiersza nie nadejdzie, lider czyta wiersz ponownie; jeśli nadal
+  nie wiadomo, gdzie partycja jest prowadzona, wynik to
+  `bus.transfer_outcome_unknown`, a stary lider zostaje zatrzymany (nie
+  przyjmuje zapisów). Przeniesienie nie gubi potwierdzonych zapisów (test: 300
+  zapisów `acks=leader` tuż przed przeniesieniem; opóźniony cel testowany na
+  poziomie menedżera).
+- Grupa konsumentów wstrzymana (pauza) blokuje przeniesienie topiku:
+  `bus.transfer_blocked`. Pauza jest trzymana przez lidera i nie jest
+  replikowana, więc nowy lider wznowiłby grupę.
+- Przeniesienie na inny węzeł robi z niego węzeł preferowany (`replicas[0]`);
+  powrót na węzeł preferowany nie zmienia kolejności replik; failover nigdy jej
+  nie zmienia.
+- „Rozłóż prowadzenie”: `LeaderBalancePlanRequest` pokazuje plan (które topiki
+  zmienią lidera, ile partycji prowadzi każdy węzeł przed i po, co blokuje
+  topik), `LeaderBalanceApplyRequest` go wykonuje. Plan przenosi cały topik z
+  najbardziej do najmniej obciążonego węzła, dopóki ruch zmniejsza różnicę,
+  wybierając ruch zostawiający najmniejszą różnicę (zachłannie, nie dowodliwe
+  minimum); najpierw wracają topiki na swój węzeł preferowany. Różnica
+  „najwyżej waga najmniejszego topiku” nie zawsze jest osiągalna (topiki 8, 3
+  i 1 dają co najwyżej 4); gdy zostaje szersza i nic jej nie tłumaczy, plan
+  wskazuje topik z powodem `would_not_improve`. Powrót zablokowany tylko
+  chwilowo (cel w tyle, poza ISR, niedostępny) liczy obciążenie na węźle
+  preferowanym, więc plan nie przenosi w tym czasie innego topiku na ten węzeł.
+  ISR z księgi, które nie jest żywe, nie blokuje ruchu: ocenia go lider.
+  „Prowadzona” znaczy: aktualny lider (`leader_node_id`), nie preferowany.
+  `per_node` dotyczy organizacji wołającego.
+  Wykonanie liczy plan jeszcze raz i przy różnicy odrzuca żądanie kodem
+  `bus.plan_changed`. Wymaga roli Admin w organizacji, uprawnienia `bus.admin`
+  i prawa administratora do każdego ruszanego topiku (`bus.permission_denied`).
+  Topiki idą po kolei, pierwszy błąd zatrzymuje resztę (`not_attempted`).
+  Jeden rozkład naraz na węzeł (`bus.rebalance_busy`); rozkłady na różnych
+  węzłach nie są wykluczane, ale każdy ruch czyta wiersze od nowa, więc drugi
+  dostaje `bus.plan_changed`. Wynik bez odpowiedzi to `failed_partial` z kodem
+  `bus.transfer_outcome_unknown`.
+  Audyt: `bus.leader.transfer` dla każdej partycji i jeden
+  `bus.leader.rebalance` na organizację.
+- `BusReplicaNodeWire.forward_capable` i
+  `BusPartitionReplicaWire.preferred_leader_node_id` (pola opcjonalne,
+  `SCHEMA_VERSION` bez zmian; stary klient je ignoruje, stary węzeł ich nie
+  podaje).
+- Jednorazowy rozkład po aktualizacji: gdy wszystkie węzły instancji ogłaszają
+  nowe funkcje, węzeł o najniższym id raz rozkłada istniejące topiki (audyt
+  `bus.leader.rebalance`, aktor `system`, `reason=post_upgrade_spread`).
+  Znacznik wykonania to klucz ustawień lokalnego węzła
+  `bus.leader_spread:<instancja>` (bez migracji; nie jest replikowany, więc
+  węzeł o niższym id, który dołączy później, może uruchomić rozkład ponownie,
+  co przy zrównoważonych topikach nic nie przenosi). Topik, który zawiedzie,
+  nie zatrzymuje pozostałych. Każdy topik zostawiony na miejscu ma wpis
+  `bus.leader.rebalance_skipped` z powodem. Znacznik powstaje tylko wtedy, gdy
+  nic nie zostało z powodu przejściowego (cel w tyle lub poza ISR, węzeł
+  niedostępny, nieznany wynik); w przeciwnym razie rozkład jest ponawiany z
+  przerwą 1, 2, 4 ... min (najwyżej 30 min). Powód trwały (wstrzymana grupa,
+  węzeł bez przekazywania) znacznika nie wstrzymuje; do takich topików służy
+  „Rozłóż prowadzenie”. Instalacja jednowęzłowa i węzeł, który rozkładu nie
+  wykonuje, sprawdzają stan rzadko (co 10 min).
 
 ### Limity i SLA usług (TB-03)
 

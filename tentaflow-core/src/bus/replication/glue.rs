@@ -60,7 +60,7 @@ use crate::bus::replication::leader::{
 };
 use crate::bus::replication::manager::{
     BusRecv, BusSend, FollowerRunner, FollowerRunnerFactory, LeaderHandle, LeaderHandleFactory,
-    ReplAudit, Transport,
+    ReplAudit, ReplicaProgress, Transport,
 };
 use crate::bus::replication::metrics::LeaderMetrics;
 use crate::bus::topics::Acks;
@@ -383,6 +383,9 @@ impl GlueLeaderFactory {
 struct LeaderWrites {
     open: bool,
     stopped: bool,
+    /// A transfer closed the writes (`close_writes_for_transfer`) and has not
+    /// opened them again.
+    closed_for_transfer: bool,
 }
 
 struct GlueLeaderShared {
@@ -716,6 +719,16 @@ impl LeaderHandle for GlueLeaderHandle {
             .map(|state| state.last_ack_at.elapsed())
     }
 
+    fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
+        self.0
+            .leader
+            .follower_state(node_id)
+            .map(|state| ReplicaProgress {
+                leo: state.leo,
+                in_flight_bytes: state.lag_bytes,
+            })
+    }
+
     fn open_writes(&self) {
         let mut writes = self.0.writes.lock();
         if !writes.stopped && !writes.open {
@@ -727,6 +740,37 @@ impl LeaderHandle for GlueLeaderHandle {
     fn claim_term(&self) {
         let shared = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || shared.claim_term());
+    }
+
+    /// Under the `writes` lock `stop()` takes: the close goes through the
+    /// partition's writer thread, so an append already queued either lands
+    /// before it returns or is refused with `LeaderWritesClosed`, and none
+    /// lands after.
+    fn close_writes_for_transfer(&self) -> bool {
+        let mut writes = self.0.writes.lock();
+        if writes.stopped || !writes.open {
+            return false;
+        }
+        match self.0.partition.close_leader_writes() {
+            Ok(()) => {
+                writes.open = false;
+                writes.closed_for_transfer = true;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "replication: closing leader writes for a transfer failed");
+                false
+            }
+        }
+    }
+
+    fn reopen_writes_after_transfer(&self) {
+        let mut writes = self.0.writes.lock();
+        if writes.closed_for_transfer && !writes.stopped && !writes.open {
+            self.0.partition.open_leader_writes();
+            writes.open = true;
+        }
+        writes.closed_for_transfer = false;
     }
 
     fn log_epoch(&self) -> u32 {
@@ -1867,6 +1911,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(part.log_end_offset(), 1);
+    }
+
+    /// A transfer closes the leader's writes at the partition before it reads
+    /// the log end it waits for the target to reach: once the close returns,
+    /// no append lands (so the log end stays where it is), and opening the
+    /// writes again lets them through. A handle that was stopped meanwhile is
+    /// not reopened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_writes_for_a_transfer_stops_every_append_and_reopening_lets_them_through() {
+        let provider = FakeNodeProvider::new();
+        let mut a = assignment(&["l", "f1"], "l", &["l", "f1"], 5);
+        a.partition = 4;
+        let factory = Arc::new(GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        ));
+        let term = a.clone();
+        let handle = tokio::task::spawn_blocking(move || factory.spawn(&term, Vec::new()))
+            .await
+            .unwrap()
+            .expect("leader spawn");
+        handle.open_writes();
+        let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
+        let part = provider
+            .partition("org-1", "orders", 4, a.topic_generation)
+            .unwrap();
+        let append = |part: Partition| {
+            tokio::task::spawn_blocking(move || {
+                let mut b = tentaflow_bus::BatchBuilder::new(part.log_end_offset(), 1);
+                b.push(tentaflow_bus::RecordInput::new(
+                    bytes::Bytes::from_static(b"w"),
+                    0,
+                ))
+                .unwrap();
+                part.append_batch_as_leader(b.build().unwrap(), 5)
+            })
+        };
+        append(part.clone())
+            .await
+            .unwrap()
+            .expect("open writes land");
+
+        let closing = Arc::clone(&handle);
+        assert!(
+            tokio::task::spawn_blocking(move || closing.close_writes_for_transfer())
+                .await
+                .unwrap()
+        );
+        let end = part.log_end_offset();
+        for _ in 0..3 {
+            assert!(matches!(
+                append(part.clone()).await.unwrap(),
+                Err(tentaflow_bus::BusError::LeaderWritesClosed)
+            ));
+        }
+        assert_eq!(part.log_end_offset(), end, "nothing lands after the close");
+
+        let reopening = Arc::clone(&handle);
+        tokio::task::spawn_blocking(move || reopening.reopen_writes_after_transfer())
+            .await
+            .unwrap();
+        append(part.clone()).await.unwrap().expect("reopened");
+
+        // Closed, then stopped: the reopen must not undo the stop.
+        let closing = Arc::clone(&handle);
+        assert!(
+            tokio::task::spawn_blocking(move || closing.close_writes_for_transfer())
+                .await
+                .unwrap()
+        );
+        let stopping = Arc::clone(&handle);
+        tokio::task::spawn_blocking(move || {
+            stopping.stop();
+            stopping.reopen_writes_after_transfer();
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            append(part.clone()).await.unwrap(),
+            Err(tentaflow_bus::BusError::LeaderWritesClosed)
+        ));
     }
 
     /// The claim runs on a blocking thread after the manager released its

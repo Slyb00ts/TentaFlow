@@ -128,6 +128,9 @@ use tokio::io::split;
 use tentaflow_bus::{BatchBuilder, RecordInput};
 use tentaflow_protocol::environment::NodeEnvironment;
 
+use tentaflow_core::bus::leader_balance::{
+    LeaderBalanceError, MoveStatus, RequestedMove, RunContext,
+};
 use tentaflow_core::bus::replication::assignment::PartitionAssignment;
 use tentaflow_core::bus::replication::election::LogPosition;
 use tentaflow_core::bus::replication::follower::FollowerConfig;
@@ -270,6 +273,9 @@ struct SharedLedger {
     /// (`hold_propose`) — an election paused between its `LeoQuery` round
     /// and its proposal, while another one runs.
     hold: Mutex<Option<ProposeHold>>,
+    /// `Some(node)`: everything `node` proposes is lost on the way to the
+    /// ledger (`drop_proposals_from`) -- no row, no acknowledgement.
+    dropping: Mutex<Option<String>>,
 }
 
 struct ProposeHold {
@@ -300,7 +306,13 @@ impl SharedLedger {
             next_op: Mutex::new(1),
             views: Mutex::new(None),
             hold: Mutex::new(None),
+            dropping: Mutex::new(None),
         })
+    }
+
+    /// Loses every proposal `node` makes until `drop_proposals_from(None)`.
+    fn drop_proposals_from(&self, node: Option<&str>) {
+        *self.dropping.lock() = node.map(str::to_string);
     }
 
     /// Seeds an initial assignment directly (no admission gate) — the
@@ -383,6 +395,9 @@ impl SharedLedger {
         let id = OperationId::from_hash([*n; 32]);
         *n = n.wrapping_add(1).max(1);
         drop(n);
+        if self.dropping.lock().as_deref() == Some(node) {
+            return id;
+        }
         let mut views = self.views.lock();
         let acked = match views.as_mut() {
             Some(views) => {
@@ -462,6 +477,19 @@ impl AssignmentStore for NodeLedger {
             .into_values()
             .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
             .collect())
+    }
+
+    fn list_for_instance(&self, instance_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+        let mut rows: Vec<_> = self
+            .shared
+            .rows_seen_by(&self.node)
+            .into_values()
+            .filter(|a| a.instance_id == instance_id)
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.org_id, &a.topic, a.partition).cmp(&(&b.org_id, &b.topic, b.partition))
+        });
+        Ok(rows)
     }
 
     fn preferred_leader_counts(
@@ -4201,6 +4229,482 @@ async fn the_metrics_rollup_of_another_node_lands_on_the_leader_without_a_warnin
         keys,
         vec![Some(b"B".to_vec())],
         "one rollup, keyed by node B"
+    );
+    shutdown_all(&nodes);
+}
+
+// ===== TB-04 K5: spreading topic leaders =====================================
+
+/// Adds a one-partition topic `name`, replicated on `replicas` and led by
+/// `leader`, to a cluster built by `build_cluster_placed`: created on A, its
+/// row copied to the others, its epoch-1 placement applied everywhere.
+async fn add_topic(
+    nodes: &[TestNode],
+    ledger: &Arc<SharedLedger>,
+    name: &str,
+    replicas: &[&str],
+    leader: &str,
+) {
+    nodes[0]
+        .svc
+        .create_topic(
+            &ctx(),
+            name,
+            TopicOptions {
+                partitions: Some(1),
+                replication_factor: Some(replicas.len() as u32),
+                acks: Some(Acks::Leader),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+    let row =
+        tentaflow_core::db::repository::bus_topic_get(&nodes[0].db, TEST_INSTANCE_ID, ORG, name)
+            .expect("read topic row")
+            .expect("topic row");
+    for node in &nodes[1..] {
+        tentaflow_core::db::repository::bus_topic_create(&node.db, &row)
+            .expect("replicate topic row");
+    }
+    let mut placed = assignment(row.generation, replicas, leader, 1, 0);
+    placed.topic = name.to_string();
+    ledger.seed(placed.clone());
+    for node in nodes {
+        node.manager.apply_assignment(placed.clone()).await;
+    }
+}
+
+/// The leader of `topic` has every member in its live ISR.
+async fn wait_isr_full(nodes: &[TestNode], topic: &str, leader: &str, members: &[&str]) -> bool {
+    wait_until(Duration::from_secs(20), || {
+        find_node(nodes, leader)
+            .manager
+            .snapshot(ORG, Some(topic))
+            .partitions
+            .iter()
+            .any(|p| p.partition == 0 && members.iter().all(|m| p.isr.iter().any(|i| i == m)))
+    })
+    .await
+}
+
+async fn publish_on(
+    svc: &Arc<BusService>,
+    topic: &str,
+    payload: &str,
+) -> Result<tentaflow_core::bus::PublishResult, BusServiceError> {
+    svc.publish_async(
+        &ctx(),
+        topic,
+        PublishBatch {
+            partition: Some(0),
+            producer: None,
+            records: vec![PublishRecord {
+                key: None,
+                headers: vec![],
+                payload: Bytes::from(payload.to_string()),
+                timestamp_ms: 0,
+                schema_id: 0,
+            }],
+        },
+    )
+    .await
+}
+
+/// The payloads `node` holds for partition 0 of `topic`, off its own engine.
+fn payloads_of(node: &TestNode, topic: &str) -> Vec<String> {
+    node.svc
+        .local_partition(&ctx(), topic, 0)
+        .expect("partition handle")
+        .open_reader()
+        .fetch_from_offset(0, 16 * 1024 * 1024)
+        .expect("fetch_from_offset")
+        .into_iter()
+        .flat_map(|b| {
+            b.records()
+                .map(|r| String::from_utf8_lossy(&r.unwrap().payload).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn leader_of(nodes: &[TestNode], topic: &str) -> Option<String> {
+    let leaders: Vec<&TestNode> = nodes
+        .iter()
+        .filter(|n| matches!(n.manager.role(ORG, topic, 0), PartitionRole::Leader { .. }))
+        .collect();
+    (leaders.len() == 1).then(|| leaders[0].id.clone())
+}
+
+fn requested_from(plan: &tentaflow_core::bus::leader_balance::LeaderPlan) -> Vec<RequestedMove> {
+    plan.moves
+        .iter()
+        .map(|m| RequestedMove {
+            topic: m.topic.clone(),
+            partitions: m.partitions.clone(),
+            from_node_id: m.from.clone(),
+            to_node_id: m.to.clone(),
+        })
+        .collect()
+}
+
+async fn plan_on(node: &TestNode) -> tentaflow_core::bus::leader_balance::LeaderPlan {
+    let svc = Arc::clone(&node.svc);
+    tokio::task::spawn_blocking(move || svc.leader_balance_plan(Some(ORG), None, &|_, _| true))
+        .await
+        .expect("plan task")
+        .expect("plan")
+}
+
+async fn four_topics_led_by_a() -> (
+    Vec<TestNode>,
+    Arc<SharedLedger>,
+    Arc<TransportRegistry>,
+    [&'static str; 4],
+) {
+    let (nodes, ledger, registry) = build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    for name in ["t2", "t3", "t4"] {
+        add_topic(&nodes, &ledger, name, &["A", "B"], "A").await;
+    }
+    let topics = [TOPIC, "t2", "t3", "t4"];
+    for topic in topics {
+        assert!(
+            wait_isr_full(&nodes, topic, "A", &["A", "B"]).await,
+            "the ISR of {topic} never filled"
+        );
+    }
+    (nodes, ledger, registry, topics)
+}
+
+/// Four topics led by one of two nodes end two and two, by the plan the admin
+/// was shown, while a third node keeps writing to all of them through
+/// forwarding: every acknowledged write is in the log of the topic's new
+/// leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_topics_led_by_one_node_are_spread_two_and_two_while_writes_go_on() {
+    let (nodes, _ledger, registry, topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+    let c = find_node(&nodes, "C");
+
+    let plan = plan_on(a).await;
+    assert_eq!(plan.moves.len(), 2, "plan: {plan:?}");
+    let requested = requested_from(&plan);
+
+    let acked: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (svc, acked, stop) = (Arc::clone(&c.svc), Arc::clone(&acked), Arc::clone(&stop));
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                let topic = topics[i % topics.len()];
+                let payload = format!("w{i}");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    let attempt = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        publish_on(&svc, topic, &payload),
+                    )
+                    .await;
+                    if matches!(attempt, Ok(Ok(ref r)) if r.accepted == 1) {
+                        acked.lock().push((topic.to_string(), payload));
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let svc = Arc::clone(&a.svc);
+    let results = tokio::task::spawn_blocking(move || {
+        let run = RunContext {
+            actor: Some("test"),
+            reason: "rebalance",
+        };
+        svc.leader_balance_apply(ORG, run, &requested, &|_, _| true)
+    })
+    .await
+    .expect("apply task")
+    .expect("apply");
+    assert!(
+        results.iter().all(|r| r.status == MoveStatus::Moved),
+        "results: {results:?}"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let led: Vec<Option<String>> = topics.iter().map(|t| leader_of(&nodes, t)).collect();
+            led.iter().all(Option::is_some)
+                && led.iter().flatten().filter(|l| *l == "A").count() == 2
+                && led.iter().flatten().filter(|l| *l == "B").count() == 2
+        })
+        .await,
+        "the leaders did not settle two and two: {:?}",
+        topics
+            .iter()
+            .map(|t| leader_of(&nodes, t))
+            .collect::<Vec<_>>()
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.store(true, Ordering::SeqCst);
+    writer.await.expect("writer");
+
+    let acked = acked.lock().clone();
+    for topic in topics {
+        assert!(
+            acked.iter().any(|(t, _)| t == topic),
+            "no write to {topic} was acknowledged"
+        );
+    }
+    for topic in topics {
+        let leader = leader_of(&nodes, topic).expect("one leader");
+        let held = payloads_of(find_node(&nodes, &leader), topic);
+        for (_, payload) in acked.iter().filter(|(t, _)| t == topic) {
+            assert!(
+                held.contains(payload),
+                "{payload} acknowledged on {topic} is not in the log of its leader {leader}"
+            );
+        }
+    }
+    assert!(
+        registry.forwards().iter().any(|(from, _)| from == "C"),
+        "the writes of C never went through forwarding"
+    );
+    assert_eq!(
+        audit_details_of(a, "bus.leader.rebalance").len(),
+        1,
+        "one aggregate row for the run"
+    );
+    shutdown_all(&nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebalance_without_the_admin_right_on_a_topic_moves_nothing() {
+    let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+    let requested = requested_from(&plan_on(a).await);
+    assert!(!requested.is_empty());
+
+    let svc = Arc::clone(&a.svc);
+    let err = tokio::task::spawn_blocking(move || {
+        let run = RunContext {
+            actor: Some("test"),
+            reason: "rebalance",
+        };
+        svc.leader_balance_apply(ORG, run, &requested, &|_, _| false)
+    })
+    .await
+    .expect("apply task")
+    .expect_err("refused");
+    assert!(
+        matches!(err, LeaderBalanceError::PermissionDenied(_)),
+        "{err:?}"
+    );
+    for topic in topics {
+        assert_eq!(leader_of(&nodes, topic).as_deref(), Some("A"));
+    }
+    assert!(audit_details_of(a, "bus.leader.transfer").is_empty());
+    shutdown_all(&nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_that_went_stale_is_refused_with_plan_changed_and_moves_nothing() {
+    let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+    let requested = requested_from(&plan_on(a).await);
+
+    // The admin moves one topic by hand between the plan and the apply.
+    let svc = Arc::clone(&a.svc);
+    tokio::task::spawn_blocking(move || {
+        let run = RunContext {
+            actor: Some("test"),
+            reason: "manual",
+        };
+        svc.move_topic_leadership(run, ORG, "t4", "B")
+    })
+    .await
+    .expect("move task")
+    .expect("manual move");
+    let transfers = audit_details_of(a, "bus.leader.transfer").len();
+
+    let svc = Arc::clone(&a.svc);
+    let err = tokio::task::spawn_blocking(move || {
+        let run = RunContext {
+            actor: Some("test"),
+            reason: "rebalance",
+        };
+        svc.leader_balance_apply(ORG, run, &requested, &|_, _| true)
+    })
+    .await
+    .expect("apply task")
+    .expect_err("stale plan");
+    assert!(matches!(err, LeaderBalanceError::PlanChanged), "{err:?}");
+    assert_eq!(audit_details_of(a, "bus.leader.transfer").len(), transfers);
+    let _ = topics;
+    shutdown_all(&nodes);
+}
+
+/// A transfer made right after a burst of `acks=leader` writes leaves the new
+/// leader with exactly the records the old one acknowledged. This harness
+/// cannot hold a follower back, so it does not prove the wait for a lagging
+/// target; that is the manager's `a_transfer_closes_writes_first_and_proposes_\
+/// only_after_the_final_log_end_is_replicated`, and the glue's close test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_right_after_a_burst_of_acked_writes_leaves_the_new_leader_every_record() {
+    let (nodes, _ledger, _registry, _topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    for i in 0..300 {
+        publish_on(&a.svc, TOPIC, &format!("burst-{i}"))
+            .await
+            .expect("publish");
+    }
+    let before = payloads_of(a, TOPIC);
+    assert_eq!(before.len(), 300);
+
+    let manager = Arc::clone(&a.manager);
+    tokio::task::spawn_blocking(move || manager.transfer_leader(ORG, TOPIC, 0, "B"))
+        .await
+        .expect("transfer task")
+        .expect("transfer");
+    assert_eq!(
+        payloads_of(b, TOPIC),
+        before,
+        "the new leader must hold exactly what the old one acknowledged"
+    );
+    shutdown_all(&nodes);
+}
+
+/// A transfer whose proposal is never admitted (lost on its way to the
+/// ledger): the leader cannot tell, so it reports the outcome as unknown and
+/// stays stopped, and the partition is led again by the election the other
+/// replica runs when the old leader falls silent: a new term, from the replica
+/// that holds every record the old leader acknowledged. Nothing is lost and
+/// the old epoch is never resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_whose_proposal_is_never_admitted_is_unknown_and_the_partition_is_elected_a_leader(
+) {
+    // Three replicas: the proposer alone is not a quorum, so a proposal that
+    // gets no acknowledgement is not admitted (at two replicas the proposer
+    // alone admits it).
+    let (nodes, ledger, _registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B", "C"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    assert!(
+        wait_isr_full(&nodes, TOPIC, "A", &["A", "B", "C"]).await,
+        "the ISR never filled"
+    );
+    let a = find_node(&nodes, "A");
+    for i in 0..50 {
+        publish_on(&a.svc, TOPIC, &format!("kept-{i}"))
+            .await
+            .expect("publish");
+    }
+    let acknowledged = payloads_of(a, TOPIC);
+    assert_eq!(acknowledged.len(), 50);
+    let old_epoch = match a.manager.role(ORG, TOPIC, 0) {
+        PartitionRole::Leader { epoch } => epoch,
+        other => panic!("A must lead, got {other:?}"),
+    };
+
+    ledger.drop_proposals_from(Some("A"));
+    let manager = Arc::clone(&a.manager);
+    let outcome = tokio::task::spawn_blocking(move || manager.transfer_leader(ORG, TOPIC, 0, "B"))
+        .await
+        .expect("transfer task");
+    assert!(
+        matches!(outcome, Err(ReplError::TransferOutcomeUnknown { .. })),
+        "got {outcome:?}"
+    );
+    ledger.drop_proposals_from(None);
+
+    // Within a bound, one node leads again, at a newer term.
+    let started = std::time::Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(45), || leader_of(&nodes, TOPIC)
+            .is_some())
+        .await,
+        "nobody leads the partition again: {:?}",
+        nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.manager.role(ORG, TOPIC, 0)))
+            .collect::<Vec<_>>()
+    );
+    let leader_id = leader_of(&nodes, TOPIC).expect("one leader");
+    let leader = find_node(&nodes, &leader_id);
+    let new_epoch = match leader.manager.role(ORG, TOPIC, 0) {
+        PartitionRole::Leader { epoch } => epoch,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        new_epoch > old_epoch,
+        "the old term {old_epoch} was resumed ({new_epoch})"
+    );
+    eprintln!(
+        "re-elected {leader_id} at epoch {new_epoch} after {:?}",
+        started.elapsed()
+    );
+
+    // Nothing acknowledged is lost, and the partition takes writes again.
+    let held = payloads_of(leader, TOPIC);
+    assert_eq!(&held[..acknowledged.len()], acknowledged.as_slice());
+    let mut written = false;
+    for _ in 0..50 {
+        if publish_on(&leader.svc, TOPIC, "after").await.is_ok() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(written, "the new leader never accepted a write");
+    shutdown_all(&nodes);
+}
+
+/// A transfer asked of a node that does not lead the partition runs on the
+/// leader, whichever member of the instance asks: a replica, and a node that
+/// holds no replica of the topic. What the leader refuses reaches the caller
+/// as that refusal, not as a generic internal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_asked_of_any_member_runs_on_the_leader_and_a_refusal_keeps_its_reason() {
+    let (nodes, _ledger, _registry, _topics) = four_topics_led_by_a().await;
+    let c = find_node(&nodes, "C");
+
+    // C holds no replica of the topic; the target it names is not one either.
+    let manager = Arc::clone(&c.manager);
+    let refused = tokio::task::spawn_blocking(move || manager.transfer_leader(ORG, TOPIC, 0, "C"))
+        .await
+        .expect("transfer task")
+        .expect_err("a target outside the replica set is refused");
+    assert!(
+        matches!(refused, ReplError::NotAReplica { .. }),
+        "the leader's reason must reach the caller, got {refused:?}"
+    );
+    assert_eq!(leader_of(&nodes, TOPIC).as_deref(), Some("A"));
+
+    // The same node, asking for a replica, is carried out by the leader.
+    let manager = Arc::clone(&c.manager);
+    let epoch = tokio::task::spawn_blocking(move || manager.transfer_leader(ORG, TOPIC, 0, "B"))
+        .await
+        .expect("transfer task")
+        .expect("a member that holds no replica may ask the leader");
+    assert!(epoch > 1);
+    assert!(
+        wait_until(Duration::from_secs(10), || leader_of(&nodes, TOPIC)
+            .as_deref()
+            == Some("B"))
+        .await,
+        "B never took over"
     );
     shutdown_all(&nodes);
 }

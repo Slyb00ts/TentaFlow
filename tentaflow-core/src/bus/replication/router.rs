@@ -33,7 +33,9 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use crate::bus::instance::BusInstanceId;
-use crate::bus::replication::frames::{self, ReplFrame, ReplHelloAck, ReplLeoReply, ReplReject};
+use crate::bus::replication::frames::{
+    self, ForwardError, ReplFrame, ReplHelloAck, ReplLeoReply, ReplReject, TransferForwardReply,
+};
 use crate::bus::replication::leader::frame_kind_name;
 use crate::bus::replication::manager::{BusRecv, BusSend, ReplicationManager};
 use crate::bus::replication::{consume_forward, forward};
@@ -291,6 +293,8 @@ async fn spawn_routed_stream(
 ///   registered one the manager answers it (`accept_produce_forward`);
 /// - `ConsumeForward` likewise, answered with `ConsumeForwardReply`
 ///   (`consume_forward::refusal`, `accept_consume_forward`);
+/// - `TransferForward` likewise, answered with `TransferForwardReply`
+///   (`accept_transfer_forward`);
 /// - anything else (a frame kind that must never open a stream, or a
 ///   decode error) is dropped silently at the protocol level (matching
 ///   `ReplicationManager::accept_stream`'s own `_ => return` arm), logged
@@ -445,6 +449,35 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 }
             }
         }
+        Ok(ReplFrame::TransferForward(request)) => {
+            let target = BusInstanceId::parse(&request.instance_id)
+                .ok()
+                .and_then(|id| managers().get(&id).map(|e| e.value().clone()));
+            match target {
+                Some(mgr) => {
+                    mgr.accept_transfer_forward(&remote_hex, request, send)
+                        .await
+                }
+                None => {
+                    tracing::warn!(
+                        peer = %remote_hex,
+                        instance_id = %truncate_for_log(&request.instance_id),
+                        "replication::router: TransferForward named an unregistered/unparseable \
+                         instance — refusing it"
+                    );
+                    let reply = ReplFrame::TransferForwardReply(TransferForwardReply {
+                        leader_epoch: None,
+                        error: Some(ForwardError {
+                            code: forward::CODE_FORWARD_REFUSED.to_string(),
+                            message: "forward refused: unknown_instance".to_string(),
+                            texts: vec!["unknown_instance".to_string()],
+                            ..ForwardError::default()
+                        }),
+                    });
+                    let _ = frames::write_frame(&mut send, &reply).await;
+                }
+            }
+        }
         Ok(other) => {
             // W5 review round 2 finding 2: log the frame KIND only, never
             // `?other` — `ReplFrame::Batch { bytes: Bytes }` can carry up to
@@ -459,7 +492,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 peer = %remote_hex,
                 frame_kind = frame_kind_name(&other),
                 "replication::router: dropped a stream whose first frame is neither \
-                 Hello, LeoQuery, ProduceForward nor ConsumeForward"
+                 Hello, LeoQuery, ProduceForward, ConsumeForward nor TransferForward"
             );
         }
         Err(e) => {

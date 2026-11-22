@@ -99,6 +99,8 @@ pub mod groups;
 pub mod instance;
 pub mod key_audit;
 pub mod lag_history;
+pub mod leader_balance;
+mod leader_balance_plan;
 pub mod native;
 pub mod payload_format;
 pub mod producer;
@@ -1659,6 +1661,13 @@ fn map_engine_error(err: tentaflow_bus::BusError, topic: &str, partition: u32) -
         tentaflow_bus::BusError::Throttled { retry_after_ms, .. } => {
             BusServiceError::Throttled { retry_after_ms }
         }
+        // A leader that is handing the partition over has closed its writes:
+        // the write was refused before it landed, and the producer asks again
+        // (the forwarding path retries a `NotLeader` that names no leader).
+        tentaflow_bus::BusError::LeaderWritesClosed => BusServiceError::NotLeader {
+            leader_node_id: None,
+            leader_epoch: 0,
+        },
         other => BusServiceError::Engine(other),
     }
 }
@@ -1721,7 +1730,12 @@ fn map_repl_error(
         ReplError::NotEnoughReplicas { isr, required, .. } => {
             BusServiceError::NotEnoughReplicas { isr, required }
         }
-        ReplError::Internal(_) => BusServiceError::PartitionUnavailable {
+        ReplError::Internal(_)
+        | ReplError::TransferTargetBehind { .. }
+        | ReplError::TransferBlocked { .. }
+        | ReplError::TransferOutcomeUnknown { .. }
+        | ReplError::TransferRefused { .. }
+        | ReplError::NodeWithoutForwarding { .. } => BusServiceError::PartitionUnavailable {
             reason: err.to_string(),
         },
         ReplError::NoAssignment { .. }
@@ -2234,6 +2248,38 @@ pub enum ReplError {
         partition: u32,
         leader: String,
     },
+    /// A leadership transfer was refused because the target is in the live
+    /// ISR but has not caught up with the leader's log, and did not within the
+    /// short hold a transfer allows itself: it would have to take over a log
+    /// that lacks acknowledged records.
+    #[error("'{node_id}' has not caught up with the leader of '{topic}'/{partition}")]
+    TransferTargetBehind {
+        topic: String,
+        partition: u32,
+        node_id: String,
+    },
+    /// A leadership transfer was refused for a reason of the topic, not of
+    /// the target: `reason` is a stable machine value (`consumer_group_paused`).
+    #[error("leadership of '{topic}' cannot be moved now: {reason}")]
+    TransferBlocked { topic: String, reason: String },
+    /// A transfer was handed to the leader and no answer came back, or the
+    /// leader's own admission of it did not complete: the partition may
+    /// already be led by the target. The caller must read the row again
+    /// before it does anything else with the partition.
+    #[error(
+        "the outcome of moving '{topic}'/{partition} is not known; check where it is led \
+         before asking again"
+    )]
+    TransferOutcomeUnknown { topic: String, partition: u32 },
+    /// The leader refused to take a forwarded transfer from this node: it is
+    /// of another instance or another environment, or the leader shuts down.
+    #[error("the leader refused the transfer: {reason}")]
+    TransferRefused { reason: String },
+    /// The target does not understand forwarded requests (a build from before
+    /// them), so a partition moved to it could not be written through any
+    /// other node.
+    #[error("node '{node_id}' does not take forwarded requests; leadership cannot move to it")]
+    NodeWithoutForwarding { node_id: String },
     #[error("replication coordinator internal error: {0}")]
     Internal(String),
 }
@@ -2381,7 +2427,14 @@ pub trait ReplicationCoordinator: Send + Sync {
         node_id: &str,
         reason: &'static str,
     ) -> Result<u32, ReplError>;
-    /// Admin-triggered leader transfer; returns the new leader epoch.
+    /// Admin-triggered leader transfer of one partition; returns the new
+    /// leader epoch. It runs on the CURRENT leader, to which a request that
+    /// lands on another node is forwarded: only the leader knows its live ISR
+    /// and how far the target is behind. A target that is behind is waited
+    /// for briefly, with new writes held, and refused with
+    /// `ReplError::TransferTargetBehind` when it does not catch up. A move
+    /// that is not a return to the preferred node (`replicas[0]`) makes the
+    /// target the preferred node.
     fn transfer_leader(
         &self,
         org: &str,
@@ -2389,6 +2442,36 @@ pub trait ReplicationCoordinator: Send + Sync {
         partition: u32,
         target: &str,
     ) -> Result<u32, ReplError>;
+    /// `transfer_leader`, except that the replica set afterwards is
+    /// `replicas` (when it holds the same nodes as now) rather than what the
+    /// rule gives: how a rollback of a move puts the order back exactly as it
+    /// was. Defaulted to the plain transfer.
+    fn transfer_leader_restoring(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        replicas: &[String],
+    ) -> Result<u32, ReplError> {
+        let _ = replicas;
+        self.transfer_leader(org, topic, partition, target)
+    }
+    /// What `transfer_leader` would refuse on, without changing anything: the
+    /// target must be in the leader's LIVE ISR and close enough behind it to
+    /// catch up within the hold a transfer allows itself. Asked of the leader
+    /// of the partition, wherever it is. Defaulted to `Ok`, a coordinator
+    /// with no view of its replicas having nothing to refuse on.
+    fn check_transfer(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+    ) -> Result<(), ReplError> {
+        let _ = (org, topic, partition, target);
+        Ok(())
+    }
     /// Admin-triggered replica-set change, for one partition or (when
     /// `partition` is `None`) the whole topic; returns the number of
     /// partitions touched.
@@ -2517,6 +2600,15 @@ pub trait ReplicationCoordinator: Send + Sync {
     /// defaults to `0`.
     fn leader_counts(&self) -> std::collections::HashMap<String, u32> {
         std::collections::HashMap::new()
+    }
+    /// Every assignment of this instance, ordered by organisation, topic and
+    /// partition: the cluster-wide picture the planning of leaders starts
+    /// from. Defaulted to empty, so a coordinator that does not report it
+    /// plans nothing.
+    fn instance_assignments(
+        &self,
+    ) -> Result<Vec<replication::assignment::PartitionAssignment>, ReplError> {
+        Ok(Vec::new())
     }
 }
 
@@ -3150,6 +3242,11 @@ pub struct BusService {
     /// until something explicitly wires this up.
     assignment_store:
         parking_lot::RwLock<Option<Arc<replication::assignment::SqliteLedgerAssignmentStore>>>,
+    /// Held for the whole of a leader rebalance or the one-off spread
+    /// (`leader_balance`): one at a time per instance on this node. Another
+    /// node's run is not excluded; the plan is re-read and compared
+    /// (`bus.plan_changed`) instead.
+    leader_balance_run: parking_lot::Mutex<()>,
     /// M2 (PLAN-M2 §1e, A9 debt): counts every `partition_handle` call
     /// (hit or miss) with a monotonically increasing sequence number, so
     /// `maybe_evict_lru_partition_handles` can find the truly
@@ -3528,6 +3625,7 @@ impl BusService {
             publish_rates: DashMap::new(),
             replication: Arc::new(parking_lot::RwLock::new(None)),
             assignment_store: parking_lot::RwLock::new(None),
+            leader_balance_run: parking_lot::Mutex::new(()),
             partition_access: DashMap::new(),
             partition_access_clock: AtomicU64::new(0),
             partition_handle_lru: cfg.partition_handle_lru,
@@ -10987,6 +11085,8 @@ pub fn peek(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod leader_balance_tests;
 
     struct AllowAllAuthorizer;
     impl BusAuthorizer for AllowAllAuthorizer {

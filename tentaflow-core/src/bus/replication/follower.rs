@@ -230,6 +230,8 @@ fn frame_kind_name(frame: &ReplFrame) -> &'static str {
         ReplFrame::ProduceForwardReply(_) => "ProduceForwardReply",
         ReplFrame::ConsumeForward(_) => "ConsumeForward",
         ReplFrame::ConsumeForwardReply(_) => "ConsumeForwardReply",
+        ReplFrame::TransferForward(_) => "TransferForward",
+        ReplFrame::TransferForwardReply(_) => "TransferForwardReply",
     }
 }
 

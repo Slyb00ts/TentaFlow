@@ -294,6 +294,17 @@ impl SqliteLedgerAssignmentStore {
         .collect())
     }
 
+    /// Every materialized assignment of one instance
+    /// (`db::repository::bus_assignment_list_for_instance`).
+    pub fn list_for_instance(&self, instance_id: &str) -> anyhow::Result<Vec<PartitionAssignment>> {
+        Ok(
+            crate::db::repository::bus_assignment_list_for_instance(&self.pool, instance_id)?
+                .into_iter()
+                .map(PartitionAssignment::from)
+                .collect(),
+        )
+    }
+
     /// How many partitions of the instance each node is the preferred leader
     /// of (`db::repository::bus_assignment_preferred_leader_counts`).
     pub fn preferred_leader_counts(
