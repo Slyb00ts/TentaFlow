@@ -325,6 +325,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Pola opcjonalne, `SCHEMA_VERSION` bez zmian. Tekst w Flow Builderze
   (`flows_config.consumer_reason_not_leader`) dopisze K8.
 
+- Panel TentaBus pokazuje rozkład prowadzenia. W „Kopie i nody” jest karta
+  „Rozkład prowadzenia” (partycje i topiki na node, liczone razem z `__dlq`
+  jak w planerze, odchylenie, topiki poza preferowanym nodem), przycisk
+  „Rozłóż prowadzenie” tylko dla admina (nieaktywny z powodem, także gdy
+  któryś node ma starszą wersję) i przełącznik automatycznego powrotu
+  (tylko administrator platformy). Okno rozkładu pokazuje podgląd, blokady,
+  postęp i wynik z częściowym sukcesem; gdy odpowiedź nie przyjdzie w czasie,
+  okno nie ogłasza porażki, tylko sprawdza stan co 10 s. „Przejęcia
+  prowadzenia” rozróżniają rozkład po aktualizacji, rozłożenie, powrót do
+  preferowanego nodu, scalenie topiku i cofnięcie (wiersz audytu zachowuje
+  powód zapisany przez system). Strona topiku ma znacznik preferowanego nodu,
+  a „Przenieś prowadzenie” przenosi cały topik i bierze zaległość kopii od
+  nodu prowadzącego, także gdy panel działa na innym nodzie. Stan odbiorcy
+  mówi, który node prowadzi topik, a widoki z repliki są oznaczone.
+- `BusReplicaNodeWire.forwarding` (opcjonalne: `capable`, `lacking`,
+  `unknown`): node niedostępny albo jeszcze nie sprawdzony nie jest już
+  pokazywany jako starsza wersja. `forward_capable` zostaje dla starych
+  klientów.
+
 ### Limity i SLA usług (TB-03)
 
 - Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,

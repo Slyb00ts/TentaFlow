@@ -4,20 +4,29 @@
 // (one for the whole instance: nodes and leadership changes; one per topic:
 // its partitions), counted over the reader's topics only. There is no button
 // to change the copies: a topic's number of copies is chosen by the instance
-// when the topic is created. What can be done here is moving a partition's
+// when the topic is created. What can be done here is moving a topic's
 // leadership to a node with an in-sync copy (partitions.js), from a row that
-// needs attention; every other partition is reached through its topic.
+// needs attention (every other partition is reached through its topic), and
+// spreading the leadership of all topics between the nodes ("Rozłóż
+// prowadzenie", rebalance-window.js). The "Rozkład prowadzenia" card shows how
+// much each node leads (leader-balance.js) and holds the switch of the
+// automatic return of a topic to its preferred node. Every value is patched
+// in place on a poll: the cards, the table and the switch keep their nodes.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, patchKeyedList, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtWhen } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtSince, fmtWhen } from '/js/modules/tentabus/format.js';
 import { nodeRows, userTopics } from '/js/modules/tentabus/model.js';
 import { attentionRows, copyChipHtml, behindText, transferBlocker, unavailableText } from '/js/modules/tentabus/partitions.js';
+import {
+  balanceModel, fmtNumber, fmtSigned, isOlderNode, leadershipUnits, pluralNumber, rebalanceAvailability,
+} from '/js/modules/tentabus/leader-balance.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-alert.js';
+import '/js/components/tf-toggle.js';
 import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
@@ -59,13 +68,27 @@ export function readerFailovers(failovers, topics) {
   return (failovers || []).filter((f) => names.has(f.topic)).sort((a, b) => (Number(b.atMs) || 0) - (Number(a.atMs) || 0));
 }
 
-/** The reason of a leadership change, in words. */
+/**
+ * The reason of a leadership change, in words. `manual_transfer` is an
+ * administrator's "Przenieś prowadzenie"; the system's own moves name what
+ * they were for: the one-off spread after an upgrade (`post_upgrade_spread`),
+ * a topic's automatic return to its preferred node (`preferred_restore`), the
+ * regathering of a topic failover had split (`split_gather`), "Rozłóż
+ * prowadzenie" (`rebalance`) and the undoing of a move that failed
+ * (`rollback`).
+ */
 export function failoverReason(f) {
-  if (f.reason === 'manual_transfer') {
-    return f.actorLabel ? T('replication.reason_manual_by', { name: f.actorLabel }) : T('replication.reason_manual');
+  switch (f.reason) {
+    case 'manual_transfer':
+      return f.actorLabel ? T('replication.reason_manual_by', { name: f.actorLabel }) : T('replication.reason_manual');
+    case 'post_upgrade_spread': return T('replication.reason_upgrade');
+    case 'preferred_restore': return T('replication.reason_preferred_restore');
+    case 'split_gather': return T('replication.reason_split_gather');
+    case 'rebalance': return f.actorLabel ? T('replication.reason_rebalance_by', { name: f.actorLabel }) : T('replication.reason_rebalance');
+    case 'rollback': return T('replication.reason_rollback');
+    case 'lease_expired': return T('replication.reason_lease_expired', { node: f.fromNode || '—' });
+    default: return T('replication.reason_other');
   }
-  if (f.reason === 'lease_expired') return T('replication.reason_lease_expired', { node: f.fromNode || '—' });
-  return T('replication.reason_other');
 }
 
 function skeleton() {
@@ -75,6 +98,25 @@ function skeleton() {
       <div class="section-card-head"><div class="title">${sprite('cpu')} ${escapeHtml(T('replication.nodes_title'))} <span data-role="nodes-count"></span></div></div>
       <div class="section-sub" data-role="nodes-sub"></div>
       <div class="tb-node-grid" data-role="nodes"></div>
+    </div>
+    <div class="section-card" data-role="balance-card" hidden>
+      <div class="section-card-head">
+        <div class="title">${sprite('branch')} ${escapeHtml(T('replication.balance_title'))}</div>
+        <div class="actions"><tf-button variant="secondary" size="sm" icon="branch" data-role="rebalance" hidden>${escapeHtml(T('replication.balance_button'))}</tf-button></div>
+      </div>
+      <div class="section-sub">${escapeHtml(T('replication.balance_sub'))}</div>
+      <div class="tb-balance-alert" data-role="balance-alert"></div>
+      <tf-table data-role="balance">
+        <tf-column key="node" label="${escapeAttr(T('replication.balance_col_node'))}" renderer="html"></tf-column>
+        <tf-column key="leads" label="${escapeAttr(T('replication.balance_col_leads'))}" renderer="html"></tf-column>
+        <tf-column key="dev" label="${escapeAttr(T('replication.balance_col_dev'))}" renderer="html"></tf-column>
+        <tf-column key="away" label="${escapeAttr(T('replication.balance_col_away'))}" renderer="html" fill></tf-column>
+      </tf-table>
+      <div class="tb-table-footer" data-role="balance-summary"></div>
+      <div class="tb-toggle-card">
+        <tf-toggle data-role="return" aria-label="${escapeAttr(T('replication.return_title'))}"></tf-toggle>
+        <div class="tc-text"><div class="tc-name">${escapeHtml(T('replication.return_title'))}</div><div class="tc-sub" data-role="return-sub">${escapeHtml(T('replication.return_sub'))}</div></div>
+      </div>
     </div>
     <div class="section-card">
       <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('replication.attention_title'))} <span data-role="attn-count"></span></div></div>
@@ -110,7 +152,7 @@ function countChip(host, n, status = 'neutral') {
 function nodeCardSkeleton(id, label) {
   return `
     <div class="tb-node-card" data-node="${escapeAttr(id)}">
-      <div class="tb-node-card-head">${sprite('cpu')}<span class="mono tb-node-name">${escapeHtml(label)}</span><tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
+      <div class="tb-node-card-head">${sprite('cpu')}<span class="mono tb-node-name">${escapeHtml(label)}</span><tf-chip size="sm" variant="outline" status="warn" data-role="version" hidden></tf-chip><tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
       <div class="tb-stat-rows">
         <div class="sr"><span class="k">${escapeHtml(T('replication.node_leads'))}</span><span class="v" data-role="leads"></span></div>
         <div class="sr"><span class="k">${escapeHtml(T('replication.node_holds'))}</span><span class="v" data-role="holds"></span></div>
@@ -145,9 +187,12 @@ function changeRowSkeleton(key) {
 
 /**
  * Draws or repaints the tab from `ctx.view()` = `{ nodes, replicaTopics,
- * failovers, topics, canAdmin, notice, justMoved, nowMs }` (`nodes` is
- * `null` until the replica list answered). `ctx.go(action)`: `{ kind:
- * 'topic', topic }`, `{ kind: 'transfer', topic, partition }`.
+ * failovers, topics, canAdmin, notice, justMoved, leaderReturn, nowMs }`
+ * (`nodes` is `null` until the replica list answered; `notice` =
+ * `{ title, text, tone? }`; `leaderReturn` = the switch of the automatic
+ * return: `true`, `false`, or `null` while it has not been read).
+ * `ctx.go(action)`: `{ kind: 'topic', topic }`, `{ kind: 'transfer', topic,
+ * partition }`, `{ kind: 'rebalance' }`, `{ kind: 'leader-return', enabled }`.
  */
 export function drawReplication(body, ctx) {
   const view = ctx.view();
@@ -170,16 +215,137 @@ export function drawReplication(body, ctx) {
         e.preventDefault();
         ctx.go({ kind: 'topic', topic: el.dataset.topic });
       });
+      body.addEventListener('click', (e) => {
+        const button = e.target.closest('[data-role="rebalance"]');
+        if (button && body.contains(button) && !button.hasAttribute('disabled')) ctx.go({ kind: 'rebalance' });
+      });
+      body.addEventListener('change', (e) => {
+        const toggle = e.target.closest?.('[data-role="return"]');
+        if (toggle && body.contains(toggle)) ctx.go({ kind: 'leader-return', enabled: Boolean(e.detail?.checked) });
+      });
     }
   }
   if (mode === 'full') paint(body, view, ctx);
+}
+
+const nodeCell = (label) => `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(label)}</span></span>`;
+
+/** The topics a node leads, named when there are few of them. */
+function topicsText(names) {
+  const count = fmtCount(names.length);
+  return names.length > 0 && names.length <= 4
+    ? T('replication.balance_topics_named', { count, n: names.length, list: names.join(', ') })
+    : T('replication.balance_topics', { count, n: names.length });
+}
+
+/** How long a topic has to be in sync on its preferred node before it returns there (the server's rule). */
+const RETURN_AFTER_MS = 5 * 60_000;
+
+/**
+ * What the warning above the table says, or `null` when nothing needs saying.
+ * `view.reachableSince` (`Map` nodeId → when this page saw the node answer
+ * again) gives "odpowiada od 3 min" and the earliest return; a node this page
+ * has always seen answering has no such time, and the sentence leaves it out.
+ */
+function balanceAlert(model, view, availability, labels) {
+  if (availability.older.length) {
+    return { tone: 'info', title: T('replication.balance_old_info_title', { nodes: availability.older.join(', ') }), message: T('replication.balance_old_info_text') };
+  }
+  if (!model.away) return null;
+  const idle = model.rows.find((r) => r.reachable && r.partitions === 0 && r.away.length > 0);
+  const away = model.rows.flatMap((r) => r.away);
+  const since = idle ? view.reachableSince?.get(idle.nodeId) : null;
+  const upFor = since != null ? Math.max(0, view.nowMs - since) : null;
+  let title;
+  if (idle && upFor != null) title = T('replication.balance_idle_since_title', { node: idle.label, since: fmtSince(since, view.nowMs) });
+  else if (idle) title = T('replication.balance_idle_title', { node: idle.label });
+  else title = T('replication.balance_away_title', { count: fmtCount(away.length), n: away.length });
+  if (view.leaderReturn === false) return { tone: 'warning', title, message: T('replication.balance_away_manual') };
+  const where = [...new Set(away.map((u) => labels.get(u.preferredId) || u.preferredId))].join(', ');
+  let sentence = away.length === 1
+    ? T('replication.balance_away_auto_one', { node: where })
+    : T('replication.balance_away_auto_many', { count: fmtCount(away.length), n: away.length, node: where });
+  if (upFor != null && upFor < RETURN_AFTER_MS) {
+    sentence += ` — ${T('replication.balance_away_eta', { min: Math.max(1, Math.ceil((RETURN_AFTER_MS - upFor) / 60_000)) })}`;
+  }
+  const behind = away.filter((u) => (view.replicaTopics || []).find((t) => t.topic === u.name)?.partitions
+    ?.some((p) => (p.lagging || []).some((l) => l.nodeId === u.preferredId))).map((u) => u.name);
+  if (behind.length) {
+    const list = new Intl.ListFormat(I18n.getLanguage(), { type: 'conjunction' }).format(behind);
+    sentence += `; ${T('replication.balance_away_catching', { list })}`;
+  }
+  return { tone: 'warning', title, message: `${sentence}. ${T('replication.balance_away_now')}` };
+}
+
+/**
+ * "Rozkład prowadzenia": the table, the warning, the button of the spread and
+ * the switch of the automatic return. The card needs two nodes to mean
+ * anything, so a single-node instance does not show it.
+ */
+function paintBalance(body, view) {
+  const { nodes } = view;
+  const card = body.querySelector('[data-role="balance-card"]');
+  setAttr(card, 'hidden', nodes.length < 2);
+  if (nodes.length < 2) return;
+  const language = I18n.getLanguage();
+  const labels = new Map(nodes.map((n) => [n.nodeId, n.label || n.nodeId]));
+  const units = leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
+  const model = balanceModel({ units, nodes });
+  const availability = rebalanceAvailability(nodes);
+
+  const button = body.querySelector('[data-role="rebalance"]');
+  setAttr(button, 'hidden', !view.canAdmin);
+  setAttr(button, 'disabled', Boolean(availability.reason));
+  setAttr(button, 'title', availability.reason);
+
+  const alert = balanceAlert(model, view, availability, labels);
+  patchHtml(body.querySelector('[data-role="balance-alert"]'), alert
+    ? `<tf-alert tone="${escapeAttr(alert.tone)}" title="${escapeAttr(alert.title)}" message="${escapeAttr(alert.message)}"></tf-alert>`
+    : '');
+
+  const uneven = model.verdict === 'uneven';
+  const rows = model.rows.map((r) => {
+    const awayNames = r.away.map((u) => u.name);
+    const leaders = new Set(r.away.map((u) => u.leaderId));
+    let awayCell = '0';
+    if (awayNames.length) {
+      const where = leaders.size === 1 ? labels.get([...leaders][0]) || [...leaders][0] : '';
+      const list = leaders.size === 1
+        ? T(awayNames.length === 1 ? 'replication.balance_away_one' : 'replication.balance_away_many', { list: awayNames.join(', '), node: where })
+        : r.away.map((u) => `${u.name} (${labels.get(u.leaderId) || u.leaderId})`).join(', ');
+      awayCell = `<span class="tf-chip tf-chip--outline warn">${escapeHtml(T('replication.balance_away_chip', { count: fmtCount(awayNames.length), n: awayNames.length }))}</span> <span class="tf-table__cell-sub">${escapeHtml(list)}</span>`;
+    }
+    const dev = T('replication.balance_dev', { value: fmtSigned(r.deviation, language), n: pluralNumber(Math.abs(r.deviation)) });
+    return {
+      node: nodeCell(r.label),
+      leads: `<div class="tf-table__cell-title">${escapeHtml(T('replication.balance_partitions', { count: fmtCount(r.partitions), n: r.partitions }))}</div><div class="tf-table__cell-sub">${escapeHtml(topicsText(r.topics))}</div>`,
+      dev: uneven ? `<span class="tb-warn-text">${escapeHtml(dev)}</span>` : escapeHtml(dev),
+      away: awayCell,
+      _key: r.nodeId,
+    };
+  });
+  setRowsIfChanged(body.querySelector('[data-role="balance"]'), rows);
+
+  const summary = [T('replication.balance_mean', { mean: fmtNumber(model.mean, language), n: pluralNumber(model.mean) })];
+  if (!availability.older.length && units.length) {
+    summary.push(T(`replication.balance_${model.verdict === 'uneven' ? 'uneven' : model.verdict === 'equal' ? 'even_equal' : 'even_less'}`, {
+      gap: fmtCount(model.gap), n: model.gap, smallest: fmtCount(model.smallest), m: model.smallest,
+    }));
+  }
+  setText(body.querySelector('[data-role="balance-summary"]'), summary.join(' '));
+
+  // The switch is a platform setting: only the platform administrator changes it, whatever the reader may do on the bus.
+  const toggle = body.querySelector('[data-role="return"]');
+  setAttr(toggle, 'checked', view.leaderReturn === true);
+  setAttr(toggle, 'disabled', !view.platformAdmin || view.leaderReturn == null);
+  setText(body.querySelector('[data-role="return-sub"]'), view.platformAdmin ? T('replication.return_sub') : `${T('replication.return_sub')} ${T('replication.return_admin_only')}`);
 }
 
 function paint(body, view, ctx) {
   const { nodes, replicaTopics, notice } = view;
   const moved = view.justMoved || new Set();
   patchHtml(body.querySelector('[data-role="notice"]'), notice
-    ? `<tf-alert tone="success" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}"></tf-alert>`
+    ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}"></tf-alert>`
     : '');
 
   setText(body.querySelector('[data-role="topics-sub"]'), T(view.canAdmin ? 'replication.topics_sub' : 'replication.topics_sub_read'));
@@ -203,7 +369,14 @@ function paint(body, view, ctx) {
     setText(sync, T('replication.in_sync_of', { isr: fmtCount(c.inSync), total: fmtCount(c.total) }));
     sync.classList.toggle('is-warn', c.inSync < c.total);
     setText(card.querySelector('[data-role="signal"]'), lastSignal(n));
+    const version = card.querySelector('[data-role="version"]');
+    const older = nodes.length > 1 && isOlderNode(n);
+    setAttr(version, 'hidden', !older);
+    setAttr(version, 'label', older ? T('replication.balance_old_chip') : null);
+    setAttr(version, 'title', older ? T('replication.balance_old_title', { node: n.label || n.nodeId }) : null);
   });
+
+  paintBalance(body, view);
 
   // Partitions that need attention.
   const attention = attentionRows(replicaTopics || [], nodes);

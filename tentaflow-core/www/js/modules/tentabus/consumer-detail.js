@@ -32,6 +32,7 @@ import { valueRow, settingsCard } from '/js/modules/tentabus/topic-settings.js';
 import { commitModeLabel, commitModeHint } from '/js/modules/tentabus/consumers.js';
 import { partitionPlace, lastRead, lastMessage } from '/js/modules/tentabus/offset-move.js';
 import { headerText } from '/js/modules/tentabus/payload.js';
+import { replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
 import { concurrencyTile, slaSettingsHtml, throttledTexts, throttledUntilMs } from '/js/modules/tentabus/consumer-sla.js';
 import { UNPROCESSED_PAGE } from '/js/modules/tentabus/unprocessed.js';
 import '/js/components/tf-tabs.js';
@@ -368,12 +369,36 @@ function alertTexts(a, k, nowMs) {
   };
 }
 
+/**
+ * "Czeka: ten topik prowadzi node …" over the state tiles of a consumer whose
+ * topic another node leads: the reading runs there, so this node has no
+ * reading of its own. The leader's name is only sent to an administrator;
+ * without it the sentence says "inny node". `null` when the reading is here.
+ */
+export function otherNodeNotice(data, topic, nodes = []) {
+  const local = data?.sla?.local;
+  if (!local || local.reason !== 'not_leader') return null;
+  // The label this page knows the node by, else the name the server sent (to an administrator), else its id.
+  const node = nodes.find((n) => n.nodeId === local.leaderNodeId)?.label || local.leaderNodeName || local.leaderNodeId || '';
+  return {
+    title: node ? T('consumer.other_node_title', { node }) : T('consumer.other_node_title_unnamed'),
+    text: [T('consumer.other_node_text', { topic }), data.fromReplica ? T('consumer.other_node_replica') : '', T('consumer.other_node_only_there')].filter(Boolean).join(' '),
+  };
+}
+
+function otherNodeNoticeHtml(data, topic, nodes) {
+  const n = otherNodeNotice(data, topic, nodes);
+  return n ? `<tf-alert tone="info" title="${escapeAttr(n.title)}" message="${escapeAttr(n.text)}"></tf-alert>` : '';
+}
+
 function paintStateSection(host, view) {
   const { data, stats, nowMs, canAdmin, live } = view;
   if (host.__tbState !== 'built') {
     host.__tbState = 'built';
     patchHtml(host, `
       <div data-role="notice"></div>
+      <div data-role="leader-notice"></div>
+      <div class="tb-replica-note" data-role="replica-note" hidden></div>
       <div class="tb-kpi" data-role="kpi"></div>
       <div class="section-card">
         <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('detail.state.attention_title'))} <span data-role="attn-count"></span></div></div>
@@ -394,6 +419,12 @@ function paintStateSection(host, view) {
       </div>`);
   }
   patchHtml(host.querySelector('[data-role="notice"]'), noticeHtml(view.notice));
+  patchHtml(host.querySelector('[data-role="leader-notice"]'), otherNodeNoticeHtml(data, view.topic, view.nodes));
+  const replicaNote = host.querySelector('[data-role="replica-note"]');
+  // The leader notice already says the numbers come from a copy; the separate note would repeat it.
+  const noteShown = data.fromReplica === true && !otherNodeNotice(data, view.topic, view.nodes);
+  replicaNote.hidden = !noteShown;
+  patchHtml(replicaNote, replicaNoteHtml('values', noteShown));
   const topicStats = (stats?.topics || []).find((t) => t.topic === view.topic) || null;
   const k = consumerKpis({ live, detail: data.detail, topicStats, dlq: data.dlq, samples: data.samples, nowMs, sla: data.sla ?? null });
   tiles(host.querySelector('[data-role="kpi"]'), k, nowMs);

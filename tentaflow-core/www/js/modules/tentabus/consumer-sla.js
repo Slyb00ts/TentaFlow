@@ -73,6 +73,8 @@ export async function loadConsumerSla({ group, topic, instanceId, call, flows, c
   return {
     flow,
     consumer,
+    // The reading of the node this page is open on: the one that says "not the leader of the topic here".
+    local: match.busConsumer,
     elsewhere,
     policy: policyResponse?.policy ?? null,
     policyError: Boolean(match.slaPolicyId) && !elsewhere && !policyResponse?.policy,

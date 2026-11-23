@@ -39,6 +39,25 @@ export function fmtBytes(bytes) {
 }
 
 /**
+ * A size that says how far a copy trails: one decimal below 100 of the unit
+ * ("2,8 MB", "12,4 MB"), none above ("331 MB"), as the screens show it. A
+ * small lag read as a whole number would round 2,8 MB up to 3 MB.
+ */
+export function fmtLagSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return '—';
+  let v = value;
+  let i = 0;
+  while (v >= 1024 && i < BYTE_UNITS.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  const digits = i > 0 && v < 100 ? 1 : 0;
+  const text = new Intl.NumberFormat(I18n.getLanguage(), { minimumFractionDigits: 0, maximumFractionDigits: digits, useGrouping: 'always' }).format(v);
+  return `${text} ${BYTE_UNITS[i]}`;
+}
+
+/**
  * Elapsed time as the header and the stale line say it: "3 s", "2 min",
  * "1 godz.". Rounds down, so "sprzed 2 min" never claims fresher data than
  * the reader has.

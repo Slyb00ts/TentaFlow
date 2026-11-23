@@ -47,7 +47,7 @@ const stats = {
 };
 const samples = [{ atMs: NOW - 2 * MIN, lagTotal: 2500, committedTotal: 10 }, { atMs: NOW - MIN, lagTotal: 3000, committedTotal: 20 }];
 
-function mount({ section = 'state', access = topicDetail.access, adminLabels = [], data, error = null, statsOverride, justMoved = new Set(), notice = null } = {}) {
+function mount({ nodes = [], section = 'state', access = topicDetail.access, adminLabels = [], data, error = null, statsOverride, justMoved = new Set(), notice = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -66,6 +66,7 @@ function mount({ section = 'state', access = topicDetail.access, adminLabels = [
     stats: statsOverride || stats,
     notice,
     justMoved,
+    nodes,
     busy: false,
     instanceLabel: 'Produkcja',
     nowMs: NOW,
@@ -203,4 +204,45 @@ test('a consumer gone meanwhile says so and leads back to the list', () => {
   assert.match(body.querySelector('tf-empty-state').getAttribute('title'), /aplikacja-lekarza/);
   body.querySelector('tf-empty-state [data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
+});
+
+// The topic is led by another node: the reading runs there, the notice names it (only an
+// administrator is told the name), and the numbers served from a copy say they may trail.
+const withLeader = (local, fromReplica = false) => ({
+  detail,
+  topicDetail,
+  dlq: null,
+  samples,
+  fromReplica,
+  sla: { flow: { id: 'f', name: 'Odbiór' }, consumer: null, local },
+});
+
+test('Stan: a topic led by another node says where the reading runs, by name when it is known', () => {
+  const named = mount({ data: withLeader({ state: 'waiting', reason: 'not_leader', leaderNodeId: 'b', leaderNodeName: 'Serwer B' }, true) });
+  const alert = named.body.querySelector('[data-role="leader-notice"] tf-alert');
+  assert.equal(alert.getAttribute('title'), 'Czeka: ten topik prowadzi node Serwer B (tam działa odbiór).');
+  assert.match(norm(alert.getAttribute('message')), /czyta na nodzie, który prowadzi topik wyniki-badan.*z kopii na tym nodzie i mogą być opóźnione do ok\. 1 s.*tylko tam, gdzie działa odbiór/);
+  assert.equal(named.body.querySelector('[data-role="replica-note"]').hidden, true, 'the notice already says it; the separate note is not shown twice');
+
+  // The label this page knows the node by comes first; then the server's name; then the id.
+  const nodes = [{ nodeId: 'b', label: 'rig-b' }];
+  const byLabel = mount({ data: withLeader({ state: 'waiting', reason: 'not_leader', leaderNodeId: 'b', leaderNodeName: 'Serwer B' }), nodes });
+  assert.match(byLabel.body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title'), /prowadzi node rig-b /);
+  const byId = mount({ data: withLeader({ state: 'waiting', reason: 'not_leader', leaderNodeId: 'node-9' }) });
+  assert.match(byId.body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title'), /prowadzi node node-9 /);
+
+  const unnamed = mount({ data: withLeader({ state: 'waiting', reason: 'not_leader' }) });
+  assert.equal(unnamed.body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title'), 'Czeka: ten topik prowadzi inny node (tam działa odbiór).');
+  const ordinary = mount({ data: withLeader({ state: 'running' }, true) });
+  assert.equal(ordinary.body.querySelector('[data-role="replica-note"]').hidden, false, 'values from a copy carry the note when no notice says so');
+  assert.equal(mount({ data: withLeader({ state: 'running' }, false) }).body.querySelector('[data-role="replica-note"]').hidden, true, 'values from the leader carry no note');
+});
+
+test('Stan: a reading that runs here has no leader notice, and a poll keeps the notice element', () => {
+  const here = mount({ data: withLeader({ state: 'running' }) });
+  assert.equal(here.body.querySelector('[data-role="leader-notice"] tf-alert'), null);
+  const other = mount({ data: withLeader({ state: 'waiting', reason: 'not_leader', leaderNodeName: 'Serwer B' }) });
+  const kept = other.body.querySelector('[data-role="leader-notice"] tf-alert');
+  other.redraw();
+  assert.equal(other.body.querySelector('[data-role="leader-notice"] tf-alert'), kept);
 });

@@ -13,6 +13,7 @@ import { patchHtml, patchKeyedList, paintStatCards, setAttr, setText } from '/js
 import { T, fmtCount, fmtBytes, fmtDate, fmtSince, fmtLagSeconds, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
 import { computeAlerts, isLagging } from '/js/modules/tentabus/alerts.js';
 import { userRate } from '/js/modules/tentabus/model.js';
+import { replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
 import { storageFacts } from '/js/modules/tentabus/topic-settings.js';
 import '/js/components/tf-stat-card.js';
 import '/js/components/tf-button.js';
@@ -198,6 +199,7 @@ export function paintStateSection(host, view) {
   if (host.__tbState !== 'built') {
     host.__tbState = 'built';
     patchHtml(host, `
+      <div class="tb-replica-note" data-role="replica-note" hidden></div>
       <div class="tb-kpi" data-role="kpi"></div>
       <div class="section-card">
         <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('detail.state.attention_title'))} <span data-role="attn-count"></span></div></div>
@@ -211,6 +213,9 @@ export function paintStateSection(host, view) {
         <div class="muted" data-role="consumers-none" hidden>${escapeHtml(T('detail.state.consumers_none'))}</div>
       </div>`);
   }
+  const replicaNote = host.querySelector('[data-role="replica-note"]');
+  replicaNote.hidden = view.fromReplica !== true;
+  patchHtml(replicaNote, replicaNoteHtml('values', view.fromReplica === true));
   const name = topic.name;
   const groups = (stats?.groups || []).filter((g) => g.topic === name);
   const topicStats = (stats?.topics || []).find((t) => t.topic === name) || null;

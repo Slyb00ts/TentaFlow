@@ -388,3 +388,20 @@ test('a kind other than JSON says a flow reads JSON only; switching back to JSON
   pick('application/json');
   assert.equal(note.hidden, true);
 });
+
+// Step 3 names the node the instance will lead a new topic from: the least loaded one, or — while a node
+// is on an older version — says it will be chosen only after the update. One node says nothing.
+const toSummary = (overrides) => {
+  const { win } = open(overrides);
+  typeName(win, 'skierowania');
+  win.querySelector('#tb-cr-kind').dispatchEvent(new CustomEvent('change', { detail: { value: 'application/json' } }));
+  nextBtn(win).click();
+  nextBtn(win).click();
+  return summaryText(win);
+};
+
+test('step 3 says which node will lead the new topic', () => {
+  assert.match(toSummary({ leaderHint: { node: 'Serwer B', partitions: 17, older: false } }), /Node prowadzący dobierze instancja — node, który prowadzi najmniej partycji \(teraz Serwer B, 17 partycji\)/);
+  assert.match(toSummary({ leaderHint: { node: 'Serwer B', partitions: 17, older: true } }), /Node prowadzący node, na którym powstaje topik — instancja dobierze go sama dopiero po aktualizacji wszystkich nodów/);
+  assert.doesNotMatch(toSummary({ leaderHint: null }), /Node prowadzący/);
+});

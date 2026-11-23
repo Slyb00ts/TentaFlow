@@ -6,18 +6,21 @@
 // message, a copy "behind" is still catching up, and one out of the ISR that
 // the leader does not report as catching up has lost contact.
 //
-// Moving the leadership (`LeaderTransferRequest`) proposes a new placement
-// with the next leader epoch and waits until a majority of the partition's
-// replicas has taken it, at most 5 seconds (`replication::manager::
-// transfer_leader`); the old leader stops taking writes, so a write in flight
-// at that moment can be refused and has to be sent again by its program.
-// Only a node whose copy is in sync may take over (`NotAReplica` otherwise),
+// Moving the leadership (`LeaderTransferRequest`) moves the WHOLE topic with
+// its unprocessed messages (TB-04 K5): a topic led by two nodes would be read
+// by neither, so the partition the request names only says where it started.
+// The current leader runs the move, proposes a new placement with the next
+// leader epoch for every partition and waits until a majority of its replicas
+// has taken it. Only a node whose copy is in sync and caught up may take over,
 // and the transfer is written to the audit log. The window offers exactly
-// those nodes and says why every other one cannot.
+// those nodes and says why every other one cannot; a node viewing a topic it
+// does not lead cannot see the leader's lag, so the shell asks the leader for
+// its own replica list and builds the choices from that.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, fmtCount, fmtBytes, fmtLagSeconds } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtBytes, fmtLagSize, fmtLagSeconds } from '/js/modules/tentabus/format.js';
+import { isOlderNode } from '/js/modules/tentabus/leader-balance.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-choice-card.js';
@@ -41,13 +44,15 @@ const labelOf = (nodes) => {
 export function copyStates(p, nodes) {
   const label = labelOf(nodes);
   const lagging = new Map((p?.lagging || []).map((l) => [l.nodeId, l]));
+  // A pin only means something where there is a choice of nodes.
+  const preferredId = (p?.replicas || []).length > 1 ? p?.preferredLeaderNodeId || null : null;
   return (p?.replicas || []).map((id) => {
     let state = 'out';
     if (id === p.leaderNodeId) state = 'leader';
     else if (lagging.has(id)) state = 'lag';
     else if ((p.isr || []).includes(id)) state = 'ok';
     const lag = lagging.get(id);
-    return { nodeId: id, label: label(id), state, lagBytes: Number(lag?.lagBytes) || 0, lagMs: Number(lag?.lagMs) || 0, reason: lag?.reason || '' };
+    return { nodeId: id, label: label(id), state, preferred: id === preferredId, lagBytes: Number(lag?.lagBytes) || 0, lagMs: Number(lag?.lagMs) || 0, reason: lag?.reason || '' };
   });
 }
 
@@ -55,14 +60,73 @@ export function copyStates(p, nodes) {
  * Every node a partition's leadership could go to, with the reason it can
  * or cannot: `leader` (leads now), `ok` (in-sync copy on a node that
  * answers), `lag` (copy behind), `out` (copy not in sync), `down` (node does
- * not answer). Only `ok` may be chosen.
+ * not answer), `old` (node of an older version: it takes no forwarded
+ * requests, so it cannot lead). Only `ok` may be chosen. `byLeader` marks
+ * a verdict made from a partition row that is not this node's to judge (the
+ * page is open on a node that does not lead it): `p` is then the leader's own
+ * row, and the note names the leader.
  */
 export function transferChoices(p, nodes) {
   const reach = new Map((nodes || []).map((n) => [n.nodeId, n.reachable !== false]));
-  return copyStates(p, nodes).map((c) => ({
-    ...c,
-    state: c.state === 'ok' && reach.get(c.nodeId) === false ? 'down' : c.state,
-  }));
+  const older = new Map((nodes || []).map((n) => [n.nodeId, isOlderNode(n)]));
+  const local = (nodes || []).find((n) => n.isLocal)?.nodeId || null;
+  const label = labelOf(nodes);
+  const byLeader = Boolean(p?.leaderNodeId) && local != null && p.leaderNodeId !== local;
+  return copyStates(p, nodes).map((c) => {
+    let state = c.state;
+    if (state === 'ok' && reach.get(c.nodeId) === false) state = 'down';
+    else if (state === 'ok' && older.get(c.nodeId)) state = 'old';
+    return { ...c, state, byLeader, leaderLabel: label(p?.leaderNodeId) };
+  });
+}
+
+/** The refusals of a plan that concern the whole topic and so stop a move of it to any node. */
+const TOPIC_WIDE_REASONS = new Set(['consumer_group_paused', 'pause_state_unreadable']);
+
+/**
+ * The reason a plan (`LeaderBalancePlanResponse.blockers`) gives for not
+ * moving `topic` to any node, or `null`. Only a paused consumer (or a pause
+ * that cannot be read) blocks the topic as a whole: the other blockers
+ * (no leader now, no improvement, a node that is behind) say nothing about a
+ * move an administrator chooses by hand.
+ */
+export function topicWideBlocker(blockers, topic) {
+  return (blockers || []).find((b) => b.topic === topic && TOPIC_WIDE_REASONS.has(b.reason)) || null;
+}
+
+/** Lets one call at a time through: `gate(fn)` answers `undefined` without calling `fn` while an earlier call has not finished. */
+export function exclusive() {
+  let busy = false;
+  return async (fn) => {
+    if (busy) return undefined;
+    busy = true;
+    try {
+      return await fn();
+    } finally {
+      busy = false;
+    }
+  };
+}
+
+/**
+ * What the window "Przenieś prowadzenie" is built from. On the node that leads the partition its own row is
+ * the truth. On any other node the leader is asked for its row (`readLeader()`: the leader's own replica list,
+ * with the lag of every copy in bytes) and for a plan of the topic (`readPlan()`: its blockers), and the
+ * answers replace what this node can see. Either read failing (or answering nothing) leaves the window to open
+ * with what this node has: the leader still refuses a copy that is behind when the move is sent.
+ * `describeBlocker(blocker)` words the reason a topic as a whole cannot move; only a paused consumer is one.
+ */
+export async function transferContext({ topic, partition, replica, nodes, readLeader, readPlan, describeBlocker }) {
+  const local = (nodes || []).find((n) => n.isLocal);
+  if (!local || !replica?.leaderNodeId || local.nodeId === replica.leaderNodeId) return { row: replica, blockedNote: '' };
+  const [leaders, plan] = await Promise.all([
+    Promise.resolve().then(readLeader).catch(() => null),
+    Promise.resolve().then(readPlan).catch(() => null),
+  ]);
+  const leaderRow = (leaders?.partitions || []).find((p) => Number(p.partition) === Number(partition));
+  const row = leaderRow ? { ...leaderRow, preferredLeaderNodeId: leaderRow.preferredLeaderNodeId ?? replica.preferredLeaderNodeId } : replica;
+  const blocker = topicWideBlocker(plan?.blockers, topic);
+  return { row, blockedNote: blocker ? describeBlocker(blocker) : '' };
 }
 
 /** Why "Przenieś prowadzenie" cannot run for a partition, or `null` when it can. */
@@ -130,11 +194,19 @@ export function attentionRows(perTopic, nodes) {
   return out.sort((a, b) => a.topic.localeCompare(b.topic) || a.partition - b.partition);
 }
 
-/** The words of a copy's state for its chip. */
+const PIN = '<svg class="icon tb-pin" aria-hidden="true"><use href="#i-pin"/></svg>';
+
+/** The words of a copy's state for its chip; the preferred node's copy carries a pin. */
 export function copyChipHtml(c) {
-  const tone = { leader: 'ok', ok: 'ok', lag: 'warn', out: 'warn', down: 'err' }[c.state] || 'neutral';
+  const tone = { leader: 'ok', ok: 'ok', lag: 'warn', out: 'warn', down: 'err', old: 'warn' }[c.state] || 'neutral';
   const title = T(`partitions.copy_${c.state}`);
-  return `<span class="tf-chip tf-chip--outline ${tone}" title="${escapeAttr(title)}">${escapeHtml(c.label)}</span>`;
+  const full = c.preferred ? `${title} · ${T('partitions.copy_preferred')}` : title;
+  return `<span class="tf-chip tf-chip--outline ${tone}" title="${escapeAttr(full)}">${c.preferred ? PIN : ''}${escapeHtml(c.label)}</span>`;
+}
+
+/** The legend entry that explains the pin; shown where a pinned copy is. */
+export function preferredLegendHtml() {
+  return `<span data-role="legend-preferred"><span class="tf-chip tf-chip--outline ok">${PIN}${escapeHtml(T('partitions.legend_preferred_chip'))}</span> ${escapeHtml(T('partitions.legend_preferred'))}</span>`;
 }
 
 /** "mac-studio: 87 MB · 4 s" — how far each copy behind trails. */
@@ -159,12 +231,14 @@ export function rangeText(range) {
 }
 
 /**
- * Opens "Przenieś prowadzenie" for one partition. `choices` =
- * `transferChoices(...)`; `transfer(nodeId)` sends the request (may throw:
- * the window stays with `describeError(err)`); `onDone({ nodeId, label })`
- * runs after the window closed.
+ * Opens "Przenieś prowadzenie" from one partition of `topic`; the whole topic
+ * moves, so the window says the topic's name and what goes with it. `choices` =
+ * `transferChoices(...)`; `blockedNote` (optional) = a reason that stops the
+ * whole topic, shown instead of an offer to move; `transfer(nodeId)` sends the
+ * request (may throw: the window stays with `describeError(err)`);
+ * `onDone({ nodeId, label })` runs after the window closed.
  */
-export function openLeaderTransfer({ topic, partition, choices, transfer, describeError, onDone }) {
+export function openLeaderTransfer({ topic, partition, choices, blockedNote = '', transfer, describeError, onDone }) {
   const pick = choices.find((c) => c.state === 'ok') || null;
   let selected = pick?.nodeId || '';
   const win = document.createElement('tf-window');
@@ -179,14 +253,19 @@ export function openLeaderTransfer({ topic, partition, choices, transfer, descri
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
   const noteOf = (c) => {
-    if (c.state === 'lag') return T('partitions.choice_lag', { size: fmtBytes(c.lagBytes) });
+    if (c.state === 'lag') {
+      if (c.byLeader) return c.lagBytes > 0 ? T('partitions.choice_lag_by', { size: fmtLagSize(c.lagBytes), owner: c.leaderLabel }) : T('partitions.choice_lag_leader', { owner: c.leaderLabel });
+      return T('partitions.choice_lag', { size: fmtLagSize(c.lagBytes) });
+    }
+    if (c.state === 'out' && c.byLeader) return T('partitions.choice_out_leader', { owner: c.leaderLabel });
     return T(`partitions.choice_${c.state}`);
   };
+  const headingOf = (c) => (c.preferred ? T('partitions.choice_preferred_tag', { label: c.label }) : c.label);
   win.innerHTML = `
     <div slot="body" class="stack">
-      <div class="tb-explain-box">${escapeHtml(T('partitions.transfer_explain', { partition: fmtCount(partition) }))}</div>
+      <div class="tb-explain-box">${escapeHtml(T('partitions.transfer_explain', { topic }))}</div>
       <tf-choice-group id="tb-transfer-target" value="${escapeAttr(selected)}" columns="1" aria-label="${escapeAttr(T('partitions.transfer_target'))}">
-        ${choices.map((c) => `<tf-choice-card value="${escapeAttr(c.nodeId)}" icon="cpu" heading="${escapeAttr(c.label)}" description="${escapeAttr(noteOf(c))}" ${c.state === 'ok' ? '' : 'disabled'}></tf-choice-card>`).join('')}
+        ${choices.map((c) => `<tf-choice-card value="${escapeAttr(c.nodeId)}" icon="cpu" heading="${escapeAttr(headingOf(c))}" description="${escapeAttr(noteOf(c))}" ${c.state === 'ok' && !blockedNote ? '' : 'disabled'}></tf-choice-card>`).join('')}
       </tf-choice-group>
       <div class="tb-will-happen" data-role="impact" aria-live="polite"></div>
       <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<span></span></div>
@@ -201,10 +280,10 @@ export function openLeaderTransfer({ topic, partition, choices, transfer, descri
   const cancel = win.querySelector('[data-act="cancel"]');
   let busy = false;
   const sync = () => {
-    const c = choices.find((x) => x.nodeId === selected && x.state === 'ok');
+    const c = blockedNote ? null : choices.find((x) => x.nodeId === selected && x.state === 'ok');
     win.querySelector('[data-role="impact"]').innerHTML = c
-      ? `${sprite('info')}<div><b>${escapeHtml(T('partitions.transfer_will_happen'))}</b> ${escapeHtml(T('partitions.transfer_impact', { partition: fmtCount(partition), node: c.label, secs: fmtCount(TRANSFER_WAIT_SECS) }))}</div>`
-      : `${sprite('info')}<div>${escapeHtml(T('partitions.transfer_pick'))}</div>`;
+      ? `${sprite('info')}<div><b>${escapeHtml(T('partitions.transfer_will_happen'))}</b> ${escapeHtml(T('partitions.transfer_impact', { topic, node: c.label, secs: fmtCount(TRANSFER_WAIT_SECS) }))}</div>`
+      : `${sprite('info')}<div>${escapeHtml(blockedNote || T('partitions.transfer_pick'))}</div>`;
     move.toggleAttribute('disabled', busy || !c);
     cancel.toggleAttribute('disabled', busy);
   };
@@ -215,7 +294,7 @@ export function openLeaderTransfer({ topic, partition, choices, transfer, descri
     const btn = e.target.closest('[data-act]');
     if (!btn || btn.hasAttribute('disabled')) return;
     if (btn.dataset.act === 'cancel') { win.close(true); return; }
-    const target = choices.find((x) => x.nodeId === selected && x.state === 'ok');
+    const target = blockedNote ? null : choices.find((x) => x.nodeId === selected && x.state === 'ok');
     if (!target) return;
     busy = true;
     sync();

@@ -259,7 +259,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
       _offset: r.offset,
       _class: i === state.selected ? 'selected' : '',
     }));
-    note.textContent = [state.notice, state.records.length ? pageNote(state.info, state.correlation ? state.records.length : null) : ''].filter(Boolean).join(' ');
+    note.textContent = [state.notice, state.records.length ? pageNote(state.info, state.correlation ? state.records.length : null) : '', state.info?.fromReplica ? T('replica.note_messages') : ''].filter(Boolean).join(' ');
     more.hidden = !(state.info?.hasMore) || state.loading || searchRanOut(state);
     paintDetail();
   };

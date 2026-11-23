@@ -182,9 +182,10 @@ export function buildTopicCreateRequest(instanceId, draft) {
  * throwing), and when that fails step 3 says so and offers to ask again. `existingNames` = the listed topics.
  * `create(request)` sends the request (it may throw; the window stays open
  * with `describeError(err)`), `onCreated({ name, schemaId, plan })` runs
- * after the window closed on success.
+ * after the window closed on success. `leaderHint` = `{ node, partitions, older }` (where the instance would lead
+ * a new topic now, from the last poll) or `null` on one node: step 3 says which node is chosen automatically.
  */
-export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = [], reloadSubjects, existingNames = [], instanceId, create, describeError = (e) => String(e?.message || e), onCreated }) {
+export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = [], reloadSubjects, existingNames = [], leaderHint = null, instanceId, create, describeError = (e) => String(e?.message || e), onCreated }) {
   const kinds = creatorContentTypes(capabilities.contentTypes);
   const plan = copiesPlan(capabilities);
   const draft = newDraft(kinds);
@@ -294,6 +295,14 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
     return T(`topics.creator.summary_schema_${draft.onMismatch === 'warn' ? 'warn' : 'dlq'}`, { schema });
   };
 
+  const leaderRow = () => {
+    if (!leaderHint || (!leaderHint.older && !leaderHint.node)) return [];
+    const text = leaderHint.older
+      ? T('topics.creator.summary_leader_old')
+      : T('topics.creator.summary_leader', { node: leaderHint.node, count: fmtCount(leaderHint.partitions), n: leaderHint.partitions });
+    return [[T('topics.creator.leader_label'), escapeHtml(text)]];
+  };
+
   const summary = () => {
     const rows = [
       [T('topics.creator.summary_name'), `<span class="mono">${escapeHtml(draft.name.trim())}</span>`],
@@ -302,6 +311,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
       [T('topics.creator.partitions_label'), escapeHtml(fmtCount(draft.partitions))],
       [T('topics.creator.summary_storage'), escapeHtml(summaryRetention())],
       [T('topics.creator.copies_label'), escapeHtml(plan.kind === 'unknown' ? T('topics.creator.summary_copies_unknown') : `${fmtCount(plan.count)}, ${copiesReason(plan)}`)],
+      ...leaderRow(),
       [T('topics.creator.durability_label'), escapeHtml(T(`topics.creator.summary_durability_${draft.durabilityClass}`))],
       [T('topics.creator.summary_schema'), escapeHtml(summarySchema())],
     ];

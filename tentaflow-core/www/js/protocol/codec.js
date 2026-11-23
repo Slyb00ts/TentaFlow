@@ -4452,6 +4452,29 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * BusPayload::LeaderBalancePlanRequest (Admin — "Rozłóż prowadzenie", the preview). payload:
+   * { instanceId, topic? }. `topic` omitted plans the whole organisation.
+   */
+  busLeaderBalancePlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusLeaderBalancePlanRequest(
+      encode._busInstanceId(payload),
+      payload.topic == null ? undefined : String(payload.topic),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::LeaderBalanceApplyRequest (Admin). payload: { instanceId, moves: [{ topic,
+   * partitions, fromNodeId, toNodeId, returnsToPreferred }] } — the moves of a plan answer, as shown.
+   */
+  busLeaderBalanceApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusLeaderBalanceApplyRequest(encode._busInstanceId(payload), payload.moves || []);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // ----- Field policies (SUM/tentabus/POLITYKI-POL.md — F0; JS-codec) -----
 
   /** BusPayload::FieldPolicyListRequest — every field policy configured on `topic`. payload: { instanceId, topic }. */

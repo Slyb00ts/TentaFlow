@@ -629,7 +629,8 @@ function paintInstance(body, view, topics) {
   setAttr(count.firstElementChild, 'label', fmtCount(total));
   // A reader who administers none of these topics can look, not retry.
   const anyAdmin = topics.some((t) => access.get(t.topic)?.canAdmin === true);
-  setText(body.querySelector('[data-role="list-hint"]'), T(anyAdmin ? 'unprocessed.list_hint' : 'unprocessed.list_hint_read'));
+  const fromCopy = topics.some((t) => byTopic.get(t.topic)?.fromReplica === true);
+  setText(body.querySelector('[data-role="list-hint"]'), [T(anyAdmin ? 'unprocessed.list_hint' : 'unprocessed.list_hint_read'), fromCopy ? T('replica.note_messages') : ''].filter(Boolean).join(' '));
   patchHtml(body.querySelector('[data-role="footer"]'), shownRows.length ? footerHtml(shownRows.length, total) : '');
   const more = body.querySelector('[data-role="more"]');
   more.hidden = !(rows.length > shownRows.length || (pending && shownRows.length < total));

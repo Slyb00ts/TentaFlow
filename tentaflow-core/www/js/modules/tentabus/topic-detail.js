@@ -26,9 +26,10 @@ import { T, fmtCount, fmtBytes, contentTypeLabel } from '/js/modules/tentabus/fo
 import { TOPIC_SECTIONS } from '/js/modules/tentabus/routes.js';
 import { topicSubline } from '/js/modules/tentabus/topics.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
+import { fromReplica, replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
 import { paintStateSection } from '/js/modules/tentabus/topic-state.js';
 import { settingsHtml, whoCanChange } from '/js/modules/tentabus/topic-settings.js';
-import { partitionRows, transferBlocker, copyChipHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
+import { partitionRows, transferBlocker, copyChipHtml, preferredLegendHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
 import { paintUnprocessedSection } from '/js/modules/tentabus/unprocessed.js';
 import { paintAccessSection, accessCount } from '/js/modules/tentabus/topic-access.js';
 import { paintHidingSection, hidingCount } from '/js/modules/tentabus/topic-hiding.js';
@@ -250,6 +251,8 @@ function paintPage(body, view, ctx) {
     ...view,
     topic,
     partitions: detail.partitions || [],
+    // The numbers come from this node's own copy when it does not lead the topic (partitions) or hold the group's lag (groups).
+    fromReplica: fromReplica(...(detail.partitions || []), ...(detail.groups || [])),
     access,
     adminLabels: detail.adminLabels || [],
     notice: view.notice?.section === section ? view.notice : null,
@@ -268,6 +271,7 @@ function partitionsSkeleton() {
     <div data-role="notice"></div>
     <div data-role="who"></div>
     <div data-role="blocked"></div>
+    <div class="tb-replica-note" data-role="replica-note" hidden></div>
     <div class="section-card">
       <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('detail.section.partitions'))} <span data-role="count"></span></div></div>
       <div class="section-sub">${escapeHtml(T('partitions.explain'))}</div>
@@ -289,6 +293,9 @@ function paintPartitionsSection(host, view, ctx) {
   }
   const { topic, partitions, nodes, replicaTopics, access, justMoved, notice } = view;
   const canAdmin = Boolean(access.canAdmin);
+  const note = host.querySelector('[data-role="replica-note"]');
+  note.hidden = view.fromReplica !== true;
+  patchHtml(note, replicaNoteHtml('values', view.fromReplica === true));
   patchHtml(host.querySelector('[data-role="notice"]'), notice
     ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}"></tf-alert>`
     : '');
@@ -350,6 +357,7 @@ function paintPartitionsSection(host, view, ctx) {
   patchHtml(host.querySelector('[data-role="legend"]'), [
     `<span>${copyChipHtml({ state: 'ok', label: T('partitions.legend_ok_chip') })} ${escapeHtml(T('partitions.legend_ok'))}</span>`,
     `<span>${copyChipHtml({ state: 'lag', label: T('partitions.legend_lag_chip') })} ${escapeHtml(T('partitions.legend_lag'))}</span>`,
+    rows.some((r) => r.copies.some((c) => c.preferred)) ? preferredLegendHtml() : '',
     moved.size ? `<span>${escapeHtml(T('partitions.legend_just_changed'))}</span>` : '',
   ].join(''));
 }

@@ -121,3 +121,238 @@ test('a topic row leads to that topic\'s partitions; a single node says every pa
   const changes = [...body.querySelectorAll('[data-role="changes"] .job-row')].map((r) => norm(r.querySelector('[data-role="name"]').textContent));
   assert.deepEqual(changes, ['odczyty-urzadzen · partycja 1: prowadzenie przeszło z n-mac na rig26', 'wizyty · partycja 0: prowadzenie przeszło z rig26 na n-mac']);
 });
+
+// ---------------------------------------------------------------------------
+// "Rozkład prowadzenia" (TB-04): per-node load, the topics away from their
+// preferred node, the spread button with its reason, the switch of the
+// automatic return and the new reasons of a leadership change.
+// ---------------------------------------------------------------------------
+
+const A = { nodeId: 'a', label: 'Serwer A', reachable: true, isLocal: true, lastHeartbeatMsAgo: 0, forwardCapable: true };
+const B = { nodeId: 'b', label: 'Serwer B', reachable: true, lastHeartbeatMsAgo: 400, forwardCapable: true };
+const pair = [A, B];
+
+/** A topic of `count` partitions led by `leader`, whose preferred node is `preferred`. */
+function led(topic, count, leader, preferred, lagging = []) {
+  return {
+    topic,
+    partitions: Array.from({ length: count }, (_, partition) => ({
+      partition,
+      leaderNodeId: leader,
+      replicas: preferred === 'a' ? ['a', 'b'] : ['b', 'a'],
+      preferredLeaderNodeId: preferred,
+      isr: lagging.length ? [leader] : ['a', 'b'],
+      lagging: lagging.map((nodeId) => ({ nodeId, lagBytes: 3 * MIB, lagMs: 1000 })),
+    })),
+  };
+}
+const listOf = (...perTopic) => perTopic.map((t) => ({ name: t.topic, partitions: t.partitions.length }));
+
+const evenTopics = [led('odczyty', 12, 'a', 'a'), led('powiadomienia', 3, 'a', 'a'), led('wyniki', 6, 'b', 'b'), led('przyjecia', 4, 'b', 'b'), led('wizyty', 4, 'b', 'b'), led('faktury', 3, 'b', 'b')];
+const unevenTopics = [led('wyniki', 6, 'a', 'b', ['b']), led('przyjecia', 4, 'a', 'b'), led('wizyty', 4, 'a', 'b', ['b']), led('faktury', 3, 'a', 'b'), led('odczyty', 12, 'a', 'a'), led('powiadomienia', 3, 'a', 'a')];
+
+function mountBalance({ nodesList = pair, perTopic = evenTopics, canAdmin = true, platformAdmin = canAdmin, leaderReturn = true, notice = null, reachableSince = new Map() } = {}) {
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  const calls = [];
+  const state = { nodesList, perTopic, canAdmin, platformAdmin, leaderReturn, notice, reachableSince };
+  const ctx = {
+    view: () => ({
+      nodes: state.nodesList, replicaTopics: state.perTopic, failovers: [], topics: listOf(...state.perTopic), canAdmin: state.canAdmin,
+      notice: state.notice, justMoved: new Set(), leaderReturn: state.leaderReturn, platformAdmin: state.platformAdmin, reachableSince: state.reachableSince, nowMs: Date.now(),
+    }),
+    go: (a) => calls.push(a),
+  };
+  drawReplication(body, ctx);
+  return { body, calls, state, ctx, repaint: () => drawReplication(body, ctx) };
+}
+
+const text = (el) => norm(el.textContent);
+const plain = (html) => norm(String(html).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+
+test('an even spread: per node what it leads, the distance from an even split and the topics away from home', async () => {
+  const { body } = mountBalance();
+  await tick();
+  const rows = body.querySelector('[data-role="balance"]').rows;
+  assert.equal(rows.length, 2);
+  assert.match(plain(rows[0].leads), /^15 partycji/);
+  assert.match(plain(rows[0].leads), /2 topiki: odczyty, powiadomienia/);
+  assert.match(plain(rows[1].leads), /17 partycji.*4 topiki: faktury, przyjecia, wizyty, wyniki/);
+  assert.equal(norm(rows[0].dev), '−1 partycja');
+  assert.equal(norm(rows[1].dev), '+1 partycja');
+  assert.equal(rows[0].away, '0');
+  assert.equal(text(body.querySelector('[data-role="balance-summary"]')), 'Równy podział to 16 partycji na node. Rozkład jest równy: różnica między nodami (2 partycje) jest mniejsza niż najmniejszy topik (3 partycje).');
+  assert.equal(body.querySelector('[data-role="balance-alert"]').children.length, 0, 'nothing to warn about');
+  assert.equal(body.querySelector('[data-role="balance-card"]').hidden, false);
+});
+
+test('an uneven spread names the idle node, the topics waiting for it and the copies still catching up', async () => {
+  const { body } = mountBalance({ perTopic: unevenTopics });
+  await tick();
+  const rows = body.querySelector('[data-role="balance"]').rows;
+  assert.match(plain(rows[0].leads), /^32 partycje/);
+  assert.match(plain(rows[1].leads), /^0 partycji.*0 topików/);
+  assert.match(rows[0].dev, /tb-warn-text/, 'the distance is flagged');
+  assert.match(plain(rows[1].away), /^4 topiki .*faktury, przyjecia, wizyty, wyniki — prowadzi je teraz Serwer A$/);
+  const alert = body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.equal(alert.getAttribute('tone'), 'warning');
+  assert.equal(alert.getAttribute('title'), 'Serwer B odpowiada, ale nie prowadzi żadnego topiku.', 'without a known time the sentence says no "od ..."');
+  assert.equal(norm(alert.getAttribute('message')), '4 topiki wrócą na Serwer B same, gdy ich kopie będą tam zgodne nieprzerwanie przez 5 min; kopie wizyty i wyniki jeszcze doganiają. Możesz też rozłożyć prowadzenie teraz.');
+  assert.match(text(body.querySelector('[data-role="balance-summary"]')), /Różnica między nodami \(32 partycje\) jest większa niż najmniejszy topik \(3 partycje\)\.$/);
+});
+
+test('the warning says since when the node answers and when its topics can return at the earliest', async () => {
+  const reachableSince = new Map([['b', Date.now() - 3 * 60_000 - 5000]]);
+  const { body } = mountBalance({ perTopic: unevenTopics, reachableSince });
+  await tick();
+  const alert = body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.equal(alert.getAttribute('title'), 'Serwer B odpowiada od 3 min, ale nie prowadzi żadnego topiku.');
+  assert.equal(norm(alert.getAttribute('message')), '4 topiki wrócą na Serwer B same, gdy ich kopie będą tam zgodne nieprzerwanie przez 5 min — najwcześniej za ok. 2 min; kopie wizyty i wyniki jeszcze doganiają. Możesz też rozłożyć prowadzenie teraz.');
+  const past = mountBalance({ perTopic: unevenTopics, reachableSince: new Map([['b', Date.now() - 9 * 60_000]]) });
+  await tick();
+  assert.doesNotMatch(past.body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('message'), /najwcześniej/, 'after 5 min there is nothing left to wait for');
+});
+
+test('with the automatic return off the warning says the topics stay until the spread', async () => {
+  const { body } = mountBalance({ perTopic: unevenTopics, leaderReturn: false });
+  await tick();
+  const message = body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('message');
+  assert.match(message, /Automatyczny powrót do preferowanego nodu jest wyłączony/);
+  assert.doesNotMatch(message, /wrócą/);
+  assert.equal(body.querySelector('[data-role="return"]').hasAttribute('checked'), false);
+});
+
+test('the spread button is the administrator\'s, and a disabled one says why — an older node included', async () => {
+  const ok = mountBalance();
+  await tick();
+  const button = ok.body.querySelector('[data-role="rebalance"]');
+  assert.equal(button.hidden, false);
+  assert.equal(button.hasAttribute('disabled'), false);
+  button.click();
+  assert.deepEqual(ok.calls, [{ kind: 'rebalance' }]);
+
+  const reader = mountBalance({ canAdmin: false });
+  await tick();
+  assert.equal(reader.body.querySelector('[data-role="rebalance"]').hidden, true);
+
+  // The switch is a platform setting: being the administrator of this bus is not enough.
+  const busAdmin = mountBalance({ canAdmin: true, platformAdmin: false });
+  await tick();
+  const locked = busAdmin.body.querySelector('[data-role="return"]');
+  assert.equal(locked.hasAttribute('disabled'), true, 'a bus administrator who is no platform administrator sees the switch, not changes it');
+  assert.match(text(busAdmin.body.querySelector('[data-role="return-sub"]')), /Ustawienie zmienia administrator\./);
+  assert.equal(busAdmin.body.querySelector('[data-role="rebalance"]').hidden, false, 'the spread is still the bus administrator\'s');
+  const platform = mountBalance({ platformAdmin: true });
+  await tick();
+  assert.equal(platform.body.querySelector('[data-role="return"]').hasAttribute('disabled'), false);
+
+  const old = mountBalance({ nodesList: [A, { ...B, forwarding: 'lacking', forwardCapable: false }], perTopic: unevenTopics });
+  await tick();
+  const blocked = old.body.querySelector('[data-role="rebalance"]');
+  assert.equal(blocked.hasAttribute('disabled'), true);
+  assert.equal(blocked.getAttribute('title'), 'Zaktualizuj wszystkie nody, aby rozłożyć prowadzenie. Serwer B ma starszą wersję TentaFlow.');
+  blocked.click();
+  assert.deepEqual(old.calls, [], 'a disabled button sends nothing');
+  const chip = old.body.querySelector('.tb-node-card[data-node="b"] [data-role="version"]');
+  assert.equal(chip.hidden, false);
+  assert.equal(chip.getAttribute('label'), 'starsza wersja');
+  assert.match(chip.getAttribute('title'), /Serwer B ma starszą wersję TentaFlow: nie przekazuje zapisów/);
+  assert.equal(old.body.querySelector('.tb-node-card[data-node="a"] [data-role="version"]').hidden, true);
+  const info = old.body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.equal(info.getAttribute('tone'), 'info');
+  assert.equal(info.getAttribute('title'), 'Rozkład prowadzenia ruszy po aktualizacji Serwer B.');
+  assert.doesNotMatch(text(old.body.querySelector('[data-role="balance-summary"]')), /Różnica/, 'no verdict while the spread cannot run');
+
+  // A node that is down is sent as the server sends it: not capable (nothing is known of it), "unknown", no heartbeat.
+  for (const sent of [{ forwarding: 'unknown' }, {}]) {
+    const down = mountBalance({ nodesList: [A, { ...B, reachable: false, forwardCapable: false, lastHeartbeatMsAgo: 90_000, ...sent }] });
+    await tick();
+    assert.match(down.body.querySelector('[data-role="rebalance"]').getAttribute('title'), /Żaden inny node nie odpowiada/, 'the reason is that no node answers, not an old version');
+    assert.equal(down.body.querySelector('.tb-node-card[data-node="b"] [data-role="version"]').hidden, true, 'a node that is down is not an older version');
+    assert.doesNotMatch(down.body.querySelector('[data-role="balance-alert"]').textContent, /po aktualizacji/);
+  }
+});
+
+test('one node has nothing to spread between, and shows no such card', async () => {
+  const { body } = mountBalance({ nodesList: [A] });
+  await tick();
+  assert.equal(body.querySelector('[data-role="balance-card"]').hidden, true);
+});
+
+test('the switch of the automatic return reports what the administrator chose', async () => {
+  const { body, calls } = mountBalance();
+  await tick();
+  const toggle = body.querySelector('[data-role="return"]');
+  assert.equal(toggle.hasAttribute('checked'), true);
+  toggle.querySelector('.tf-toggle').click();
+  assert.deepEqual(calls, [{ kind: 'leader-return', enabled: false }]);
+});
+
+test('a poll patches the card in place: the nodes, the table, the button and the switch keep their elements', async () => {
+  const { body, state, repaint } = mountBalance({ perTopic: unevenTopics });
+  await tick();
+  const kept = {
+    card: body.querySelector('.tb-node-card[data-node="b"]'),
+    table: body.querySelector('[data-role="balance"]'),
+    button: body.querySelector('[data-role="rebalance"]'),
+    toggle: body.querySelector('[data-role="return"]'),
+    alert: body.querySelector('[data-role="balance-alert"] tf-alert'),
+    rows: body.querySelector('[data-role="balance"]').rows,
+  };
+  repaint();
+  await tick();
+  assert.equal(body.querySelector('.tb-node-card[data-node="b"]'), kept.card);
+  assert.equal(body.querySelector('[data-role="balance"]'), kept.table);
+  assert.equal(body.querySelector('[data-role="rebalance"]'), kept.button);
+  assert.equal(body.querySelector('[data-role="return"]'), kept.toggle);
+  assert.equal(body.querySelector('[data-role="balance-alert"] tf-alert'), kept.alert, 'an unchanged warning is not rewritten');
+  assert.equal(body.querySelector('[data-role="balance"]').rows, kept.rows, 'an unchanged table is not handed its rows again');
+
+  // The next poll: two topics came home and the other node reports an old version.
+  state.perTopic = [...unevenTopics.slice(0, 2).map((t) => led(t.topic, t.partitions.length, 'b', 'b')), ...unevenTopics.slice(2)];
+  state.nodesList = [A, { ...B, forwardCapable: false }];
+  repaint();
+  await tick();
+  assert.equal(body.querySelector('.tb-node-card[data-node="b"]'), kept.card, 'the node card is the same element');
+  assert.equal(body.querySelector('[data-role="balance"]'), kept.table);
+  assert.equal(body.querySelector('[data-role="rebalance"]'), kept.button);
+  assert.equal(body.querySelector('[data-role="return"]'), kept.toggle);
+  assert.match(plain(body.querySelector('[data-role="balance"]').rows[1].leads), /^10 partycji/);
+  assert.equal(body.querySelector('[data-role="rebalance"]').hasAttribute('disabled'), true);
+  assert.equal(body.querySelector('.tb-node-card[data-node="b"] [data-role="version"]').hidden, false);
+});
+
+test('the leadership changes name the system\'s own reasons', () => {
+  const f = (reason, extra = {}) => ({ reason, ...extra });
+  assert.equal(failoverReason(f('post_upgrade_spread')), 'automatyczny rozkład po aktualizacji nodów');
+  assert.equal(failoverReason(f('preferred_restore')), 'automatyczny powrót do preferowanego nodu');
+  assert.equal(failoverReason(f('split_gather')), 'automatyczne zebranie topiku rozdzielonego między nody');
+  assert.equal(failoverReason(f('manual_transfer', { actorLabel: 'Administrator' })), 'przeniesione ręcznie przez: Administrator');
+  assert.equal(failoverReason(f('manual_transfer')), 'przeniesione ręcznie');
+  assert.equal(failoverReason(f('rebalance', { actorLabel: 'Administrator' })), 'rozłożone przez: Administrator');
+  assert.equal(failoverReason(f('rollback')), 'cofnięte po nieudanym przeniesieniu topiku');
+  assert.equal(failoverReason(f('something-new')), 'przyczyna nieznana');
+});
+
+test('the history lists each partition\'s change with its reason, newest first', async () => {
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  const at = Date.now();
+  const history = [
+    { atMs: at - 3000, topic: 'wyniki', partition: 0, fromNode: 'b', toNode: 'a', toEpoch: 4, durationMs: 700, reason: 'post_upgrade_spread' },
+    { atMs: at - 2000, topic: 'wyniki', partition: 1, fromNode: 'a', toNode: 'b', toEpoch: 5, durationMs: 700, reason: 'preferred_restore' },
+    { atMs: at - 1000, topic: 'wyniki', partition: 2, fromNode: 'b', toNode: 'a', toEpoch: 6, durationMs: 700, reason: 'manual_transfer', actorLabel: 'Administrator' },
+  ];
+  drawReplication(body, {
+    view: () => ({ nodes: pair, replicaTopics: evenTopics, failovers: history, topics: listOf(...evenTopics), canAdmin: true, notice: null, justMoved: new Set(), leaderReturn: true, nowMs: at }),
+    go() {},
+  });
+  await tick();
+  const rows = [...body.querySelectorAll('[data-change]')];
+  assert.deepEqual(rows.map((r) => text(r.querySelector('[data-role="why"]'))), [
+    'przeniesione ręcznie przez: Administrator',
+    'automatyczny powrót do preferowanego nodu',
+    'automatyczny rozkład po aktualizacji nodów',
+  ]);
+  assert.match(text(rows[0].querySelector('[data-role="name"]')), /wyniki · partycja 2: prowadzenie przeszło z Serwer B na Serwer A/);
+});

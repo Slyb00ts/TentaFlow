@@ -18,6 +18,7 @@ import { setAttr, patchHtml } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
 import { isLagging, isPausedWithBacklog } from '/js/modules/tentabus/alerts.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
+import { fromReplica, replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-segmented.js';
@@ -169,6 +170,7 @@ function listHtml() {
       </div>
       <div class="section-sub">${escapeHtml(T('consumers.explain'))}</div>
       <div class="muted tb-admin-note" data-role="admin-note" hidden>${sprite('lock')} <span></span></div>
+      <div class="tb-replica-note" data-role="replica-note" hidden></div>
       <tf-table data-role="table">
         <tf-column key="group" label="${escapeAttr(T('consumers.col_group'))}" renderer="html" fill></tf-column>
         <tf-column key="topic" label="${escapeAttr(T('consumers.col_topic'))}" renderer="html"></tf-column>
@@ -284,6 +286,10 @@ function paintList(body, view) {
   const note = body.querySelector('[data-role="admin-note"]');
   note.hidden = all.length === 0 || all.some((r) => r.canAdmin);
   note.querySelector('span').textContent = T('consumers.admin_only');
+  const replicaNote = body.querySelector('[data-role="replica-note"]');
+  const fromCopy = fromReplica(...(view.groups || []));
+  replicaNote.hidden = !fromCopy;
+  patchHtml(replicaNote, replicaNoteHtml('values', fromCopy));
   const maxWaiting = rows.reduce((m, r) => Math.max(m, r.waiting || 0), 0);
   const table = body.querySelector('[data-role="table"]');
   const next = rows.map((r) => tableRow(r, maxWaiting, view.nowMs));

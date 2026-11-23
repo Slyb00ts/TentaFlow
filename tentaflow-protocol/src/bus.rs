@@ -987,6 +987,11 @@ pub struct BusReplicaNodeWire {
     /// report it. Appended.
     #[serde(default)]
     pub forward_capable: bool,
+    /// What `forward_capable` cannot say: "capable", "lacking" (answered, and
+    /// is an older build) or "unknown" (not answered yet, or no member of the
+    /// instance). Absent from an older server. Appended.
+    #[serde(default)]
+    pub forwarding: Option<String>,
 }
 
 /// One replica's lag behind the leader (mirrors `bus::ReplicaLagInfo`) —
@@ -2637,6 +2642,7 @@ mod tests {
             follower_count: 3,
             isr_count: 8,
             forward_capable: true,
+            forwarding: Some("capable".to_string()),
         }
     }
 
@@ -2945,6 +2951,20 @@ mod tests {
     }
 
     #[test]
+    fn a_node_forwarding_state_round_trips_in_each_of_its_forms() {
+        for forwarding in [Some("capable"), Some("lacking"), Some("unknown"), None] {
+            let node = BusReplicaNodeWire {
+                forwarding: forwarding.map(str::to_string),
+                forward_capable: forwarding == Some("capable"),
+                ..sample_replica_node()
+            };
+            let decoded: BusReplicaNodeWire =
+                crate::cbor::decode(&crate::cbor::encode(&node).expect("encode")).expect("decode");
+            assert_eq!(decoded, node);
+        }
+    }
+
+    #[test]
     fn replica_wire_fields_of_tb04_default_for_an_old_peer() {
         #[derive(SerdeSerialize)]
         struct OldNode {
@@ -2984,6 +3004,7 @@ mod tests {
         let decoded: BusReplicaNodeWire =
             crate::cbor::decode(&crate::cbor::encode(&node).expect("encode")).expect("decode");
         assert!(!decoded.forward_capable);
+        assert_eq!(decoded.forwarding, None, "an old peer names no forwarding state");
         let partition = OldPartition {
             partition: 0,
             leader_node_id: Some("n".into()),

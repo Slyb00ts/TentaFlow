@@ -45,9 +45,11 @@ import { policyRows, topicFormat, fieldSource, previewAvailable } from '/js/modu
 import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
 import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
-import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
+import { openLeaderTransfer, transferChoices, transferContext, exclusive } from '/js/modules/tentabus/partitions.js';
+import { openRebalanceWindow, blockerText } from '/js/modules/tentabus/rebalance-window.js';
+import { leaderReturnEnabled, leaderReturnKey, leaderReturnValue, leastLoadedNode, isOlderNode } from '/js/modules/tentabus/leader-balance.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
-import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
+import { drawConsumers, consumerKey, consumerRows } from '/js/modules/tentabus/consumers.js';
 import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
 import { loadConsumerSla } from '/js/modules/tentabus/consumer-sla.js';
 import { readFlowList } from '/js/modules/sla/flow-list.js';
@@ -265,6 +267,10 @@ const state = {
   instanceId: null,
   instanceLabel: '',
   capabilities: NO_CAPABILITIES,
+  // The platform role: the automatic-return switch is a platform setting, changed by the platform administrator only.
+  platformAdmin: false,
+  // The switch's update is in flight: a poll must not put the old value back.
+  leaderReturnPending: false,
   tab: DEFAULT_TAB,
   view: null, // null | { kind: 'topic-detail', name, section } | { kind: 'consumer-detail', group, topic, section } | { kind: 'schema-detail', subject }
 
@@ -376,6 +382,10 @@ function freshShellState() {
     replicaTopics: null,
     failovers: [],
     replicaLags: [],
+    // The switch of the automatic return of topics to their preferred node: `null` until the settings were read.
+    leaderReturn: null,
+    // When this page saw each node answer again after it had not (`Map` nodeId → ms); a node it has always seen answering has none.
+    reachableSince: new Map(),
     lagSeries: new Map(),
     replicaPoll: null,
   };
@@ -525,6 +535,7 @@ const TentaBusScreen = {
     } catch {
       state.capabilities = NO_CAPABILITIES;
     }
+    state.platformAdmin = await ApiBinary.one('authMeRequest').then((me) => String(me?.role ?? '').toLowerCase() === 'admin', () => false);
     const root = byId('tb-root');
     if (!root) return;
     root.innerHTML = shellHtml();
@@ -866,6 +877,7 @@ function setTab(id) {
   if (id !== 'dlq') { state.unprocessed.notice = null; state.unprocessed.shown = LIST_STEP; }
   state.tab = id;
   renderPanel();
+  if (id === 'replication') refreshLeaderReturn(state.instanceId).then(() => { if (state.tab === 'replication' && !state.view) renderPanel(); });
   if (id === 'groups' && state.groups == null) loadGroups();
   if (id === 'dlq') ensureUnprocessed();
 }
@@ -1041,6 +1053,17 @@ async function refreshLagSeries(instanceId) {
   if (state.instanceId === instanceId) state.shell.lagSeries = next;
 }
 
+// The per-instance switch lives in the settings list (`bus.leader_return:<instance>`); a failed read keeps what the screen knew.
+async function refreshLeaderReturn(instanceId) {
+  if (state.leaderReturnPending) return;
+  try {
+    const { entries } = await ApiBinary.one('settingsListRequest');
+    if (state.instanceId === instanceId && !state.leaderReturnPending) state.shell.leaderReturn = leaderReturnEnabled(entries || [], instanceId);
+  } catch {
+    // The switch stays as it was (or unknown): the card shows it disabled rather than guess.
+  }
+}
+
 async function refreshReplicas() {
   const instanceId = state.instanceId;
   if (!instanceId || !state.topicsLoaded) return;
@@ -1051,17 +1074,32 @@ async function refreshReplicas() {
     return;
   }
   const names = state.topics.map((t) => t.name);
-  const perTopic = await Promise.all(names.map((topic) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic))
-    .then((r) => ({ topic, partitions: r?.partitions || [] }), () => ({ topic, partitions: [] }))));
-  if (state.instanceId !== instanceId) return;
   const nodes = all?.nodes || [];
+  // A topic's `__dlq.` partitions move with it and weigh into what a node leads, so they are read too, but
+  // only where the leadership card is shown (two nodes); a topic without unprocessed messages has none.
+  const withDlq = nodes.length >= 2;
+  const partitionsOf = (topic) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic)).then((r) => r?.partitions || [], () => []);
+  const perTopic = await Promise.all(names.map(async (topic) => ({
+    topic,
+    partitions: await partitionsOf(topic),
+    dlqPartitions: withDlq ? await partitionsOf(`__dlq.${topic}`) : [],
+  })));
+  if (state.instanceId !== instanceId) return;
+  const since = state.shell.reachableSince;
+  const known = new Map((state.shell.nodes || []).map((n) => [n.nodeId, n.reachable !== false]));
+  for (const n of nodes) {
+    if (n.reachable === false) since.delete(n.nodeId);
+    else if (known.get(n.nodeId) === false && !since.has(n.nodeId)) since.set(n.nodeId, Date.now());
+  }
   state.shell.nodes = nodes;
   state.shell.replicaTopics = perTopic;
   state.shell.failovers = all?.failovers || [];
   state.shell.replicaLags = laggingReplicas(perTopic, nodes);
+  if (state.tab === 'replication' && !state.view) await refreshLeaderReturn(instanceId);
   await refreshLagSeries(instanceId);
   if (state.instanceId !== instanceId) return;
   paintShell();
+  rebalanceHandle?.refresh();
   if (state.view?.kind === 'topic-detail') {
     // The page's partition numbers and sizes move with the log; they come
     // with the topic's own answer, asked again on the replica cadence.
@@ -1132,6 +1170,15 @@ function topicByName(name) {
   return state.topics.find((t) => t.name === name) || null;
 }
 
+// Where a new topic would be led: the reachable node that the fewest partitions prefer, from the last poll.
+// `{ node, partitions, older }` — `older` when a node cannot take part in an automatic choice yet.
+function leaderHint() {
+  const nodes = state.shell.nodes || [];
+  if (nodes.length < 2 || !state.shell.replicaTopics) return null;
+  const least = leastLoadedNode({ perTopic: state.shell.replicaTopics, nodes });
+  return { node: least ? least.label : null, partitions: least ? least.partitions : 0, older: nodes.some(isOlderNode) };
+}
+
 function openCreator() {
   if (!canAdmin()) return;
   const instanceId = state.instanceId;
@@ -1146,6 +1193,7 @@ function openCreator() {
       return state.shell.subjects || [];
     },
     existingNames: state.topics.map((t) => t.name),
+    leaderHint: leaderHint(),
     create: (request) => busCall('busTopicCreateRequest', request),
     describeError: describeBusError,
     onCreated: async ({ name, schemaId, plan }) => {
@@ -1770,32 +1818,135 @@ async function openHashKeyWindow(name) {
 // "Przenieś prowadzenie" from a topic's Partycje i kopie (`from = 'topic'`)
 // or from Kopie i nody (`from = 'replication'`): the same window over the
 // replica list the shell polls; the result lands as a note where it started.
-function openPartitionTransfer(topic, partition, from) {
+const transferGate = exclusive();
+
+async function openPartitionTransfer(topic, partition, from) {
   const allowed = from === 'topic' ? state.detail?.access?.canAdmin === true : canAdmin();
   if (!allowed) return;
   const replica = (state.shell.replicaTopics || []).find((r) => r.topic === topic)?.partitions?.find((p) => Number(p.partition) === Number(partition));
   if (!replica) return;
   const instanceId = state.instanceId;
+  const nodes = state.shell.nodes || [];
+  const label = (id) => nodes.find((n) => n.nodeId === id)?.label || id;
+  // The answer from the leader can take a moment: a line says so, and a second click meanwhile opens nothing.
+  const context = await transferGate(async () => {
+    const busy = toastBusy(T('partitions.checking_leader'));
+    try {
+      return await transferContext({
+        topic,
+        partition,
+        replica,
+        nodes,
+        readLeader: () => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic), { targetNodeId: replica.leaderNodeId }),
+        readPlan: () => busCall('busLeaderBalancePlanRequest', { instanceId: requireInstanceId(instanceId), topic }),
+        describeBlocker: (blocker) => blockerText(blocker, label, pausedConsumers()),
+      });
+    } finally {
+      busy.close();
+    }
+  });
+  if (!context || state.instanceId !== instanceId) return;
+  const { row, blockedNote } = context;
   openLeaderTransfer({
     topic,
     partition,
-    choices: transferChoices(replica, state.shell.nodes || []),
+    choices: transferChoices(row, nodes),
+    blockedNote,
     transfer: (target) => busCall('busLeaderTransferRequest', buildLeaderTransferRequest(instanceId, topic, partition, target)),
     describeError: describeBusError,
     onDone: async ({ label }) => {
       if (state.instanceId !== instanceId) return;
-      const text = T('partitions.moved_text', { partition: fmtCount(partition), topic, node: label });
+      const text = T('partitions.moved_text', { topic, node: label });
+      const moved = (state.shell.replicaTopics || []).find((r) => r.topic === topic)?.partitions || [];
       if (from === 'topic' && state.view?.name === topic) {
-        state.justMoved.add(Number(partition));
+        for (const p of moved) state.justMoved.add(Number(p.partition));
         state.detailNotice = { section: 'partitions', tone: 'success', title: T('partitions.moved_title'), text };
       } else if (from === 'replication') {
-        state.justMoved.add(`${topic}:${partition}`);
+        for (const p of moved) state.justMoved.add(`${topic}:${p.partition}`);
         state.replicationNotice = { title: T('partitions.moved_title'), text };
       }
       renderPanel();
       await refreshReplicas();
     },
   });
+}
+
+// A short "checking" line while the leader is asked (a second click meanwhile opens nothing).
+function toastBusy(text) {
+  const el = document.createElement('div');
+  el.className = 'tb-busy-toast';
+  el.setAttribute('role', 'status');
+  el.innerHTML = `<tf-spinner size="sm"></tf-spinner><span></span>`;
+  el.querySelector('span').textContent = text;
+  document.body.appendChild(el);
+  return { close: () => el.remove() };
+}
+
+// The consumers that are paused, by name and topic: what a refused move of a topic names.
+function pausedConsumers() {
+  return consumerRows({ groups: state.groups, stats: state.stats, nowMs: Date.now() }).filter((r) => r.paused).map((r) => ({ label: r.label, topic: r.topic }));
+}
+
+// "Rozłóż prowadzenie": the plan is asked for when the window opens and the
+// moves shown are the ones sent back; the window follows the replica lists
+// this shell polls (`rebalanceHandle.refresh()` after each).
+let rebalanceHandle = null;
+
+// The plan probes the nodes for up to a second or two and asks the leaders; a moved topic waits for its copies.
+const PLAN_TIMEOUT_MS = 30_000;
+// Apply re-plans for up to 20 s, then moves the topics one after another, each with a catch-up wait and a rollback.
+const APPLY_BASE_MS = 20_000;
+const APPLY_PER_MOVE_MS = 15_000;
+const applyTimeoutMs = (moves) => Math.max(120_000, APPLY_BASE_MS + moves * APPLY_PER_MOVE_MS);
+
+function openRebalance() {
+  if (!canAdmin() || rebalanceHandle) return;
+  const instanceId = state.instanceId;
+  rebalanceHandle = openRebalanceWindow({
+    instanceLabel: state.instanceLabel,
+    loadPlan: () => busCall('busLeaderBalancePlanRequest', { instanceId: requireInstanceId(instanceId) }, { timeoutMs: PLAN_TIMEOUT_MS }),
+    apply: async (moves) => (await busCall('busLeaderBalanceApplyRequest', { instanceId: requireInstanceId(instanceId), moves }, { timeoutMs: applyTimeoutMs(moves.length) })).results || [],
+    observe: () => ({
+      nodes: state.shell.nodes || [],
+      replicaTopics: state.shell.replicaTopics || [],
+      topics: state.topics,
+      leaderReturn: state.shell.leaderReturn,
+      pausedConsumers: pausedConsumers(),
+    }),
+    describeError: describeBusError,
+    onDone: async ({ moved, total, unknown }) => {
+      if (state.instanceId !== instanceId) return;
+      state.justMoved = new Set();
+      if (!unknown && moved > 0) {
+        state.replicationNotice = moved === total
+          ? { title: T('rebalance.result_ok_title'), text: T('rebalance.result_ok_text', { count: fmtCount(moved), n: moved }) }
+          : { tone: 'warning', title: T('rebalance.result_title', { done: fmtCount(moved), total: fmtCount(total), n: total }), text: T('rebalance.result_partial_notice') };
+      }
+      renderPanel();
+      await refreshReplicas();
+    },
+  });
+  rebalanceHandle.win.addEventListener('closed', () => { rebalanceHandle = null; });
+}
+
+async function setLeaderReturn(enabled) {
+  if (!state.platformAdmin || state.leaderReturnPending) return;
+  const instanceId = state.instanceId;
+  const previous = state.shell.leaderReturn;
+  state.shell.leaderReturn = enabled;
+  state.leaderReturnPending = true;
+  state.replicationNotice = null;
+  try {
+    await ApiBinary.action('settingsUpdateRequest', { entries: [{ key: leaderReturnKey(instanceId), value: leaderReturnValue(enabled), isSecret: false }] });
+  } catch (err) {
+    if (state.instanceId === instanceId) {
+      state.shell.leaderReturn = previous;
+      state.replicationNotice = { tone: 'danger', title: T('replication.return_title'), text: T('replication.return_error', { error: describeBusError(err) }) };
+    }
+  } finally {
+    state.leaderReturnPending = false;
+  }
+  if (state.instanceId === instanceId) renderPanel();
 }
 
 // =============================================================================
@@ -1814,12 +1965,17 @@ const replicationContext = {
       canAdmin: canAdmin(),
       notice: state.replicationNotice,
       justMoved: state.justMoved,
+      leaderReturn: sh.leaderReturn,
+      platformAdmin: state.platformAdmin,
+      reachableSince: sh.reachableSince,
       nowMs: Date.now(),
     };
   },
   go(action) {
     if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, 'partitions'); }
     else if (action.kind === 'transfer') openPartitionTransfer(action.topic, action.partition, 'replication');
+    else if (action.kind === 'rebalance') openRebalance();
+    else if (action.kind === 'leader-return') setLeaderReturn(action.enabled);
   },
 };
 
@@ -1921,8 +2077,10 @@ async function fetchConsumer(instanceId, group, topic) {
     busCall('busLagHistoryRequest', { instanceId: iid, group, topic, sinceMs: nowMs - 10 * 60_000 }),
   ]);
   let dlq = null;
+  let dlqFromReplica = !readDlq && state.consumer?.dlqFromReplica === true;
   if (!readDlq) dlq = state.consumer?.dlq ?? null;
   else if (dlqResp.status === 'fulfilled') {
+    dlqFromReplica = (dlqResp.value?.result?.partitions || []).some((p) => p.fromReplica === true);
     dlq = consumerDlq({ records: dlqResp.value?.result?.records, hasMore: dlqResp.value?.result?.hasMore, group, nowMs });
   } else if (busErrorCode(dlqResp.reason?.message) === 'topic_not_found') {
     // The topic has never had an unprocessed message: nothing is this consumer's.
@@ -1941,7 +2099,7 @@ async function fetchConsumer(instanceId, group, topic) {
     cache: consumerFlowGraphs,
   })
     .catch(() => null);
-  return { detail: groupResp?.detail, topicDetail, dlq, samples: series?.samples || [], sla };
+  return { detail: groupResp?.detail, topicDetail, dlq, samples: series?.samples || [], sla, dlqFromReplica, fromReplica: groupResp?.detail?.fromReplica === true || series?.fromReplica === true || dlqFromReplica };
 }
 
 // A failed reload keeps the page it already shows (the header says the data
@@ -1987,6 +2145,7 @@ const consumerContext = {
       stats: state.stats,
       notice: state.consumerNotice,
       justMoved: state.consumerMoved,
+      nodes: state.shell.nodes || [],
       busy: state.consumerBusy,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
@@ -2146,7 +2305,7 @@ async function fetchUnprocessedTopic(topic, { more = false }) {
       fromOffsets: fromOffsets.length ? fromOffsets : undefined,
     });
     const records = (resp?.records || []).map((r) => unprocessedRecord(topic, r));
-    entry = { records: more && prev ? [...prev.records, ...records] : records, hasMore: Boolean(resp?.hasMore), partitions: resp?.partitions || [], error: null };
+    entry = { records: more && prev ? [...prev.records, ...records] : records, hasMore: Boolean(resp?.hasMore), partitions: resp?.partitions || [], fromReplica: (resp?.partitions || []).some((p) => p.fromReplica === true), error: null };
   } catch (err) {
     // A topic whose messages were all processed never needed the store.
     entry = busErrorCode(err?.message) === 'topic_not_found'

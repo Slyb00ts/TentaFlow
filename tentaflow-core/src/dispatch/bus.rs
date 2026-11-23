@@ -5042,6 +5042,16 @@ async fn capabilities_v1(
 // repliki" view, plus the two admin mutations (`Reassign`/`LeaderTransfer`).
 // =============================================================================
 
+/// `BusReplicaNodeWire::forwarding`: "capable", "lacking" (an older build) or
+/// "unknown" (not answered yet, or not a member of the instance).
+fn forwarding_wire(forwarding: NodeForwarding) -> &'static str {
+    match forwarding {
+        NodeForwarding::Capable => "capable",
+        NodeForwarding::Lacking => "lacking",
+        NodeForwarding::NotAMember | NodeForwarding::Unknown => "unknown",
+    }
+}
+
 fn replica_node_wire(n: &ReplicaNodeInfo) -> BusReplicaNodeWire {
     BusReplicaNodeWire {
         node_id: n.node_id.clone(),
@@ -5054,6 +5064,7 @@ fn replica_node_wire(n: &ReplicaNodeInfo) -> BusReplicaNodeWire {
         follower_count: n.follower_count,
         isr_count: n.isr_count,
         forward_capable: false,
+        forwarding: None,
     }
 }
 
@@ -5145,6 +5156,23 @@ fn parse_audit_kv(details: &str) -> std::collections::HashMap<&str, &str> {
         .split_whitespace()
         .filter_map(|tok| tok.split_once('='))
         .collect()
+}
+
+/// `BusFailoverEventWire::reason` of a `bus.leader.transfer` row. An admin's
+/// move (and a row from before the audit named a reason) stays
+/// `manual_transfer`; the reasons the system and "Rozłóż prowadzenie" write
+/// pass through, so the screen can tell an automatic return from a move by
+/// hand. Anything else reads as a manual move.
+fn transfer_failover_reason(audit_reason: Option<&str>) -> String {
+    use crate::bus::leader_balance::POST_UPGRADE_SPREAD_REASON;
+    use crate::bus::leader_return::{PREFERRED_RESTORE_REASON, SPLIT_GATHER_REASON};
+    match audit_reason {
+        Some(
+            reason @ (POST_UPGRADE_SPREAD_REASON | PREFERRED_RESTORE_REASON | SPLIT_GATHER_REASON
+            | "rebalance" | "rollback"),
+        ) => reason.to_string(),
+        _ => LEADER_TRANSFER_REASON.to_string(),
+    }
 }
 
 /// Builds the M06 failover timeline directly from `audit_log` (PLAN-M2 §1f:
@@ -5247,7 +5275,7 @@ fn failover_events_from_audit(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let reason = if is_transfer {
-            LEADER_TRANSFER_REASON.to_string()
+            transfer_failover_reason(kv.get("reason").copied())
         } else {
             kv.get("reason").copied().unwrap_or("").to_string()
         };
@@ -5341,6 +5369,7 @@ async fn replica_list_v1(
                 .zip(capable)
                 .map(|(n, forwarding)| BusReplicaNodeWire {
                     forward_capable: forwarding == NodeForwarding::Capable,
+                    forwarding: Some(forwarding_wire(forwarding).to_string()),
                     ..replica_node_wire(n)
                 })
                 .collect();
@@ -5408,6 +5437,7 @@ async fn replica_list_v1(
             follower_count: 0,
             isr_count: partition_count,
             forward_capable: true,
+            forwarding: Some(forwarding_wire(NodeForwarding::Capable).to_string()),
         };
         Ok((vec![node], partitions_wire))
     })
@@ -8211,6 +8241,30 @@ mod tests {
                 mapped.message
             );
         }
+    }
+
+    #[test]
+    fn a_transfer_row_keeps_the_reason_the_system_wrote() {
+        for reason in [
+            "rebalance",
+            "post_upgrade_spread",
+            "preferred_restore",
+            "split_gather",
+            "rollback",
+        ] {
+            assert_eq!(transfer_failover_reason(Some(reason)), reason);
+        }
+        for reason in [Some("manual"), Some("something-new"), Some(""), None] {
+            assert_eq!(transfer_failover_reason(reason), "manual_transfer");
+        }
+    }
+
+    #[test]
+    fn a_node_that_is_down_or_not_asked_is_not_reported_as_an_older_build() {
+        assert_eq!(forwarding_wire(NodeForwarding::Capable), "capable");
+        assert_eq!(forwarding_wire(NodeForwarding::Lacking), "lacking");
+        assert_eq!(forwarding_wire(NodeForwarding::Unknown), "unknown");
+        assert_eq!(forwarding_wire(NodeForwarding::NotAMember), "unknown");
     }
 
     #[test]
