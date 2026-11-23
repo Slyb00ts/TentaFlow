@@ -2430,6 +2430,422 @@ async fn committed_consumer_offsets_propagate_to_followers_and_survive_promotion
     shutdown_all(&nodes);
 }
 
+// ===== TB-04 K7: an admin on a replica reads a topic another node leads ====
+
+/// The read-only views of the admin screens, asked on B for a topic A leads:
+/// the messages are the leader's up to B's high watermark (an uncommitted
+/// tail B holds past it stays hidden), the lag is the leader's once the
+/// commit has crossed the coalescing window, and every change of state is
+/// still refused on B, naming A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_on_a_follower_reads_a_topic_led_by_another_node() {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Leader).await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "B/C never completed the initial Hello handshake"
+    );
+    for i in 0..6u32 {
+        publish_text(a, Some(0), &format!("rec-{i}"))
+            .await
+            .expect("publish on the leader");
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(b, 0) >= 6).await,
+        "B never committed the six records: b_leo={} b_hw={}",
+        log_end_offset(b, 0),
+        high_watermark(b, 0)
+    );
+
+    const GROUP: &str = "g-replica-read";
+    let consumer = a
+        .svc
+        .open_consumer(
+            &ctx(),
+            GROUP,
+            &[TOPIC.to_string()],
+            ConsumerConfig {
+                commit_mode: tentaflow_core::bus::groups::CommitMode::Explicit,
+            },
+        )
+        .expect("open_consumer on the leader");
+    consumer.fetch(1024 * 1024, 2_000).expect("fetch");
+    consumer
+        .commit(&[(
+            TopicPartition {
+                topic: TOPIC.to_string(),
+                partition: 0,
+            },
+            4,
+        )])
+        .expect("commit offset 4");
+    assert!(
+        wait_until(Duration::from_secs(5), || committed_group_offset(
+            b, GROUP, 0
+        ) == 4)
+        .await,
+        "the commit never reached B"
+    );
+
+    // B reads up to what the leader has told it is on a majority, which trails
+    // its high watermark by a heartbeat.
+    assert!(
+        wait_until(Duration::from_secs(5), || readable_up_to(b) == 6).await,
+        "B never learned that the six records are committed"
+    );
+
+    // An uncommitted tail on B, past its high watermark.
+    let b_part = b
+        .svc
+        .local_partition(&ctx(), TOPIC, 0)
+        .expect("B partition");
+    b_part
+        .append_batch_async(one_text_batch("ghost-1"))
+        .await
+        .expect("append the uncommitted tail");
+    assert_eq!(log_end_offset(b, 0), 7);
+    assert_eq!(high_watermark(b, 0), 6, "the tail is past hw");
+
+    let peek = |node: &TestNode| {
+        node.svc
+            .peek(
+                &ctx(),
+                TOPIC,
+                0,
+                0,
+                100,
+                tentaflow_core::bus::PEEK_MAX_BYTES,
+            )
+            .expect("peek")
+    };
+    let (on_a, on_b) = (peek(a), peek(b));
+    assert!(!on_a.from_replica && on_b.from_replica);
+    let seen = |r: &tentaflow_core::bus::PeekResult| -> Vec<(u64, Vec<u8>)> {
+        r.records
+            .iter()
+            .map(|r| (r.offset, r.payload.to_vec()))
+            .collect()
+    };
+    assert_eq!(
+        seen(&on_b),
+        seen(&on_a),
+        "the replica shows the leader's records"
+    );
+    assert_eq!(on_b.records.len(), 6, "the ghost past hw is not shown");
+    assert_eq!(on_b.high_watermark, 6);
+
+    let runs = b
+        .svc
+        .peek_runs(&ctx(), TOPIC, 0, &[0..7], 64)
+        .expect("peek_runs");
+    assert_eq!(runs.records.len(), 6);
+    assert!(runs.records.iter().all(|r| r.offset < 6));
+
+    let lag = |node: &TestNode| {
+        node.svc
+            .group_lag(&ctx(), GROUP, TOPIC)
+            .expect("group_lag")
+            .into_iter()
+            .map(|p| (p.committed_offset, p.high_watermark, p.lag))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lag(a), vec![(4, 6, 2)]);
+    assert_eq!(
+        lag(b),
+        lag(a),
+        "the lag on B is the leader's once the commit arrived"
+    );
+
+    // Nothing that changes state is let through on B; each refusal names A.
+    let names_a = |what: &str, outcome: Result<(), BusServiceError>| match outcome {
+        Err(BusServiceError::NotLeader {
+            leader_node_id: Some(leader),
+            leader_epoch: 1,
+        }) => assert_eq!(leader, "A", "{what}"),
+        other => panic!("{what}: expected NotLeader naming A, got {other:?}"),
+    };
+    names_a("pause", b.svc.pause_group(&ctx(), GROUP, TOPIC));
+    names_a("reset", b.svc.reset_offset(&ctx(), GROUP, TOPIC, 0, 0));
+    assert_eq!(committed_group_offset(b, GROUP, 0), 4);
+    assert_eq!(committed_group_offset(a, GROUP, 0), 4);
+
+    shutdown_all(&nodes);
+}
+
+// ===== TB-04 K7: consumer-group rows and pauses are replicated ============
+
+fn group_row(node: &TestNode, group: &str) -> Option<tentaflow_core::db::repository::DbBusGroup> {
+    tentaflow_core::db::repository::bus_group_get(node.svc.local_db(), ORG, group, TOPIC)
+        .expect("read the group row")
+}
+
+/// How far a read on `node` goes: its high watermark, but never past what the
+/// leader has told it is on a majority (`committed_offset`), which trails the
+/// high watermark by a heartbeat.
+fn readable_up_to(node: &TestNode) -> u64 {
+    node.svc
+        .read_window(&ctx(), TOPIC, 0)
+        .expect("read window")
+        .high_watermark
+}
+
+fn open_explicit(node: &TestNode, group: &str) -> tentaflow_core::bus::ConsumerHandle {
+    node.svc
+        .open_consumer(
+            &ctx(),
+            group,
+            &[TOPIC.to_string()],
+            ConsumerConfig {
+                commit_mode: tentaflow_core::bus::groups::CommitMode::Explicit,
+            },
+        )
+        .expect("open_consumer")
+}
+
+/// A pause set on the leader reaches the replicas, is still there on the
+/// node that takes over, keeps the topic where it is (the leader-return loop
+/// would otherwise move a paused group's topic and drop its pause), and is
+/// lifted on the node that comes back once it is resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pause_reaches_the_replicas_and_survives_a_failover_and_a_return() {
+    const GROUP: &str = "g-paused";
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B", "C"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    assert!(
+        wait_isr_full(&nodes, TOPIC, "A", &["A", "B", "C"]).await,
+        "the ISR never filled"
+    );
+    let a = find_node(&nodes, "A");
+    for i in 0..4 {
+        publish_on(&a.svc, TOPIC, &format!("rec-{i}"))
+            .await
+            .expect("publish");
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(a, 0) >= 4).await,
+        "the records never became visible"
+    );
+    let consumer = open_explicit(a, GROUP);
+    assert_eq!(consumer.fetch(1024 * 1024, 2_000).unwrap().records.len(), 4);
+    consumer
+        .commit(&[(
+            TopicPartition {
+                topic: TOPIC.to_string(),
+                partition: 0,
+            },
+            2,
+        )])
+        .expect("commit");
+
+    // A replica lists the group the moment the leader opened it.
+    for id in ["B", "C"] {
+        let node = find_node(&nodes, id);
+        assert!(
+            wait_until(Duration::from_secs(5), || group_row(node, GROUP)
+                .is_some_and(|row| !row.paused))
+            .await,
+            "the group row never reached {id}"
+        );
+    }
+    a.svc.pause_group(&ctx(), GROUP, TOPIC).expect("pause");
+    for id in ["B", "C"] {
+        let node = find_node(&nodes, id);
+        assert!(
+            wait_until(Duration::from_secs(5), || group_row(node, GROUP)
+                .is_some_and(|row| row.paused))
+            .await,
+            "the pause never reached {id}"
+        );
+    }
+
+    // A crashes; a survivor takes over and holds the pause it was sent.
+    registry.peers.lock().remove("A");
+    let a_pos = nodes.iter().position(|n| n.id == "A").expect("node A");
+    let crashed = nodes.remove(a_pos);
+    crashed.manager.shutdown();
+    drop(crashed);
+    assert!(
+        wait_until(Duration::from_secs(20), || leader_of(&nodes, TOPIC)
+            .is_some())
+        .await,
+        "no survivor took over"
+    );
+    let survivor = leader_of(&nodes, TOPIC).expect("one leader");
+    let leader = find_node(&nodes, &survivor);
+    let resumed = open_explicit(leader, GROUP);
+    assert!(
+        matches!(
+            resumed.fetch(1024 * 1024, 100),
+            Err(tentaflow_core::bus::BusServiceError::GroupPaused { .. })
+        ),
+        "the promoted node served a group that was paused"
+    );
+
+    // A comes back with an empty disk. Its topic stays with the survivor
+    // while the group is paused, however long A has been in sync.
+    for node in &nodes {
+        node.svc.set_leader_return_timing(quick_return_timing());
+        spawn_leader_return_loop(node);
+    }
+    let row =
+        tentaflow_core::db::repository::bus_topic_get(&leader.db, TEST_INSTANCE_ID, ORG, TOPIC)
+            .expect("read topic row")
+            .expect("topic row");
+    let back = build_node(
+        "A",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+    );
+    tentaflow_core::db::repository::bus_topic_create(&back.db, &row).expect("topic row on A");
+    back.svc.set_leader_return_timing(quick_return_timing());
+    spawn_background_loops(&back);
+    spawn_leader_return_loop(&back);
+    nodes.push(back);
+    let leader = find_node(&nodes, &survivor);
+    assert!(
+        wait_until(Duration::from_secs(30), || leader
+            .manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .any(|p| p.isr.iter().any(|n| n == "A")))
+        .await,
+        "A never rejoined the in-sync set"
+    );
+    tokio::time::sleep(RETURN_STABLE_FOR * 2).await;
+    assert_eq!(
+        leader_of(&nodes, TOPIC).as_deref(),
+        Some(survivor.as_str()),
+        "a paused group's topic must not be moved"
+    );
+    let a = find_node(&nodes, "A");
+    assert!(
+        wait_until(Duration::from_secs(10), || group_row(a, GROUP)
+            .is_some_and(|row| row.paused))
+        .await,
+        "the node that was away never learned the pause"
+    );
+
+    // Resumed on the leader, the topic goes back to A, which serves the group.
+    leader
+        .svc
+        .resume_group(&ctx(), GROUP, TOPIC)
+        .expect("resume");
+    assert!(
+        wait_until(Duration::from_secs(40), || leader_of(&nodes, TOPIC)
+            .as_deref()
+            == Some("A"))
+        .await,
+        "the topic never went back to A"
+    );
+    // The resume travels to A as a replicated row, which can trail the move.
+    assert!(
+        wait_until(Duration::from_secs(10), || group_row(a, GROUP)
+            .is_some_and(|row| !row.paused))
+        .await,
+        "the resume never reached A"
+    );
+    let on_a = open_explicit(a, GROUP);
+    let batch = on_a
+        .fetch(1024 * 1024, 2_000)
+        .expect("a resumed group is served by the node that came back");
+    assert_eq!(
+        batch.records.first().map(|r| r.offset),
+        Some(2),
+        "it reads on from the offset that was committed"
+    );
+    shutdown_all(&nodes);
+}
+
+/// A replica that was down while a group committed learns the commit when
+/// its stream opens, even though the group is idle by then and sends nothing
+/// more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_that_was_away_gets_the_commit_of_an_idle_group_when_it_rejoins() {
+    const GROUP: &str = "g-idle";
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B", "C"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    assert!(
+        wait_isr_full(&nodes, TOPIC, "A", &["A", "B", "C"]).await,
+        "the ISR never filled"
+    );
+
+    registry.peers.lock().remove("B");
+    let b_pos = nodes.iter().position(|n| n.id == "B").expect("node B");
+    let crashed = nodes.remove(b_pos);
+    crashed.manager.shutdown();
+    drop(crashed);
+
+    let a = find_node(&nodes, "A");
+    for i in 0..6 {
+        publish_on(&a.svc, TOPIC, &format!("rec-{i}"))
+            .await
+            .expect("publish with one replica away");
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(a, 0) >= 6).await,
+        "the records never became visible"
+    );
+    let consumer = open_explicit(a, GROUP);
+    assert_eq!(consumer.fetch(1024 * 1024, 2_000).unwrap().records.len(), 6);
+    consumer
+        .commit(&[(
+            TopicPartition {
+                topic: TOPIC.to_string(),
+                partition: 0,
+            },
+            4,
+        )])
+        .expect("commit");
+    drop(consumer);
+    // Long past the coalescing window: the live note is gone for good.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let row = tentaflow_core::db::repository::bus_topic_get(&a.db, TEST_INSTANCE_ID, ORG, TOPIC)
+        .expect("read topic row")
+        .expect("topic row");
+    let back = build_node(
+        "B",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+    );
+    tentaflow_core::db::repository::bus_topic_create(&back.db, &row).expect("topic row on B");
+    spawn_background_loops(&back);
+    nodes.push(back);
+    let b = find_node(&nodes, "B");
+
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            high_watermark(b, 0) >= 6 && committed_group_offset(b, GROUP, 0) == 4
+        })
+        .await,
+        "B never learned the commit: hw={} committed={}",
+        high_watermark(b, 0),
+        committed_group_offset(b, GROUP, 0)
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || readable_up_to(b) == 6).await,
+        "B never learned that the six records are committed"
+    );
+    let lag = b.svc.group_lag(&ctx(), GROUP, TOPIC).expect("lag on B");
+    assert_eq!(
+        (lag[0].committed_offset, lag[0].lag),
+        (4, 2),
+        "the replica's lag is the leader's"
+    );
+    assert!(group_row(b, GROUP).is_some(), "and it lists the group");
+    shutdown_all(&nodes);
+}
+
 // ===== Scenario 8: a divergent replica is truncated back to the =========
 // ===== leader's authority when its stream reopens ========================
 
@@ -5027,13 +5443,18 @@ async fn a_topic_split_by_a_failover_is_gathered_at_once_and_goes_back_to_its_pr
         split_since.elapsed() < stable_for,
         "a split topic is gathered promptly, not after the stable time"
     );
+    // The driver writes its audit row after the move is done, so the unit can
+    // already be led by C a moment before the row exists.
     let driver = find_node(&nodes, "B");
-    let gathered = audit_details_of(driver, "bus.leader.transfer");
-    assert!(
-        gathered
+    let gathered_by_split_gather = || {
+        audit_details_of(driver, "bus.leader.transfer")
             .iter()
-            .any(|d| d.contains("reason=split_gather") && d.contains("target_node_id=C")),
-        "{gathered:?}"
+            .any(|d| d.contains("reason=split_gather") && d.contains("target_node_id=C"))
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), gathered_by_split_gather).await,
+        "{:?}",
+        audit_details_of(driver, "bus.leader.transfer")
     );
     for (topic, partition) in [(TOPIC, 0), (TOPIC, 1), ("__dlq.orders", 0)] {
         let rows = find_node(&nodes, "C")
@@ -5100,12 +5521,15 @@ async fn a_topic_split_by_a_failover_is_gathered_at_once_and_goes_back_to_its_pr
         in_sync_since.elapsed() + timing.sample_interval * 2 >= stable_for,
         "it went back before A had been in sync for the stable time"
     );
-    let returns = audit_details_of(find_node(&nodes, "C"), "bus.leader.transfer");
-    assert!(
-        returns
+    let returned_to_preferred = || {
+        audit_details_of(find_node(&nodes, "C"), "bus.leader.transfer")
             .iter()
-            .any(|d| d.contains("reason=preferred_restore") && d.contains("target_node_id=A")),
-        "{returns:?}"
+            .any(|d| d.contains("reason=preferred_restore") && d.contains("target_node_id=A"))
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), returned_to_preferred).await,
+        "{:?}",
+        audit_details_of(find_node(&nodes, "C"), "bus.leader.transfer")
     );
     shutdown_all(&nodes);
 }

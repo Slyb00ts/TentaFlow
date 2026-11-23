@@ -127,6 +127,12 @@ pub trait PartitionProvider: Send + Sync {
     /// follower stream applies `Offsets`/`Batch.producer` into
     /// (`follower::FollowerStores`'s own doc).
     fn follower_stores(&self) -> FollowerStores;
+    /// The consumer-group rows of `topic` on this node, for the snapshot a
+    /// leader's replica stream sends.
+    fn group_rows(&self, org: &str, topic: &str) -> Vec<super::frames::ReplGroup> {
+        let _ = (org, topic);
+        Vec::new()
+    }
     /// Producer-idempotency side channel for one outbound batch
     /// (`leader::OutboundBatchMeta`'s doc, K-M2-6): `None` when the batch
     /// at `base_offset` was not published with a `producer_id` (or the
@@ -567,6 +573,48 @@ fn handled_offsets_lookup(
     }))
 }
 
+/// `leader::GroupSnapshotLookup` of one partition over this node's own
+/// stores. Best-effort like `handled_offsets_lookup`: a torn-down engine or an
+/// unreadable store sends nothing this time, and the next stream start,
+/// lag or row change sends it again.
+fn group_snapshot_lookup(
+    provider: Weak<dyn PartitionProvider>,
+    org: String,
+    topic: String,
+    partition: u32,
+) -> leader::GroupSnapshotLookup {
+    Arc::new(move |with_commits| {
+        let Some(provider) = provider.upgrade() else {
+            return leader::GroupSnapshot::default();
+        };
+        let commits = if with_commits {
+            match provider
+                .follower_stores()
+                .offsets
+                .committed_in_partition(&org, &topic, partition)
+            {
+                Ok(found) => found
+                    .into_iter()
+                    .map(|(group, offset, attempts)| (group, partition, offset, attempts))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        org_id = %org, topic = %topic, partition, error = %e,
+                        "replication: reading the consumer groups' offsets failed"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        leader::GroupSnapshot {
+            commits,
+            groups: provider.group_rows(&org, &topic),
+        }
+    })
+}
+
 /// One follower's reconnect-supervised stream lifecycle (module doc's
 /// "DIAL DIRECTION / RECONNECT OWNERSHIP" section): runs `leader::
 /// run_follower_stream` to completion, then either stops for good
@@ -635,6 +683,13 @@ fn spawn_follower_supervisor(
                 topic.clone(),
                 partition_id,
             );
+
+            shared.leader.set_group_snapshot(group_snapshot_lookup(
+                Weak::clone(&provider),
+                org_id.clone(),
+                topic.clone(),
+                partition_id,
+            ));
 
             let result = leader::run_follower_stream(
                 Arc::clone(&shared.leader),
@@ -863,6 +918,10 @@ impl LeaderHandle for GlueLeaderHandle {
 
     fn note_offset_discarded(&self, offset: u64) {
         self.0.leader.note_offset_discarded(offset);
+    }
+
+    fn note_groups_changed(&self) {
+        self.0.leader.note_groups_changed();
     }
 
     fn send_truncate(&self, node: &str, to_offset: u64) {
@@ -1396,6 +1455,7 @@ mod tests {
                 offsets: Arc::new(GroupOffsetStore::open(&db).unwrap()),
                 discarded: Arc::new(DiscardStore::open(&db).unwrap()),
                 producer_seq: Arc::new(ProducerSeqStore::open(&db).unwrap()),
+                groups: None,
             };
             Arc::new(Self {
                 _dirs: vec![store_dir],

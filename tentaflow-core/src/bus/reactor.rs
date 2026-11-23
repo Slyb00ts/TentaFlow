@@ -274,6 +274,9 @@ pub struct ConsumerStatus {
     /// Unix milliseconds until which the policy holds the consumer back (its
     /// call limit is used up, or no slot is free); `None` when it is not.
     pub throttled_until: Option<u64>,
+    /// With `reason = not_leader`: the node that leads the topic, when this
+    /// node knows it. Cleared by every other status.
+    pub leader_node_id: Option<String>,
 }
 
 /// What `StatusStore::set` found.
@@ -354,6 +357,7 @@ impl StatusStore {
                 in_flight: 0,
                 max_concurrency: None,
                 throttled_until: None,
+                leader_node_id: None,
             });
         status.throttled_until = Some(status.throttled_until.map_or(until_ms, |t| t.max(until_ms)));
     }
@@ -366,6 +370,7 @@ impl StatusStore {
         state: ConsumerState,
         reason: Option<&'static str>,
         detail: Option<String>,
+        leader_node_id: Option<String>,
     ) -> Transition {
         let mut map = self.map();
         let previous = map.get(flow_id);
@@ -389,6 +394,7 @@ impl StatusStore {
                 in_flight,
                 max_concurrency,
                 throttled_until,
+                leader_node_id,
             },
         );
         Transition {
@@ -413,8 +419,21 @@ impl StatusStore {
         reason: Option<&'static str>,
         detail: Option<String>,
     ) {
+        self.record_waiting_on(flow_id, state, reason, detail, None);
+    }
+
+    /// `record`, naming the node a `not_leader` wait is for, in the same step
+    /// as the status itself.
+    fn record_waiting_on(
+        &self,
+        flow_id: &str,
+        state: ConsumerState,
+        reason: Option<&'static str>,
+        detail: Option<String>,
+        leader_node_id: Option<String>,
+    ) {
         let log_detail = detail.clone().unwrap_or_default();
-        let t = self.set(flow_id, state, reason, detail);
+        let t = self.set(flow_id, state, reason, detail, leader_node_id);
         let reason_str = reason.unwrap_or("-");
         match state {
             ConsumerState::Refused if t.changed => tracing::warn!(
@@ -1908,7 +1927,16 @@ async fn run_cycle_in(
             }
             Ok(Err(e)) => {
                 let (state, why, detail) = classify_open_error(svc.db(), service_account, &e);
-                status.record(flow_id, state, Some(why), detail);
+                // A topic whose partitions are led by different nodes names
+                // the one that leads most of them (`topic_leader_hint`), not
+                // whichever partition refused first.
+                let leader = match &e {
+                    BusServiceError::NotLeader { leader_node_id, .. } => svc
+                        .topic_leader_hint(&bctx.org_id, &config.topic)
+                        .or_else(|| leader_node_id.clone()),
+                    _ => None,
+                };
+                status.record_waiting_on(flow_id, state, Some(why), detail, leader);
                 if state == ConsumerState::Refused {
                     return AfterFailure::Refused;
                 }
@@ -3745,6 +3773,137 @@ mod tests {
         (s.state, s.reason)
     }
 
+    /// TB-04 K7: a consumer that waits because another node leads its topic
+    /// says which node, and stops saying it once this node reads again.
+    #[tokio::test]
+    async fn a_consumer_waiting_on_another_leader_names_that_leader() {
+        use crate::bus::tests::FakeCoordinator;
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(&svc, &ctx, "orders.raw", TopicOptions::default()).await;
+        let coordinator = FakeCoordinator::leader(1);
+        coordinator.set_role(crate::bus::PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 3,
+        });
+        svc.set_replication(coordinator.clone());
+
+        let dispatch: Arc<dyn ReactorFlowDispatch> = Arc::new(ScriptedDispatch::new());
+        let status = StatusStore::default();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .unwrap();
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
+        let waiting = status.get("flow-1").expect("a status was recorded");
+        assert_eq!(
+            (
+                waiting.state,
+                waiting.reason,
+                waiting.leader_node_id.as_deref()
+            ),
+            (
+                ConsumerState::Waiting,
+                Some(reason::NOT_LEADER),
+                Some("node-b")
+            )
+        );
+
+        // This node leads now: reading again, and no leader left to name.
+        coordinator.set_role(crate::bus::PartitionRole::Leader { epoch: 4 });
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
+        let running = status.get("flow-1").unwrap();
+        assert_eq!(
+            (running.state, running.leader_node_id),
+            (ConsumerState::Running, None)
+        );
+
+        // A topic mid-election: waiting again, with no leader to name.
+        coordinator.set_role(crate::bus::PartitionRole::Unavailable {
+            reason: crate::bus::UnavailableReason::NoAssignment,
+        });
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
+        let waiting = status.get("flow-1").unwrap();
+        assert_eq!(
+            (waiting.reason, waiting.leader_node_id),
+            (Some(reason::NOT_LEADER), None)
+        );
+    }
+
+    /// A topic whose partitions are led by different nodes waits on the node
+    /// that leads most of them, not on whichever partition refused first.
+    #[tokio::test]
+    async fn a_consumer_of_a_topic_led_in_parts_waits_on_the_node_leading_most_of_it() {
+        use crate::bus::tests::FakeCoordinator;
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &svc,
+            &ctx,
+            "orders.raw",
+            TopicOptions {
+                partitions: Some(3),
+                ..Default::default()
+            },
+        )
+        .await;
+        let coordinator = FakeCoordinator::leader(1);
+        let follower = |node: &str| crate::bus::PartitionRole::Follower {
+            leader_node_id: node.to_string(),
+            epoch: 3,
+        };
+        // Partition 0 refuses first, and names a node that leads only it.
+        coordinator.set_role(follower("node-c"));
+        coordinator.set_partition_role(1, follower("node-b"));
+        coordinator.set_partition_role(2, follower("node-b"));
+        svc.set_replication(coordinator);
+
+        let dispatch: Arc<dyn ReactorFlowDispatch> = Arc::new(ScriptedDispatch::new());
+        let status = StatusStore::default();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "service_account": TEST_KEY_UID, "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .unwrap();
+        run_cycle(
+            &svc,
+            "flow-1",
+            &config,
+            &dispatch,
+            &status,
+            &mut ConsumerSlot::None,
+        )
+        .await;
+        let waiting = status.get("flow-1").expect("a status was recorded");
+        assert_eq!(
+            (waiting.reason, waiting.leader_node_id.as_deref()),
+            (Some(reason::NOT_LEADER), Some("node-b"))
+        );
+    }
+
     /// THE regression guard: the reactor used to consume with no actor, which
     /// the production authorizer refuses, so no `bus_consume` flow ever read.
     /// Now the flow reads as its service account: the run carries the key, the
@@ -4723,11 +4882,23 @@ mod tests {
     #[test]
     fn a_repeated_status_logs_nothing_and_keeps_its_time() {
         let store = StatusStore::default();
-        let first = store.set("f", ConsumerState::Refused, Some(reason::READ_DENIED), None);
+        let first = store.set(
+            "f",
+            ConsumerState::Refused,
+            Some(reason::READ_DENIED),
+            None,
+            None,
+        );
         assert!(first.changed);
-        let again = store.set("f", ConsumerState::Refused, Some(reason::READ_DENIED), None);
+        let again = store.set(
+            "f",
+            ConsumerState::Refused,
+            Some(reason::READ_DENIED),
+            None,
+            None,
+        );
         assert!(!again.changed);
-        let recovered = store.set("f", ConsumerState::Running, None, None);
+        let recovered = store.set("f", ConsumerState::Running, None, None, None);
         assert!(recovered.changed && recovered.was_blocked);
     }
 

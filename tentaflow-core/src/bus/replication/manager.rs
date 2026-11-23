@@ -356,6 +356,9 @@ pub trait LeaderHandle: Send + Sync {
     /// A DLQ record of this partition's `__dlq.<topic>` was retried or
     /// discarded, for `ReplOffsets` coalescing next to the commits.
     fn note_offset_discarded(&self, offset: u64);
+    /// A consumer-group row of this partition's topic was written, so every
+    /// open replica stream sends the rows again.
+    fn note_groups_changed(&self) {}
     /// K-M2-1: truncates `node`'s tail down to `to_offset` (a replica ahead
     /// of the new leader's own `leo` — see `election.rs`'s header).
     fn send_truncate(&self, node: &str, to_offset: u64);
@@ -3976,6 +3979,17 @@ impl ReplicationCoordinator for ReplicationManager {
         if let Some(entry) = self.registry.get(&key) {
             if let Some(leader) = entry.leader.as_ref() {
                 leader.note_offset_commit(group, partition, offset, attempts);
+            }
+        }
+    }
+
+    fn note_group_rows_changed(&self, org: &str, topic: &str) {
+        for entry in self.registry.iter() {
+            let (entry_org, entry_topic, _) = entry.key();
+            if entry_org == org && entry_topic == topic {
+                if let Some(leader) = entry.leader.as_ref() {
+                    leader.note_groups_changed();
+                }
             }
         }
     }

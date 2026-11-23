@@ -336,9 +336,9 @@ impl BusService {
             .cloned()
             .chain(std::iter::once(local.clone()))
             .collect();
-        // A pause is kept by the node that leads the topic; the ones this
-        // node knows are listed here, the rest come back as the leaders'
-        // refusals (`TransferBlocked`).
+        // A pause is written by the node that leads the topic and sent to
+        // its replicas; the ones this node knows are listed here, the rest
+        // come back as the leaders' refusals (`TransferBlocked`).
         let paused = crate::db::repository::bus_group_list_all(&self.local_db)
             .map_err(|e| {
                 LeaderBalanceError::Failed(format!("cannot read the consumer groups: {e}"))
@@ -964,8 +964,8 @@ impl BusService {
 
     /// Why leadership of `topic` of `org` must not be moved from this node
     /// now: a consumer group of it (or of its dead-letter topic) is paused.
-    /// The pause is kept by the leader and not replicated, so the new leader
-    /// would resume the group. A pause that cannot be read is a refusal too:
+    /// A pause not yet sent to the replicas (one coalescing window) would be
+    /// lost with the old leader. A pause that cannot be read is a refusal too:
     /// the move is not made on a guess.
     pub(super) fn leader_move_blocker(&self, org: &str, topic: &str) -> Option<String> {
         let unit = source_of(topic);

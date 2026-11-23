@@ -66,6 +66,12 @@ const STEPS: &[(i64, &str)] = &[
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_bus_dlq_samples_at ON bus_dlq_samples(sampled_at_ms);",
     ),
+    // Step 3 — the leader epoch a replicated `bus_groups` row arrived under
+    // (`bus_group_apply_replicated`); `0` for a row written on this node.
+    (
+        3,
+        "ALTER TABLE bus_groups ADD COLUMN repl_epoch INTEGER NOT NULL DEFAULT 0;",
+    ),
 ];
 
 /// Brings the instance's content database up to date. Idempotent: the

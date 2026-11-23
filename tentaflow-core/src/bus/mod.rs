@@ -558,6 +558,47 @@ impl GroupStateCache {
     }
 }
 
+/// Writes the consumer-group rows a leader replicates into this node's
+/// `bus_groups` and drops what `fetch` cached about them, so a promoted
+/// replica serves the group's pause from its first fetch.
+struct GroupRowApplier {
+    db: DbPool,
+    group_state: Arc<GroupStateCache>,
+}
+
+impl replication::follower::GroupRowSink for GroupRowApplier {
+    fn apply(
+        &self,
+        org_id: &str,
+        topic: &str,
+        leader_epoch: u32,
+        rows: &[replication::frames::ReplGroup],
+    ) -> Result<(), BusServiceError> {
+        for row in rows {
+            // The group name reaches a table key; a leader's row is held to
+            // the rule a local one is.
+            validate_group_name(&row.group)?;
+            let written = crate::db::repository::bus_group_apply_replicated(
+                &self.db,
+                &crate::db::repository::DbBusGroup {
+                    org_id: org_id.to_string(),
+                    group_id: row.group.clone(),
+                    topic: topic.to_string(),
+                    commit_mode: row.commit_mode.clone(),
+                    paused: row.paused,
+                    created_at_ms: row.created_at_ms,
+                    updated_at_ms: row.updated_at_ms,
+                },
+                leader_epoch,
+            )?;
+            if written {
+                self.group_state.invalidate(org_id, &row.group, topic);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Shared by `BusService::audit_windowed` and `ConsumerHandle::revalidate`
 /// (the latter has no `&BusService` to call a method on) — writes exactly
 /// one `audit_log` row when `windows.record` says this occurrence is not
@@ -1693,7 +1734,7 @@ fn role_not_leader_error(role: PartitionRole) -> BusServiceError {
             leader_node_id,
             epoch,
         } => BusServiceError::NotLeader {
-            leader_node_id: Some(leader_node_id),
+            leader_node_id: known_leader(leader_node_id),
             leader_epoch: epoch,
         },
         PartitionRole::Unavailable { .. } => BusServiceError::NotLeader {
@@ -1758,11 +1799,11 @@ fn map_repl_error(
 }
 
 /// M2 (PLAN-M2 §1e): consumption is leader-only — `open_consumer`/`fetch`/
-/// `commit`/`peek` all refuse with `NotLeader` when a coordinator is
-/// installed and this node's `role()` for `(org, topic, partition)` is not
-/// `Leader` (reading from a follower's `hw` is out of scope for M2, PLAN-M2
-/// §0's own note). A free function, not a method, so both `BusService`
-/// (`open_consumer`, `peek`) and `ConsumerHandle` (`fetch`, `commit`) — two
+/// `commit` (and every state-changing admin call) refuse with `NotLeader`
+/// when a coordinator is installed and this node's `role()` for `(org, topic,
+/// partition)` is not `Leader`. The read-only views (`peek`, `group_lag`)
+/// use `check_readable_role` instead. A free function, not a method, so both
+/// `BusService` (`open_consumer`) and `ConsumerHandle` (`fetch`, `commit`) — two
 /// different `self` types with no relationship to each other — share the
 /// exact same check. `coordinator: None` is always `Ok(())`: RF=1's consume
 /// path (and any build that never calls `set_replication`) is unaffected.
@@ -1779,6 +1820,120 @@ fn check_leader_role(
         PartitionRole::Leader { .. } => Ok(()),
         other => Err(role_not_leader_error(other)),
     }
+}
+
+/// A leader id the coordinator reports as an empty string means "no leader
+/// known" (a stale ex-leader that stepped down), not a node called "".
+fn known_leader(leader_node_id: String) -> Option<String> {
+    (!leader_node_id.is_empty()).then_some(leader_node_id)
+}
+
+/// The node leading most of the partitions `roles` describe that this node
+/// does not lead (a follower names its leader); the smallest id on a tie.
+fn majority_leader(roles: impl IntoIterator<Item = PartitionRole>) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for role in roles {
+        if let PartitionRole::Follower { leader_node_id, .. } = role {
+            if let Some(leader) = known_leader(leader_node_id) {
+                *counts.entry(leader).or_default() += 1;
+            }
+        }
+    }
+    // `BTreeMap` iterates by id, and `max_by_key` keeps the last of equal
+    // keys, so the count is reversed in favour of the smaller id.
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, count)| *count)
+        .map(|(leader, _)| leader)
+}
+
+/// Who answers a read-only view of a partition from this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadServedBy {
+    /// This node leads the partition (or no coordinator is installed).
+    Leader,
+    /// This node holds a replica; what it shows is bounded by its own high
+    /// watermark and can trail the leader.
+    Replica,
+}
+
+/// TB-04 K7: the role rule of the read-only views (`peek`, `peek_runs`,
+/// `group_lag`, lag sampling). A replica serves them too, because its local
+/// high watermark is the leader's committed one (`follower.rs` applies the
+/// `hw` of every batch and heartbeat, `Manual` tracking, never past the local
+/// log end) and its group offsets arrive through `ReplOffsets`. Anything that
+/// changes state keeps `check_leader_role`. A node with no replica of the
+/// partition still answers `NotLeader`, and so does a follower that names no
+/// leader (a stale ex-leader), whose log may be a branch nobody else holds.
+///
+/// A replica authorizes and projects with ITS copy of the ledger: topic ACLs
+/// and field policies are as fresh as that copy, so a right revoked on the
+/// leader can still read here until the change reaches this node.
+fn check_readable_role(
+    coordinator: &Option<Arc<dyn ReplicationCoordinator>>,
+    org: &str,
+    topic: &str,
+    partition: u32,
+) -> Result<ReadServedBy, BusServiceError> {
+    let Some(coordinator) = coordinator else {
+        return Ok(ReadServedBy::Leader);
+    };
+    match coordinator.role(org, topic, partition) {
+        PartitionRole::Leader { .. } => Ok(ReadServedBy::Leader),
+        PartitionRole::Follower { leader_node_id, .. } if !leader_node_id.is_empty() => {
+            Ok(ReadServedBy::Replica)
+        }
+        other => Err(role_not_leader_error(other)),
+    }
+}
+
+/// The offset a read stops at. A leader shows what its high watermark
+/// covers. A replica shows less: under `acks=leader` (and at RF=2) the
+/// leader's watermark runs ahead of any majority, while a replica can be cut
+/// back to its `committed_offset` (`kept_end`), so only what is below that is
+/// certain to survive a failover.
+fn served_by_of(replica: bool) -> ReadServedBy {
+    if replica {
+        ReadServedBy::Replica
+    } else {
+        ReadServedBy::Leader
+    }
+}
+
+fn read_bound(
+    part: &tentaflow_bus::Partition,
+    reader: &tentaflow_bus::PartitionReader,
+    served_by: ReadServedBy,
+) -> u64 {
+    let hw = reader.high_watermark();
+    match served_by {
+        ReadServedBy::Leader => hw,
+        ReadServedBy::Replica => hw.min(part.committed_offset()),
+    }
+}
+
+/// Runs a read, and on a replica reruns it once when the log was cut back
+/// while it ran (a page must not mix records from before and after a
+/// truncation); a second cut refuses the read.
+fn read_stable<T>(
+    part: &tentaflow_bus::Partition,
+    served_by: ReadServedBy,
+    mut read: impl FnMut() -> Result<T, BusServiceError>,
+) -> Result<T, BusServiceError> {
+    if served_by == ReadServedBy::Leader {
+        return read();
+    }
+    for _ in 0..2 {
+        let cuts = part.truncation_count();
+        let out = read();
+        if part.truncation_count() == cuts {
+            return out;
+        }
+    }
+    Err(BusServiceError::PartitionUnavailable {
+        reason: "the replica was cut back while it was read; try again".to_string(),
+    })
 }
 
 /// Validates a consumer group name against the same charset PLAN §7.1 uses
@@ -2117,6 +2272,9 @@ pub struct PeekResult {
     /// resumes. The scan is bounded, so it can end well before the page is
     /// full or the partition is exhausted.
     pub next_offset: Option<u64>,
+    /// The partition was read on a replica that does not lead it: `records`
+    /// and `high_watermark` are that replica's, and can trail the leader.
+    pub from_replica: bool,
 }
 
 /// A correlation-filtered read examines at most this many records per
@@ -2428,6 +2586,13 @@ pub trait ReplicationCoordinator: Send + Sync {
     /// first sent every marker of the partition, so one that was away when
     /// the marker was written still receives it.
     fn note_dlq_handled(&self, org: &str, dlq_topic: &str, partition: u32, offset: u64);
+    /// A consumer-group row (`bus_groups`: commit mode, pause flag) of
+    /// `topic` was written on this node. The replica streams of every
+    /// partition of it that this node leads send the rows again, so the
+    /// replicas list the group and a promoted one keeps its pause.
+    fn note_group_rows_changed(&self, org: &str, topic: &str) {
+        let _ = (org, topic);
+    }
     /// Removes `node_id` from every replica set it belongs to (PLAN §4.4:
     /// environment-change fencing) — returns the number of assignments
     /// touched.
@@ -2659,6 +2824,14 @@ pub trait ReplicationCoordinator: Send + Sync {
 /// Read-only, no-consumer-session partition metadata for `StatsSnapshot`/
 /// `TopicDetail`'s per-partition KPIs (PLAN §6.2, follow-up toru P task 3) —
 /// the same "cheap introspection without opening a real consumer" spirit as
+/// What `BusService::read_window` reports.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadWindow {
+    pub earliest_offset: u64,
+    pub high_watermark: u64,
+    pub from_replica: bool,
+}
+
 /// `peek`, but for sizes/offsets rather than record bytes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PartitionStats {
@@ -6371,9 +6544,11 @@ impl BusService {
         // replayed after the topic/org was already erased).
         let cfg = self.topic_config(&ctx.org_id, topic)?;
         check_partition_in_range(topic, partition, &cfg)?;
-        self.require_group_row(&ctx.org_id, group, topic)?;
+        // Before the group row: a replica holds no row of a group it never
+        // served, and "not found" would hide that the leader is elsewhere.
         let coordinator = self.replication();
         check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
+        self.require_group_row(&ctx.org_id, group, topic)?;
         // Read straight off the partition: Admin is already authorized, and
         // `partition_stats` would additionally demand Consume.
         let stats = self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)?;
@@ -7419,12 +7594,19 @@ impl BusService {
     /// chose (and `updated_at_ms`) are never touched by a dashboard poll.
     /// Same checks `open_consumer` runs before its side effects — Consume
     /// authorization (denial audited, windowed), Z12 environment fencing,
-    /// and leadership of every partition (offsets are committed on the
-    /// leader, so a follower's copy would be stale) — except that the right
+    /// and a replica of every partition — except that the right
     /// asked for is Consume on the TOPIC, not on the group: reading a lag
     /// neither consumes nor commits, so the group-scoped rules (an API key's
     /// `k:` groups belong to that key alone) have nothing to protect here,
     /// and an administrator reading a key's group must not be refused.
+    ///
+    /// TB-04 K7: a replica answers too. Its high watermark is the leader's
+    /// committed one and its committed offset is the last `ReplOffsets` frame
+    /// it applied, which the leader coalesces
+    /// (`LeaderConfig::offsets_coalesce_interval`) and which only ever moves
+    /// forward there (`follower::apply_offsets`). So a replica's lag can trail
+    /// the leader's by about that window, and after a BACKWARD offset reset it
+    /// keeps showing the old, lower lag until the group commits past it.
     pub fn group_lag(
         &self,
         ctx: &BusCallContext,
@@ -7448,10 +7630,10 @@ impl BusService {
         let cfg = self.topic_config(&ctx.org_id, topic)?;
         self.check_environment(&cfg)?;
         let coordinator = self.replication();
-        for p in 0..cfg.partitions {
-            check_leader_role(&coordinator, &ctx.org_id, topic, p)?;
-        }
-        self.read_group_lag(&ctx.org_id, group, topic, &cfg)
+        let served_by = (0..cfg.partitions)
+            .map(|p| check_readable_role(&coordinator, &ctx.org_id, topic, p))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.read_group_lag(&ctx.org_id, group, topic, &cfg, &served_by)
     }
 
     fn read_group_lag(
@@ -7460,6 +7642,7 @@ impl BusService {
         group: &str,
         topic: &str,
         cfg: &topics::TopicConfig,
+        served_by: &[ReadServedBy],
     ) -> Result<Vec<GroupPartitionLag>, BusServiceError> {
         (0..cfg.partitions)
             .map(|partition| {
@@ -7470,7 +7653,7 @@ impl BusService {
                         name: topic.to_string(),
                     });
                 }
-                let high_watermark = reader.high_watermark();
+                let high_watermark = read_bound(&part, &reader, served_by[partition as usize]);
                 let committed_offset = self
                     .offsets
                     .committed_offset(org_id, group, topic, partition)?;
@@ -7753,6 +7936,7 @@ impl BusService {
         org_id: &str,
         topic: &str,
         partition: u32,
+        replica: bool,
     ) -> Option<(u64, u64)> {
         let key = (org_id.to_string(), topic.to_string(), partition);
         let live = self
@@ -7769,7 +7953,10 @@ impl BusService {
             if reader.is_detached() {
                 return None;
             }
-            return Some((reader.earliest_offset(), reader.high_watermark()));
+            return Some((
+                reader.earliest_offset(),
+                read_bound(&part, &reader, served_by_of(replica)),
+            ));
         }
         let dir = topics::partition_dir(&self.bus_dir, org_id, topic, partition);
         if !dir.exists() {
@@ -7784,7 +7971,12 @@ impl BusService {
             })
             .min()
             .unwrap_or(meta.high_watermark);
-        Some((earliest.min(meta.high_watermark), meta.high_watermark))
+        let bound = if replica {
+            meta.high_watermark.min(meta.committed_offset.unwrap_or(0))
+        } else {
+            meta.high_watermark
+        };
+        Some((earliest.min(bound), bound))
     }
 
     /// One sampling round at `now_ms`: every registered (group, topic) whose
@@ -7810,7 +8002,7 @@ impl BusService {
             };
             if self.check_environment(&cfg).is_err()
                 || (0..cfg.partitions)
-                    .any(|p| check_leader_role(&coordinator, &row.org_id, &row.topic, p).is_err())
+                    .any(|p| check_readable_role(&coordinator, &row.org_id, &row.topic, p).is_err())
             {
                 continue;
             }
@@ -7821,8 +8013,12 @@ impl BusService {
                 let committed =
                     self.offsets
                         .committed_offset(&row.org_id, &row.group_id, &row.topic, p);
+                let replica = matches!(
+                    check_readable_role(&coordinator, &row.org_id, &row.topic, p),
+                    Ok(ReadServedBy::Replica)
+                );
                 match (
-                    self.passive_partition_offsets(&row.org_id, &row.topic, p),
+                    self.passive_partition_offsets(&row.org_id, &row.topic, p, replica),
                     committed,
                 ) {
                     (Some((_, high_watermark)), Ok(committed)) => {
@@ -7872,8 +8068,12 @@ impl BusService {
                 let mut depth = 0u64;
                 let mut complete = true;
                 for p in 0..cfg.partitions {
+                    let replica = matches!(
+                        check_readable_role(&coordinator, org_id, &cfg.name, p),
+                        Ok(ReadServedBy::Replica)
+                    );
                     let waiting = self
-                        .passive_partition_offsets(org_id, &cfg.name, p)
+                        .passive_partition_offsets(org_id, &cfg.name, p, replica)
                         .and_then(|(earliest, high_watermark)| {
                             self.dlq_waiting(org_id, &cfg.name, p, earliest, high_watermark)
                                 .ok()
@@ -8146,6 +8346,9 @@ impl BusService {
                     updated_at_ms: now,
                 },
             )?;
+            if let Some(coordinator) = self.replication() {
+                coordinator.note_group_rows_changed(&ctx.org_id, topic);
+            }
             let env_byte = environment_to_u8(topic_cfg.environment);
             for p in 0..topic_cfg.partitions {
                 let part = self.partition_handle(&ctx.org_id, topic, p, topic_cfg)?;
@@ -8325,7 +8528,7 @@ impl BusService {
     /// scan spends down so a caller can share one budget across partitions.
     /// A page can come back short or empty well before the partition ends;
     /// `PeekResult::next_offset` says how far it got (`from_offset` when the
-    /// budget was already spent). Authorization, leader rule, projection and
+    /// budget was already spent). Authorization, replica rule, projection and
     /// audit are `peek`'s (the audit row is written only when at least one
     /// record is returned, and names the filter). `None` is exactly `peek`.
     #[allow(clippy::too_many_arguments)]
@@ -8340,12 +8543,66 @@ impl BusService {
         correlation_id: Option<&str>,
         budget: &mut ScanBudget,
     ) -> Result<PeekResult, BusServiceError> {
-        let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
+        let (cfg, part, served_by) = self.peek_partition(ctx, topic, partition)?;
+        let entry_budget = *budget;
+        let mut page = read_stable(&part, served_by, || {
+            *budget = entry_budget;
+            Self::peek_page(
+                &part,
+                served_by,
+                topic,
+                partition,
+                from_offset,
+                max_records,
+                max_bytes,
+                correlation_id,
+                budget,
+            )
+        })?;
+        let records = &mut page.records;
+        if !records.is_empty() {
+            let filter = correlation_id
+                .map(|id| format!(" correlation_id={id}"))
+                .unwrap_or_default();
+            self.audit_browse(
+                ctx,
+                topic,
+                &format!(
+                    "partition={partition} from_offset={from_offset} count={}{filter}",
+                    records.len()
+                ),
+            );
+            // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
+            // "hide only"): applied AFTER the audit above, so the browse
+            // audit trail still reflects the real record count regardless of
+            // what a policy later hides from the payload.
+            if let Some(projection) = self.read_projection(ctx, topic, &cfg)? {
+                for rec in records.iter_mut() {
+                    projection.apply(rec);
+                }
+            }
+        }
+        Ok(page)
+    }
+
+    /// One attempt at the page `peek_filtered_within` returns.
+    #[allow(clippy::too_many_arguments)]
+    fn peek_page(
+        part: &tentaflow_bus::Partition,
+        served_by: ReadServedBy,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        correlation_id: Option<&str>,
+        budget: &mut ScanBudget,
+    ) -> Result<PeekResult, BusServiceError> {
         let max_records = max_records.min(PEEK_MAX_RECORDS);
         let max_bytes = max_bytes.min(PEEK_MAX_BYTES);
 
         let reader = part.open_reader();
-        let high_watermark = reader.high_watermark();
+        let high_watermark = read_bound(part, &reader, served_by);
         let earliest_offset = reader.earliest_offset();
 
         let mut records = Vec::new();
@@ -8360,7 +8617,13 @@ impl BusService {
                         if records.len() >= max_records {
                             break 'batches;
                         }
-                        records.push(fetched_record(topic, partition, view, rv?));
+                        let rv = rv?;
+                        // A fetched batch is whole: a replica must not show
+                        // the part of one that lies past its watermark.
+                        if view.header().base_offset + rv.offset_delta as u64 >= high_watermark {
+                            break 'batches;
+                        }
+                        records.push(fetched_record(topic, partition, view, rv));
                     }
                 }
             }
@@ -8379,6 +8642,9 @@ impl BusService {
                         for rv in view.records_from(cursor) {
                             let rv = rv?;
                             let offset = view.header().base_offset + rv.offset_delta as u64;
+                            if offset >= high_watermark {
+                                break 'scan;
+                            }
                             cursor = offset + 1;
                             budget.records = budget.records.saturating_sub(1);
                             budget.bytes = budget.bytes.saturating_sub(
@@ -8415,33 +8681,12 @@ impl BusService {
             }
         }
 
-        if !records.is_empty() {
-            let filter = correlation_id
-                .map(|id| format!(" correlation_id={id}"))
-                .unwrap_or_default();
-            self.audit_browse(
-                ctx,
-                topic,
-                &format!(
-                    "partition={partition} from_offset={from_offset} count={}{filter}",
-                    records.len()
-                ),
-            );
-            // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
-            // "hide only"): applied AFTER the audit above, so the browse
-            // audit trail still reflects the real record count regardless of
-            // what a policy later hides from the payload.
-            if let Some(projection) = self.read_projection(ctx, topic, &cfg)? {
-                for rec in records.iter_mut() {
-                    projection.apply(rec);
-                }
-            }
-        }
         Ok(PeekResult {
             records,
             high_watermark,
             earliest_offset,
             next_offset,
+            from_replica: served_by == ReadServedBy::Replica,
         })
     }
 
@@ -8455,7 +8700,7 @@ impl BusService {
     /// projected through the reader's field policy and then cut to at most
     /// `payload_keep` bytes (copied, so the fetched batch is freed), one
     /// record at a time — a DLQ list keeps a preview, "Ponów wszystkie" only
-    /// the coordinates and headers. Same authorization, leader rule and
+    /// the coordinates and headers. Same authorization, replica rule and
     /// audit (one `bus.messages.browse` row for the whole call) as `peek`.
     pub fn peek_runs(
         &self,
@@ -8465,10 +8710,51 @@ impl BusService {
         runs: &[std::ops::Range<u64>],
         payload_keep: usize,
     ) -> Result<PeekResult, BusServiceError> {
-        let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
+        let (cfg, part, served_by) = self.peek_partition(ctx, topic, partition)?;
         let projection = self.read_projection(ctx, topic, &cfg)?;
+        let (records, high_watermark, earliest_offset) = read_stable(&part, served_by, || {
+            Self::read_runs(
+                &part,
+                served_by,
+                topic,
+                partition,
+                runs,
+                payload_keep,
+                &projection,
+            )
+        })?;
+        if !records.is_empty() {
+            self.audit_browse(
+                ctx,
+                topic,
+                &format!(
+                    "partition={partition} ranges={} count={}",
+                    runs.len(),
+                    records.len()
+                ),
+            );
+        }
+        Ok(PeekResult {
+            records,
+            high_watermark,
+            earliest_offset,
+            next_offset: None,
+            from_replica: served_by == ReadServedBy::Replica,
+        })
+    }
+
+    /// One attempt at the records of `peek_runs`.
+    fn read_runs(
+        part: &tentaflow_bus::Partition,
+        served_by: ReadServedBy,
+        topic: &str,
+        partition: u32,
+        runs: &[std::ops::Range<u64>],
+        payload_keep: usize,
+        projection: &Option<ReadProjection>,
+    ) -> Result<(Vec<FetchedRecordMeta>, u64, u64), BusServiceError> {
         let reader = part.open_reader();
-        let high_watermark = reader.high_watermark();
+        let high_watermark = read_bound(part, &reader, served_by);
         let earliest_offset = reader.earliest_offset();
         let mut records = Vec::new();
         for run in runs {
@@ -8486,7 +8772,7 @@ impl BusService {
                             break 'batches;
                         }
                         cursor = rec.offset + 1;
-                        if let Some(projection) = &projection {
+                        if let Some(projection) = projection {
                             // Nothing of the payload is kept at 0: the
                             // projection (parsing, hashing) would be thrown away.
                             if payload_keep == 0 {
@@ -8506,34 +8792,20 @@ impl BusService {
                 }
             }
         }
-        if !records.is_empty() {
-            self.audit_browse(
-                ctx,
-                topic,
-                &format!(
-                    "partition={partition} ranges={} count={}",
-                    runs.len(),
-                    records.len()
-                ),
-            );
-        }
-        Ok(PeekResult {
-            records,
-            high_watermark,
-            earliest_offset,
-            next_offset: None,
-        })
+        Ok((records, high_watermark, earliest_offset))
     }
 
     /// The checks every stateless read makes before touching a partition
     /// (`peek`, `peek_runs`): `Consume` on the topic, its environment, the
-    /// partition in range, and this node leading it.
+    /// partition in range, and this node holding a replica of it (see
+    /// `check_readable_role`).
     fn peek_partition(
         &self,
         ctx: &BusCallContext,
         topic: &str,
         partition: u32,
-    ) -> Result<(topics::TopicConfig, tentaflow_bus::Partition), BusServiceError> {
+    ) -> Result<(topics::TopicConfig, tentaflow_bus::Partition, ReadServedBy), BusServiceError>
+    {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
@@ -8550,11 +8822,9 @@ impl BusService {
                 cfg.partitions
             )));
         }
-        // M2 (PLAN-M2 §1e): `peek` is a read, same as `fetch` — leader-only
-        // under the same rule.
-        check_leader_role(&self.replication(), &ctx.org_id, topic, partition)?;
+        let served_by = check_readable_role(&self.replication(), &ctx.org_id, topic, partition)?;
         let part = self.partition_handle(&ctx.org_id, topic, partition, &cfg)?;
-        Ok((cfg, part))
+        Ok((cfg, part, served_by))
     }
 
     /// The `bus.messages.browse` row of a stateless read that returned
@@ -8801,7 +9071,7 @@ impl BusService {
         Ok(())
     }
 
-    fn ensure_dlq_topic(
+    pub(crate) fn ensure_dlq_topic(
         &self,
         ctx: &BusCallContext,
         source_topic: &str,
@@ -9455,6 +9725,73 @@ impl BusService {
         Ok(())
     }
 
+    /// `NotLeader` (naming the leader when known) unless this node leads
+    /// `(topic, partition)`. For a caller that is about to act on what a
+    /// read-only view (`peek_runs`) returns, such as "Ponów wszystkie": the
+    /// view is served by any replica, the action only by the leader.
+    pub fn require_partition_leader(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
+        check_leader_role(&self.replication(), &ctx.org_id, topic, partition)
+    }
+
+    /// This node holds a replica, not the lead, of at least one partition of
+    /// `topic`: the group figures it reads are its own and can trail the
+    /// leader.
+    pub fn reads_from_replica(&self, org_id: &str, topic: &str) -> bool {
+        let Ok(cfg) = self.topic_config(org_id, topic) else {
+            return false;
+        };
+        let coordinator = self.replication();
+        (0..cfg.partitions).any(|partition| {
+            matches!(
+                check_readable_role(&coordinator, org_id, topic, partition),
+                Ok(ReadServedBy::Replica)
+            )
+        })
+    }
+
+    /// The node a consumer of `topic` is waiting on when this node does not
+    /// lead all of it: the one that leads most of the partitions this node
+    /// does not, the smallest node id on a tie. `None` when no partition names
+    /// a leader (an election, or no coordinator).
+    pub fn topic_leader_hint(&self, org_id: &str, topic: &str) -> Option<String> {
+        let coordinator = self.replication()?;
+        let cfg = self.topic_config(org_id, topic).ok()?;
+        majority_leader((0..cfg.partitions).map(|p| coordinator.role(org_id, topic, p)))
+    }
+
+    /// What a read-only view of one partition may show from this node: its
+    /// earliest offset, the offset it reads up to (`peek`'s bound), and whether
+    /// a replica answers. Authorized like `partition_stats`, but a node
+    /// holding no replica is refused even when nothing is waiting.
+    pub fn read_window(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<ReadWindow, BusServiceError> {
+        let stats = self.partition_stats(ctx, topic, partition)?;
+        let served_by = check_readable_role(&self.replication(), &ctx.org_id, topic, partition)?;
+        let high_watermark = match served_by {
+            ReadServedBy::Leader => stats.high_watermark,
+            ReadServedBy::Replica => {
+                let cfg = self.topic_config(&ctx.org_id, topic)?;
+                let part = self.partition_handle(&ctx.org_id, topic, partition, &cfg)?;
+                stats.high_watermark.min(part.committed_offset())
+            }
+        };
+        Ok(ReadWindow {
+            earliest_offset: stats.earliest_offset,
+            high_watermark,
+            from_replica: served_by == ReadServedBy::Replica,
+        })
+    }
+
     /// Writes the durable "handled" marker of one DLQ record and hands it to
     /// the DLQ partition's replication stream, so its other copies stop
     /// listing it too.
@@ -9559,12 +9896,14 @@ impl BusService {
     /// invalidated right below) and refuses to serve a paused group with
     /// `BusServiceError::GroupPaused`.
     ///
-    /// The flag lives in THIS node's `tentabus.db` and is not replicated,
-    /// while `fetch` runs on each partition's leader. So the call is
-    /// refused with `NotLeader` unless this node leads EVERY partition of
-    /// the topic — a flag written anywhere else would be accepted and then
-    /// ignored by the node actually serving the group. After a leadership
-    /// change the new leader does not know the flag.
+    /// The flag lives in THIS node's `tentabus.db`, and `fetch` runs on each
+    /// partition's leader. So the call is refused with `NotLeader` unless
+    /// this node leads EVERY partition of the topic — a flag written
+    /// anywhere else would be accepted and then ignored by the node actually
+    /// serving the group. The row is sent to the replicas
+    /// (`note_group_rows_changed`, `ReplOffsets::groups`), so a replica
+    /// promoted later keeps the pause; a pause that had not reached it yet
+    /// (one coalescing window) is lost with the old leader.
     ///
     /// Only an existing group (a `bus_groups` row, written when a consumer
     /// opens a session) can be paused or resumed, else `GroupNotFound`.
@@ -9602,6 +9941,9 @@ impl BusService {
         // call, not `fetch`'s hot path — the one extra SQLite read on the
         // very next `fetch` is a non-issue.
         self.group_state.invalidate(&ctx.org_id, group, topic);
+        if let Some(coordinator) = coordinator {
+            coordinator.note_group_rows_changed(&ctx.org_id, topic);
+        }
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.audit_actor().as_deref(),
@@ -10143,6 +10485,30 @@ impl replication::glue::PartitionProvider for BusService {
             offsets: Arc::clone(&self.offsets),
             discarded: Arc::clone(&self.discarded),
             producer_seq: Arc::clone(&self.producer_seq),
+            groups: Some(Arc::new(GroupRowApplier {
+                db: self.local_db.clone(),
+                group_state: Arc::clone(&self.group_state),
+            })),
+        }
+    }
+
+    fn group_rows(&self, org: &str, topic: &str) -> Vec<replication::frames::ReplGroup> {
+        match crate::db::repository::bus_group_list(&self.local_db, org) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| row.topic == topic)
+                .map(|row| replication::frames::ReplGroup {
+                    group: row.group_id,
+                    commit_mode: row.commit_mode,
+                    paused: row.paused,
+                    created_at_ms: row.created_at_ms,
+                    updated_at_ms: row.updated_at_ms,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(topic = %topic, error = %e, "replication: reading the consumer groups failed");
+                Vec::new()
+            }
         }
     }
 
@@ -10538,6 +10904,10 @@ impl ConsumerHandle {
                 self.check_environment(cp)?;
                 check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
                 let from = cp.cursor.lock().next;
+                // Read before the fetch: a fetch returns whole batches, and a
+                // record past the watermark is not replicated yet, so it may
+                // still be truncated.
+                let high_watermark = cp.reader.high_watermark();
                 let batches = match cp.reader.fetch_from_offset_limited(
                     from,
                     max_bytes.saturating_sub(consumed),
@@ -10587,6 +10957,10 @@ impl ConsumerHandle {
                     for rv in view.records_from(from) {
                         let rv = rv?;
                         let offset = view.header().base_offset + rv.offset_delta as u64;
+                        if offset >= high_watermark {
+                            new_next = offset;
+                            break 'batches;
+                        }
                         if records.len() - records_before == remaining {
                             // Cut inside this batch: the cursor stops at the
                             // first record not returned.
@@ -11136,6 +11510,7 @@ mod tests {
 
     mod leader_balance_tests;
     mod leader_return_tests;
+    mod replica_read_tests;
 
     struct AllowAllAuthorizer;
     impl BusAuthorizer for AllowAllAuthorizer {
@@ -18521,13 +18896,15 @@ mod tests {
     /// `parking_lot::Mutex`-guarded rather than fixed at construction since
     /// several tests below flip behavior (e.g. leader -> not-leader)
     /// mid-test.
-    struct FakeCoordinator {
+    pub(in crate::bus) struct FakeCoordinator {
         role: parking_lot::Mutex<PartitionRole>,
         preflight_err: parking_lot::Mutex<Option<ReplError>>,
         await_outcome: parking_lot::Mutex<AckOutcome>,
         #[allow(clippy::type_complexity)]
         note_offset_commit_calls: parking_lot::Mutex<Vec<(String, String, String, u32, u64, u32)>>,
         note_dlq_handled_calls: parking_lot::Mutex<Vec<(String, String, u32, u64)>>,
+        /// Every `note_group_rows_changed` call: organisation and topic.
+        note_group_rows_calls: parking_lot::Mutex<Vec<(String, String)>>,
         snapshot: parking_lot::Mutex<ReplicationSnapshot>,
         reassign_calls: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
         local_node_id: parking_lot::Mutex<String>,
@@ -18571,7 +18948,7 @@ mod tests {
     }
 
     impl FakeCoordinator {
-        fn leader(epoch: u32) -> Arc<Self> {
+        pub(in crate::bus) fn leader(epoch: u32) -> Arc<Self> {
             Arc::new(Self {
                 partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 topic_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -18585,6 +18962,7 @@ mod tests {
                 }),
                 note_offset_commit_calls: parking_lot::Mutex::new(Vec::new()),
                 note_dlq_handled_calls: parking_lot::Mutex::new(Vec::new()),
+                note_group_rows_calls: parking_lot::Mutex::new(Vec::new()),
                 snapshot: parking_lot::Mutex::new(ReplicationSnapshot::default()),
                 reassign_calls: parking_lot::Mutex::new(Vec::new()),
                 local_node_id: parking_lot::Mutex::new(String::new()),
@@ -18627,10 +19005,10 @@ mod tests {
             self.assignment_gen
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        fn set_role(&self, role: PartitionRole) {
+        pub(in crate::bus) fn set_role(&self, role: PartitionRole) {
             *self.role.lock() = role;
         }
-        fn set_partition_role(&self, partition: u32, role: PartitionRole) {
+        pub(in crate::bus) fn set_partition_role(&self, partition: u32, role: PartitionRole) {
             self.partition_roles.lock().insert(partition, role);
         }
         fn set_preflight_err(&self, err: Option<ReplError>) {
@@ -18734,6 +19112,11 @@ mod tests {
                 offset,
                 attempts,
             ));
+        }
+        fn note_group_rows_changed(&self, org: &str, topic: &str) {
+            self.note_group_rows_calls
+                .lock()
+                .push((org.to_string(), topic.to_string()));
         }
         fn note_dlq_handled(&self, org: &str, dlq_topic: &str, partition: u32, offset: u64) {
             self.note_dlq_handled_calls.lock().push((
@@ -27118,7 +27501,7 @@ mod tests {
     fn passive_partition_offsets_never_create_a_partition() {
         let (_tmp, svc) = test_service();
         assert_eq!(
-            svc.passive_partition_offsets("org-1", "gone", 0),
+            svc.passive_partition_offsets("org-1", "gone", 0, false),
             Some((0, 0))
         );
         let dir = topics::partition_dir(&svc.bus_dir, "org-1", "gone", 0);

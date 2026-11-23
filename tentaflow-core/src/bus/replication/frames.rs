@@ -577,6 +577,24 @@ pub struct ReplOffsets {
     pub commits: Vec<(String, u32, u64, u32)>,
     /// `(partition, offset)` — `dlq_discarded` entries (PLAN-M2 §0 K-M2-5).
     pub discarded: Vec<(u32, u64)>,
+    /// The consumer-group rows of this stream's topic, so a replica lists
+    /// them and a promoted one keeps a pause. Appended: empty from a leader
+    /// that predates it. A follower applies a row only when `(leader_epoch,
+    /// updated_at_ms)` is not older than what it holds.
+    #[serde(default)]
+    pub groups: Vec<ReplGroup>,
+}
+
+/// One `bus_groups` row of the topic a stream replicates. The topic is not
+/// carried: a row always belongs to the stream's own topic, so a leader
+/// cannot write a row for another one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplGroup {
+    pub group: String,
+    pub commit_mode: String,
+    pub paused: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 /// One record of a forwarded publish: the caller's record as it reached the
@@ -1219,6 +1237,32 @@ mod tests {
         assert_eq!(decode_cbor::<HeartbeatBefore>(&hb).unwrap(), old_hb);
     }
 
+    /// An `Offsets` frame from a leader that predates the group rows decodes
+    /// with none, and a current one round-trips them.
+    #[test]
+    fn an_offsets_frame_without_group_rows_decodes_with_none() {
+        #[derive(Serialize)]
+        struct OffsetsBeforeGroups {
+            leader_epoch: u32,
+            commits: Vec<(String, u32, u64, u32)>,
+            discarded: Vec<(u32, u64)>,
+        }
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(
+            &OffsetsBeforeGroups {
+                leader_epoch: 4,
+                commits: vec![("g".into(), 1, 9, 0)],
+                discarded: vec![(1, 2)],
+            },
+            &mut cbor,
+        )
+        .unwrap();
+        let decoded: ReplOffsets = decode_cbor(&cbor).unwrap();
+        assert_eq!(decoded.leader_epoch, 4);
+        assert_eq!(decoded.commits, vec![("g".to_string(), 1, 9, 0)]);
+        assert!(decoded.groups.is_empty());
+    }
+
     /// A Hello from a build that predates `topic_generation` decodes with the
     /// incarnation unknown (`None`), not as incarnation 0 — the two are judged
     /// differently by `accept_hello`.
@@ -1701,6 +1745,13 @@ mod tests {
             leader_epoch: 7,
             commits: vec![("grp-a".into(), 3, 55, 1)],
             discarded: vec![(3, 12)],
+            groups: vec![ReplGroup {
+                group: "grp-a".into(),
+                commit_mode: "auto".into(),
+                paused: true,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+            }],
         });
         assert_eq!(roundtrip(off.clone()).await, off);
     }

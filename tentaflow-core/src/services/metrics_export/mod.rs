@@ -421,12 +421,18 @@ pub(crate) fn collect_instance_bus_metrics(
                 // and the coordinator's registry is itself keyed by
                 // (org, topic, partition), so one partition reaches this
                 // point exactly once and no entry can shadow another.
-                hw_by_org_topic
-                    .entry(org.clone())
-                    .or_default()
-                    .entry(p.topic.clone())
-                    .or_default()
-                    .push((p.partition, p.high_watermark));
+                // Only what this node leads: a replica holds the group rows
+                // too (`ReplOffsets::groups`), and counting a partition on
+                // every node that copies it would multiply its lag in any
+                // sum across nodes.
+                if led_here(p, &snapshot.nodes) {
+                    hw_by_org_topic
+                        .entry(org.clone())
+                        .or_default()
+                        .entry(p.topic.clone())
+                        .or_default()
+                        .push((p.partition, p.high_watermark));
+                }
             }
         }
 
@@ -453,6 +459,17 @@ pub(crate) fn collect_instance_bus_metrics(
     // shrunk an ISR on this node), not a placeholder.
 
     rollup
+}
+
+/// This node leads `partition` of a replication snapshot.
+fn led_here(
+    partition: &crate::bus::PartitionReplicaInfo,
+    nodes: &[crate::bus::ReplicaNodeInfo],
+) -> bool {
+    partition
+        .leader_node_id
+        .as_deref()
+        .is_some_and(|leader| nodes.iter().any(|n| n.is_local && n.node_id == leader))
 }
 
 /// `org -> topic -> [(partition, high_watermark)]`. Nested by exactly the
@@ -2084,5 +2101,37 @@ mod tests {
             (part == 0).then_some(25)
         });
         assert_eq!((max, sum), (75, 75));
+    }
+
+    #[test]
+    fn a_partition_counts_for_consumer_lag_only_on_the_node_that_leads_it() {
+        use crate::bus::{PartitionReplicaInfo, ReplicaNodeInfo};
+        let node = |id: &str, is_local: bool| ReplicaNodeInfo {
+            node_id: id.to_string(),
+            label: id.to_string(),
+            environment: tentaflow_protocol::environment::NodeEnvironment::Prod,
+            is_local,
+            reachable: true,
+            last_heartbeat_ms_ago: None,
+            leader_count: 0,
+            follower_count: 0,
+            isr_count: 0,
+        };
+        let partition = |leader: Option<&str>| PartitionReplicaInfo {
+            topic: "t".into(),
+            partition: 0,
+            leader_node_id: leader.map(str::to_string),
+            leader_epoch: 1,
+            replicas: vec![],
+            isr: vec![],
+            lagging: vec![],
+            high_watermark: 0,
+            log_end_offset: 0,
+            unavailable_reason: None,
+        };
+        let nodes = [node("a", true), node("b", false)];
+        assert!(led_here(&partition(Some("a")), &nodes));
+        assert!(!led_here(&partition(Some("b")), &nodes));
+        assert!(!led_here(&partition(None), &nodes));
     }
 }

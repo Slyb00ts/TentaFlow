@@ -1025,6 +1025,14 @@ pub struct BusConsumerStatus {
     /// call limit or a full concurrency limit; `None` when it is not.
     #[serde(default)]
     pub throttled_until: Option<u64>,
+    /// With `reason = "not_leader"`: the node that leads the topic, when this
+    /// node knows it (`None` during an election). Appended.
+    #[serde(default)]
+    pub leader_node_id: Option<String>,
+    /// Display name of `leader_node_id`; `None` when the node has no name on
+    /// the answering node, which the UI then replaces with the id. Appended.
+    #[serde(default)]
+    pub leader_node_name: Option<String>,
 }
 
 /// One entry of the Flow Builder's service-account picker: an active general
@@ -10655,6 +10663,8 @@ mod tests {
             in_flight: 3,
             max_concurrency: Some(4),
             throttled_until: Some(1_700_000_060_000),
+            leader_node_id: Some("node-2".to_string()),
+            leader_node_name: Some("gcm-core-02".to_string()),
         };
         let body = MessageBody::FlowListResponse {
             flows: vec![FlowSummary {
@@ -10690,6 +10700,44 @@ mod tests {
             ),
             (0, None, None)
         );
+    }
+
+    /// TB-04 K7: the leader fields were appended with `#[serde(default)]`: a
+    /// status from an older node decodes without them, and a reader that
+    /// predates them skips the new keys.
+    #[test]
+    fn bus_consumer_status_decodes_without_the_leader_fields() {
+        let status: BusConsumerStatus = serde_json::from_value(serde_json::json!({
+            "state": "waiting", "reason": "not_leader", "since_epoch": 1, "node_id": "node-1",
+        }))
+        .expect("decode");
+        assert_eq!(
+            (
+                status.leader_node_id.as_deref(),
+                status.leader_node_name.as_deref()
+            ),
+            (None, None)
+        );
+
+        #[derive(SerdeDeserialize)]
+        struct OldStatus {
+            state: String,
+            node_id: String,
+        }
+        let new = BusConsumerStatus {
+            leader_node_id: Some("node-2".to_string()),
+            leader_node_name: Some("gcm-core-02".to_string()),
+            ..status
+        };
+        let seen: OldStatus =
+            crate::cbor::decode(&crate::cbor::encode(&new).expect("encode")).expect("decode");
+        assert_eq!(
+            (seen.state.as_str(), seen.node_id.as_str()),
+            ("waiting", "node-1")
+        );
+        let back: BusConsumerStatus =
+            crate::cbor::decode(&crate::cbor::encode(&new).expect("encode")).expect("decode");
+        assert_eq!(back, new);
     }
 
     /// The SLA fields were appended with `#[serde(default)]`: a flow record from

@@ -305,6 +305,11 @@ pub struct BusPartitionInfoWire {
 pub struct BusGroupLagSummaryWire {
     pub group: String,
     pub lag_total: u64,
+    /// This node holds a replica of at least one partition of the topic, so
+    /// the figures are its own and can trail the leader. `false` on a peer
+    /// built before this field existed.
+    #[serde(default)]
+    pub from_replica: bool,
 }
 
 // =============================================================================
@@ -322,9 +327,10 @@ pub struct BusGroupSummaryWire {
     pub updated_at_ms: i64,
     /// Messages waiting for this group on `topic`, summed over every
     /// partition (`high_watermark - committed_offset`). `None` when this
-    /// node cannot measure it (the caller may not read the topic, or a
-    /// partition is led by another node) and on a peer built before this
-    /// field existed — never a guessed `0`.
+    /// node cannot measure it (the caller may not read the topic, or it holds
+    /// no replica of a partition; a replica measures it from its own high
+    /// watermark and the offsets that reached it, so it can trail the leader)
+    /// and on a peer built before this field existed — never a guessed `0`.
     #[serde(default)]
     pub lag_total: Option<u64>,
     /// Whether the caller may pause/resume this group and move its reading
@@ -343,6 +349,11 @@ pub struct BusGroupSummaryWire {
     /// left out of every waiting total. `false` on an older peer.
     #[serde(default)]
     pub key_gone: bool,
+    /// This node holds a replica of at least one partition of the topic, so
+    /// the figures are its own and can trail the leader. `false` on a peer
+    /// built before this field existed.
+    #[serde(default)]
+    pub from_replica: bool,
 }
 
 /// One partition's state for `GroupDetailResponse` — `committed_offset` is
@@ -372,6 +383,11 @@ pub struct BusGroupDetailWire {
     /// left out of every waiting total. `false` on an older peer.
     #[serde(default)]
     pub key_gone: bool,
+    /// This node holds a replica of at least one partition of the topic, so
+    /// the figures are its own and can trail the leader. `false` on a peer
+    /// built before this field existed.
+    #[serde(default)]
+    pub from_replica: bool,
 }
 
 /// `OffsetResetRequest.mode` (PLAN M04's "4 tryby" reset-offset modal).
@@ -453,6 +469,11 @@ pub struct BusBrowsePartitionInfoWire {
     pub high_watermark: u64,
     pub next_offset: u64,
     pub has_more: bool,
+    /// The answering node holds a replica of this partition and does not lead
+    /// it: the records and `high_watermark` are that replica's, bounded by its
+    /// own high watermark, and can trail the leader. Appended.
+    #[serde(default)]
+    pub from_replica: bool,
 }
 
 /// One `(partition, offset)` starting point for a `MessagesBrowseRequest`/
@@ -1041,6 +1062,11 @@ pub struct BusGroupLagSeriesWire {
     pub topic: String,
     /// Oldest first.
     pub samples: Vec<BusLagSampleWire>,
+    /// This node holds a replica of at least one partition of the topic, so
+    /// the figures are its own and can trail the leader. `false` on a peer
+    /// built before this field existed.
+    #[serde(default)]
+    pub from_replica: bool,
 }
 
 /// One per-minute sample of how many records wait in `__dlq.<topic>`
@@ -1991,6 +2017,7 @@ mod tests {
             groups: vec![BusGroupLagSummaryWire {
                 group: "radiologia-worker".to_string(),
                 lag_total: 87,
+                from_replica: true,
             }],
             access: Some(BusTopicAccessWire {
                 can_read: true,
@@ -2016,6 +2043,7 @@ mod tests {
                 can_admin: true,
                 key_name: Some("Portal wyników".to_string()),
                 key_gone: false,
+                from_replica: true,
             }],
         });
     }
@@ -2039,6 +2067,7 @@ mod tests {
                 }],
                 key_name: None,
                 key_gone: true,
+                from_replica: true,
             },
         });
     }
@@ -2131,6 +2160,7 @@ mod tests {
                     high_watermark: 100,
                     next_offset: 11,
                     has_more: true,
+                    from_replica: true,
                 }],
             },
         });
@@ -2170,6 +2200,7 @@ mod tests {
                     high_watermark: 6,
                     next_offset: 6,
                     has_more: false,
+                    from_replica: false,
                 }],
             },
         });
@@ -2872,6 +2903,47 @@ mod tests {
     /// A node card and a partition row from a build before TB-04's wire
     /// fields decode with them empty; the fields reach an older peer as
     /// unknown keys it ignores.
+    /// TB-04 K7: a partition read on a replica says so; a peer that predates
+    /// the field decodes to `false`, and an old reader skips the new key.
+    #[test]
+    fn browse_partition_info_marks_a_replica_read_and_decodes_without_it() {
+        #[derive(SerdeSerialize)]
+        struct OldInfo {
+            partition: u32,
+            earliest_offset: u64,
+            high_watermark: u64,
+            next_offset: u64,
+            has_more: bool,
+        }
+        let old = OldInfo {
+            partition: 1,
+            earliest_offset: 2,
+            high_watermark: 9,
+            next_offset: 5,
+            has_more: true,
+        };
+        let decoded: BusBrowsePartitionInfoWire =
+            crate::cbor::decode(&crate::cbor::encode(&old).expect("encode")).expect("decode");
+        assert!(!decoded.from_replica);
+        assert_eq!((decoded.partition, decoded.high_watermark), (1, 9));
+
+        #[derive(SerdeDeserialize)]
+        struct OldInfoIn {
+            partition: u32,
+            high_watermark: u64,
+        }
+        let new = BusBrowsePartitionInfoWire {
+            from_replica: true,
+            ..decoded
+        };
+        let seen: OldInfoIn =
+            crate::cbor::decode(&crate::cbor::encode(&new).expect("encode")).expect("decode");
+        assert_eq!((seen.partition, seen.high_watermark), (1, 9));
+        let back: BusBrowsePartitionInfoWire =
+            crate::cbor::decode(&crate::cbor::encode(&new).expect("encode")).expect("decode");
+        assert!(back.from_replica);
+    }
+
     #[test]
     fn replica_wire_fields_of_tb04_default_for_an_old_peer() {
         #[derive(SerdeSerialize)]
@@ -3878,6 +3950,76 @@ mod tests {
         assert_eq!(policy.member_count, None);
     }
 
+    /// Group and lag wires from a peer that predates `from_replica` decode
+    /// with it `false`.
+    #[test]
+    fn group_and_lag_wires_without_from_replica_decode_as_leader_reads() {
+        #[derive(SerdeSerialize)]
+        struct LagSummaryBefore {
+            group: String,
+            lag_total: u64,
+        }
+        #[derive(SerdeSerialize)]
+        struct SeriesBefore {
+            group: String,
+            topic: String,
+            samples: Vec<BusLagSampleWire>,
+        }
+        #[derive(SerdeSerialize)]
+        struct DetailBefore {
+            group: String,
+            topic: String,
+            commit_mode: String,
+            paused: bool,
+            partitions: Vec<BusGroupPartitionDetailWire>,
+        }
+        #[derive(SerdeSerialize)]
+        struct SummaryBefore {
+            group: String,
+            topic: String,
+            commit_mode: String,
+            paused: bool,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+        }
+        let bytes = crate::cbor::encode(&LagSummaryBefore {
+            group: "g".into(),
+            lag_total: 3,
+        })
+        .unwrap();
+        let wire: BusGroupLagSummaryWire = crate::cbor::decode(&bytes).unwrap();
+        assert!(!wire.from_replica);
+        let bytes = crate::cbor::encode(&SeriesBefore {
+            group: "g".into(),
+            topic: "t".into(),
+            samples: vec![],
+        })
+        .unwrap();
+        let wire: BusGroupLagSeriesWire = crate::cbor::decode(&bytes).unwrap();
+        assert!(!wire.from_replica);
+        let bytes = crate::cbor::encode(&DetailBefore {
+            group: "g".into(),
+            topic: "t".into(),
+            commit_mode: "explicit".into(),
+            paused: true,
+            partitions: vec![],
+        })
+        .unwrap();
+        let wire: BusGroupDetailWire = crate::cbor::decode(&bytes).unwrap();
+        assert!(!wire.from_replica);
+        let bytes = crate::cbor::encode(&SummaryBefore {
+            group: "g".into(),
+            topic: "t".into(),
+            commit_mode: "explicit".into(),
+            paused: false,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })
+        .unwrap();
+        let wire: BusGroupSummaryWire = crate::cbor::decode(&bytes).unwrap();
+        assert!(!wire.from_replica);
+    }
+
     #[test]
     fn lag_history_round_trip() {
         round_trip(BusPayload::LagHistoryRequest {
@@ -3889,6 +4031,7 @@ mod tests {
             groups: vec![BusGroupLagSeriesWire {
                 group: "ksiegowosc".to_string(),
                 topic: "faktury".to_string(),
+                from_replica: true,
                 samples: vec![
                     BusLagSampleWire {
                         at_ms: 1_756_000_000_000,

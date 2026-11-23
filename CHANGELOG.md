@@ -262,6 +262,68 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   go ani plan, ani reguła. Powód trwały (pauza, węzeł bez przekazywania)
   zostawia topik tam, gdzie jest, w planie i w regule. Przy wyłączonym
   wyłączniku takie topiki są liczone tam, gdzie stoją.
+- Ekrany tylko do odczytu działają na każdej replice, nie tylko na liderze:
+  przeglądarka wiadomości (`peek`), lista DLQ, lag grup (`group_lag`, lista i
+  szczegóły grupy, szczegóły topiku) i próbkowanie lagu. Replika czyta własny
+  log, ale tylko do `min(hw, committed_offset)`: przy `acks=leader` (i przy
+  RF=2) hw lidera wyprzedza większość, a replika może zostać obcięta z
+  powrotem do `committed_offset`, więc rekord za tą granicą mógłby zniknąć po
+  przełączeniu. Odczyt nie przekracza granicy także wtedy, gdy leży ona
+  wewnątrz paczki (zwracane są całe paczki, więc obcięcie jest co do rekordu),
+  a strona zwraca tę granicę jako `high_watermark`. Odczyt, który przeciął
+  się z obcięciem logu repliki, jest powtarzany raz, a przy drugim obcięciu
+  odmawia (`bus.partition_unavailable`) zamiast zwrócić stronę z mieszanych
+  stanów. Follower bez znanego lidera (zdegradowany były lider) niczego nie
+  udostępnia. Widok z repliki może pozostawać w tyle za liderem, a odpowiedź to
+  zaznacza polem `from_replica` (partycje przeglądarki i DLQ, podsumowanie i
+  szczegóły grupy, podsumowanie lagu topiku, serie historii lagu; pola
+  opcjonalne, `SCHEMA_VERSION` bez zmian; brak pola to `false`). Replika
+  pokazuje ACL i reguły ukrywania pól tak świeże, jak jej kopia ledgera.
+- Przeglądarka lidera i odbiorcy (`fetch`) też nie wychodzą poza hw: wcześniej
+  przy RF>1 dostawali całe paczki, także z rekordami, których repliki jeszcze
+  nie mają i które mogły zostać obcięte, a odbiorca mógł je skomitować. Teraz
+  lider tnie paczkę na hw co do rekordu.
+- Lag na replice to jej granica odczytu minus offset grupy, który do niej
+  doszedł. Offsety grup są replikowane (`ReplOffsets`, łączone w okno
+  `offsets_coalesce_interval`) i lider wysyła ich pełny stan dla partycji przy
+  każdym otwarciu strumienia oraz po utracie powiadomień, więc replika, która
+  była nieobecna albo nigdy nie widziała ostatniego commitu bezczynnej grupy,
+  nadrabia je po powrocie, a promowana replika nie dziedziczy starego offsetu.
+  Lag z repliki różni się od lagu lidera o to, co zatwierdzono w ostatnim
+  oknie i o rekordy między jej granicą odczytu a hw lidera. Replika stosuje
+  offsety tylko do przodu: po cofnięciu offsetu grupy (reset w tył) pokazuje
+  dotychczasowy, niższy lag, aż grupa zatwierdzi dalej.
+- Wiersze grup (`bus_groups`: tryb commitu, pauza) są replikowane razem z
+  offsetami (`ReplOffsets.groups`, pole opcjonalne): lider wysyła je przy
+  zmianie i w pełnym stanie przy otwarciu strumienia, a replika zapisuje je
+  według (epoka lidera, `updated_at_ms`), nowsze wygrywa, i unieważnia
+  podręczny stan grupy. Lista i szczegóły grupy na replice pokazują więc grupy
+  i ich pauzę, a węzeł przejmujący partycję zachowuje pauzę; blokady K5/K6
+  widzą ją tak samo (topik z wstrzymaną grupą nie jest przenoszony). Pauza,
+  która nie zdążyła dojść do repliki (jedno okno łączenia), ginie wraz z
+  poprzednim liderem. Metryki konsumenckiego lagu liczą tylko partycje
+  prowadzone przez dany węzeł, żeby replika nie dublowała lagu w sumie po
+  węzłach. Węzeł, który nie trzyma żadnej repliki partycji, nadal odpowiada
+  `bus.not_leader` bez nazwy lidera (także dla listy DLQ, gdy nic na nią nie
+  czeka).
+- Wszystko, co zmienia stan, zostaje na liderze: ponowienie i odrzucenie
+  rekordu DLQ, „Ponów wszystkie”, pauza i wznowienie grupy, każdy reset offsetu.
+  Na replice każda z tych operacji kończy się odmową `bus.not_leader` z
+  `leader_node_id=<id> leader_epoch=<n>` (kod Conflict) i niczego nie zmienia;
+  „Ponów wszystkie” odmawia zanim cokolwiek przeczyta, zamiast zgłaszać każdy
+  rekord jako nieudane ponowienie. Reset offsetu sprawdza lidera przed
+  wierszem grupy. Komunikat nie drukuje już `Some("...")`/`None`, a pusty
+  identyfikator lidera to brak lidera: `bus.not_leader: epoch=<n>`, bez nazwy,
+  którą UI mógłby wziąć za węzeł.
+- Stan odbiorcy flow (`BusConsumerStatus`) przy `reason = not_leader` podaje
+  węzeł prowadzący topik: `leader_node_id` i `leader_node_name` (nazwa
+  wyświetlana, gdy ten węzeł ją zna), ustawiane razem ze statusem. Gdy
+  partycje topiku prowadzą różne węzły, jest to węzeł prowadzący ich
+  najwięcej (przy remisie o mniejszym identyfikatorze); w trakcie wyborów
+  pola są puste. Węzeł i nazwę dostaje tylko sesja administratora; inne sesje
+  widzą sam `reason = not_leader`. Nazwy są rozwiązywane raz na żądanie.
+  Pola opcjonalne, `SCHEMA_VERSION` bez zmian. Tekst w Flow Builderze
+  (`flows_config.consumer_reason_not_leader`) dopisze K8.
 
 ### Limity i SLA usług (TB-03)
 

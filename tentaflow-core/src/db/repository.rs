@@ -32186,6 +32186,42 @@ pub fn bus_group_upsert(pool: &DbPool, row: &DbBusGroup) -> Result<()> {
     Ok(())
 }
 
+/// Applies a `bus_groups` row a leader replicated, last writer wins by
+/// `(leader_epoch, updated_at_ms)`: a row this node holds under a newer
+/// epoch, or under the same epoch with a later `updated_at_ms`, is kept.
+/// Returns whether the row was written. `created_at_ms` is taken from the
+/// first write only.
+pub fn bus_group_apply_replicated(
+    pool: &DbPool,
+    row: &DbBusGroup,
+    leader_epoch: u32,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let changed = conn.execute(
+        &format!(
+            "INSERT INTO bus_groups ({BUS_GROUP_COLUMNS}, repl_epoch) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+             ON CONFLICT(org_id, group_id, topic) DO UPDATE SET \
+             commit_mode = excluded.commit_mode, paused = excluded.paused, \
+             updated_at_ms = excluded.updated_at_ms, repl_epoch = excluded.repl_epoch \
+             WHERE excluded.repl_epoch > bus_groups.repl_epoch \
+             OR (excluded.repl_epoch = bus_groups.repl_epoch \
+                 AND excluded.updated_at_ms >= bus_groups.updated_at_ms)"
+        ),
+        rusqlite::params![
+            row.org_id,
+            row.group_id,
+            row.topic,
+            row.commit_mode,
+            row.paused as i64,
+            row.created_at_ms,
+            row.updated_at_ms,
+            leader_epoch,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn bus_group_get(
     pool: &DbPool,
     org_id: &str,

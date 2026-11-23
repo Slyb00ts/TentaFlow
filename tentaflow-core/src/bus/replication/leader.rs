@@ -56,8 +56,9 @@ use tokio::time::Instant;
 
 use super::election::{availability_quorum, min_isr_required, LogPosition};
 use super::frames::{
-    write_frame, FrameReader, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplHeartbeat,
-    ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate, LOCAL_BUS_FEATURES,
+    write_frame, FrameReader, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplGroup,
+    ReplHeartbeat, ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate,
+    LOCAL_BUS_FEATURES,
 };
 use super::metrics::LeaderMetrics;
 use crate::bus::topics::Acks;
@@ -210,7 +211,23 @@ pub enum OffsetNote {
     Discarded {
         offset: u64,
     },
+    /// A consumer-group row of this topic was written (`bus_groups`); the
+    /// stream sends the current rows.
+    GroupsChanged,
 }
+
+/// Every consumer group's committed offset on one partition, and the group
+/// rows of its topic, read from this node's own stores.
+#[derive(Debug, Clone, Default)]
+pub struct GroupSnapshot {
+    /// `(group, partition, offset, attempts)`, as `ReplOffsets::commits`.
+    pub commits: Vec<(String, u32, u64, u32)>,
+    pub groups: Vec<ReplGroup>,
+}
+
+/// Reads a `GroupSnapshot`; `with_commits` false skips the offsets, for a
+/// stream that only needs the rows.
+pub type GroupSnapshotLookup = Arc<dyn Fn(bool) -> GroupSnapshot + Send + Sync>;
 
 /// Per-batch producer-identity side channel (PLAN-M2 §1b item 2): the
 /// service layer (agent S) knows which published batch carried a producer
@@ -262,6 +279,33 @@ async fn queue_handled_offsets(
         Err(e) => tracing::warn!(
             error = %e,
             "replication: reading the DLQ partition's handled markers did not finish"
+        ),
+    }
+}
+
+/// Reads the group state of `leader`'s partition for the next `Offsets`
+/// frame: its commits (when `with_commits`) merge into `pending_commits`, the
+/// group rows replace `pending_groups`. A snapshot commit already queued for
+/// the same group is superseded by the later one, so it is not sent twice.
+async fn queue_group_snapshot(
+    leader: &Arc<PartitionLeader>,
+    with_commits: bool,
+    pending_commits: &mut Vec<(String, u32, u64, u32)>,
+    pending_groups: &mut Option<Vec<ReplGroup>>,
+) {
+    let Some(lookup) = leader.group_snapshot_lookup() else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || lookup(with_commits)).await {
+        Ok(snapshot) => {
+            pending_commits
+                .retain(|(group, ..)| !snapshot.commits.iter().any(|(g, ..)| g == group));
+            pending_commits.extend(snapshot.commits);
+            *pending_groups = Some(snapshot.groups);
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "replication: reading the consumer groups' state did not finish"
         ),
     }
 }
@@ -366,6 +410,9 @@ pub struct PartitionLeader {
     ack_waiters: AckWaiters,
     events_tx: broadcast::Sender<IsrEvent>,
     offset_notes_tx: broadcast::Sender<OffsetNote>,
+    /// Where a follower stream reads the group state it sends when it opens,
+    /// after it lagged, and when the rows change. Installed by the glue.
+    group_snapshot: Mutex<Option<GroupSnapshotLookup>>,
     /// Wakes every feeder task whenever `recompute_hw` actually moves the
     /// engine-visible `high_watermark` — see `subscribe_hw`'s doc.
     hw_tx: watch::Sender<u64>,
@@ -421,6 +468,7 @@ impl PartitionLeader {
             ack_waiters: AckWaiters::new(),
             events_tx: broadcast::channel(64).0,
             offset_notes_tx: broadcast::channel(1024).0,
+            group_snapshot: Mutex::new(None),
             hw_tx,
             config,
             metrics,
@@ -750,6 +798,20 @@ impl PartitionLeader {
 
     pub fn note_offset_discarded(&self, offset: u64) {
         let _ = self.offset_notes_tx.send(OffsetNote::Discarded { offset });
+    }
+
+    /// A consumer-group row of this partition's topic was written: every open
+    /// stream sends the rows again on its next coalescing tick.
+    pub fn note_groups_changed(&self) {
+        let _ = self.offset_notes_tx.send(OffsetNote::GroupsChanged);
+    }
+
+    pub fn set_group_snapshot(&self, lookup: GroupSnapshotLookup) {
+        *self.group_snapshot.lock() = Some(lookup);
+    }
+
+    fn group_snapshot_lookup(&self) -> Option<GroupSnapshotLookup> {
+        self.group_snapshot.lock().clone()
     }
 
     /// This leader's own `log_end_offset` plus every in-ISR follower's
@@ -1316,6 +1378,10 @@ where
         &mut pending_discards,
     )
     .await;
+    // A replica that was away (or never saw an idle group's last commit)
+    // would otherwise keep a stale offset until the group commits again.
+    let mut pending_groups: Option<Vec<ReplGroup>> = None;
+    queue_group_snapshot(&leader, true, &mut pending_commits, &mut pending_groups).await;
     let mut last_frame_sent_at = Instant::now();
     // The highest `hw` any frame on this stream has carried: the follower
     // applies it monotonically, so anything at or below it is old news.
@@ -1418,6 +1484,12 @@ where
                     Ok(OffsetNote::Discarded { offset }) => {
                         pending_discards.insert(offset);
                     }
+                    Ok(OffsetNote::GroupsChanged) => {
+                        queue_group_snapshot(
+                            &leader, false, &mut pending_commits, &mut pending_groups,
+                        )
+                        .await;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // K-M2-5 already tolerates a bounded replication
                         // delay; a burst that outran this channel's
@@ -1430,6 +1502,12 @@ where
                             &handled_offsets,
                             reader_handle.earliest_offset(),
                             &mut pending_discards,
+                        )
+                        .await;
+                        // The same goes for commits and group rows: the
+                        // lost notes are not replayed, the state is re-read.
+                        queue_group_snapshot(
+                            &leader, true, &mut pending_commits, &mut pending_groups,
                         )
                         .await;
                     }
@@ -1468,13 +1546,17 @@ where
             }
 
             _ = offsets_ticker.tick() => {
-                if !pending_commits.is_empty() || !pending_discards.is_empty() {
+                if !pending_commits.is_empty()
+                    || !pending_discards.is_empty()
+                    || pending_groups.is_some()
+                {
                     let partition = leader.partition_id();
                     let discards: Vec<(u32, u64)> = std::mem::take(&mut pending_discards)
                         .into_iter()
                         .map(|offset| (partition, offset))
                         .collect();
                     let mut commits = std::mem::take(&mut pending_commits);
+                    let mut groups = pending_groups.take().unwrap_or_default();
                     let mut rest = discards.as_slice();
                     loop {
                         let (chunk, tail) =
@@ -1483,6 +1565,7 @@ where
                             leader_epoch: leader.epoch(),
                             commits: std::mem::take(&mut commits),
                             discarded: chunk.to_vec(),
+                            groups: std::mem::take(&mut groups),
                         })).await?;
                         rest = tail;
                         if rest.is_empty() {
@@ -1499,7 +1582,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     use bytes::Bytes;
     use tentaflow_bus::{BatchBuilder, Durability, HwTracking, RecordInput, RollPolicy};
@@ -3041,6 +3124,135 @@ mod tests {
         }
 
         drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    fn ack_hello(accepted_epoch: u32) -> ReplFrame {
+        ReplFrame::HelloAck(ReplHelloAck {
+            accepted: true,
+            follower_leo: 0,
+            follower_hw: 0,
+            follower_epoch: accepted_epoch,
+            environment: NodeEnvironment::Prod,
+            reject: None,
+            follower_log_epoch: None,
+            follower_committed: None,
+            bus_features: 0,
+        })
+    }
+
+    async fn next_offsets<R: AsyncRead + Unpin>(reader: &mut R, what: &str) -> ReplOffsets {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_millis(800), read_frame(reader))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                .unwrap();
+            if let ReplFrame::Offsets(offsets) = frame {
+                return offsets;
+            }
+        }
+    }
+
+    fn group_row(group: &str, paused: bool) -> ReplGroup {
+        ReplGroup {
+            group: group.to_string(),
+            commit_mode: "explicit".to_string(),
+            paused,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    /// A stream sends every group's committed offset of its partition and
+    /// every group row of the topic when it opens, so a replica that was away
+    /// (or never saw an idle group's last commit) is brought up to date; a
+    /// later change of a row sends the rows alone.
+    #[tokio::test]
+    async fn a_follower_stream_starts_with_every_group_commit_and_row() {
+        let part = temp_partition("group-snapshot");
+        let mut config = fast_config();
+        config.heartbeat_interval = Duration::from_secs(10);
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        leader.set_group_snapshot(Arc::new(|with_commits| GroupSnapshot {
+            commits: if with_commits {
+                vec![("g1".to_string(), 0, 5, 2)]
+            } else {
+                Vec::new()
+            },
+            groups: vec![group_row("g1", true)],
+        }));
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(&mut foll_w, &ack_hello(TEST_EPOCH))
+            .await
+            .unwrap();
+
+        let opened = next_offsets(&mut foll_r, "the snapshot").await;
+        assert_eq!(opened.commits, vec![("g1".to_string(), 0, 5, 2)]);
+        assert_eq!(opened.groups, vec![group_row("g1", true)]);
+
+        leader.note_groups_changed();
+        let changed = next_offsets(&mut foll_r, "the changed rows").await;
+        assert!(
+            changed.commits.is_empty(),
+            "a row change resends no offsets"
+        );
+        assert_eq!(changed.groups, vec![group_row("g1", true)]);
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    /// Commit notes the stream missed are not replayed; it reads the group
+    /// state again (and so does a stream that merely opens).
+    #[tokio::test]
+    async fn a_stream_that_lost_notes_reads_the_group_state_again() {
+        let part = temp_partition("group-lagged");
+        let mut config = fast_config();
+        config.heartbeat_interval = Duration::from_secs(10);
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        leader.set_group_snapshot(Arc::new(move |_with_commits| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            GroupSnapshot::default()
+        }));
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        // More notes than the channel holds, before the stream reads any.
+        for offset in 0..2_000u64 {
+            leader.note_offset_commit("g1", offset, 0);
+        }
+        write_frame(&mut foll_w, &ack_hello(TEST_EPOCH))
+            .await
+            .unwrap();
+
+        let drain = tokio::spawn(async move { while read_frame(&mut foll_r).await.is_ok() {} });
+        let started = Instant::now();
+        while reads.load(Ordering::SeqCst) < 2 && started.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "once when the stream opened, once after it lost notes"
+        );
+
+        // Both halves of the follower's end must go for the stream to see EOF.
+        drain.abort();
+        let _ = drain.await;
         drop(foll_w);
         let _ = handle.await;
     }

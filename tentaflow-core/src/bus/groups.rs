@@ -454,6 +454,53 @@ impl GroupOffsetStore {
         Ok(())
     }
 
+    /// Every group's committed offset on one `(topic, partition)`, with the
+    /// delivery-attempt count recorded at that offset: what a leader sends a
+    /// replica when a replication stream opens, so a replica that missed
+    /// commits (or never saw an idle group's last one) catches up. Scans the
+    /// org's keys, like `purge_topic`.
+    pub fn committed_in_partition(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Vec<(String, u64, u32)>, BusServiceError> {
+        let mut org_prefix = org_id.as_bytes().to_vec();
+        org_prefix.push(SEP);
+        let partition_bytes = partition.to_be_bytes();
+        let mut found = Vec::new();
+        for guard in self.keyspace.prefix(&org_prefix) {
+            let Ok(key) = guard.key() else {
+                continue;
+            };
+            let mut parts = key[org_prefix.len()..].splitn(3, |&b| b == SEP);
+            let (Some(group), Some(key_topic), Some(rest)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            // A commit key ends with the 4-byte partition; an attempt key
+            // extends it, so it is not equal.
+            if key_topic != topic.as_bytes() || rest != partition_bytes {
+                continue;
+            }
+            let Ok(group) = std::str::from_utf8(group) else {
+                continue;
+            };
+            let Some(record) = self.load(&key)? else {
+                continue;
+            };
+            let attempt_key =
+                Self::attempt_key(org_id, group, topic, partition, record.committed_offset);
+            let attempts = self
+                .load_attempt(&attempt_key)?
+                .map(|a| a.attempts)
+                .unwrap_or(0);
+            found.push((group.to_string(), record.committed_offset, attempts));
+        }
+        Ok(found)
+    }
+
     /// Deletes every commit and attempt key for `(org_id, topic)` across
     /// EVERY group — called by `BusService::delete_topic` so a later
     /// `create_topic` of the SAME name does not inherit a stale committed
@@ -895,5 +942,30 @@ mod tests {
             0,
             "purging an already-empty topic is a no-op, not an error"
         );
+    }
+
+    #[test]
+    fn committed_in_partition_lists_every_group_of_that_partition_only() {
+        let (_dir, db) = temp_db();
+        let store = GroupOffsetStore::open(&db).unwrap();
+        store.commit("org-1", "g1", "orders", 0, 5, 1).unwrap();
+        store.commit("org-1", "g2", "orders", 0, 9, 1).unwrap();
+        store.commit("org-1", "g1", "orders", 1, 7, 1).unwrap();
+        store.commit("org-1", "g1", "orders2", 0, 3, 1).unwrap();
+        store.commit("org-2", "g1", "orders", 0, 4, 1).unwrap();
+        store
+            .set_delivery_attempts("org-1", "g2", "orders", 0, 9, 3, None)
+            .unwrap();
+
+        let mut found = store.committed_in_partition("org-1", "orders", 0).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![("g1".to_string(), 5, 0), ("g2".to_string(), 9, 3)]
+        );
+        assert!(store
+            .committed_in_partition("org-1", "orders", 2)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -469,15 +469,20 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         // `ProducerFenced` above, not a client input error. `NotAvailable`
         // for the other three: the partition/replica set genuinely cannot
         // serve the request right now, not a bad request or a stale write.
+        // The leader is named as `leader_node_id=<id>` only when known: the
+        // UI reads the first "leader..." token after the code as the node to
+        // point at, so an unknown leader must not print another one.
         BusServiceError::NotLeader {
             leader_node_id,
             leader_epoch,
         } => ProtocolError::new(
             ProtocolErrorCode::Conflict,
-            format!(
-                "bus.not_leader: leader_node_id={:?} leader_epoch={leader_epoch}",
-                leader_node_id
-            ),
+            match leader_node_id {
+                Some(node) => {
+                    format!("bus.not_leader: leader_node_id={node} leader_epoch={leader_epoch}")
+                }
+                None => format!("bus.not_leader: epoch={leader_epoch}"),
+            },
         ),
         BusServiceError::NotEnoughReplicas { isr, required } => ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
@@ -1157,6 +1162,7 @@ fn peek_topic(
             high_watermark: result.high_watermark,
             next_offset,
             has_more,
+            from_replica: result.from_replica,
         });
         all_records.extend(result.records);
     }
@@ -1212,6 +1218,7 @@ fn peek_dlq_newest_first(
         partition: u32,
         earliest: u64,
         high_watermark: u64,
+        from_replica: bool,
         end: u64,
         handled: std::collections::BTreeSet<u64>,
         /// Read, not yet taken; offset-descending.
@@ -1259,8 +1266,8 @@ fn peek_dlq_newest_first(
     let chunk = limit.div_ceil(partition_range.len().max(1));
     let mut windows = Vec::with_capacity(partition_range.len());
     for partition in partition_range {
-        let stats = svc
-            .partition_stats(bctx, dlq_topic, partition)
+        let window = svc
+            .read_window(bctx, dlq_topic, partition)
             .map_err(map_bus_error)?;
         let handled: std::collections::BTreeSet<u64> = svc
             .dlq_discarded_offsets(bctx, dlq_topic, partition)
@@ -1270,12 +1277,13 @@ fn peek_dlq_newest_first(
         let end = ends
             .get(&partition)
             .copied()
-            .unwrap_or(stats.high_watermark)
-            .min(stats.high_watermark);
+            .unwrap_or(window.high_watermark)
+            .min(window.high_watermark);
         windows.push(Window {
             partition,
-            earliest: stats.earliest_offset,
-            high_watermark: stats.high_watermark,
+            earliest: window.earliest_offset,
+            high_watermark: window.high_watermark,
+            from_replica: window.from_replica,
             end,
             handled,
             records: std::collections::VecDeque::new(),
@@ -1322,6 +1330,7 @@ fn peek_dlq_newest_first(
             high_watermark: w.high_watermark,
             next_offset,
             has_more,
+            from_replica: w.from_replica,
         });
     }
     let next_offset = if windows.is_empty() { 0 } else { lowest_next };
@@ -2209,6 +2218,7 @@ async fn topic_detail_v1(
     let groups_wire = run_blocking(
         move || -> Result<Vec<BusGroupLagSummaryWire>, ProtocolError> {
             let mut out = Vec::with_capacity(group_rows.len());
+            let from_replica = svc.reads_from_replica(&bctx3.org_id, &name4);
             for row in group_rows {
                 // A group whose lag this session cannot read here (revoked
                 // ACL, a partition led by another node) is left out rather
@@ -2220,6 +2230,7 @@ async fn topic_detail_v1(
                 out.push(BusGroupLagSummaryWire {
                     group: row.group_id,
                     lag_total,
+                    from_replica,
                 });
             }
             Ok(out)
@@ -2290,11 +2301,16 @@ async fn group_list_v1(
         let rows = visible_groups(&svc, &bctx, &org_id)?;
         let keys = KeyGroupNames::load(&db)?;
         let mut access = TopicAccessCache::default();
+        let mut replica_topics = std::collections::HashMap::new();
         Ok(rows
             .into_iter()
             .map(|g| {
                 let (key_name, key_gone) = keys.of(&g.group_id);
+                let from_replica = *replica_topics
+                    .entry(g.topic.clone())
+                    .or_insert_with(|| svc.reads_from_replica(&bctx.org_id, &g.topic));
                 BusGroupSummaryWire {
+                    from_replica,
                     lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
                     can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
                     group: g.group_id,
@@ -2485,8 +2501,8 @@ async fn group_detail_v1(
     let group2 = group.clone();
     let topic2 = topic.clone();
     let svc = g.svc.clone();
-    let partitions = run_blocking(move || {
-        Ok(svc
+    let (partitions, from_replica) = run_blocking(move || {
+        let partitions = svc
             .group_lag(&bctx, &group2, &topic2)
             .map_err(map_bus_error)?
             .into_iter()
@@ -2495,7 +2511,8 @@ async fn group_detail_v1(
                 committed_offset: p.committed_offset,
                 lag: p.lag,
             })
-            .collect())
+            .collect();
+        Ok((partitions, svc.reads_from_replica(&bctx.org_id, &topic2)))
     })
     .await?;
 
@@ -2511,6 +2528,7 @@ async fn group_detail_v1(
             partitions,
             key_name,
             key_gone,
+            from_replica,
         },
     })
 }
@@ -2957,6 +2975,11 @@ fn retryable_dlq_records(
     let mut budget = scan_cap;
     let mut skipped_rejected = 0u32;
     for partition in 0..partitions {
+        // The reads below are served by any replica; retrying what they find
+        // is the leader's alone, so a replica refuses here, naming the
+        // leader, instead of reporting every record as a failed retry.
+        svc.require_partition_leader(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
         let share = budget.div_ceil((partitions - partition) as usize);
         let stats = svc
             .partition_stats(bctx, dlq_topic, partition)
@@ -4866,9 +4889,19 @@ async fn lag_history_v1(
     let since_ms = since_ms
         .unwrap_or(0)
         .max(bus::now_ms() - bus::lag_history::RETENTION_MS);
-    let (groups, dlqs) = run_blocking(move || {
-        svc.lag_history(&bctx, topic.as_deref(), group.as_deref(), since_ms)
-            .map_err(map_bus_error)
+    let (groups, dlqs, replica_topics) = run_blocking(move || {
+        let (groups, dlqs) = svc
+            .lag_history(&bctx, topic.as_deref(), group.as_deref(), since_ms)
+            .map_err(map_bus_error)?;
+        let replica_topics: std::collections::HashSet<String> = groups
+            .iter()
+            .map(|s| s.topic.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter(|t| svc.reads_from_replica(&bctx.org_id, t))
+            .map(str::to_string)
+            .collect();
+        Ok((groups, dlqs, replica_topics))
     })
     .await?;
     let mut groups: Vec<_> = groups
@@ -4882,6 +4915,7 @@ async fn lag_history_v1(
         groups: groups
             .into_iter()
             .map(|s| BusGroupLagSeriesWire {
+                from_replica: replica_topics.contains(&s.topic),
                 group: s.group_id,
                 topic: s.topic,
                 samples: s
@@ -7673,6 +7707,7 @@ mod tests {
     /// there would fail a test for a code path this fake was never meant
     /// to cover, not a real regression.
     struct FakeCoordinator {
+        role: std::sync::Mutex<bus::PartitionRole>,
         reassign_applied: u32,
         transfer_epoch: u32,
         snapshot_org: String,
@@ -7682,9 +7717,7 @@ mod tests {
 
     impl bus::ReplicationCoordinator for FakeCoordinator {
         fn role(&self, _org: &str, _topic: &str, _partition: u32) -> bus::PartitionRole {
-            bus::PartitionRole::Unavailable {
-                reason: bus::UnavailableReason::NoAssignment,
-            }
+            self.role.lock().unwrap().clone()
         }
         fn preflight(
             &self,
@@ -7786,6 +7819,298 @@ mod tests {
                 bus::ReplicationSnapshot::default()
             }
         }
+    }
+
+    /// A bus instance of its own (the shared fixture's is one process-wide
+    /// singleton that must never see a replica role), a coordinator that
+    /// answers `role`, and a caller context for it.
+    fn replica_fixture(
+        suffix: &str,
+    ) -> (
+        std::sync::Arc<bus::BusService>,
+        std::sync::Arc<FakeCoordinator>,
+        BusCallContext,
+    ) {
+        struct AllowAllAuthorizer;
+        impl bus::BusAuthorizer for AllowAllAuthorizer {
+            fn authorize(
+                &self,
+                _ctx: &BusCallContext,
+                _action: bus::BusAction,
+                _topic: &str,
+            ) -> Result<(), BusServiceError> {
+                Ok(())
+            }
+            fn authorize_group(
+                &self,
+                _ctx: &BusCallContext,
+                _action: bus::BusAction,
+                _topic: &str,
+                _group: &str,
+            ) -> Result<(), BusServiceError> {
+                Ok(())
+            }
+            fn generation(&self) -> u64 {
+                0
+            }
+        }
+        let id = bus::instance::BusInstanceId::parse(&format!("tentabus-{suffix}"))
+            .expect("instance id");
+        let dir = tempfile::tempdir().expect("bus_dir tempdir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(local_conn));
+        let svc = bus::init(bus::BusInitConfig {
+            instance_id: id.clone(),
+            local_db,
+            bus_dir: dir.path().to_path_buf(),
+            db,
+            authorizer: std::sync::Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
+        })
+        .expect("bus init");
+        std::mem::forget(dir);
+        let coordinator = std::sync::Arc::new(FakeCoordinator {
+            role: std::sync::Mutex::new(bus::PartitionRole::Leader { epoch: 1 }),
+            reassign_applied: 0,
+            transfer_epoch: 0,
+            snapshot_org: String::new(),
+            snapshot_topic: String::new(),
+            snapshot: bus::ReplicationSnapshot::default(),
+        });
+        let bctx = BusCallContext {
+            instance_id: id,
+            org_id: "org-1".to_string(),
+            actor: Some("u-test".to_string()),
+            actor_kind: ActorKind::User,
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        (svc, coordinator, bctx)
+    }
+
+    fn follower_of_b(coordinator: &FakeCoordinator) {
+        *coordinator.role.lock().unwrap() = bus::PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 5,
+        };
+    }
+
+    /// "Ponów wszystkie" reads the DLQ through the views a replica serves, so
+    /// its scan must stop first at a node that does not lead the partition:
+    /// otherwise every record it found would come back as a failed retry.
+    /// The DLQ does not even exist here, so a scan that got past the leader
+    /// check would fail with `topic_not_found` instead.
+    #[test]
+    fn the_retry_all_scan_on_a_replica_refuses_naming_the_leader() {
+        let (svc, coordinator, bctx) = replica_fixture("0000c007");
+        follower_of_b(&coordinator);
+        svc.set_replication(coordinator);
+
+        let err = retryable_dlq_records(&bctx, "__dlq.orders", 1, 10, 100).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::Conflict);
+        assert_eq!(
+            err.message,
+            "bus.not_leader: leader_node_id=node-b leader_epoch=5"
+        );
+    }
+
+    /// The DLQ list on a replica is the leader's: the same waiting records,
+    /// minus the ones marked handled, up to the replica's high watermark. The
+    /// third record is in the log but past it, and neither side lists it.
+    #[test]
+    fn the_dlq_list_on_a_replica_matches_the_leaders_up_to_its_high_watermark() {
+        let (svc, coordinator, bctx) = replica_fixture("0000c008");
+        let source = "labs.replica-dlq";
+        svc.create_topic(
+            &bctx,
+            source,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("create source topic");
+        let dlq_topic = dlq::dlq_topic_name(source);
+        let fail = |i: u64| {
+            svc.publish(
+                &bctx,
+                source,
+                bus::PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![bus::PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from(format!("payload-{i}")),
+                        timestamp_ms: 0,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish source record");
+            let fetched = bus::FetchedRecordMeta {
+                topic: source.to_string(),
+                partition: 0,
+                offset: i,
+                timestamp_ms: 0,
+                key: None,
+                headers: vec![],
+                payload: Bytes::from(format!("payload-{i}")),
+                schema_id: 0,
+            };
+            svc.note_delivery_failure(
+                &bctx,
+                "g",
+                source,
+                0,
+                i,
+                &fetched,
+                dlq::DlqReason::ConsumerError,
+                "boom",
+            )
+            .expect("note delivery failure sends to dlq");
+        };
+        fail(0);
+        let dlq_part = svc
+            .local_partition(&bctx, &dlq_topic, 0)
+            .expect("dlq partition");
+        dlq_part.set_hw_tracking(tentaflow_bus::HwTracking::Manual);
+        fail(1);
+        fail(2);
+        assert_eq!(dlq_part.log_end_offset(), 3);
+        assert_eq!(dlq_part.set_high_watermark(2), 2);
+        assert_eq!(dlq_part.set_committed_offset(2), 2);
+        svc.set_replication(coordinator.clone());
+
+        let list = |bctx: &BusCallContext| {
+            let (records, _, _, partitions) = peek_dlq_newest_first(
+                bctx,
+                &dlq_topic,
+                1,
+                &std::collections::HashMap::new(),
+                10,
+                None,
+            )
+            .expect("dlq list");
+            let oldest_first = peek_topic(
+                bctx,
+                &dlq_topic,
+                1,
+                &std::collections::HashMap::new(),
+                10,
+                None,
+                None,
+            )
+            .expect("dlq list, oldest first");
+            let offsets =
+                |r: &[bus::FetchedRecordMeta]| r.iter().map(|r| r.offset).collect::<Vec<_>>();
+            (offsets(&records), offsets(&oldest_first.0), partitions[0])
+        };
+
+        let (newest, oldest, on_leader) = list(&bctx);
+        assert_eq!((newest, oldest), (vec![1, 0], vec![0, 1]));
+        assert_eq!(
+            (on_leader.high_watermark, on_leader.from_replica),
+            (2, false)
+        );
+
+        svc.dlq_discard(&bctx, &dlq_topic, 0, 0)
+            .expect("discard on the leader");
+        follower_of_b(&coordinator);
+        let (newest, oldest, on_replica) = list(&bctx);
+        assert_eq!(
+            newest,
+            vec![1],
+            "the handled record is not listed on the replica either"
+        );
+        assert_eq!(
+            oldest,
+            vec![0, 1],
+            "the unfiltered read is discard-unaware, as on the leader"
+        );
+        assert_eq!(
+            (on_replica.high_watermark, on_replica.from_replica),
+            (2, true)
+        );
+    }
+
+    /// A node that holds no replica of a DLQ partition refuses its list, also
+    /// when nothing waits there: an empty list would pass for an answer.
+    #[test]
+    fn the_dlq_list_on_a_node_with_no_replica_refuses_even_when_nothing_waits() {
+        let (svc, coordinator, bctx) = replica_fixture("0000c009");
+        let source = "labs.replica-empty-dlq";
+        let cfg = svc
+            .create_topic(
+                &bctx,
+                source,
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("create source topic");
+        svc.ensure_dlq_topic(&bctx, source, &cfg).expect("dlq");
+        let dlq_topic = dlq::dlq_topic_name(source);
+        let list = |bctx: &BusCallContext| {
+            peek_dlq_newest_first(
+                bctx,
+                &dlq_topic,
+                1,
+                &std::collections::HashMap::new(),
+                10,
+                None,
+            )
+        };
+
+        svc.set_replication(coordinator.clone());
+        let (records, _, _, partitions) = list(&bctx).expect("the leader lists nothing");
+        assert!(records.is_empty() && !partitions[0].from_replica);
+
+        *coordinator.role.lock().unwrap() = bus::PartitionRole::Unavailable {
+            reason: bus::UnavailableReason::NoAssignment,
+        };
+        let err = list(&bctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::Conflict);
+        assert_eq!(err.message, "bus.not_leader: epoch=0");
+
+        follower_of_b(&coordinator);
+        let (records, _, _, partitions) = list(&bctx).expect("a replica lists nothing");
+        assert!(records.is_empty() && partitions[0].from_replica);
+    }
+
+    /// TB-04 K7: a refusal from a replica carries the stable code and, when
+    /// the leader is known, `leader_node_id=<id>` as the only "leader" token
+    /// after it: the UI reads the first one as the node to point at, so the
+    /// Debug rendering (`Some("node-b")`, `None`) it used to get is gone.
+    #[test]
+    fn a_not_leader_refusal_names_the_leader_as_a_plain_node_id() {
+        let named = map_bus_error(BusServiceError::NotLeader {
+            leader_node_id: Some("node-b".to_string()),
+            leader_epoch: 3,
+        });
+        assert_eq!(named.code, ProtocolErrorCode::Conflict);
+        assert_eq!(
+            named.message,
+            "bus.not_leader: leader_node_id=node-b leader_epoch=3"
+        );
+        let unknown = map_bus_error(BusServiceError::NotLeader {
+            leader_node_id: None,
+            leader_epoch: 0,
+        });
+        assert_eq!(unknown.code, ProtocolErrorCode::Conflict);
+        assert_eq!(unknown.message, "bus.not_leader: epoch=0");
+        assert!(!unknown.message.contains("leader_node_id"));
     }
 
     /// Pure-function coverage for `map_repl_error` (PLAN-M2 §1e) — every
@@ -8184,6 +8509,9 @@ mod tests {
         };
         rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(&db).await;
         let coordinator = std::sync::Arc::new(FakeCoordinator {
+            role: std::sync::Mutex::new(bus::PartitionRole::Unavailable {
+                reason: bus::UnavailableReason::NoAssignment,
+            }),
             reassign_applied: 3,
             transfer_epoch: 7,
             snapshot_org: org_id.clone(),

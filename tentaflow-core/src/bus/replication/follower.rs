@@ -162,6 +162,23 @@ pub struct FollowerStores {
     pub offsets: Arc<GroupOffsetStore>,
     pub discarded: Arc<DiscardStore>,
     pub producer_seq: Arc<ProducerSeqStore>,
+    /// Where the consumer-group rows of a `ReplOffsets` frame go; `None`
+    /// ignores them.
+    pub groups: Option<Arc<dyn GroupRowSink>>,
+}
+
+/// Takes the consumer-group rows a leader replicates (`ReplOffsets::groups`)
+/// into the node's `bus_groups` table.
+pub trait GroupRowSink: Send + Sync {
+    /// Applies `rows` of `topic`, each only when it is not older than what
+    /// the node holds by `(leader_epoch, updated_at_ms)`.
+    fn apply(
+        &self,
+        org_id: &str,
+        topic: &str,
+        leader_epoch: u32,
+        rows: &[super::frames::ReplGroup],
+    ) -> Result<(), BusServiceError>;
 }
 
 /// How one `run_follower_stream` call ended (PLAN-M2 §1b). See the module
@@ -820,6 +837,11 @@ fn apply_offsets(
     stores
         .discarded
         .mark_many(org_id, topic, &frame.discarded, now)?;
+    if let Some(sink) = &stores.groups {
+        if !frame.groups.is_empty() {
+            sink.apply(org_id, topic, frame.leader_epoch, &frame.groups)?;
+        }
+    }
     Ok(())
 }
 
@@ -861,6 +883,7 @@ mod tests {
             offsets: Arc::new(GroupOffsetStore::open(&db).unwrap()),
             discarded: Arc::new(DiscardStore::open(&db).unwrap()),
             producer_seq: Arc::new(ProducerSeqStore::open(&db).unwrap()),
+            groups: None,
         };
         (dir, stores)
     }
@@ -2015,6 +2038,7 @@ mod tests {
                 leader_epoch: 1,
                 commits: vec![("grp-a".to_string(), PART, 10, 0)],
                 discarded: vec![(PART, 3)],
+                groups: vec![],
             }),
         )
         .await
@@ -2028,6 +2052,7 @@ mod tests {
                 leader_epoch: 1,
                 commits: vec![("grp-a".to_string(), PART, 4, 0)],
                 discarded: vec![],
+                groups: vec![],
             }),
         )
         .await
@@ -2105,6 +2130,7 @@ mod tests {
                 leader_epoch: 1,
                 commits: vec![("grp-b".to_string(), PART, 20, 5)],
                 discarded: vec![],
+                groups: vec![],
             }),
         )
         .await

@@ -331,6 +331,21 @@ test('extractNotLeaderHint pulls a node id out of a few plausible message shapes
   assert.equal(helpers.extractNotLeaderHint('bus.not_leader: leader: "gcm-core-01"'), 'gcm-core-01');
 });
 
+// The exact texts `dispatch/bus.rs::map_bus_error` writes (TB-04 K7): the leader
+// when it is known, only the epoch while there is none. The epoch must never
+// be read as a node.
+test('extractNotLeaderHint reads the texts the server writes', () => {
+  assert.equal(
+    helpers.extractNotLeaderHint('bus.not_leader: leader_node_id=gcm-core-02 leader_epoch=3'),
+    'gcm-core-02',
+  );
+  assert.equal(helpers.extractNotLeaderHint('bus.not_leader: epoch=3'), null);
+  assert.equal(
+    helpers.extractNotLeaderHint("bus.dlq_retry_source_not_leader: 'orders'/1 leader_node_id=gcm-core-02"),
+    'gcm-core-02',
+  );
+});
+
 test('extractNotLeaderHint returns null when the message does not carry a recognizable node id', () => {
   assert.equal(helpers.extractNotLeaderHint('bus.not_leader'), null);
   assert.equal(helpers.extractNotLeaderHint(''), null);

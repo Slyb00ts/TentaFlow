@@ -2682,8 +2682,12 @@ impl Partition {
     ///
     /// (a) A follower's `high_watermark` is replication bookkeeping, not a
     ///     read contract. Consumption is leader-only — `bus::check_leader_role`
-    ///     refuses `open_consumer`/`fetch`/`peek`/`commit` on any non-Leader
-    ///     role — so nothing a consumer has seen is being retracted.
+    ///     refuses `open_consumer`/`fetch`/`commit` on any non-Leader role —
+    ///     so no consumer's position is retracted. Read-only admin views
+    ///     (`peek`, `peek_runs`, the DLQ list) do run on a follower, but they
+    ///     stop at `min(high_watermark, committed_offset)`, which this call
+    ///     never cuts below (`TruncateBelowCommitted`), and they rerun a page
+    ///     when `truncation_count` changed while it was read.
     /// (b) The accepted leader's log IS the authority, and the records above
     ///     `to_offset` are deleted either way. Refusing to lower `hw` does not
     ///     preserve them; it only leaves the replica permanently unable to

@@ -2293,6 +2293,7 @@ pub fn hub_model_search(
 pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flows = repository::list_flows(&ctx.state.db, 0, 1000).map_err(db_err)?;
     let mut sla = super::sla::flow_sla_overview(ctx, crate::sla::global());
+    let mut statuses = ConsumerStatuses::new(ctx);
     let summaries: Vec<FlowSummary> = flows
         .into_iter()
         .map(|f| {
@@ -2311,7 +2312,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
                 published_model_name: f.published_model_name,
                 is_factory: crate::db::seed::is_factory_flow(&f.id),
                 is_system: f.is_system,
-                bus_consumer: bus_consumer_status(&ctx.state.local_node_id, &f.id),
+                bus_consumer: statuses.of(&f.id),
                 sla_policy_id,
                 sla_brief,
             }
@@ -2333,18 +2334,58 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
 
-    Ok(MessageBody::FlowDetailResponse(flow_detail_body(
-        flow,
-        &ctx.state.local_node_id,
-    )))
+    Ok(MessageBody::FlowDetailResponse(flow_detail_body(flow, ctx)))
 }
 
-/// The flow's consumer status on this node, for the wire.
-fn bus_consumer_status(
+/// The flow's consumer status on this node, for the wire. Who leads the
+/// topic a waiting consumer is blocked on is topology, and these handlers
+/// only need a session: the node (id and display name) goes to an admin
+/// session, any other session sees `reason = not_leader` and nothing more.
+/// A node's name is resolved once per request, not once per flow.
+struct ConsumerStatuses<'a> {
+    ctx: &'a HandlerContext,
+    reveal_leader: bool,
+    leader_names: std::collections::HashMap<String, Option<String>>,
+}
+
+impl<'a> ConsumerStatuses<'a> {
+    fn new(ctx: &'a HandlerContext) -> Self {
+        Self {
+            ctx,
+            reveal_leader: session_is_admin(ctx),
+            leader_names: std::collections::HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, flow_id: &str) -> Option<tentaflow_protocol::BusConsumerStatus> {
+        let status = crate::bus::reactor::consumer_status(flow_id)?;
+        let leader_node_name = match status.leader_node_id.as_deref() {
+            Some(leader) if self.reveal_leader => self
+                .leader_names
+                .entry(leader.to_string())
+                .or_insert_with(|| {
+                    Some(super::app_route::node_display_name(self.ctx, leader))
+                        .filter(|name| !name.is_empty())
+                })
+                .clone(),
+            _ => None,
+        };
+        Some(consumer_status_wire(
+            status,
+            &self.ctx.state.local_node_id,
+            leader_node_name,
+            self.reveal_leader,
+        ))
+    }
+}
+
+fn consumer_status_wire(
+    s: crate::bus::reactor::ConsumerStatus,
     node_id: &str,
-    flow_id: &str,
-) -> Option<tentaflow_protocol::BusConsumerStatus> {
-    crate::bus::reactor::consumer_status(flow_id).map(|s| tentaflow_protocol::BusConsumerStatus {
+    leader_node_name: Option<String>,
+    reveal_leader: bool,
+) -> tentaflow_protocol::BusConsumerStatus {
+    tentaflow_protocol::BusConsumerStatus {
         state: s.state.as_str().to_string(),
         reason: s.reason.map(str::to_string),
         detail: s.detail,
@@ -2353,12 +2394,14 @@ fn bus_consumer_status(
         in_flight: s.in_flight,
         max_concurrency: s.max_concurrency,
         throttled_until: s.throttled_until,
-    })
+        leader_node_id: s.leader_node_id.filter(|_| reveal_leader),
+        leader_node_name: leader_node_name.filter(|_| reveal_leader),
+    }
 }
 
-fn flow_detail_body(flow: db::models::DbFlow, node_id: &str) -> FlowDetail {
+fn flow_detail_body(flow: db::models::DbFlow, ctx: &HandlerContext) -> FlowDetail {
     FlowDetail {
-        bus_consumer: bus_consumer_status(node_id, &flow.id),
+        bus_consumer: ConsumerStatuses::new(ctx).of(&flow.id),
         is_factory: crate::db::seed::is_factory_flow(&flow.id),
         id: flow.id.to_string(),
         name: flow.name,
@@ -3056,8 +3099,7 @@ pub fn flow_factory_restore(
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
     Ok(MessageBody::FlowDetailResponse(flow_detail_body(
-        restored,
-        &ctx.state.local_node_id,
+        restored, ctx,
     )))
 }
 
@@ -15531,5 +15573,72 @@ mod audit_severity_tests {
             list("sla.breach.resolved")[0].severity.as_deref(),
             Some("info")
         );
+    }
+}
+
+#[cfg(test)]
+mod bus_consumer_status_wire_tests {
+    use super::consumer_status_wire;
+    use crate::bus::reactor::{ConsumerState, ConsumerStatus};
+
+    fn waiting(leader_node_id: Option<&str>) -> ConsumerStatus {
+        ConsumerStatus {
+            state: ConsumerState::Waiting,
+            reason: Some("not_leader"),
+            detail: None,
+            since_epoch: 1_700_000_000,
+            in_flight: 0,
+            max_concurrency: None,
+            throttled_until: None,
+            leader_node_id: leader_node_id.map(str::to_string),
+        }
+    }
+
+    /// A consumer waiting on another node's leadership names that node, with
+    /// its display name, in the status the Flow Builder reads.
+    #[test]
+    fn a_not_leader_wait_carries_the_leader_node_and_its_name() {
+        let wire = consumer_status_wire(
+            waiting(Some("node-b")),
+            "node-a",
+            Some("gcm-core-02".to_string()),
+            true,
+        );
+        assert_eq!(
+            (
+                wire.state.as_str(),
+                wire.reason.as_deref(),
+                wire.node_id.as_str()
+            ),
+            ("waiting", Some("not_leader"), "node-a")
+        );
+        assert_eq!(
+            (
+                wire.leader_node_id.as_deref(),
+                wire.leader_node_name.as_deref()
+            ),
+            (Some("node-b"), Some("gcm-core-02"))
+        );
+    }
+
+    /// A session that is not an admin learns that the consumer waits on
+    /// another node's leadership (`reason`), and nothing of which node leads.
+    #[test]
+    fn a_session_that_is_not_an_admin_gets_no_leader_node() {
+        let wire = consumer_status_wire(
+            waiting(Some("node-b")),
+            "node-a",
+            Some("gcm-core-02".to_string()),
+            false,
+        );
+        assert_eq!(wire.reason.as_deref(), Some("not_leader"));
+        assert_eq!((wire.leader_node_id, wire.leader_node_name), (None, None));
+    }
+
+    /// During an election there is no leader to name.
+    #[test]
+    fn a_wait_without_a_known_leader_names_none() {
+        let wire = consumer_status_wire(waiting(None), "node-a", None, true);
+        assert_eq!((wire.leader_node_id, wire.leader_node_name), (None, None));
     }
 }
