@@ -11926,6 +11926,83 @@ mod tests {
         });
     }
 
+    /// The TentaBus leader return switch is per instance and replicates: a
+    /// switch set on one node is captured into the ledger (so it reaches the
+    /// others, whose materializer admits the key by the same
+    /// `is_shared_setting_key`), the node's own spread marker is not, and the
+    /// cutover reseeds the switch.
+    #[test]
+    fn the_bus_leader_return_switch_is_captured_for_the_ledger_and_the_spread_marker_is_not() {
+        with_tmp_home(|| {
+            let key = "bus.leader_return:tentabus-00000001";
+            let node = make_runtime(172);
+            seed_core_authority_target(
+                &node.runtime.db,
+                "core.shared_setting_secret",
+                "peer-authority",
+            );
+            repository::set_setting(&node.runtime.db, key, "off").expect("set the switch");
+            repository::set_setting(
+                &node.runtime.db,
+                "bus.leader_spread:tentabus-00000001",
+                "done",
+            )
+            .expect("set the node's own marker");
+
+            let ops_of = |node: &RuntimeHarness| {
+                crate::sync::core_capture::drain_pending_core_captures_with(
+                    &node.runtime.db,
+                    1000,
+                    |capture| {
+                        node.runtime
+                            .record_core_capture(capture)
+                            .map(|record| Some(record.op_id))
+                    },
+                )
+                .expect("drain pending captures");
+                let push = node
+                    .runtime
+                    .build_push_payload_for_target("peer-authority", 256)
+                    .expect("push")
+                    .expect("payload");
+                push.operations
+                    .iter()
+                    .map(|wire| {
+                        node.runtime
+                            .ledger
+                            .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
+                            .expect("op")
+                    })
+                    .filter(|op| op.body.resource_type == "core.shared_setting_secret")
+                    .collect::<Vec<_>>()
+            };
+            let live = ops_of(&node);
+            assert!(
+                live.iter().any(|op| op.body.resource_id == key),
+                "the switch is captured when it is set"
+            );
+            assert!(
+                !live
+                    .iter()
+                    .any(|op| op.body.resource_id.starts_with("bus.leader_spread:")),
+                "the spread marker stays this node's own"
+            );
+
+            // A cutover re-seeds it with the other shared settings.
+            repository::set_setting(
+                &node.runtime.db,
+                crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
+                "1",
+            )
+            .expect("arm marker");
+            node.runtime
+                .run_pending_baseline_cutover()
+                .expect("cutover runs")
+                .expect("cutover pending");
+            assert!(ops_of(&node).iter().any(|op| op.body.resource_id == key));
+        });
+    }
+
     /// CRITICAL 2: a crash between `bump_epoch` and clearing the marker must not
     /// double-bump. Re-arming the marker with the counter the runtime persisted
     /// (the crash-resume state) and re-running leaves the epoch bumped exactly

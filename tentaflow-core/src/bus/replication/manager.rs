@@ -4050,7 +4050,7 @@ impl ReplicationCoordinator for ReplicationManager {
         partition: u32,
         target: &str,
     ) -> Result<u32, ReplError> {
-        self.transfer_on_leader(org, topic, partition, target, false, &[])
+        self.transfer_on_leader(org, topic, partition, target, false, &[], None)
     }
 
     fn transfer_leader_restoring(
@@ -4061,7 +4061,44 @@ impl ReplicationCoordinator for ReplicationManager {
         target: &str,
         replicas: &[String],
     ) -> Result<u32, ReplError> {
-        self.transfer_on_leader(org, topic, partition, target, false, replicas)
+        self.transfer_on_leader(org, topic, partition, target, false, replicas, None)
+    }
+
+    fn transfer_leader_expecting(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        replicas: &[String],
+        expected: &crate::bus::ExpectedLeader,
+    ) -> Result<u32, ReplError> {
+        self.transfer_on_leader(
+            org,
+            topic,
+            partition,
+            target,
+            false,
+            replicas,
+            Some(expected),
+        )
+    }
+
+    fn replica_record_gap(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        node: &str,
+    ) -> Option<u64> {
+        let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
+        let handle = self
+            .registry
+            .get(&key)
+            .filter(|entry| entry.role == LocalRole::Leader)
+            .and_then(|entry| entry.leader.clone())?;
+        let progress = handle.replica_progress(node)?;
+        Some(handle.log_end_offset().saturating_sub(progress.leo))
     }
 
     fn check_transfer(
@@ -4071,7 +4108,7 @@ impl ReplicationCoordinator for ReplicationManager {
         partition: u32,
         target: &str,
     ) -> Result<(), ReplError> {
-        self.transfer_on_leader(org, topic, partition, target, true, &[])
+        self.transfer_on_leader(org, topic, partition, target, true, &[], None)
             .map(|_| ())
     }
 
@@ -4361,6 +4398,7 @@ impl ReplicationManager {
         target: &str,
         dry_run: bool,
         restore: &[String],
+        expected: Option<&crate::bus::ExpectedLeader>,
     ) -> Result<u32, ReplError> {
         let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
         let row = self
@@ -4370,7 +4408,13 @@ impl ReplicationManager {
                 partition,
             })?;
         if row.leader_node_id == self.local_node_id {
-            return self.transfer_leader_here(&key, target, dry_run, restore);
+            return self.transfer_leader_here(
+                &key,
+                target,
+                dry_run,
+                restore,
+                expected.map(|e| (e.node_id.as_str(), e.epoch)),
+            );
         }
         let leader = row.leader_node_id;
         let request = TransferForward {
@@ -4382,6 +4426,8 @@ impl ReplicationManager {
             target_node_id: target.to_string(),
             dry_run,
             replicas: restore.to_vec(),
+            expected_leader: expected.map(|e| e.node_id.clone()).unwrap_or_default(),
+            expected_epoch: expected.map(|e| e.epoch),
         };
         let timeout = if dry_run {
             TRANSFER_CHECK_TIMEOUT
@@ -4465,6 +4511,7 @@ impl ReplicationManager {
         target: &str,
         dry_run: bool,
         restore: &[String],
+        expected: Option<(&str, u32)>,
     ) -> Result<u32, ReplError> {
         let (org, topic, partition) = (key.0.as_str(), key.1.as_str(), key.2);
         let blocker = self
@@ -4489,6 +4536,17 @@ impl ReplicationManager {
                 partition,
             })?;
         if assignment.leader_node_id != self.local_node_id {
+            return Err(ReplError::NotPartitionLeader {
+                topic: topic.to_string(),
+                partition,
+                leader: assignment.leader_node_id,
+            });
+        }
+        // The row the caller planned from is not this one any more: it was
+        // moved (and perhaps moved back) since.
+        if expected.is_some_and(|(node, epoch)| {
+            node != self.local_node_id || epoch != assignment.leader_epoch
+        }) {
             return Err(ReplError::NotPartitionLeader {
                 topic: topic.to_string(),
                 partition,
@@ -4724,11 +4782,22 @@ impl ReplicationManager {
         };
         let (target, dry_run, restore) =
             (request.target_node_id, request.dry_run, request.replicas);
+        let expected = request
+            .expected_epoch
+            .map(|epoch| (request.expected_leader, epoch));
         // This node's own row decides who leads: a transfer is never handed
         // on, so one that arrives after the leadership moved is refused
         // (`NotPartitionLeader`) and its sender asks again.
         let outcome = tokio::task::spawn_blocking(move || {
-            me.transfer_leader_here(&key, &target, dry_run, &restore)
+            me.transfer_leader_here(
+                &key,
+                &target,
+                dry_run,
+                &restore,
+                expected
+                    .as_ref()
+                    .map(|(node, epoch)| (node.as_str(), *epoch)),
+            )
         })
         .await;
         match outcome {
@@ -8411,6 +8480,56 @@ mod tests {
         );
     }
 
+    /// A transfer planned from a read of the row that has gone stale (the
+    /// partition was moved since, or re-elected at another epoch) is refused
+    /// by the leader and changes nothing; one that names the epoch the leader
+    /// stands at goes through.
+    #[tokio::test]
+    async fn a_transfer_that_expects_another_epoch_than_the_leaders_is_refused() {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            4,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        for raw in 1u8..=4 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f1".to_string()]);
+        }
+        let expect = |node: &str, epoch: u32| crate::bus::ExpectedLeader {
+            node_id: node.to_string(),
+            epoch,
+        };
+
+        for stale in [expect("l", 3), expect("other", 4)] {
+            let refused = fx
+                .manager
+                .transfer_leader_expecting("org", "orders", 0, "f1", &[], &stale)
+                .expect_err("the row is not the one that was read");
+            assert!(
+                matches!(refused, ReplError::NotPartitionLeader { .. }),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 4 },
+            "a refused transfer changes nothing"
+        );
+        assert_eq!(*fx.audit.transfers.lock(), 0);
+
+        fx.manager
+            .transfer_leader_expecting("org", "orders", 0, "f1", &[], &expect("l", 4))
+            .expect("the row is as it was read");
+        assert_eq!(*fx.audit.transfers.lock(), 1);
+    }
+
     #[tokio::test]
     async fn transfer_leader_rejects_a_target_outside_the_isr() {
         let fx = build("l");
@@ -8762,6 +8881,8 @@ mod tests {
             target_node_id: "f1".to_string(),
             dry_run: false,
             replicas: Vec::new(),
+            expected_leader: String::new(),
+            expected_epoch: None,
         }
     }
 

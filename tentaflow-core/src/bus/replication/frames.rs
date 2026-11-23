@@ -774,6 +774,14 @@ pub struct TransferForward {
     /// transfer.
     #[serde(default)]
     pub replicas: Vec<String>,
+    /// The leader and epoch the sender read the row at. The leader refuses
+    /// (`NotPartitionLeader`) when its own row has moved on since, so a move
+    /// planned from an old read cannot undo a newer one. Empty/`None` from a
+    /// build that does not send them: no check.
+    #[serde(default)]
+    pub expected_leader: String,
+    #[serde(default)]
+    pub expected_epoch: Option<u32>,
 }
 
 /// The leader's answer to `TransferForward`: exactly one of the two is set.
@@ -1416,6 +1424,38 @@ mod tests {
         ));
     }
 
+    /// A `TransferForward` from a build that does not send the expectation
+    /// still decodes, with no expectation: the leader makes no check.
+    #[test]
+    fn a_transfer_forward_without_the_expectation_decodes_with_none() {
+        #[derive(Serialize)]
+        struct Before {
+            instance_id: String,
+            environment: NodeEnvironment,
+            org_id: String,
+            topic: String,
+            partition: u32,
+            target_node_id: String,
+            dry_run: bool,
+            replicas: Vec<String>,
+        }
+        let cbor = encode_cbor(&Before {
+            instance_id: "tentabus-00000001".into(),
+            environment: NodeEnvironment::Prod,
+            org_id: "org-1".into(),
+            topic: "orders".into(),
+            partition: 3,
+            target_node_id: "node-b".into(),
+            dry_run: false,
+            replicas: Vec::new(),
+        })
+        .expect("encode");
+        let decoded: TransferForward = decode_cbor(&cbor).expect("decode");
+        assert_eq!(decoded.expected_epoch, None);
+        assert_eq!(decoded.expected_leader, "");
+        assert_eq!(decoded.target_node_id, "node-b");
+    }
+
     #[tokio::test]
     async fn transfer_forward_frames_round_trip() {
         let request = TransferForward {
@@ -1427,6 +1467,8 @@ mod tests {
             target_node_id: "node-b".into(),
             dry_run: true,
             replicas: vec!["node-a".into(), "node-b".into()],
+            expected_leader: "node-a".into(),
+            expected_epoch: Some(7),
         };
         assert_eq!(
             roundtrip(ReplFrame::TransferForward(request.clone())).await,

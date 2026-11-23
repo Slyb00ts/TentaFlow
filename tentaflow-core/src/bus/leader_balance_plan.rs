@@ -39,6 +39,18 @@
 // cannot take forwarded transfers, no right) leaves the unit where it is,
 // counted where it is.
 //
+// THE SAME LINE IS DRAWN BY THE AUTOMATIC RETURN (`leader_return`, K6), which
+// is what makes counting on a transient return honest: it returns a topic
+// once its preferred node has been in sync for a while, so a return that is
+// only waiting for the node (outside the in-sync set, behind, not answering,
+// forwarding not known yet) does happen by itself; and it never returns a
+// topic whose group is paused or whose preferred node cannot take forwarded
+// requests, which are exactly the lasting reasons (`is_lasting`). The one
+// case where nothing returns by itself is the switch being off on the node
+// that makes the plan: `PlanInput::automatic_return_off` then counts every
+// unit where it is. (The switch is per node, and it is the leading node's
+// that counts, so with nodes that disagree this is the plan's best guess.)
+//
 // GOAL. Among the nodes that answer, the plan keeps moving a whole unit from
 // the most to the least loaded node for as long as one move makes their gap
 // smaller. Each move is the one that leaves the smallest gap between the two
@@ -122,6 +134,10 @@ pub struct PlanInput {
     pub scope_org: Option<String>,
     /// Only this topic (and its DLQ) may move.
     pub scope_topic: Option<String>,
+    /// The automatic return of topics to their preferred leaders is off, so
+    /// a return blocked for now is not expected to happen by itself and the
+    /// unit counts where it is, as for a lasting reason.
+    pub automatic_return_off: bool,
 }
 
 /// One move of a plan: every partition of the topic and its DLQ topic that is
@@ -176,7 +192,7 @@ fn unit_topic(topic: &str) -> &str {
 
 /// `true` for a topic the broker keeps for itself (`__bus.metrics`): it stays
 /// where it was created.
-fn is_internal(unit: &str) -> bool {
+pub(super) fn is_internal(unit: &str) -> bool {
     unit.starts_with("__")
 }
 
@@ -216,7 +232,7 @@ impl Unit {
 }
 
 /// The node most partitions of `led` are led by; the lowest id on a tie.
-fn majority(led: &BTreeMap<String, u32>) -> String {
+pub(super) fn majority(led: &BTreeMap<String, u32>) -> String {
     led.iter()
         .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
         .map(|(node, _)| node.clone())
@@ -260,11 +276,21 @@ pub fn plan(input: &PlanInput) -> LeaderPlan {
                 moves.push(planned);
             }
             Err((why, node)) => {
-                if !is_lasting(why) {
-                    // Counted where it will be once the return can happen.
-                    apply_to_load(&mut load, &units[i], &preferred);
+                if !is_lasting(why) && !input.automatic_return_off {
+                    // Counted where it will be once the automatic return has
+                    // dealt with it. A unit led from one node is returned
+                    // when its preferred node has been in sync long enough:
+                    // counted there. A split unit is not left waiting: the
+                    // rule gathers its strays on the node that leads most of
+                    // it at once, and the return follows.
+                    let to = if units[i].led.len() > 1 {
+                        units[i].home.clone()
+                    } else {
+                        preferred.clone()
+                    };
+                    apply_to_load(&mut load, &units[i], &to);
                     if in_view(&units[i].org) {
-                        apply_to_load(&mut shown, &units[i], &preferred);
+                        apply_to_load(&mut shown, &units[i], &to);
                     }
                     units[i].moved = true;
                 }
@@ -389,11 +415,13 @@ fn build_units(input: &PlanInput) -> Vec<Unit> {
             for r in &rows {
                 *led.entry(r.leader.clone()).or_insert(0) += 1;
             }
+            // The preferred node is the one every row names first; rows that
+            // disagree leave the unit with none (the automatic return reads
+            // it the same way, `leader_return::unanimous_preferred`).
             let mut preferred_votes: BTreeMap<String, u32> = BTreeMap::new();
             for r in &rows {
-                if let Some(first) = r.replicas.first() {
-                    *preferred_votes.entry(first.clone()).or_insert(0) += 1;
-                }
+                let first = r.replicas.first().cloned().unwrap_or_default();
+                *preferred_votes.entry(first).or_insert(0) += 1;
             }
             let source_partitions: Vec<u32> = rows
                 .iter()
@@ -410,7 +438,9 @@ fn build_units(input: &PlanInput) -> Vec<Unit> {
                 source_partitions,
                 weight: rows.len() as u32,
                 home: majority(&led),
-                preferred: (!preferred_votes.is_empty()).then(|| majority(&preferred_votes)),
+                preferred: (preferred_votes.len() == 1)
+                    .then(|| majority(&preferred_votes))
+                    .filter(|p| !p.is_empty()),
                 led,
                 rows: rows
                     .iter()
@@ -508,7 +538,10 @@ fn check(input: &PlanInput, unit: &Unit, to: &str) -> Result<(), (&'static str, 
 }
 
 /// A reason that will be the same next time: the return is not retried in the
-/// hope that it passes, and the unit is counted where it is.
+/// hope that it passes, and the unit is counted where it is. The automatic
+/// return (`leader_return`) holds the same two reasons that can arise on the
+/// leader (a paused group, a preferred node without forwarding) to be lasting
+/// and skips such a topic.
 fn is_lasting(why: &str) -> bool {
     matches!(
         why,
@@ -1155,6 +1188,65 @@ mod tests {
         assert_eq!(
             (after(&plan, "a"), after(&plan, "b"), after(&plan, "c")),
             (4, 4, 4)
+        );
+    }
+
+    /// A split topic whose return is blocked for now is counted on the node
+    /// that leads most of it: the automatic rule gathers it there at once
+    /// instead of waiting for the preferred node.
+    #[test]
+    fn a_split_topic_blocked_for_now_counts_on_the_node_that_leads_most_of_it() {
+        let mut parts = topic("t1", 2, "b", &["a", "b", "c"]);
+        let mut stray = topic("t1", 1, "c", &["a", "b", "c"]);
+        stray[0].partition = 2;
+        parts.extend(stray);
+        let mut facts = input(parts);
+        facts.vetoed.insert(
+            ("org-1".into(), "t1".into()),
+            (reason::TARGET_BEHIND.to_string(), Some("a".into())),
+        );
+        let plan = plan(&facts);
+        assert!(plan.moves.is_empty(), "{plan:?}");
+        assert_eq!(
+            (after(&plan, "a"), after(&plan, "b"), after(&plan, "c")),
+            (0, 3, 0),
+            "{plan:?}"
+        );
+    }
+
+    /// Rows that disagree on who is preferred leave the unit with none, as
+    /// they do for the automatic return: nothing is returned or counted at
+    /// either node.
+    #[test]
+    fn a_unit_whose_rows_disagree_on_the_preferred_node_has_none() {
+        let mut parts = topic("t1", 1, "b", &["a", "b"]);
+        let mut other = topic("t1", 1, "b", &["b", "a"]);
+        other[0].partition = 1;
+        parts.extend(other);
+        let plan = plan(&input(parts));
+        assert!(plan.moves.is_empty(), "{plan:?}");
+        assert!(plan.blockers.is_empty(), "{plan:?}");
+    }
+
+    /// With the automatic return switched off nothing brings the topic back
+    /// by itself, so a return blocked for now counts where the unit is.
+    #[test]
+    fn a_return_blocked_for_now_counts_where_the_unit_is_when_the_automatic_return_is_off() {
+        let mut parts = topic("t1", 4, "b", &["a", "b"]);
+        parts.extend(topic("t2", 4, "b", &["b", "c"]));
+        parts.extend(topic("t3", 4, "c", &["c", "a"]));
+        let mut facts = input(parts);
+        facts.automatic_return_off = true;
+        facts.vetoed.insert(
+            ("org-1".into(), "t1".into()),
+            (reason::TARGET_BEHIND.to_string(), Some("a".into())),
+        );
+        let plan = plan(&facts);
+        assert!(plan.moves.iter().all(|m| m.topic != "t1"), "{plan:?}");
+        assert_eq!(
+            (after(&plan, "a"), after(&plan, "b"), after(&plan, "c")),
+            (0, 8, 4),
+            "t1 stays counted on b: {plan:?}"
         );
     }
 

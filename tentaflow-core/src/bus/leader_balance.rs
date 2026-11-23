@@ -37,15 +37,18 @@ use std::time::{Duration, Instant};
 use super::leader_balance_plan::{self as planner, reason, PartitionFacts, PlanInput};
 pub use super::leader_balance_plan::{LeaderPlan, NodeLoad, PlanBlocker, PlannedMove};
 use super::replication::assignment::PartitionAssignment;
-use super::{dlq, BusService, NodeForwarding, ReplError, ReplicationCoordinator};
+use super::{dlq, BusService, ExpectedLeader, NodeForwarding, ReplError, ReplicationCoordinator};
 
 /// Audit action of a partition that changed leader through an admin action or
 /// a rebalance. Details: `instance_id=<id> org_id=<org> partition=<u32>
 /// from_node=<id|-> from_epoch=<u32> target_node_id=<id> leader_epoch=<u32>
-/// duration_ms=<u64> reason=<manual|rebalance|post_upgrade_spread|rollback>`.
+/// duration_ms=<u64> reason=<manual|rebalance|post_upgrade_spread|preferred_restore|
+/// rollback>`.
 pub const LEADER_TRANSFER_AUDIT_ACTION: &str = "bus.leader.transfer";
 
-/// Audit action summing up one run of moves for one organisation.
+/// Audit action summing up one run of moves for one organisation. The
+/// automatic return of a topic to its preferred leader (`leader_return`) writes
+/// one for its single move too, with `reason=preferred_restore`.
 pub const LEADER_REBALANCE_AUDIT_ACTION: &str = "bus.leader.rebalance";
 
 /// Audit action of a topic a one-off spread left where it was, with the reason.
@@ -56,7 +59,7 @@ pub const LEADER_REBALANCE_SKIPPED_AUDIT_ACTION: &str = "bus.leader.rebalance_sk
 pub const POST_UPGRADE_SPREAD_REASON: &str = "post_upgrade_spread";
 
 /// How long the nodes are asked what they accept when a plan is made.
-const PLAN_PROBE_BUDGET: Duration = Duration::from_secs(1);
+pub(super) const PLAN_PROBE_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long a rollback keeps trying to hand a partition back: the node that
 /// just took it over has to publish the move before the previous leader is
@@ -193,6 +196,8 @@ pub struct TopicMoveFailure {
     /// either in time: they may be led by the target or still by the old
     /// leader (which stays stopped until the ledger says).
     pub unresolved: Vec<(String, u32)>,
+    /// Another run holds this node's executor: nothing was tried.
+    pub busy: bool,
 }
 
 /// Who a run acts for, and why (the audit's `actor`/`reason`).
@@ -258,7 +263,7 @@ fn veto_of(e: &ReplError, target: &str, leader: &str) -> (String, Option<String>
 }
 
 /// The topic a (possibly dead-letter) topic belongs to.
-fn source_of(topic: &str) -> &str {
+pub(super) fn source_of(topic: &str) -> &str {
     topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX).unwrap_or(topic)
 }
 
@@ -351,11 +356,12 @@ impl BusService {
             vetoed: BTreeMap::new(),
             scope_org: None,
             scope_topic: None,
+            automatic_return_off: !self.leader_return_enabled(),
         })
     }
 
     /// The rows of the topic `unit` (source and DLQ), by `(org, source)`.
-    fn unit_rows<'a>(
+    pub(super) fn unit_rows<'a>(
         rows: &'a [PartitionAssignment],
         org: &str,
         unit: &str,
@@ -512,19 +518,20 @@ impl BusService {
             }
         }
         let coordinator = self.balance_coordinator()?;
-        Ok(self.execute_plan(&coordinator, run, plan.moves, true))
+        Ok(self.execute_plan(&coordinator, run, plan.moves, true, false))
     }
 
     /// Runs `moves` one after the other; with `stop_on_failure` the first
     /// failure stops the rest (reported as not attempted), otherwise the
     /// following moves still run. One `bus.leader.rebalance` audit row per
     /// organisation touched.
-    fn execute_plan(
+    pub(super) fn execute_plan(
         &self,
         coordinator: &Arc<dyn ReplicationCoordinator>,
         run: RunContext<'_>,
         moves: Vec<PlannedMove>,
         stop_on_failure: bool,
+        keep_order: bool,
     ) -> Vec<MoveResult> {
         let rows = match self.instance_rows() {
             Ok(rows) => rows,
@@ -542,7 +549,15 @@ impl BusService {
                 results.push(unattempted(mv, None));
                 continue;
             }
-            let outcome = self.move_unit(coordinator, &rows, run, &mv.org_id, &mv.topic, &mv.to);
+            let outcome = self.move_unit(
+                coordinator,
+                &rows,
+                run,
+                &mv.org_id,
+                &mv.topic,
+                &mv.to,
+                keep_order,
+            );
             let (status, error_code, detail) = match outcome {
                 Ok(_) => (MoveStatus::Moved, None, None),
                 Err(f) => {
@@ -647,6 +662,20 @@ impl BusService {
             status: MoveStatus::Failed,
             stranded: Vec::new(),
             unresolved: Vec::new(),
+            busy: false,
+        };
+        // The same lock as a plan's run: a manual move and a rebalance, the
+        // spread or the automatic return never move one topic at once on this
+        // node. (Another node's run is caught by the epoch each transfer
+        // expects.)
+        let Some(_running) = self.leader_balance_run.try_lock() else {
+            return Err(TopicMoveFailure {
+                busy: true,
+                ..refused(ReplError::TransferBlocked {
+                    topic: topic.to_string(),
+                    reason: "rebalance_busy".to_string(),
+                })
+            });
         };
         let coordinator = self.replication().ok_or_else(|| {
             refused(ReplError::Internal(
@@ -656,7 +685,7 @@ impl BusService {
         let rows = self
             .instance_rows()
             .map_err(|e| refused(ReplError::Internal(e.to_string())))?;
-        self.move_unit(&coordinator, &rows, run, org, source_of(topic), to)
+        self.move_unit(&coordinator, &rows, run, org, source_of(topic), to, false)
     }
 
     /// The whole-topic move (see the module doc). `rows` are the instance's
@@ -672,6 +701,7 @@ impl BusService {
         org: &str,
         unit: &str,
         to: &str,
+        keep_order: bool,
     ) -> Result<TopicMoved, TopicMoveFailure> {
         let local = coordinator.local_node_id();
         let all = Self::unit_rows(rows, org, unit);
@@ -680,6 +710,7 @@ impl BusService {
             status: MoveStatus::Failed,
             stranded: Vec::new(),
             unresolved: Vec::new(),
+            busy: false,
         };
         if all.is_empty() {
             return Err(refused(ReplError::NoAssignment {
@@ -718,7 +749,23 @@ impl BusService {
         let mut moved: Vec<(&PartitionAssignment, u32)> = Vec::new();
         for row in &todo {
             let started = Instant::now();
-            let result = match coordinator.transfer_leader(org, &row.topic, row.partition, to) {
+            // The rows were read for this run: a partition that has been moved
+            // since (by another node's run, an election) is refused by its
+            // leader. `keep_order` leaves the replica order as it is (a gather
+            // is not a choice of a new preferred node).
+            let expected = ExpectedLeader {
+                node_id: row.leader_node_id.clone(),
+                epoch: row.leader_epoch,
+            };
+            let order: &[String] = if keep_order { &row.replicas } else { &[] };
+            let result = match coordinator.transfer_leader_expecting(
+                org,
+                &row.topic,
+                row.partition,
+                to,
+                order,
+                &expected,
+            ) {
                 Ok(epoch) => Ok(epoch),
                 // No answer: the partition may have moved all the same. The
                 // row says which; only a row that does not say leaves the
@@ -797,9 +844,12 @@ impl BusService {
     }
 
     /// Hands every partition in `moved` (taken by `taken_by`) back to the
-    /// leader it had, with the replica order it had, in the reverse order.
-    /// `unresolved` are partitions of the failed move whose fate is not known:
-    /// they make the result partial, since the topic may be split.
+    /// leader it had, with the replica order it had, in the reverse order, but
+    /// only while `taken_by` still leads it at the epoch the move gave it: a
+    /// partition somebody moved on meanwhile is not taken back from where
+    /// they put it, and is reported with `unresolved`, as are the partitions
+    /// of the failed move whose fate is not known. Either makes the result
+    /// partial, since the topic may be split.
     #[allow(clippy::too_many_arguments)]
     fn roll_back(
         &self,
@@ -810,21 +860,35 @@ impl BusService {
         taken_by: &str,
         moved: &[(&PartitionAssignment, u32)],
         cause: ReplError,
-        unresolved: Vec<(String, u32)>,
+        mut unresolved: Vec<(String, u32)>,
     ) -> TopicMoveFailure {
         let mut stranded = Vec::new();
         for (row, taken_at_epoch) in moved.iter().rev() {
             let started = Instant::now();
             let deadline = started + ROLLBACK_WINDOW;
+            let still_taken = ExpectedLeader {
+                node_id: taken_by.to_string(),
+                epoch: *taken_at_epoch,
+            };
+            let mut moved_on = false;
             let restored = loop {
-                match coordinator.transfer_leader_restoring(
+                match coordinator.transfer_leader_expecting(
                     org,
                     &row.topic,
                     row.partition,
                     &row.leader_node_id,
                     &row.replicas,
+                    &still_taken,
                 ) {
                     Ok(epoch) => break Some(epoch),
+                    Err(e @ ReplError::NotPartitionLeader { .. }) => {
+                        tracing::warn!(
+                            org, topic = %row.topic, partition = row.partition, error = %e,
+                            "leader move: a partition was moved on by someone else and is not handed back"
+                        );
+                        moved_on = true;
+                        break None;
+                    }
                     Err(e) if Instant::now() >= deadline => {
                         tracing::warn!(
                             org, topic = %row.topic, partition = row.partition, error = %e,
@@ -848,6 +912,7 @@ impl BusService {
                     };
                     self.audit_transfer(local, run, org, &record, &row.leader_node_id, "rollback");
                 }
+                None if moved_on => unresolved.push((row.topic.clone(), row.partition)),
                 None => stranded.push((row.topic.clone(), row.partition)),
             }
         }
@@ -863,6 +928,7 @@ impl BusService {
             status,
             stranded,
             unresolved,
+            busy: false,
         }
     }
 
@@ -1012,7 +1078,7 @@ impl BusService {
             skip(&b.topic, &b.org_id, &b.reason, b.node_id.as_deref());
             transient |= !is_permanent_reason(&b.reason);
         }
-        let results = self.execute_plan(&coordinator, run, plan.moves, false);
+        let results = self.execute_plan(&coordinator, run, plan.moves, false, false);
         for r in results.iter().filter(|r| r.status != MoveStatus::Moved) {
             let code = r.error_code.as_deref().unwrap_or("not_attempted");
             skip(&r.topic, &r.org_id, code, Some(&r.to_node_id));

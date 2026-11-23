@@ -3747,6 +3747,23 @@ pub fn settings_update(
         }
     }
 
+    // TentaBus: the per-instance switch of the automatic return of topics to
+    // their preferred leader replicates, so it is checked before it is stored.
+    for entry in &payload.entries {
+        if let Err(problem) = crate::bus::leader_return::validate_switch_setting(
+            &entry.key,
+            &entry.value,
+            entry.is_secret,
+            &|instance| {
+                crate::bus::instance::BusInstanceId::parse(instance)
+                    .ok()
+                    .is_some_and(|id| crate::bus::instance(&id).is_some())
+            },
+        ) {
+            return Err(ProtocolError::bad_request(problem));
+        }
+    }
+
     // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
     // odrzucamy caly request, zeby nie zapisac nieuzywalnej lokalizacji.
     for entry in &payload.entries {

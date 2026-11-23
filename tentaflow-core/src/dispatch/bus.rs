@@ -5604,6 +5604,9 @@ async fn leader_transfer_v1(
 /// A failed whole-topic move as the error the client reads: the cause's own
 /// code, and what became of the partitions.
 fn map_topic_move_failure(failure: TopicMoveFailure) -> ProtocolError {
+    if failure.busy {
+        return map_leader_balance_error(LeaderBalanceError::Busy);
+    }
     let mut error = map_repl_error(failure.cause);
     match failure.status {
         MoveStatus::FailedRolledBack => error

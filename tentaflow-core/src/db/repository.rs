@@ -1058,8 +1058,19 @@ pub const SHARED_SETTING_KEYS: &[&str] = &[
     "tentanas.forward_allowlist",
 ];
 
+/// Prefixes of per-instance non-secret keys that replicate fleet-wide: a key
+/// is shared when it is a prefix followed by a non-empty suffix. Everything
+/// said of `SHARED_SETTING_KEYS` holds. `bus.leader_return:<instance>` is the
+/// TentaBus switch of the automatic return of topics to their preferred
+/// leader. A build that does not know a shared key records its op as a
+/// conflict (`apply_shared_setting_secret`) and goes on, which is harmless.
+pub const SHARED_SETTING_KEY_PREFIXES: &[&str] = &["bus.leader_return:"];
+
 pub fn is_shared_setting_key(key: &str) -> bool {
     SHARED_SETTING_KEYS.contains(&key)
+        || SHARED_SETTING_KEY_PREFIXES
+            .iter()
+            .any(|p| key.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
 }
 
 fn shared_secret_setting_fields(
@@ -5908,6 +5919,28 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                         None,
                     )?;
                     emitted += 1;
+                }
+                for prefix in SHARED_SETTING_KEY_PREFIXES {
+                    let mut stmt = tx.prepare(
+                        "SELECT key, value FROM settings WHERE substr(key, 1, length(?1)) = ?1 \
+                         AND length(key) > length(?1) ORDER BY key",
+                    )?;
+                    let found = stmt
+                        .query_map(rusqlite::params![prefix], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    for (key, value) in found {
+                        record_core_capture_tx(
+                            &tx,
+                            descriptor.kind,
+                            &key,
+                            Update,
+                            shared_secret_setting_fields(&key, &value),
+                            None,
+                        )?;
+                        emitted += 1;
+                    }
                 }
             }
             K::AddonInstance => {
@@ -26715,6 +26748,15 @@ mod shared_setting_allowlist_tests {
         assert!(is_shared_setting_key("mesh.iroh_relay_url"));
         assert!(is_shared_setting_key("oauth_redirect_base_url"));
         assert!(!is_shared_setting_key("totally_unknown_key"));
+        // The TentaBus switch is per instance, so it is shared by prefix; the
+        // bare prefix and the node-wide spelling are not keys.
+        assert!(is_shared_setting_key("bus.leader_return:tentabus-00000001"));
+        assert!(!is_shared_setting_key("bus.leader_return:"));
+        assert!(!is_shared_setting_key("bus.leader_return"));
+        // The spread's marker stays this node's own.
+        assert!(!is_shared_setting_key(
+            "bus.leader_spread:tentabus-00000001"
+        ));
         // Disjoint keyspaces — no key is both a shared secret and a shared plain.
         for &k in SHARED_SETTING_KEYS {
             assert!(!is_shared_secret_setting_key(k), "key '{k}' in both lists");

@@ -13,9 +13,14 @@ use super::super::leader_balance::{
 use super::super::replication::assignment::PartitionAssignment;
 use super::*;
 
-const ORG: &str = "org-1";
+pub(super) const ORG: &str = "org-1";
 
-fn row(topic: &str, partition: u32, leader: &str, replicas: &[&str]) -> PartitionAssignment {
+pub(super) fn row(
+    topic: &str,
+    partition: u32,
+    leader: &str,
+    replicas: &[&str],
+) -> PartitionAssignment {
     PartitionAssignment {
         instance_id: "tentabus-00000001".to_string(),
         org_id: ORG.to_string(),
@@ -33,38 +38,63 @@ fn row(topic: &str, partition: u32, leader: &str, replicas: &[&str]) -> Partitio
 
 /// A coordinator holding the assignments itself: a transfer rewrites its row
 /// the way the ledger would, and the ones named in `failing` are refused.
-struct ScriptedCoordinator {
+pub(super) struct ScriptedCoordinator {
     local: String,
-    rows: Mutex<Vec<PartitionAssignment>>,
-    forwarding: Mutex<HashMap<String, NodeForwarding>>,
+    pub(super) rows: Mutex<Vec<PartitionAssignment>>,
+    pub(super) forwarding: Mutex<HashMap<String, NodeForwarding>>,
     /// `(topic, partition)` whose real transfer fails (after the precheck).
-    failing: Mutex<HashSet<(String, u32)>>,
+    pub(super) failing: Mutex<HashSet<(String, u32)>>,
     /// `(topic, partition)` the dry run refuses as a paused group.
     refusing: Mutex<HashSet<(String, u32)>>,
     /// `(topic, partition)` the dry run refuses as a target that is behind.
-    behind: Mutex<HashSet<(String, u32)>>,
+    pub(super) behind: Mutex<HashSet<(String, u32)>>,
+    /// Nodes the dry run refuses as a target that is behind, for any partition.
+    pub(super) behind_nodes: Mutex<HashSet<String>>,
     /// `(topic, partition)` whose first real transfer gets no answer; the
     /// flag says whether the move was made all the same.
     unknown: Mutex<HashMap<(String, u32), bool>>,
     /// Every transfer made, as `topic/partition->target`, in order.
-    transfers: Mutex<Vec<String>>,
+    pub(super) transfers: Mutex<Vec<String>>,
+    /// The live state of the partitions this node leads, as the snapshot
+    /// reports it: `(topic, partition)` to the in-sync set. A partition with
+    /// no entry is not in the snapshot.
+    pub(super) live: Mutex<HashMap<(String, u32), Vec<String>>>,
+    /// How many records the preferred node is behind, per partition (0 when
+    /// not listed): `replica_record_gap`.
+    pub(super) gaps: Mutex<HashMap<(String, u32), u64>>,
+    /// Who led each partition when the coordinator was made: a transfer back
+    /// to it is a rollback, which `failing` and `unknown` do not touch.
+    first_leader: HashMap<(String, u32), String>,
+    /// Runs before every checked transfer, with no lock held: a stand-in for
+    /// someone else moving a partition in the meantime.
+    pub(super) before_transfer:
+        Mutex<Option<Box<dyn FnMut(&ScriptedCoordinator, &str, u32) + Send>>>,
 }
 
 impl ScriptedCoordinator {
     fn new(local: &str, rows: Vec<PartitionAssignment>) -> Arc<Self> {
+        let first_leader = rows
+            .iter()
+            .map(|r| ((r.topic.clone(), r.partition), r.leader_node_id.clone()))
+            .collect();
         Arc::new(Self {
+            first_leader,
+            gaps: Mutex::new(HashMap::new()),
+            before_transfer: Mutex::new(None),
             local: local.to_string(),
             rows: Mutex::new(rows),
             forwarding: Mutex::new(HashMap::new()),
             failing: Mutex::new(HashSet::new()),
             refusing: Mutex::new(HashSet::new()),
             behind: Mutex::new(HashSet::new()),
+            behind_nodes: Mutex::new(HashSet::new()),
             unknown: Mutex::new(HashMap::new()),
             transfers: Mutex::new(Vec::new()),
+            live: Mutex::new(HashMap::new()),
         })
     }
 
-    fn leaders_of(&self, topic: &str) -> Vec<String> {
+    pub(super) fn leaders_of(&self, topic: &str) -> Vec<String> {
         let mut rows: Vec<_> = self
             .rows
             .lock()
@@ -76,7 +106,7 @@ impl ScriptedCoordinator {
         rows.into_iter().map(|r| r.leader_node_id).collect()
     }
 
-    fn led_by(&self, node: &str) -> usize {
+    pub(super) fn led_by(&self, node: &str) -> usize {
         self.rows
             .lock()
             .iter()
@@ -90,8 +120,8 @@ impl ScriptedCoordinator {
         partition: u32,
         target: &str,
         replicas: Result<&str, &[String]>,
+        forward: bool,
     ) -> Result<u32, ReplError> {
-        let forward = replicas.is_ok();
         if self
             .failing
             .lock()
@@ -182,7 +212,7 @@ impl ReplicationCoordinator for ScriptedCoordinator {
         target: &str,
     ) -> Result<u32, ReplError> {
         // A move to a node that is not the preferred one makes it preferred.
-        self.move_row(topic, partition, target, Ok(target))
+        self.move_row(topic, partition, target, Ok(target), true)
     }
     fn transfer_leader_restoring(
         &self,
@@ -192,7 +222,56 @@ impl ReplicationCoordinator for ScriptedCoordinator {
         target: &str,
         replicas: &[String],
     ) -> Result<u32, ReplError> {
-        self.move_row(topic, partition, target, Err(replicas))
+        self.move_row(topic, partition, target, Err(replicas), false)
+    }
+    fn transfer_leader_expecting(
+        &self,
+        _org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        replicas: &[String],
+        expected: &ExpectedLeader,
+    ) -> Result<u32, ReplError> {
+        if let Some(hook) = self.before_transfer.lock().as_mut() {
+            hook(self, topic, partition);
+        }
+        let key = (topic.to_string(), partition);
+        {
+            let rows = self.rows.lock();
+            let row = rows
+                .iter()
+                .find(|r| r.topic == topic && r.partition == partition)
+                .ok_or_else(|| ReplError::NoAssignment {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+            if row.leader_node_id != expected.node_id || row.leader_epoch != expected.epoch {
+                return Err(ReplError::NotPartitionLeader {
+                    topic: topic.to_string(),
+                    partition,
+                    leader: row.leader_node_id.clone(),
+                });
+            }
+        }
+        let forward = self.first_leader.get(&key).map(String::as_str) != Some(target);
+        if replicas.is_empty() {
+            self.move_row(topic, partition, target, Ok(target), forward)
+        } else {
+            self.move_row(topic, partition, target, Err(replicas), forward)
+        }
+    }
+    fn replica_record_gap(&self, _: &str, topic: &str, partition: u32, _: &str) -> Option<u64> {
+        let led_here = self.rows.lock().iter().any(|r| {
+            r.topic == topic && r.partition == partition && r.leader_node_id == self.local
+        });
+        led_here.then(|| {
+            self.gaps
+                .lock()
+                .get(&(topic.to_string(), partition))
+                .copied()
+                .unwrap_or(0)
+        })
     }
     fn check_transfer(
         &self,
@@ -201,7 +280,9 @@ impl ReplicationCoordinator for ScriptedCoordinator {
         partition: u32,
         target: &str,
     ) -> Result<(), ReplError> {
-        if self.behind.lock().contains(&(topic.to_string(), partition)) {
+        if self.behind.lock().contains(&(topic.to_string(), partition))
+            || self.behind_nodes.lock().contains(target)
+        {
             return Err(ReplError::TransferTargetBehind {
                 topic: topic.to_string(),
                 partition,
@@ -224,9 +305,31 @@ impl ReplicationCoordinator for ScriptedCoordinator {
         Ok(0)
     }
     fn snapshot(&self, _: &str, _: Option<&str>) -> ReplicationSnapshot {
+        let live = self.live.lock();
+        let partitions = self
+            .rows
+            .lock()
+            .iter()
+            .filter(|r| r.leader_node_id == self.local)
+            .filter_map(|r| {
+                let isr = live.get(&(r.topic.clone(), r.partition))?;
+                Some(PartitionReplicaInfo {
+                    topic: r.topic.clone(),
+                    partition: r.partition,
+                    leader_node_id: Some(r.leader_node_id.clone()),
+                    leader_epoch: r.leader_epoch,
+                    replicas: r.replicas.clone(),
+                    isr: isr.clone(),
+                    lagging: Vec::new(),
+                    high_watermark: 0,
+                    log_end_offset: 0,
+                    unavailable_reason: None,
+                })
+            })
+            .collect();
         ReplicationSnapshot {
             nodes: Vec::new(),
-            partitions: Vec::new(),
+            partitions,
             failovers: Vec::new(),
         }
     }
@@ -247,7 +350,7 @@ impl ReplicationCoordinator for ScriptedCoordinator {
     }
 }
 
-fn service_with(
+pub(super) fn service_with(
     local: &str,
     rows: Vec<PartitionAssignment>,
 ) -> (tempfile::TempDir, BusService, Arc<ScriptedCoordinator>) {
@@ -257,7 +360,7 @@ fn service_with(
     (dir, svc, coordinator)
 }
 
-fn audit_details(svc: &BusService, action: &str) -> Vec<String> {
+pub(super) fn audit_details(svc: &BusService, action: &str) -> Vec<String> {
     let conn = svc.db.read().expect("db read");
     let mut stmt = conn
         .prepare("SELECT COALESCE(details, '') FROM audit_log WHERE action = ?1 ORDER BY rowid")
@@ -500,8 +603,12 @@ fn the_spread_after_an_upgrade_runs_once_and_is_audited_as_the_system() {
     );
 
     // Skew it again: the marker keeps the spread from running a second time.
-    coordinator.move_row("a", 0, "n1", Ok("n1")).expect("skew");
-    coordinator.move_row("b", 0, "n1", Ok("n1")).expect("skew");
+    coordinator
+        .move_row("a", 0, "n1", Ok("n1"), true)
+        .expect("skew");
+    coordinator
+        .move_row("b", 0, "n1", Ok("n1"), true)
+        .expect("skew");
     let transfers = coordinator.transfers.lock().len();
     assert_eq!(svc.run_post_upgrade_spread(), SpreadStatus::Done);
     assert_eq!(coordinator.transfers.lock().len(), transfers);

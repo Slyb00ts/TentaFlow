@@ -3990,6 +3990,19 @@ async fn place_internal_topic(
     topic: &str,
     leader: &str,
 ) {
+    place_internal_topic_on(nodes, ledger, org, topic, leader, &[leader]).await;
+}
+
+/// `place_internal_topic` with the replicas given (the first is the preferred
+/// leader), all of them in the in-sync set.
+async fn place_internal_topic_on(
+    nodes: &[TestNode],
+    ledger: &SharedLedger,
+    org: &str,
+    topic: &str,
+    leader: &str,
+    replicas: &[&str],
+) {
     let creator = find_node(nodes, "A");
     let row_cfg = tentaflow_core::bus::topics::create_internal_topic(
         &creator.db,
@@ -3998,7 +4011,7 @@ async fn place_internal_topic(
         topic,
         TopicOptions {
             partitions: Some(1),
-            replication_factor: Some(1),
+            replication_factor: Some(replicas.len() as u32),
             acks: Some(Acks::Leader),
             ..Default::default()
         },
@@ -4020,8 +4033,8 @@ async fn place_internal_topic(
         topic: topic.to_string(),
         partition: 0,
         leader_node_id: leader.to_string(),
-        replicas: vec![leader.to_string()],
-        isr: vec![leader.to_string()],
+        replicas: replicas.iter().map(|r| r.to_string()).collect(),
+        isr: replicas.iter().map(|r| r.to_string()).collect(),
         leader_epoch: 1,
         updated_at_ms: 0,
         topic_generation: row_cfg.generation,
@@ -4705,6 +4718,394 @@ async fn a_transfer_asked_of_any_member_runs_on_the_leader_and_a_refusal_keeps_i
             == Some("B"))
         .await,
         "B never took over"
+    );
+    shutdown_all(&nodes);
+}
+
+// ===== K6: the topic goes back to its preferred node ======================
+
+/// What the node's background loop (`init::spawn_leader_return_loop`) does,
+/// against this suite's node.
+fn spawn_leader_return_loop(node: &TestNode) {
+    let svc = Arc::clone(&node.svc);
+    let shutdown = node.manager.shutdown_token();
+    tokio::spawn(async move {
+        loop {
+            let pause = svc.leader_return_timing().sample_interval;
+            let tick = Arc::clone(&svc);
+            let stopping = shutdown.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                tick.leader_return_tick_at(std::time::Instant::now(), &|| stopping.is_cancelled())
+            })
+            .await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(pause) => {}
+            }
+        }
+    });
+}
+
+const RETURN_STABLE_FOR: Duration = Duration::from_secs(2);
+
+fn quick_return_timing() -> tentaflow_core::bus::leader_return::LeaderReturnTiming {
+    tentaflow_core::bus::leader_return::LeaderReturnTiming {
+        stable_for: RETURN_STABLE_FOR,
+        decision_interval: Duration::from_millis(300),
+        sample_interval: Duration::from_millis(100),
+        idle_interval: Duration::from_millis(100),
+    }
+}
+
+/// The preferred node leads, crashes, and a survivor takes over; the topic
+/// stays with the survivor while the preferred node is away, and goes back to
+/// it only after it has been back, in the leader's live in-sync set, for the
+/// stable time. A third node writes through forwarding the whole time: every
+/// write it was told was accepted is in the log of the preferred node after
+/// the return, and the replica order still names the preferred node first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topic_that_failed_over_goes_back_to_its_preferred_node_once_it_has_stayed_in_sync() {
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B", "C"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    assert!(
+        wait_isr_full(&nodes, TOPIC, "A", &["A", "B", "C"]).await,
+        "the ISR never filled"
+    );
+    let a = find_node(&nodes, "A");
+    for i in 0..20 {
+        publish_on(&a.svc, TOPIC, &format!("pre-{i}"))
+            .await
+            .expect("publish before the crash");
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            log_end_offset(find_node(&nodes, "B"), 0) >= 20
+                && log_end_offset(find_node(&nodes, "C"), 0) >= 20
+        })
+        .await,
+        "the followers never caught up"
+    );
+
+    // A crashes (the same way `crashed_leader_without_graceful_stop...` does).
+    registry.peers.lock().remove("A");
+    let a_pos = nodes.iter().position(|n| n.id == "A").expect("node A");
+    let crashed = nodes.remove(a_pos);
+    crashed.manager.shutdown();
+    drop(crashed);
+
+    assert!(
+        wait_until(Duration::from_secs(20), || leader_of(&nodes, TOPIC)
+            .is_some())
+        .await,
+        "no survivor took over"
+    );
+    let survivor = leader_of(&nodes, TOPIC).expect("one leader");
+    assert_ne!(survivor, "A");
+    let writer_node = nodes
+        .iter()
+        .find(|n| n.id != survivor)
+        .map(|n| n.id.clone())
+        .expect("the other survivor");
+    for node in &nodes {
+        node.svc.set_leader_return_timing(quick_return_timing());
+        spawn_leader_return_loop(node);
+    }
+
+    // The writer goes through the node that does not lead.
+    let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let svc = Arc::clone(&find_node(&nodes, &writer_node).svc);
+        let (acked, stop) = (Arc::clone(&acked), Arc::clone(&stop));
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                let payload = format!("w{i}");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    let attempt = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        publish_on(&svc, TOPIC, &payload),
+                    )
+                    .await;
+                    if matches!(attempt, Ok(Ok(ref r)) if r.accepted == 1) {
+                        acked.lock().push(payload);
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+
+    // The preferred node is away: well past the stable time, nothing returns.
+    tokio::time::sleep(RETURN_STABLE_FOR * 2).await;
+    assert_eq!(
+        leader_of(&nodes, TOPIC).as_deref(),
+        Some(survivor.as_str()),
+        "nothing to return to while the preferred node is away"
+    );
+
+    // A comes back with nothing on its disk, and is caught up by the leader.
+    let back = build_node(
+        "A",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+    );
+    let row = tentaflow_core::db::repository::bus_topic_get(
+        &find_node(&nodes, &survivor).db,
+        TEST_INSTANCE_ID,
+        ORG,
+        TOPIC,
+    )
+    .expect("read topic row")
+    .expect("topic row");
+    tentaflow_core::db::repository::bus_topic_create(&back.db, &row).expect("topic row on A");
+    back.svc.set_leader_return_timing(quick_return_timing());
+    spawn_background_loops(&back);
+    spawn_leader_return_loop(&back);
+    nodes.push(back);
+
+    let in_sync_since = {
+        let leader = find_node(&nodes, &survivor);
+        let joined = wait_until(Duration::from_secs(30), || {
+            leader
+                .manager
+                .snapshot(ORG, Some(TOPIC))
+                .partitions
+                .iter()
+                .any(|p| p.isr.iter().any(|n| n == "A"))
+        })
+        .await;
+        assert!(joined, "A never rejoined the in-sync set");
+        tokio::time::Instant::now()
+    };
+    assert_eq!(
+        leader_of(&nodes, TOPIC).as_deref(),
+        Some(survivor.as_str()),
+        "not returned the moment the node is back"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(40), || leader_of(&nodes, TOPIC)
+            .as_deref()
+            == Some("A"))
+        .await,
+        "the topic never went back to A: {:?}",
+        nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.manager.role(ORG, TOPIC, 0)))
+            .collect::<Vec<_>>()
+    );
+    // The clock starts at the first sample that saw A in sync, which may be
+    // one sample period before the poll above did.
+    assert!(
+        in_sync_since.elapsed() + quick_return_timing().sample_interval * 2 >= RETURN_STABLE_FOR,
+        "it went back before A had been in sync for the stable time"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.store(true, Ordering::SeqCst);
+    writer.await.expect("writer");
+
+    let acked = acked.lock().clone();
+    assert!(!acked.is_empty(), "the writer never got a write accepted");
+    let a = find_node(&nodes, "A");
+    let held = payloads_of(a, TOPIC);
+    for i in 0..20 {
+        assert!(held.contains(&format!("pre-{i}")), "pre-{i} was lost");
+    }
+    for payload in &acked {
+        assert!(
+            held.contains(payload),
+            "{payload} was accepted and is not in the log of A"
+        );
+    }
+
+    let rows = a
+        .ledger
+        .list_for_node(TEST_INSTANCE_ID, "A")
+        .expect("rows of A");
+    let row = rows
+        .iter()
+        .find(|r| r.topic == TOPIC && r.partition == 0)
+        .expect("row of the topic");
+    assert_eq!(row.replicas, vec!["A", "B", "C"], "the order is as placed");
+    assert_eq!(row.leader_node_id, "A");
+
+    let leader_node = find_node(&nodes, &survivor);
+    let transfers = audit_details_of(leader_node, "bus.leader.transfer");
+    assert!(
+        transfers
+            .iter()
+            .any(|d| d.contains("reason=preferred_restore") && d.contains("target_node_id=A")),
+        "{transfers:?}"
+    );
+    assert_eq!(
+        audit_details_of(leader_node, "bus.leader.rebalance").len(),
+        1,
+        "one aggregate row"
+    );
+    shutdown_all(&nodes);
+}
+
+/// Who leads partition `partition` of `topic`, if exactly one node says so.
+fn leader_of_partition(nodes: &[TestNode], topic: &str, partition: u32) -> Option<String> {
+    let leaders: Vec<&TestNode> = nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.manager.role(ORG, topic, partition),
+                PartitionRole::Leader { .. }
+            )
+        })
+        .collect();
+    (leaders.len() == 1).then(|| leaders[0].id.clone())
+}
+
+/// Every partition of the unit (two of `orders` and its DLQ) has one leader
+/// and it is `node`.
+fn unit_led_by(nodes: &[TestNode], node: &str) -> bool {
+    [(TOPIC, 0), (TOPIC, 1), ("__dlq.orders", 0)]
+        .iter()
+        .all(|(t, p)| leader_of_partition(nodes, t, *p).as_deref() == Some(node))
+}
+
+/// The preferred node A is away and the survivors share the unit: B leads
+/// partition 0, C leads partition 1 and the DLQ. The driver (B, the lowest
+/// leader) gathers the unit at once, with no wait for the stable time, onto
+/// C that leads most of it, and does not rewrite the replica order. When A is
+/// back and has stayed in sync, C returns the whole unit to A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topic_split_by_a_failover_is_gathered_at_once_and_goes_back_to_its_preferred_node() {
+    let stable_for = Duration::from_secs(4);
+    let timing = tentaflow_core::bus::leader_return::LeaderReturnTiming {
+        stable_for,
+        ..quick_return_timing()
+    };
+    let (mut nodes, ledger, registry) =
+        build_cluster_led_by(2, Acks::Leader, &["A", "B", "C"], |p| {
+            if p == 0 { "B" } else { "C" }.to_string()
+        })
+        .await;
+    place_internal_topic_on(&nodes, &ledger, ORG, "__dlq.orders", "C", &["A", "B", "C"]).await;
+
+    let a_pos = nodes.iter().position(|n| n.id == "A").expect("node A");
+    registry.peers.lock().remove("A");
+    let away = nodes.remove(a_pos);
+    away.manager.shutdown();
+    drop(away);
+    assert!(
+        !unit_led_by(&nodes, "B") && !unit_led_by(&nodes, "C"),
+        "the unit starts out split"
+    );
+    for node in &nodes {
+        spawn_background_loops(node);
+        node.svc.set_leader_return_timing(timing);
+        spawn_leader_return_loop(node);
+    }
+
+    let split_since = tokio::time::Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(20), || unit_led_by(&nodes, "C")).await,
+        "the split unit was never gathered: {:?}",
+        [(TOPIC, 0), (TOPIC, 1), ("__dlq.orders", 0)]
+            .iter()
+            .map(|(t, p)| leader_of_partition(&nodes, t, *p))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        split_since.elapsed() < stable_for,
+        "a split topic is gathered promptly, not after the stable time"
+    );
+    let driver = find_node(&nodes, "B");
+    let gathered = audit_details_of(driver, "bus.leader.transfer");
+    assert!(
+        gathered
+            .iter()
+            .any(|d| d.contains("reason=split_gather") && d.contains("target_node_id=C")),
+        "{gathered:?}"
+    );
+    for (topic, partition) in [(TOPIC, 0), (TOPIC, 1), ("__dlq.orders", 0)] {
+        let rows = find_node(&nodes, "C")
+            .ledger
+            .list_for_node(TEST_INSTANCE_ID, "C")
+            .expect("rows of C");
+        let row = rows
+            .iter()
+            .find(|r| r.topic == topic && r.partition == partition)
+            .expect("row");
+        assert_eq!(
+            row.replicas,
+            vec!["A", "B", "C"],
+            "the gather leaves the order alone: {topic}/{partition}"
+        );
+    }
+
+    // A comes back with nothing on its disk.
+    let back = build_node(
+        "A",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+    );
+    for topic in [TOPIC, "__dlq.orders"] {
+        let row = tentaflow_core::db::repository::bus_topic_get(
+            &find_node(&nodes, "C").db,
+            TEST_INSTANCE_ID,
+            ORG,
+            topic,
+        )
+        .expect("read topic row")
+        .expect("topic row");
+        tentaflow_core::db::repository::bus_topic_create(&back.db, &row).expect("topic row on A");
+    }
+    back.svc.set_leader_return_timing(timing);
+    spawn_background_loops(&back);
+    spawn_leader_return_loop(&back);
+    nodes.push(back);
+
+    let in_sync_since = {
+        let leader = find_node(&nodes, "C");
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                leader
+                    .manager
+                    .snapshot(ORG, None)
+                    .partitions
+                    .iter()
+                    .all(|p| {
+                        p.leader_node_id.as_deref() != Some("C") || p.isr.iter().any(|n| n == "A")
+                    })
+            })
+            .await,
+            "A never rejoined the in-sync set"
+        );
+        tokio::time::Instant::now()
+    };
+    assert!(
+        wait_until(Duration::from_secs(40), || unit_led_by(&nodes, "A")).await,
+        "the unit never went back to A"
+    );
+    assert!(
+        in_sync_since.elapsed() + timing.sample_interval * 2 >= stable_for,
+        "it went back before A had been in sync for the stable time"
+    );
+    let returns = audit_details_of(find_node(&nodes, "C"), "bus.leader.transfer");
+    assert!(
+        returns
+            .iter()
+            .any(|d| d.contains("reason=preferred_restore") && d.contains("target_node_id=A")),
+        "{returns:?}"
     );
     shutdown_all(&nodes);
 }

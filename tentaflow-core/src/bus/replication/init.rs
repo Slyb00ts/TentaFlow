@@ -286,6 +286,7 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         cfg.local_node_id.clone(),
     );
     spawn_leader_spread_loop(Arc::clone(&manager), Arc::downgrade(&svc));
+    spawn_leader_return_loop(Arc::clone(&manager), Arc::downgrade(&svc));
 
     #[cfg(test)]
     fire_pre_wiring_hook(&cfg.instance_id);
@@ -585,6 +586,43 @@ fn spawn_leader_spread_loop(manager: Arc<ReplicationManager>, svc: Weak<crate::b
                 Err(e) => {
                     tracing::warn!(error = %e, "leader spread: the look failed");
                     LEADER_SPREAD_LOOK_INTERVAL
+                }
+            };
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(pause) => {}
+            }
+        }
+    });
+}
+
+/// TB-04 K6: the automatic return of topics to their preferred leaders
+/// (`BusService::leader_return_tick`). The tick samples the in-sync sets every
+/// `sample_interval` and decides at most every `decision_interval`; this loop
+/// only calls it. Ends with the manager, or with the engine.
+fn spawn_leader_return_loop(manager: Arc<ReplicationManager>, svc: Weak<crate::bus::BusService>) {
+    let shutdown = manager.shutdown_token();
+    tokio::spawn(async move {
+        loop {
+            let Some(engine) = svc.upgrade() else {
+                return;
+            };
+            let timing = engine.leader_return_timing();
+            let stopping = shutdown.clone();
+            // The tick blocks on the ledger and on other nodes.
+            let tick = tokio::task::spawn_blocking(move || {
+                engine.leader_return_tick_at(std::time::Instant::now(), &|| stopping.is_cancelled())
+            })
+            .await;
+            let pause = match tick {
+                Ok(
+                    crate::bus::leader_return::LeaderReturnTick::NoReplication
+                    | crate::bus::leader_return::LeaderReturnTick::SingleNode,
+                ) => timing.idle_interval,
+                Ok(_) => timing.sample_interval,
+                Err(e) => {
+                    tracing::warn!(error = %e, "leader return: the tick failed");
+                    timing.sample_interval
                 }
             };
             tokio::select! {

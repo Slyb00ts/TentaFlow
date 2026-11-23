@@ -1069,6 +1069,145 @@ fn process_three_node_bus_publish_on_a_non_leader_node_reaches_the_leader() {
     assert_eq!(hash_a, hash_c);
 }
 
+// ===== The topic goes back to its preferred node (K6) ======================
+
+/// The preferred node is killed and restarted: the survivors elect a leader,
+/// and once the restarted node is back in the leader's live ISR and has stayed
+/// there for the (shortened) stable time, the leader hands the topic back to
+/// it by itself. What the survivors acknowledged meanwhile is on every node.
+#[test]
+fn process_three_node_bus_topic_returns_to_the_preferred_node_after_a_restart() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    const STABLE_SECS: &str = "5";
+    let env = [("TENTAFLOW_BUS_RETURN_STABLE_SECS", STABLE_SECS)];
+    let root = tempfile::tempdir().expect("root");
+    let home_a = root.path().join("a");
+
+    let mut a = ChildNode::spawn_with_env("a", home_a.clone(), &env);
+    let mut b = ChildNode::spawn_with_env("b", root.path().join("b"), &env);
+    let mut c = ChildNode::spawn_with_env("c", root.path().join("c"), &env);
+    connect_nodes(&mut a, &mut b);
+    connect_nodes(&mut a, &mut c);
+    connect_nodes(&mut b, &mut c);
+    create_topic_everywhere(&mut a, &mut [&mut b, &mut c]);
+
+    let leader_id = a.node_id.clone();
+    let replicas = vec![a.node_id.clone(), b.node_id.clone(), c.node_id.clone()];
+    assign_and_wait(
+        &mut a,
+        &mut [&mut b, &mut c],
+        &leader_id,
+        &replicas,
+        Duration::from_secs(30),
+    );
+    wait_live_isr(&mut a, &replicas, Duration::from_secs(30));
+    let mut total_acked = 0u64;
+    for _ in 0..2 {
+        let (base_offset, accepted, _hw) =
+            publish_batch(&mut a, Duration::from_secs(10)).expect("publish before the kill");
+        total_acked = base_offset + accepted as u64;
+    }
+
+    a.kill();
+    drop(a);
+    let settled = wait_settled_leader(&mut b, &mut c, Duration::from_secs(30));
+    let (leader, follower) = if settled == b.name {
+        (&mut b, &mut c)
+    } else {
+        (&mut c, &mut b)
+    };
+    let survivors = vec![leader.node_id.clone(), follower.node_id.clone()];
+    wait_live_isr(leader, &survivors, Duration::from_secs(30));
+    for _ in 0..2 {
+        let (base_offset, accepted, _hw) =
+            publish_batch(leader, Duration::from_secs(10)).expect("publish after the failover");
+        total_acked = total_acked.max(base_offset + accepted as u64);
+    }
+
+    let mut a2 = ChildNode::spawn_with_env("a-restart", home_a, &env);
+    assert_eq!(a2.node_id, leader_id, "the restart keeps its identity");
+    for peer in [&*leader, &*follower] {
+        a2.command(&format!(
+            "CONNECT {} {} {}",
+            peer.node_id, peer.public_key, peer.addr
+        ));
+        // The survivors' dial of the restarted node is the step the mesh
+        // layer is slow at (POSTEP.md, "transport").
+    }
+    for peer in [&mut *leader, &mut *follower] {
+        peer.command(&format!(
+            "CONNECT {} {} {}",
+            a2.node_id, a2.public_key, a2.addr
+        ));
+    }
+
+    // Back in the leader's live ISR first (the clock starts then), and then
+    // the topic comes home by itself.
+    let started = Instant::now();
+    let mut want = survivors.clone();
+    want.push(leader_id.clone());
+    wait_live_isr(leader, &want, Duration::from_secs(90));
+    let in_sync_after = started.elapsed();
+    eprintln!("k6: the restarted node is in the live ISR after {in_sync_after:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let role = role_of(&mut a2);
+        if role.contains("Leader {") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the topic never went back to the preferred node: a2={role} leader={} follower={}",
+            role_of(leader),
+            role_of(follower)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!(
+        "k6: back on the preferred node after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() >= in_sync_after + Duration::from_secs(4),
+        "it went back before the preferred node had been in sync for the stable time"
+    );
+    let line = wait_role(leader, "Follower", Duration::from_secs(30));
+    assert!(
+        line.contains(&leader_id),
+        "the old leader follows a: {line}"
+    );
+
+    // Writes go on through the preferred node, and every node holds the same
+    // log.
+    let (base_offset, accepted, _hw) =
+        publish_batch(&mut a2, Duration::from_secs(20)).expect("publish after the return");
+    total_acked = total_acked.max(base_offset + accepted as u64);
+    for node in [&mut a2, &mut *leader, &mut *follower] {
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, hw, _) = partition_stats(node);
+            if hw >= total_acked {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "{} did not reach hw={total_acked}",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+    let (hash_a, count_a) = hash_log(&mut a2, total_acked);
+    assert_eq!(count_a, total_acked, "nothing acknowledged was lost");
+    for node in [&mut *leader, &mut *follower] {
+        let (hash, count) = hash_log(node, total_acked);
+        assert_eq!((hash, count), (hash_a.clone(), count_a), "{}", node.name);
+    }
+}
+
 // ===== Topic re-creation across nodes (non-ignored) =========================
 //
 // A topic deleted on one node and created again under the same name is a
@@ -1959,6 +2098,19 @@ async fn child_main() {
         lease_check_interval: ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
     };
     let manager = replication_init(repl_cfg).await.expect("replication init");
+    // K6: a test that waits for a topic to go back to its preferred node
+    // cannot wait the five minutes of production.
+    if let Some(stable) = std::env::var("TENTAFLOW_BUS_RETURN_STABLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        svc.set_leader_return_timing(tentaflow_core::bus::leader_return::LeaderReturnTiming {
+            stable_for: Duration::from_secs(stable),
+            decision_interval: Duration::from_secs(1),
+            sample_interval: Duration::from_millis(500),
+            idle_interval: Duration::from_millis(500),
+        });
+    }
 
     let assignment_store = SqliteLedgerAssignmentStore::new(db.clone());
 

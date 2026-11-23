@@ -101,6 +101,7 @@ pub mod key_audit;
 pub mod lag_history;
 pub mod leader_balance;
 mod leader_balance_plan;
+pub mod leader_return;
 pub mod native;
 pub mod payload_format;
 pub mod producer;
@@ -2353,6 +2354,14 @@ pub struct ReplicationSnapshot {
     pub failovers: Vec<FailoverEventInfo>,
 }
 
+/// The row of a partition as a caller read it: the leader and the epoch the
+/// leader stood at (`ReplicationCoordinator::transfer_leader_expecting`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedLeader {
+    pub node_id: String,
+    pub epoch: u32,
+}
+
 /// What a peer is known to accept (`ReplicationCoordinator::node_forwarding`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeForwarding {
@@ -2456,6 +2465,41 @@ pub trait ReplicationCoordinator: Send + Sync {
     ) -> Result<u32, ReplError> {
         let _ = replicas;
         self.transfer_leader(org, topic, partition, target)
+    }
+    /// `transfer_leader_restoring` (or the plain transfer when `replicas` is
+    /// empty), refused with `ReplError::NotPartitionLeader` when the row of
+    /// the partition is no longer the one the caller read: led by someone
+    /// else, or at another epoch. A move planned from a read that has gone
+    /// stale (another admin, the automatic return, an election) therefore
+    /// cannot undo what happened since. Defaulted to the unchecked transfer.
+    fn transfer_leader_expecting(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        target: &str,
+        replicas: &[String],
+        expected: &ExpectedLeader,
+    ) -> Result<u32, ReplError> {
+        let _ = expected;
+        if replicas.is_empty() {
+            self.transfer_leader(org, topic, partition, target)
+        } else {
+            self.transfer_leader_restoring(org, topic, partition, target, replicas)
+        }
+    }
+    /// How many records the replica `node` is behind the log end of this
+    /// node's leader of the partition; `None` when this node does not lead it
+    /// or has no progress of the replica yet.
+    fn replica_record_gap(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        node: &str,
+    ) -> Option<u64> {
+        let _ = (org, topic, partition, node);
+        None
     }
     /// What `transfer_leader` would refuse on, without changing anything: the
     /// target must be in the leader's LIVE ISR and close enough behind it to
@@ -3247,6 +3291,9 @@ pub struct BusService {
     /// node's run is not excluded; the plan is re-read and compared
     /// (`bus.plan_changed`) instead.
     leader_balance_run: parking_lot::Mutex<()>,
+    /// The clocks and timings of the automatic return of topics to their
+    /// preferred leaders (`leader_return`).
+    leader_return: leader_return::LeaderReturnState,
     /// M2 (PLAN-M2 §1e, A9 debt): counts every `partition_handle` call
     /// (hit or miss) with a monotonically increasing sequence number, so
     /// `maybe_evict_lru_partition_handles` can find the truly
@@ -3626,6 +3673,7 @@ impl BusService {
             replication: Arc::new(parking_lot::RwLock::new(None)),
             assignment_store: parking_lot::RwLock::new(None),
             leader_balance_run: parking_lot::Mutex::new(()),
+            leader_return: leader_return::LeaderReturnState::default(),
             partition_access: DashMap::new(),
             partition_access_clock: AtomicU64::new(0),
             partition_handle_lru: cfg.partition_handle_lru,
@@ -11087,6 +11135,7 @@ mod tests {
     use super::*;
 
     mod leader_balance_tests;
+    mod leader_return_tests;
 
     struct AllowAllAuthorizer;
     impl BusAuthorizer for AllowAllAuthorizer {

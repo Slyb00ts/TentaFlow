@@ -194,6 +194,75 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   „Rozłóż prowadzenie”. Instalacja jednowęzłowa i węzeł, który rozkładu nie
   wykonuje, sprawdzają stan rzadko (co 10 min).
 
+- Automatyczny powrót topiku do węzła preferowanego: po awarii topik prowadzi
+  inny węzeł niż `replicas[0]`. Gdy węzeł preferowany wróci, lider topiku
+  oddaje mu go sam, bez koordynatora. Warunki, wszystkie naraz:
+  - węzeł preferowany jest w ŻYWYM ISR tego lidera i nie jest dalej niż 100
+    rekordów za końcem logu (to samo, co „bez lagu”, liczone z
+    `replica_progress`) nieprzerwanie od co najmniej 5 minut, dla każdej
+    partycji topiku i jego `__dlq.*` (jednostką jest cały topik z DLQ).
+    Stan ISR jest próbkowany co 5 s, decyzje zapadają co 30 s, więc
+    wypadnięcie z ISR zauważone przez próbkę zaczyna odliczanie od nowa
+    (wypadnięcie krótsze niż 5 s może umknąć). Odliczanie dotyczy epoki
+    lidera i generacji topiku: utrata i odzyskanie prowadzenia albo
+    ponowne utworzenie topiku zaczyna je od zera, tak samo restart węzła;
+  - węzeł preferowany przyjmuje przekazywane żądania;
+  - nic nie blokuje przeniesienia: pauza grupy konsumentów (jak przy
+    „Przenieś prowadzenie”, `bus.transfer_blocked`) zostawia topik na miejscu.
+  Powrót używa tego samego przeniesienia całego topiku co „Rozłóż prowadzenie”
+  (sprawdzenie każdej partycji u lidera, dogonienie celu, cofnięcie przy
+  błędzie) i nie zmienia `replicas[0]`. Idzie przez ten sam zamek wykonawcy co
+  ręczne przeniesienie, ręczny rozkład i rozkład po aktualizacji: gdy któryś
+  trwa, ten krok jest pomijany (bez błędu) i powtarzany przy następnej próbce.
+  Najwyżej jeden topik na 30 s na węzeł. Powrót, który się nie udał i niczego
+  nie przeniósł, zaczyna odliczanie topiku od nowa. Audyt: wiersze
+  `bus.leader.transfer` z `reason=preferred_restore` oraz jeden
+  `bus.leader.rebalance` (aktor `system`, `reason=preferred_restore`)
+  na powrót.
+- Topik rozdzielony po awarii (partycje wybrały liderów po kolei, więc
+  prowadzą go różne węzły, a taki topik nie da się czytać) zbiera jeden węzeł:
+  ten o najniższym id wśród liderów jego partycji. Nie czeka 5 minut. Jeśli
+  liderzy mówią, że węzeł preferowany może go teraz przejąć (sprawdzenie
+  na sucho każdej partycji), idzie do niego (`reason=preferred_restore`),
+  w przeciwnym razie na węzeł, który prowadzi największą część jednostki
+  (`reason=split_gather`, przy remisie najniższe id). Takie zebranie NIE
+  przepisuje `replicas[0]`: naprawia rozdzielenie, nie wybiera lidera,
+  a powrót do węzła preferowanego następuje potem zwykłą regułą. Przeniesienie,
+  które zostawiło topik rozdzielony (`failed_partial`), jest ponawiane
+  przy następnym przeglądzie jako zebranie; nieudane zebranie czeka dwa
+  przeglądy.
+- Przeniesienia nie mogą się już minąć: `TransferForward` niesie
+  oczekiwanego lidera i jego epokę (pole opcjonalne; starszy węzeł go nie
+  wysyła i nie sprawdza), a lider odmawia (`bus.not_leader`), gdy wiersz
+  partycji jest już inny niż ten, z którego liczono przeniesienie. To samo
+  dotyczy przeniesień lokalnych. Cofnięcie po błędzie oddaje partycję tylko
+  wtedy, gdy nadal prowadzi ją ten, kto ją wziął; wynik, który zostawił
+  część partycji gdzie indziej, jest raportowany jako `failed_partial`.
+  Ręczne „Przenieś prowadzenie” bierze ten sam zamek co plan i zwraca
+  `Busy`, gdy inny przebieg trwa. Zamek jest per węzeł; wyścig między
+  węzłami (ręczne przeniesienie na jednym, powrót na drugim) łapie sprawdzenie
+  epoki u lidera partycji, a nie zamek.
+- Wyłącznik powrotu jest per instancja i domyślnie WŁĄCZONY: klucz ustawień
+  `bus.leader_return:<instancja>` o wartości `on`/`off` (także `true`/`false`,
+  `1`/`0`), ustawiany zwykłym `SettingsUpdateRequest` (rola Admin). Obsługa
+  odrzuca instancję, której ten węzeł nie hostuje, wartość inną niż te
+  i ustawienie oznaczone jako sekret. Klucz jest replikowany przez Sync
+  Ledger do wszystkich węzłów (lista przedrostków `SHARED_SETTING_KEY_PREFIXES`,
+  bez migracji): wyłączenie na jednym węźle wyłącza powroty i zbieranie
+  na wszystkich. Węzeł ze starszą wersją nie zna klucza i zapisuje jego
+  operację jako konflikt bez skutków (działa domyślnie, czyli włączony).
+  Wartość nieczytelna jest traktowana jak `off` (ostrzeżenie najwyżej co
+  5 minut). Wyłączenie zeruje odliczanie.
+- Plan „Rozłóż prowadzenie” zakłada, że powrót zablokowany tylko chwilowo (cel
+  w tyle, poza ISR, niedostępny) nastąpi sam, czyli dokładnie to, co robi
+  powyższa reguła: topik prowadzony z jednego węzła liczy się przy węźle
+  preferowanym, a rozdzielony przy węźle, który prowadzi jego większość
+  (tam zbierze go reguła). Węzłem preferowanym jednostki jest ten, który
+  wymieniają jako pierwszy wszystkie jej wiersze; przy braku zgody nie ma
+  go ani plan, ani reguła. Powód trwały (pauza, węzeł bez przekazywania)
+  zostawia topik tam, gdzie jest, w planie i w regule. Przy wyłączonym
+  wyłączniku takie topiki są liczone tam, gdzie stoją.
+
 ### Limity i SLA usług (TB-03)
 
 - Migracje 211 i 212. 211 dodaje `service_sla_policies` i `service_sla_assignments`,
