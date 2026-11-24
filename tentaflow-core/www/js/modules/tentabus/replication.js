@@ -18,7 +18,8 @@ import { I18n } from '/js/i18n.js';
 import { patchHtml, patchKeyedList, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtSince, fmtWhen } from '/js/modules/tentabus/format.js';
 import { nodeRows, userTopics } from '/js/modules/tentabus/model.js';
-import { attentionRows, copyChipHtml, behindText, transferBlocker, unavailableText } from '/js/modules/tentabus/partitions.js';
+import { attentionRows, copyChipHtml, behindText, nodeNameHtml, transferBlocker, unavailableText } from '/js/modules/tentabus/partitions.js';
+import { nodeNamer, nodeTitler, nodeLabel, nodeTitle } from '/js/modules/tentabus/node-label.js';
 import {
   balanceModel, fmtNumber, fmtSigned, isOlderNode, leadershipUnits, pluralNumber, rebalanceAvailability,
 } from '/js/modules/tentabus/leader-balance.js';
@@ -47,7 +48,8 @@ export function lastSignal(node) {
  * how many each node leads, and how many of them need attention.
  */
 export function topicLeadRows({ topics, perTopic, nodes, attention }) {
-  const labels = new Map((nodes || []).map((n) => [n.nodeId, n.label || n.nodeId]));
+  const name = nodeNamer(nodes);
+  const titleOf = nodeTitler(nodes);
   const byTopic = new Map((perTopic || []).map((t) => [t.topic, t.partitions || []]));
   return userTopics(topics).map((t) => {
     const parts = byTopic.get(t.name) || [];
@@ -56,10 +58,39 @@ export function topicLeadRows({ topics, perTopic, nodes, attention }) {
     return {
       name: t.name,
       partitions: Number(t.partitions) || parts.length,
-      leads: [...leads.entries()].map(([id, n]) => ({ label: labels.get(id) || id, n })),
+      leads: [...leads.entries()].map(([id, n]) => ({ label: name(id), title: titleOf(id), n })),
       attention: (attention || []).filter((a) => a.topic === t.name).length,
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * One history out of the leadership changes every node reports. The audit log
+ * is kept per node, so a move started from one node is on that node alone:
+ * the lists are merged and a change several nodes know of is counted once
+ * (same topic, partition, epoch and moment).
+ */
+export function mergeFailovers(lists) {
+  const merged = new Map();
+  for (const list of lists || []) {
+    for (const f of list || []) {
+      const key = `${f.topic}|${f.partition}|${f.toEpoch}|${f.atMs}`;
+      if (!merged.has(key)) merged.set(key, f);
+    }
+  }
+  return [...merged.values()];
+}
+
+/**
+ * The leadership changes of the whole instance: this node's own (`own`) and
+ * those every other node that answers has in its audit log (`read(nodeId)`
+ * resolves that node's replica list, `{ failovers }`). A node that is down or
+ * does not answer adds nothing and breaks nothing.
+ */
+export async function collectFailovers({ own, nodes, read }) {
+  const others = (nodes || []).filter((n) => !n.isLocal && n.reachable !== false);
+  const lists = await Promise.all(others.map((n) => Promise.resolve().then(() => read(n.nodeId)).then((r) => r?.failovers || [], () => [])));
+  return mergeFailovers([own, ...lists]);
 }
 
 /** Leadership changes of the reader's topics, newest first. */
@@ -149,10 +180,10 @@ function countChip(host, n, status = 'neutral') {
   setAttr(host.firstElementChild, 'label', fmtCount(n));
 }
 
-function nodeCardSkeleton(id, label) {
+function nodeCardSkeleton(id, label, title) {
   return `
     <div class="tb-node-card" data-node="${escapeAttr(id)}">
-      <div class="tb-node-card-head">${sprite('cpu')}<span class="mono tb-node-name">${escapeHtml(label)}</span><tf-chip size="sm" variant="outline" status="warn" data-role="version" hidden></tf-chip><tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
+      <div class="tb-node-card-head">${sprite('cpu')}<span class="mono tb-node-name"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(label)}</span><tf-chip size="sm" variant="outline" status="warn" data-role="version" hidden></tf-chip><tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
       <div class="tb-stat-rows">
         <div class="sr"><span class="k">${escapeHtml(T('replication.node_leads'))}</span><span class="v" data-role="leads"></span></div>
         <div class="sr"><span class="k">${escapeHtml(T('replication.node_holds'))}</span><span class="v" data-role="holds"></span></div>
@@ -228,7 +259,7 @@ export function drawReplication(body, ctx) {
   if (mode === 'full') paint(body, view, ctx);
 }
 
-const nodeCell = (label) => `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(label)}</span></span>`;
+const nodeCell = (label, title = '') => `<span class="tf-table__cell--mono"${title ? ` title="${escapeAttr(title)}"` : ''}><span class="tf-table__cell-title">${escapeHtml(label)}</span></span>`;
 
 /** The topics a node leads, named when there are few of them. */
 function topicsText(names) {
@@ -247,7 +278,7 @@ const RETURN_AFTER_MS = 5 * 60_000;
  * again) gives "odpowiada od 3 min" and the earliest return; a node this page
  * has always seen answering has no such time, and the sentence leaves it out.
  */
-function balanceAlert(model, view, availability, labels) {
+function balanceAlert(model, view, availability, name) {
   if (availability.older.length) {
     return { tone: 'info', title: T('replication.balance_old_info_title', { nodes: availability.older.join(', ') }), message: T('replication.balance_old_info_text') };
   }
@@ -257,11 +288,12 @@ function balanceAlert(model, view, availability, labels) {
   const since = idle ? view.reachableSince?.get(idle.nodeId) : null;
   const upFor = since != null ? Math.max(0, view.nowMs - since) : null;
   let title;
-  if (idle && upFor != null) title = T('replication.balance_idle_since_title', { node: idle.label, since: fmtSince(since, view.nowMs) });
+  if (idle && upFor != null && upFor < 60_000) title = T('replication.balance_idle_just_now_title', { node: idle.label });
+  else if (idle && upFor != null) title = T('replication.balance_idle_since_title', { node: idle.label, since: fmtSince(since, view.nowMs) });
   else if (idle) title = T('replication.balance_idle_title', { node: idle.label });
   else title = T('replication.balance_away_title', { count: fmtCount(away.length), n: away.length });
   if (view.leaderReturn === false) return { tone: 'warning', title, message: T('replication.balance_away_manual') };
-  const where = [...new Set(away.map((u) => labels.get(u.preferredId) || u.preferredId))].join(', ');
+  const where = [...new Set(away.map((u) => name(u.preferredId)))].join(', ');
   let sentence = away.length === 1
     ? T('replication.balance_away_auto_one', { node: where })
     : T('replication.balance_away_auto_many', { count: fmtCount(away.length), n: away.length, node: where });
@@ -274,7 +306,9 @@ function balanceAlert(model, view, availability, labels) {
     const list = new Intl.ListFormat(I18n.getLanguage(), { type: 'conjunction' }).format(behind);
     sentence += `; ${T('replication.balance_away_catching', { list })}`;
   }
-  return { tone: 'warning', title, message: `${sentence}. ${T('replication.balance_away_now')}` };
+  // The offer is only made while the button that carries it out is there and enabled.
+  const canSpreadNow = Boolean(view.canAdmin) && !availability.reason;
+  return { tone: 'warning', title, message: canSpreadNow ? `${sentence}. ${T('replication.balance_away_now')}` : `${sentence}.` };
 }
 
 /**
@@ -288,7 +322,7 @@ function paintBalance(body, view) {
   setAttr(card, 'hidden', nodes.length < 2);
   if (nodes.length < 2) return;
   const language = I18n.getLanguage();
-  const labels = new Map(nodes.map((n) => [n.nodeId, n.label || n.nodeId]));
+  const name = nodeNamer(nodes);
   const units = leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
   const model = balanceModel({ units, nodes });
   const availability = rebalanceAvailability(nodes);
@@ -298,7 +332,7 @@ function paintBalance(body, view) {
   setAttr(button, 'disabled', Boolean(availability.reason));
   setAttr(button, 'title', availability.reason);
 
-  const alert = balanceAlert(model, view, availability, labels);
+  const alert = balanceAlert(model, view, availability, name);
   patchHtml(body.querySelector('[data-role="balance-alert"]'), alert
     ? `<tf-alert tone="${escapeAttr(alert.tone)}" title="${escapeAttr(alert.title)}" message="${escapeAttr(alert.message)}"></tf-alert>`
     : '');
@@ -309,15 +343,15 @@ function paintBalance(body, view) {
     const leaders = new Set(r.away.map((u) => u.leaderId));
     let awayCell = '0';
     if (awayNames.length) {
-      const where = leaders.size === 1 ? labels.get([...leaders][0]) || [...leaders][0] : '';
+      const where = leaders.size === 1 ? name([...leaders][0]) : '';
       const list = leaders.size === 1
         ? T(awayNames.length === 1 ? 'replication.balance_away_one' : 'replication.balance_away_many', { list: awayNames.join(', '), node: where })
-        : r.away.map((u) => `${u.name} (${labels.get(u.leaderId) || u.leaderId})`).join(', ');
+        : r.away.map((u) => `${u.name} (${name(u.leaderId)})`).join(', ');
       awayCell = `<span class="tf-chip tf-chip--outline warn">${escapeHtml(T('replication.balance_away_chip', { count: fmtCount(awayNames.length), n: awayNames.length }))}</span> <span class="tf-table__cell-sub">${escapeHtml(list)}</span>`;
     }
     const dev = T('replication.balance_dev', { value: fmtSigned(r.deviation, language), n: pluralNumber(Math.abs(r.deviation)) });
     return {
-      node: nodeCell(r.label),
+      node: nodeCell(r.label, r.title),
       leads: `<div class="tf-table__cell-title">${escapeHtml(T('replication.balance_partitions', { count: fmtCount(r.partitions), n: r.partitions }))}</div><div class="tf-table__cell-sub">${escapeHtml(topicsText(r.topics))}</div>`,
       dev: uneven ? `<span class="tb-warn-text">${escapeHtml(dev)}</span>` : escapeHtml(dev),
       away: awayCell,
@@ -355,7 +389,7 @@ function paint(body, view, ctx) {
   countChip(body.querySelector('[data-role="nodes-count"]'), nodes.length);
   setText(body.querySelector('[data-role="nodes-sub"]'), nodes.length === 1 ? T('replication.nodes_sub_single') : T('replication.nodes_sub'));
   const nodesHost = body.querySelector('[data-role="nodes"]');
-  patchKeyedList(nodesHost, nodes.map((n) => ({ key: n.nodeId, html: nodeCardSkeleton(n.nodeId, n.label || n.nodeId) })));
+  patchKeyedList(nodesHost, nodes.map((n) => ({ key: n.nodeId, html: nodeCardSkeleton(n.nodeId, nodeLabel(n), nodeTitle(n)) })));
   nodes.forEach((n, i) => {
     const card = nodesHost.children[i];
     if (!card) return;
@@ -373,7 +407,7 @@ function paint(body, view, ctx) {
     const older = nodes.length > 1 && isOlderNode(n);
     setAttr(version, 'hidden', !older);
     setAttr(version, 'label', older ? T('replication.balance_old_chip') : null);
-    setAttr(version, 'title', older ? T('replication.balance_old_title', { node: n.label || n.nodeId }) : null);
+    setAttr(version, 'title', older ? T('replication.balance_old_title', { node: nodeLabel(n) }) : null);
   });
 
   paintBalance(body, view);
@@ -388,7 +422,7 @@ function paint(body, view, ctx) {
     const justMoved = moved.has(a.key);
     return {
       where: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(a.topic)}</span></span><div class="tf-table__cell-sub">${escapeHtml(T('partitions.name_lower', { n: fmtCount(a.partition) }))}${justMoved ? ` · ${escapeHtml(T('partitions.just_changed'))}` : ''}</div>`,
-      leader: a.leader ? `<span class="tf-table__cell--mono">${escapeHtml(a.leader)}</span>` : '—',
+      leader: a.leader ? nodeNameHtml(a.leader, a.leaderTitle) : '—',
       copies: a.copies.map(copyChipHtml).join(' '),
       behind: a.unavailable
         ? `<span class="tf-chip tf-chip--outline err">${escapeHtml(unavailableText(a.unavailable))}</span>`
@@ -439,6 +473,7 @@ function paint(body, view, ctx) {
     patchHtml(chip, r.attention ? '<tf-chip size="sm" variant="outline" status="warn"></tf-chip>' : '');
     setAttr(chip.firstElementChild, 'label', T('replication.topic_attention', { count: fmtCount(r.attention), n: r.attention }));
     const leads = r.leads.map((l) => `${l.label} ${fmtCount(l.n)}`).join(', ');
+    setAttr(row.querySelector('[data-role="sub"]'), 'title', r.leads.filter((l) => l.title).map((l) => `${l.label}: ${l.title}`).join('\n') || null);
     setText(row.querySelector('[data-role="sub"]'), [
       T('overview.topic_partitions', { count: fmtCount(r.partitions), n: r.partitions }),
       leads ? T('replication.topic_leads', { list: leads }) : '',
@@ -450,7 +485,8 @@ function paint(body, view, ctx) {
   countChip(body.querySelector('[data-role="changes-count"]'), changes.length);
   body.querySelector('[data-role="changes-none"]').hidden = changes.length > 0;
   const changesHost = body.querySelector('[data-role="changes"]');
-  const labels = new Map((nodes || []).map((n) => [n.nodeId, n.label || n.nodeId]));
+  const name = nodeNamer(nodes);
+  const titleOf = nodeTitler(nodes);
   const keyOf = (f) => `${f.topic}|${f.partition}|${f.atMs}|${f.toEpoch}`;
   patchKeyedList(changesHost, changes.map((f) => ({ key: keyOf(f), html: changeRowSkeleton(keyOf(f)) })));
   changes.forEach((f, i) => {
@@ -459,14 +495,16 @@ function paint(body, view, ctx) {
     setText(row.querySelector('[data-role="name"]'), T('replication.change_name', {
       topic: f.topic,
       partition: fmtCount(f.partition),
-      from: labels.get(f.fromNode) || f.fromNode || '—',
-      to: labels.get(f.toNode) || f.toNode,
+      from: name(f.fromNode) || '—',
+      to: name(f.toNode),
     }));
+    // A node shown by its short id: the full ids of the two nodes of the move.
+    setAttr(row.querySelector('[data-role="name"]'), 'title', [titleOf(f.fromNode), titleOf(f.toNode)].filter(Boolean).join(' → ') || null);
     setText(row.querySelector('[data-role="when"]'), fmtWhen(f.atMs, view.nowMs));
     const secs = (Number(f.durationMs) || 0) / 1000;
-    setText(row.querySelector('[data-role="took"]'), T('replication.change_took', {
-      secs: new Intl.NumberFormat(I18n.getLanguage(), { maximumFractionDigits: 1 }).format(secs),
-    }));
-    setText(row.querySelector('[data-role="why"]'), failoverReason({ ...f, fromNode: labels.get(f.fromNode) || f.fromNode }));
+    setText(row.querySelector('[data-role="took"]'), secs < 1
+      ? T('replication.change_took_short')
+      : T('replication.change_took', { secs: new Intl.NumberFormat(I18n.getLanguage(), { maximumFractionDigits: 1 }).format(secs) }));
+    setText(row.querySelector('[data-role="why"]'), failoverReason({ ...f, fromNode: name(f.fromNode) }));
   });
 }

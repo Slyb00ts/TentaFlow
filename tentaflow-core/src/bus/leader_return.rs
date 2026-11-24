@@ -37,7 +37,10 @@
 //    its own live ISR and the catch-up of the target): to the preferred node
 //    when every stray can go there now (the leaders' dry-run checks stand in
 //    for the 5 minutes), otherwise onto the node that leads most of the
-//    unit. A gather onto a node that is not the preferred one does NOT
+//    unit. A unit whose rows disagree on the preferred node has none to gather
+//    on: its strays go onto the node that leads most of it, and the way to
+//    the preferred node (the plurality one) is case 1, with its clock. A
+//    gather onto a node that is not the preferred one does NOT
 //    rewrite `replicas[0]` (`keep_order`): it is a repair of a split, not a
 //    choice of a leader, and the return to the true preferred node follows
 //    by case 1. A split is gathered at the next look, with no 5 minutes.
@@ -68,15 +71,19 @@
 // requests) is never made here, and the planner counts the topic where it is.
 // With the switch off nothing is moved automatically, so the planner stops
 // counting on it (`PlanInput::automatic_return_off`). The preferred node of a
-// unit is the one every row names first (`unanimous_preferred`); rows that
-// disagree leave it with none, in the rule and in the planner alike.
+// unit is the one most rows name first (`plurality_preferred`), a tie going to
+// the node that leads most of it, in the rule and in the planner alike. Rows
+// that disagree are healed: a unit led by its preferred node alone has the
+// replica order of the stray rows rewritten (`DueKind::Align`, reorder-only,
+// audited as `bus.leader.align`), and one led
+// elsewhere returns, which rewrites the order of every row it moves.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::leader_balance::{source_of, MoveStatus, RunContext, PLAN_PROBE_BUDGET};
-use super::leader_balance_plan::{is_internal, majority, PlannedMove};
+use super::leader_balance_plan::{is_internal, majority, plurality_preferred, PlannedMove};
 use super::replication::assignment::PartitionAssignment;
 use super::{parse_autocreate_setting, BusService, NodeForwarding, ReplicationCoordinator};
 
@@ -87,6 +94,13 @@ pub const PREFERRED_RESTORE_REASON: &str = "preferred_restore";
 /// `reason` of the audit rows of a split topic gathered on the node that led
 /// most of it.
 pub const SPLIT_GATHER_REASON: &str = "split_gather";
+
+/// `action` of the audit row of a partition whose replica order was rewritten
+/// so that it names the preferred node of its topic first.
+pub const LEADER_ALIGN_AUDIT_ACTION: &str = "bus.leader.align";
+
+/// `reason` of those rows.
+pub const PREFERRED_ALIGN_REASON: &str = "preferred_align";
 
 /// How many records the preferred node may be behind the leader's log end and
 /// still count as in sync for the clock. A busy topic is never exactly level.
@@ -190,6 +204,13 @@ pub(super) enum DueKind {
         /// The node that leads most of the unit (lowest id on a tie).
         home: String,
     },
+    /// Led from this node alone, which is its preferred node, while some rows
+    /// still name another node first (a transfer that raced an election left
+    /// them behind). Nothing moves; the replica order of those rows is
+    /// rewritten, each as `(topic, partition, epoch it was read at, replicas)`.
+    Align {
+        stray: Vec<(String, u32, u32, Vec<String>)>,
+    },
 }
 
 /// A topic that may be moved now.
@@ -210,15 +231,47 @@ struct Clock {
     since: Instant,
 }
 
-/// The node every row of the unit names first: its preferred leader. Rows
-/// that disagree, or name none, leave the unit with no preferred node. The
-/// planner reads it the same way (`leader_balance_plan::build_units`).
-pub(super) fn unanimous_preferred<'a>(rows: &[&'a PartitionAssignment]) -> Option<&'a str> {
+/// The preferred node of a unit: the one most of its rows name first, a tie
+/// going to the node that leads most of it (`plurality_preferred`). Rows that
+/// disagree therefore still leave the unit one preferred node to return to,
+/// where reading them as unanimous-or-nothing skipped the topic for good.
+pub(super) fn unit_preferred(
+    rows: &[&PartitionAssignment],
+    led: &BTreeMap<String, u32>,
+) -> Option<String> {
+    plurality_preferred(
+        rows.iter()
+            .map(|r| r.replicas.first().map(String::as_str).unwrap_or("")),
+        led,
+    )
+}
+
+/// The node every row of the unit names first, `None` when they disagree.
+fn unanimous_preferred(rows: &[&PartitionAssignment]) -> Option<String> {
     let first = rows.first()?.replicas.first()?;
-    rows.iter()
-        .all(|r| r.replicas.first() == Some(first))
-        .then_some(first.as_str())
-        .filter(|p| !p.is_empty())
+    (!first.is_empty() && rows.iter().all(|r| r.replicas.first() == Some(first)))
+        .then(|| first.clone())
+}
+
+/// The preferred node of every unit `(organisation, source topic)` of `rows`.
+fn preferred_by_unit(rows: &[PartitionAssignment]) -> HashMap<(String, String), String> {
+    let mut units: BTreeMap<(&str, &str), Vec<&PartitionAssignment>> = BTreeMap::new();
+    for row in rows {
+        units
+            .entry((row.org_id.as_str(), source_of(&row.topic)))
+            .or_default()
+            .push(row);
+    }
+    units
+        .into_iter()
+        .filter_map(|((org, topic), members)| {
+            let mut led: BTreeMap<String, u32> = BTreeMap::new();
+            for r in &members {
+                *led.entry(r.leader_node_id.clone()).or_insert(0) += 1;
+            }
+            unit_preferred(&members, &led).map(|p| ((org.to_string(), topic.to_string()), p))
+        })
+        .collect()
 }
 
 /// Since when each partition's preferred node has been in sync, without a
@@ -325,24 +378,44 @@ impl PreferredStability {
             for r in &members {
                 *led.entry(r.leader_node_id.clone()).or_insert(0) += 1;
             }
-            let preferred = unanimous_preferred(&members);
+            let preferred = unit_preferred(&members, &led);
             let kind = if led.len() == 1 {
                 if led.keys().next().map(String::as_str) != Some(local) {
                     continue;
                 }
-                let Some(to) = preferred.filter(|p| *p != local) else {
+                let Some(to) = preferred.as_deref() else {
                     continue;
                 };
-                if !members.iter().all(|r| self.stable(r, to, now, needed)) {
-                    continue;
+                if to == local {
+                    let stray: Vec<(String, u32, u32, Vec<String>)> = members
+                        .iter()
+                        .filter(|r| r.replicas.first().map(String::as_str) != Some(local))
+                        .map(|r| {
+                            let mut order = vec![local.to_string()];
+                            order.extend(r.replicas.iter().filter(|n| *n != local).cloned());
+                            (r.topic.clone(), r.partition, r.leader_epoch, order)
+                        })
+                        .collect();
+                    if stray.is_empty() {
+                        continue;
+                    }
+                    DueKind::Align { stray }
+                } else {
+                    if !members.iter().all(|r| self.stable(r, to, now, needed)) {
+                        continue;
+                    }
+                    DueKind::Return { to: to.to_string() }
                 }
-                DueKind::Return { to: to.to_string() }
             } else {
                 if led.keys().next().map(String::as_str) != Some(local) {
                     continue;
                 }
                 DueKind::Split {
-                    preferred: preferred.map(str::to_string),
+                    // Only a node every row names first is a place to gather
+                    // on. Rows that disagree leave the strays to the node that
+                    // leads most of the unit: the way back to the preferred
+                    // node is the return, with its clock.
+                    preferred: unanimous_preferred(&members),
                     home: majority(&led),
                 }
             };
@@ -396,6 +469,12 @@ pub enum LeaderReturnTick {
         org: String,
         topic: String,
         to: String,
+    },
+    /// The rows of a topic led by its preferred node that named another node
+    /// first were rewritten to name it first.
+    Aligned {
+        org: String,
+        topic: String,
     },
     /// A split topic was gathered on `to`.
     Gathered {
@@ -491,18 +570,22 @@ impl BusService {
         if nodes.len() < 2 {
             return LeaderReturnTick::SingleNode;
         }
+        let preferred = preferred_by_unit(&rows);
         let displaced = |r: &&PartitionAssignment| {
-            r.leader_node_id == local && r.replicas.first().is_some_and(|p| *p != local)
+            r.leader_node_id == local
+                && preferred
+                    .get(&(r.org_id.clone(), source_of(&r.topic).to_string()))
+                    .is_some_and(|p| *p != local)
         };
-        let has_split = self
+        let has_unit_work = self
             .leader_return
             .inner
             .lock()
             .stability
             .due_units(&rows, &local, now, Duration::MAX)
             .iter()
-            .any(|u| matches!(u.kind, DueKind::Split { .. }));
-        if !rows.iter().any(|r| displaced(&r)) && !has_split {
+            .any(|u| matches!(u.kind, DueKind::Split { .. } | DueKind::Align { .. }));
+        if !rows.iter().any(|r| displaced(&r)) && !has_unit_work {
             self.leader_return.inner.lock().stability.clear();
             return LeaderReturnTick::Idle;
         }
@@ -551,6 +634,15 @@ impl BusService {
                     .contains_key(&(unit.org.clone(), unit.topic.clone()))
             {
                 continue;
+            }
+            if matches!(unit.kind, DueKind::Align { .. }) {
+                if cancelled() {
+                    return LeaderReturnTick::Cancelled;
+                }
+                match self.align_due_unit(&coordinator, timing, now, unit) {
+                    LeaderReturnTick::Idle => continue,
+                    done => return done,
+                }
             }
             let Some((to, keep_order)) = self.target_of(&coordinator, &rows, &local, &unit) else {
                 continue;
@@ -612,6 +704,7 @@ impl BusService {
                     None
                 }
             }
+            DueKind::Align { .. } => None,
             DueKind::Split { preferred, home } => {
                 let unit_rows = Self::unit_rows(rows, &unit.org, &unit.topic);
                 if let Some(p) = preferred.as_deref().filter(|p| capable(p)) {
@@ -629,6 +722,87 @@ impl BusService {
                 (preferred.as_deref() != Some(home.as_str())).then(|| (home.clone(), true))
             }
         }
+    }
+
+    /// Rewrites the replica order of the stray rows of a unit led by its
+    /// preferred node, so that every row names that node first. The leader
+    /// stays; each row is reordered only (`reorder_replicas`: a new epoch of
+    /// the same leader, refused for a row that is no longer the one planned
+    /// from) and audited.
+    fn align_due_unit(
+        &self,
+        coordinator: &Arc<dyn ReplicationCoordinator>,
+        timing: LeaderReturnTiming,
+        now: Instant,
+        unit: DueUnit,
+    ) -> LeaderReturnTick {
+        let DueKind::Align { stray } = unit.kind else {
+            return LeaderReturnTick::Idle;
+        };
+        let local = coordinator.local_node_id();
+        let mut aligned = 0usize;
+        for (topic, partition, epoch, order) in &stray {
+            match coordinator.reorder_replicas(&unit.org, topic, *partition, *epoch, order) {
+                // The row is not the one planned from (a node left, a move
+                // was made): nothing is rewritten, the next look plans anew.
+                Ok(None) => {}
+                Ok(Some(new_epoch)) => {
+                    aligned += 1;
+                    self.audit_align(&unit.org, topic, *partition, order, new_epoch, &local);
+                }
+                Err(e) => {
+                    tracing::warn!(org = %unit.org, %topic, partition, error = %e, "leader return: the preferred node of a partition could not be aligned with its topic");
+                    self.leader_return.inner.lock().backoff.insert(
+                        (unit.org.clone(), unit.topic.clone()),
+                        now + timing.decision_interval * 2,
+                    );
+                    return LeaderReturnTick::Failed {
+                        org: unit.org,
+                        topic: unit.topic,
+                        to: local,
+                        code: e.to_string(),
+                        partial: aligned > 0,
+                    };
+                }
+            }
+        }
+        if aligned == 0 {
+            return LeaderReturnTick::Idle;
+        }
+        tracing::info!(org = %unit.org, topic = %unit.topic, rows = aligned, "leader return: the preferred node of every partition now agrees");
+        LeaderReturnTick::Aligned {
+            org: unit.org,
+            topic: unit.topic,
+        }
+    }
+
+    /// One `bus.leader.align` row: the persisted preferred node of the
+    /// partition changed, by the system, with no leader move.
+    fn audit_align(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        order: &[String],
+        epoch: u32,
+        local: &str,
+    ) {
+        let _ = crate::db::repository::log_audit(
+            &self.db,
+            None,
+            None,
+            LEADER_ALIGN_AUDIT_ACTION,
+            Some(topic),
+            Some(&format!(
+                "instance_id={} org_id={org} partition={partition} leader_node_id={local} \
+                 preferred_node_id={} replicas={} leader_epoch={epoch} reason={PREFERRED_ALIGN_REASON}",
+                self.instance_id,
+                order.first().map(String::as_str).unwrap_or(""),
+                order.join(","),
+            )),
+            None,
+            Some(local),
+        );
     }
 
     fn move_due_unit(
@@ -707,12 +881,13 @@ impl BusService {
         rows: &[PartitionAssignment],
         local: &str,
     ) -> Vec<Observation> {
+        let preferred_nodes = preferred_by_unit(rows);
         let displaced: Vec<(&PartitionAssignment, &String)> = rows
             .iter()
             .filter(|r| r.leader_node_id == local)
             .filter_map(|r| {
-                r.replicas
-                    .first()
+                preferred_nodes
+                    .get(&(r.org_id.clone(), source_of(&r.topic).to_string()))
                     .filter(|p| p.as_str() != local && !p.is_empty())
                     .map(|p| (r, p))
             })

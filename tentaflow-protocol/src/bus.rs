@@ -1149,7 +1149,7 @@ pub struct BusLeaderBlockerWire {
     pub topic: String,
     /// 'node_unreachable' | 'node_without_forwarding' | 'target_outside_isr'
     /// | 'target_behind' | 'consumer_group_paused' | 'no_admin_right' |
-    /// 'leader_unavailable'.
+    /// 'leader_unavailable' | 'would_not_improve'.
     pub reason: String,
     #[serde(default)]
     pub node_id: Option<String>,

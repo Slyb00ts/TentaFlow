@@ -75,8 +75,9 @@ const REPLY_MARGIN: Duration = Duration::from_secs(5);
 const REPLY_RESERVE: Duration = Duration::from_secs(1);
 
 /// `ForwardError::code` of a refusal made by the forwarding layer itself (not
-/// by the publish pipeline): wrong instance or environment, a sender that is
-/// not a replica, no handler installed.
+/// by the publish pipeline): `unknown_instance`, `environment_mismatch` or
+/// `handler_failed`. Any member of the instance and environment may forward;
+/// the sender is not checked to be a replica.
 pub const CODE_FORWARD_REFUSED: &str = "bus.forward_refused";
 
 /// Why a forwarding attempt produced no answer from the leader. What the

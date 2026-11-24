@@ -627,16 +627,20 @@ fn map_repl_error(e: ReplError) -> ProtocolError {
             ProtocolErrorCode::Conflict,
             format!("bus.not_leader: epoch fenced have={have} requested={requested}"),
         ),
+        // The leader is named the way a refused read or write names it, so one
+        // reader of the text finds `leader_node_id` and `leader_epoch` in every
+        // `bus.not_leader`; none is named when none is known.
         ReplError::NotPartitionLeader {
-            topic,
-            partition,
             leader,
+            leader_epoch,
+            ..
         } => ProtocolError::new(
             ProtocolErrorCode::Conflict,
-            format!(
-                "bus.not_leader: only the leader '{leader}' of '{topic}'/{partition} may add \
-                 nodes to its replica set"
-            ),
+            if leader.is_empty() {
+                format!("bus.not_leader: epoch={leader_epoch}")
+            } else {
+                format!("bus.not_leader: leader_node_id={leader} leader_epoch={leader_epoch}")
+            },
         ),
         ReplError::TransferTargetBehind {
             topic,
@@ -5068,6 +5072,61 @@ fn replica_node_wire(n: &ReplicaNodeInfo) -> BusReplicaNodeWire {
     }
 }
 
+/// Gives every node of the replica view the name the app already shows for it
+/// (`app_route::node_display_name`: this machine's hostname for the local node,
+/// the mesh hostname of a peer, then the name the sync registry recorded).
+/// A node with no name keeps an EMPTY label, never its id: the screen shows a
+/// short id for it.
+///
+/// Reads the sync registry (SQLite), so it runs on the blocking pool.
+fn label_nodes(state: &super::state::AppState, nodes: &mut [BusReplicaNodeWire]) {
+    let names: Vec<(String, String)> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.node_id.clone(),
+                super::app_route::node_display_name_in(state, &n.node_id),
+            )
+        })
+        .collect();
+    let labels =
+        disambiguate_node_labels(names, |id| super::app_route::registry_name_in(state, id));
+    for node in nodes {
+        node.label = labels.get(&node.node_id).cloned().unwrap_or_default();
+    }
+}
+
+/// Two nodes on one machine share its hostname, and a label that cannot tell
+/// two nodes apart is worse than none. Nodes that share one fall back to the
+/// name the sync registry holds for them (`registry_name`), and any that still
+/// share a label end up with an empty one.
+fn disambiguate_node_labels(
+    names: Vec<(String, String)>,
+    registry_name: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, String> {
+    let shared = |labels: &[(String, String)], name: &str| {
+        !name.is_empty() && labels.iter().filter(|(_, other)| other == name).count() > 1
+    };
+    let mut labels = names;
+    let before = labels.clone();
+    let mut fell_back = std::collections::HashSet::new();
+    for (id, name) in labels.iter_mut() {
+        if shared(&before, name) {
+            *name = registry_name(id).unwrap_or_default();
+            fell_back.insert(id.clone());
+        }
+    }
+    // Only a name that was a fallback gives way to a clash: a node whose own,
+    // unique hostname happens to equal another node's registry name keeps it.
+    let before = labels.clone();
+    for (id, name) in labels.iter_mut() {
+        if fell_back.contains(id) && shared(&before, name) {
+            name.clear();
+        }
+    }
+    labels.into_iter().collect()
+}
+
 fn replica_lag_wire(l: &ReplicaLagInfo) -> BusReplicaLagWire {
     BusReplicaLagWire {
         node_id: l.node_id.clone(),
@@ -5340,19 +5399,13 @@ async fn replica_list_v1(
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
-    let local_label = ctx
-        .state
-        .mesh_peer_store
-        .get_hostname(&local_node_id)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| local_node_id.clone());
 
     let topic_for_snapshot = topic.clone();
     let org_id_for_snapshot = org_id.clone();
     let db_for_snapshot = db.clone();
     let bctx_for_snapshot = bctx.clone();
     let local_node_id_for_snapshot = local_node_id.clone();
-    let local_label_for_snapshot = local_label.clone();
+    let state_for_labels = ctx.state.clone();
     let svc = g.svc.clone();
     let (nodes, partitions) = run_blocking(move || -> Result<_, ProtocolError> {
         let svc = svc;
@@ -5428,7 +5481,10 @@ async fn replica_list_v1(
         }
         let node = BusReplicaNodeWire {
             node_id: local_node_id_for_snapshot.clone(),
-            label: local_label_for_snapshot,
+            label: super::app_route::node_display_name_in(
+                &state_for_labels,
+                &local_node_id_for_snapshot,
+            ),
             environment: env.as_str().to_string(),
             is_local: true,
             reachable: true,
@@ -5440,6 +5496,14 @@ async fn replica_list_v1(
             forwarding: Some(forwarding_wire(NodeForwarding::Capable).to_string()),
         };
         Ok((vec![node], partitions_wire))
+    })
+    .await?;
+
+    let state_for_names = ctx.state.clone();
+    let nodes = run_blocking(move || {
+        let mut nodes = nodes;
+        label_nodes(&state_for_names, &mut nodes);
+        Ok(nodes)
     })
     .await?;
 
@@ -5961,6 +6025,39 @@ mod tests {
             .message
             .starts_with("bus.schema_compare_too_complex: 's' mode=backward"));
     }
+    #[test]
+    fn nodes_sharing_a_hostname_fall_back_to_their_registry_name_then_to_none() {
+        let ids = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(i, n)| (i.to_string(), n.to_string()))
+                .collect()
+        };
+        let none = |_: &str| None;
+        let unique = disambiguate_node_labels(ids(&[("a", "mini"), ("b", "")]), none);
+        assert_eq!((unique["a"].as_str(), unique["b"].as_str()), ("mini", ""));
+
+        let registry = |id: &str| (id == "a").then(|| "node A".to_string());
+        let shared = disambiguate_node_labels(ids(&[("a", "mini"), ("b", "mini")]), registry);
+        assert_eq!((shared["a"].as_str(), shared["b"].as_str()), ("node A", ""));
+
+        let same = |_: &str| Some("one".to_string());
+        let clash = disambiguate_node_labels(ids(&[("a", "mini"), ("b", "mini")]), same);
+        assert_eq!((clash["a"].as_str(), clash["b"].as_str()), ("", ""));
+
+        // A fallback that lands on another node's own, unique hostname gives
+        // way; the node that owns the hostname keeps it.
+        let lands_on_c = |id: &str| (id == "a").then(|| "node C".to_string());
+        let kept = disambiguate_node_labels(
+            ids(&[("a", "mini"), ("b", "mini"), ("c", "node C")]),
+            lands_on_c,
+        );
+        assert_eq!(
+            (kept["a"].as_str(), kept["b"].as_str(), kept["c"].as_str()),
+            ("", "", "node C")
+        );
+    }
+
     use crate::db::models::AuditLogFilters;
     use crate::db::DbPool;
     use std::sync::{Mutex, OnceLock};
@@ -8186,6 +8283,26 @@ mod tests {
                 },
                 ProtocolErrorCode::Conflict,
                 "bus.not_leader:",
+            ),
+            (
+                ReplError::NotPartitionLeader {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    leader: "n1".to_string(),
+                    leader_epoch: 7,
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.not_leader: leader_node_id=n1 leader_epoch=7",
+            ),
+            (
+                ReplError::NotPartitionLeader {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    leader: String::new(),
+                    leader_epoch: 7,
+                },
+                ProtocolErrorCode::Conflict,
+                "bus.not_leader: epoch=7",
             ),
             (
                 ReplError::TransferTargetBehind {

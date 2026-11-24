@@ -139,3 +139,24 @@ test('a key\'s consumer is named after its key; a gone key\'s consumer is said t
   assert.deepEqual(consumersFooter(shown), { consumers: 2, waiting: 5, paused: 0 });
   assert.equal(filterConsumerRows(rows, { query: 'portal' }).rows.length, 1, 'found by the key\'s name');
 });
+
+test('pause and resume wait on a node that does not lead the topic, and say which node does', async () => {
+  const nodes = [{ nodeId: 'here', label: 'Serwer A', isLocal: true }, { nodeId: 'there', label: 'Serwer B' }];
+  const ledBy = (topic, leader) => ({ topic, partitions: [{ partition: 0, leaderNodeId: leader, replicas: ['here', 'there'] }] });
+  const { body, moves } = mount({ nodes, replicaTopics: [ledBy('wyniki-badan', 'there'), ledBy('faktury', 'here')] });
+  await tick();
+  const table = body.querySelector('[data-role="table"]');
+  const actionsOf = (group) => {
+    const idx = table.rows.findIndex((r) => r._group === group);
+    return table.rowActions(table.rows[idx], idx, () => table.rows[idx]);
+  };
+  const away = actionsOf('aplikacja-lekarza').querySelector('[data-act="pause"]');
+  assert.equal(away.hasAttribute('disabled'), true);
+  assert.equal(away.title, 'Ten topik prowadzi node Serwer B — odbiorcę wstrzymasz i wznowisz tam.');
+  away.click();
+  assert.deepEqual(moves, []);
+  const home = actionsOf('system-rozliczen').querySelector('[data-act="resume"]');
+  assert.equal(home.hasAttribute('disabled'), false);
+  home.click();
+  assert.deepEqual(moves, [{ kind: 'resume', group: 'system-rozliczen', topic: 'faktury' }]);
+});

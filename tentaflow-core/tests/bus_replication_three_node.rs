@@ -1991,6 +1991,109 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
     a.manager.shutdown();
 }
 
+/// A lone leader at RF = 2 with `acks=leader` has to keep making what it
+/// appends readable: `hw` follows the leader's own appends once the follower
+/// is gone, because nothing else (no ack, no ISR change) moves it any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_rf2_leader_keeps_its_appends_readable_after_the_follower_dies() {
+    let (nodes, _ledger, _registry) = build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    spawn_background_loops(a);
+    spawn_background_loops(b);
+    let isr_of_a = |node: &TestNode| -> Vec<String> {
+        node.manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .map(|info| info.isr.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || isr_of_a(a)
+            .iter()
+            .any(|m| m == "B"))
+        .await,
+        "the follower never joined the in-sync set"
+    );
+    publish_text(a, Some(0), "before-1").await.expect("publish");
+    publish_text(a, Some(0), "before-2").await.expect("publish");
+
+    b.manager.shutdown();
+    assert!(
+        wait_until(Duration::from_secs(10), || !isr_of_a(a)
+            .iter()
+            .any(|m| m == "B"))
+        .await,
+        "the leader never dropped the dead follower from its in-sync set"
+    );
+
+    for i in 0..5 {
+        publish_text(a, Some(0), &format!("alone-{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("publish {i} with the follower dead: {e:?}"));
+    }
+    assert_eq!(log_end_offset(a, 0), 7);
+    assert_eq!(
+        high_watermark(a, 0),
+        7,
+        "records the leader accepted must be readable"
+    );
+    let read = consume_bounded(a, ctx(), "fresh-group", 1024 * 1024, usize::MAX)
+        .await
+        .expect("a new consumer reads on the lone leader");
+    assert_eq!(read.len(), 7, "a new group reads every accepted record");
+    shutdown_all(&nodes);
+}
+
+/// What a node that does not lead shows as the in-sync set of a partition is
+/// the leader's live one, within a heartbeat, not the set the replicated row
+/// carried since the last placement change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_shows_the_leaders_live_in_sync_set_not_the_one_of_the_row() {
+    let (nodes, _ledger, _registry) = build_cluster(1, Acks::Quorum).await;
+    assert!(
+        wait_for_hello_handshake(&nodes, 1, Duration::from_secs(10)).await,
+        "the Hello handshake never completed"
+    );
+    let b = find_node(&nodes, "B");
+    // The row B holds names the leader alone as in sync: what a placement
+    // change that happened before the followers caught up leaves behind.
+    let mut stale = assignment(topic_generation(b), &["A", "B", "C"], "A", 1, 0);
+    stale.isr = vec!["A".to_string()];
+    b.manager.apply_assignment(stale).await;
+
+    let isr_on_b = || -> Vec<String> {
+        let mut isr = b
+            .manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .map(|info| info.isr.clone())
+            .unwrap_or_default();
+        isr.sort();
+        isr
+    };
+    let everyone = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    assert!(
+        wait_until(Duration::from_secs(5), || isr_on_b() == everyone).await,
+        "B shows {:?}, the leader's live set is {everyone:?}",
+        isr_on_b()
+    );
+
+    // And it follows the leader when a member leaves.
+    find_node(&nodes, "C").manager.shutdown();
+    let without_c = vec!["A".to_string(), "B".to_string()];
+    assert!(
+        wait_until(Duration::from_secs(15), || isr_on_b() == without_c).await,
+        "B shows {:?} after C left, the leader's live set is {without_c:?}",
+        isr_on_b()
+    );
+    shutdown_all(&nodes);
+}
+
 // ===== Scenario 4: Z12 — environment mismatch rejected both ways =========
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2842,7 +2945,12 @@ async fn a_replica_that_was_away_gets_the_commit_of_an_idle_group_when_it_rejoin
         (4, 2),
         "the replica's lag is the leader's"
     );
-    assert!(group_row(b, GROUP).is_some(), "and it lists the group");
+    // The group row travels in its own frame, a coalescing window after the
+    // commit that the waits above saw.
+    assert!(
+        wait_until(Duration::from_secs(10), || group_row(b, GROUP).is_some()).await,
+        "and it lists the group"
+    );
     shutdown_all(&nodes);
 }
 

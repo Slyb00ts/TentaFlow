@@ -2398,14 +2398,14 @@ pub enum ReplError {
     /// A change only the partition's leader may make — adding a node to its
     /// replica set, which hands that node an epoch slot — was asked of
     /// another node.
-    #[error(
-        "'{topic}'/{partition}: only its leader '{leader}' may add nodes to its replica set; \
-         make the change on that node"
-    )]
+    #[error("bus.not_leader: leader_node_id={leader} leader_epoch={leader_epoch}")]
     NotPartitionLeader {
         topic: String,
         partition: u32,
+        /// Empty when none is known (a transfer in flight).
         leader: String,
+        /// The epoch of the row that names `leader`.
+        leader_epoch: u32,
     },
     /// A leadership transfer was refused because the target is in the live
     /// ISR but has not caught up with the leader's log, and did not within the
@@ -2691,6 +2691,23 @@ pub trait ReplicationCoordinator: Send + Sync {
         partition: Option<u32>,
         replicas: &[String],
     ) -> Result<u32, ReplError>;
+    /// Rewrites only the ORDER of the replicas of one partition this node
+    /// leads, a new epoch of the same leader. It does nothing, and says so
+    /// with `Ok(None)`, unless the row now held has the same set of nodes
+    /// as `order` and is still at `expected_epoch` (the epoch the caller
+    /// planned from): a node evicted or a move made since is not undone.
+    /// `Ok(Some(epoch))` is the epoch the new order was proposed at.
+    fn reorder_replicas(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        expected_epoch: u32,
+        order: &[String],
+    ) -> Result<Option<u32>, ReplError> {
+        let _ = (org, topic, partition, expected_epoch, order);
+        Ok(None)
+    }
     /// Snapshot for the M06 UI/`ReplicaListResponse` (`topic: None` means
     /// every topic in `org`).
     fn snapshot(&self, org: &str, topic: Option<&str>) -> ReplicationSnapshot;
@@ -5747,7 +5764,8 @@ impl BusService {
                 placed += 1;
             }
         }
-        all_replicas.sort();
+        // Placement order: the leader (the preferred node) first, then the
+        // others as the partitions took them.
         Some((placed, all_replicas))
     }
 
@@ -20750,8 +20768,8 @@ mod tests {
         let details = audit_details_of(&svc, "bus.topic.create", "k4.spread");
         assert!(details.contains(" leader=node-c leader_rf=3 "), "{details}");
         assert!(
-            details.contains("replicas=node-a,node-b,node-c"),
-            "{details}"
+            details.contains("replicas=node-c,node-a,node-b"),
+            "the replicas are listed in placement order, leader first: {details}"
         );
     }
 

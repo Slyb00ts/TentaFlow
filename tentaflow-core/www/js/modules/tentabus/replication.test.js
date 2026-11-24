@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
-const { drawReplication, lastSignal, topicLeadRows, readerFailovers, failoverReason } = await import('./replication.js');
+const { drawReplication, lastSignal, topicLeadRows, readerFailovers, failoverReason, mergeFailovers, collectFailovers } = await import('./replication.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ');
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -355,4 +355,124 @@ test('the history lists each partition\'s change with its reason, newest first',
     'automatyczny rozkład po aktualizacji nodów',
   ]);
   assert.match(text(rows[0].querySelector('[data-role="name"]')), /wyniki · partycja 2: prowadzenie przeszło z Serwer B na Serwer A/);
+});
+
+// ---------------------------------------------------------------------------
+// TB-04 K10: node names, the warning that matches the button, a truthful
+// "since", the history of every node, "<1 s" and counts that agree.
+// ---------------------------------------------------------------------------
+
+const HEX_A = '41291e2758d793a2d740f5db7d7c99141f32f02199c1427803d4373636e7ca57';
+const HEX_B = '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54';
+
+test('a node without a label is named by its first 8 characters, the full id in a tooltip, everywhere it is named', async () => {
+  const unnamed = [{ ...A, nodeId: HEX_A, label: '' }, { ...B, nodeId: HEX_B, label: HEX_B }];
+  const hexLed = (topic, count, id) => ({
+    topic,
+    partitions: Array.from({ length: count }, (_, partition) => ({
+      partition, leaderNodeId: id, replicas: [id, id === HEX_A ? HEX_B : HEX_A], preferredLeaderNodeId: id, isr: [HEX_A, HEX_B], lagging: [],
+    })),
+  });
+  const { body } = mountBalance({ nodesList: unnamed, perTopic: [hexLed('wyniki', 6, HEX_B), hexLed('odczyty', 4, HEX_A)] });
+  await tick();
+  const cards = [...body.querySelectorAll('.tb-node-card .tb-node-name')];
+  assert.deepEqual(cards.map((c) => c.textContent), ['41291e27', '365123c5']);
+  assert.deepEqual(cards.map((c) => c.getAttribute('title')), [HEX_A, HEX_B]);
+  const rows = body.querySelector('[data-role="balance"]').rows;
+  assert.match(rows[0].node, /41291e27/);
+  assert.match(rows[0].node, new RegExp(`title="${HEX_A}"`));
+  // The full id is only ever a tooltip, never visible text.
+  const visible = (body.innerHTML + rows.map(({ node, leads, dev, away }) => [node, leads, dev, away].join(' ')).join(' ')).replace(/(?:title|data-node)="[^"]*"/g, '');
+  assert.doesNotMatch(visible, /[0-9a-f]{20}/);
+  const sub = body.querySelector('[data-role="topics"] [data-topic="wyniki"] [data-role="sub"]');
+  assert.match(sub.textContent, /prowadzą: 41291e27 0, 365123c5 6/);
+  assert.match(sub.getAttribute('title'), new RegExp(HEX_B));
+});
+
+test('a labelled node keeps its label and carries no tooltip', async () => {
+  const { body } = mountBalance();
+  await tick();
+  const name = body.querySelector('.tb-node-card[data-node="a"] .tb-node-name');
+  assert.equal(name.textContent, 'Serwer A');
+  assert.equal(name.hasAttribute('title'), false);
+});
+
+test('the warning does not offer the spread while its button is disabled or hidden', async () => {
+  const down = mountBalance({ nodesList: [A, { ...B, reachable: false }], perTopic: unevenTopics });
+  await tick();
+  assert.equal(down.body.querySelector('[data-role="rebalance"]').hasAttribute('disabled'), true);
+  const downAlert = down.body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.ok(downAlert, 'the topics away from home are still said');
+  assert.doesNotMatch(downAlert.getAttribute('message'), /Możesz też rozłożyć/);
+  const reader = mountBalance({ perTopic: unevenTopics, canAdmin: false });
+  await tick();
+  assert.doesNotMatch(reader.body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('message'), /Możesz też rozłożyć/);
+  const admin = mountBalance({ perTopic: unevenTopics });
+  await tick();
+  assert.match(admin.body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('message'), /Możesz też rozłożyć prowadzenie teraz\.$/);
+});
+
+test('"odpowiada od" is rounded down and says "przed chwilą" under a minute', async () => {
+  const title = async (agoMs) => {
+    const { body } = mountBalance({ perTopic: unevenTopics, reachableSince: new Map([['b', Date.now() - agoMs]]) });
+    await tick();
+    return body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('title');
+  };
+  assert.equal(await title(11_000), 'Serwer B odpowiada dopiero przed chwilą i nie prowadzi jeszcze żadnego topiku.');
+  assert.equal(await title(59_000), 'Serwer B odpowiada dopiero przed chwilą i nie prowadzi jeszcze żadnego topiku.');
+  assert.equal(await title(61_000), 'Serwer B odpowiada od 1 min, ale nie prowadzi żadnego topiku.');
+  assert.equal(await title(119_000), 'Serwer B odpowiada od 1 min, ale nie prowadzi żadnego topiku.', 'rounded down, never up to 2');
+});
+
+test('a change that took milliseconds says "<1 s"; a longer one keeps its seconds', async () => {
+  const at = Date.now();
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  const history = [
+    { atMs: at - 3000, topic: 'wyniki', partition: 0, fromNode: 'b', toNode: 'a', toEpoch: 4, durationMs: 32, reason: 'manual_transfer' },
+    { atMs: at - 2000, topic: 'wyniki', partition: 1, fromNode: 'a', toNode: 'b', toEpoch: 5, durationMs: 1800, reason: 'manual_transfer' },
+  ];
+  drawReplication(body, { view: () => ({ nodes: pair, replicaTopics: evenTopics, failovers: history, topics: listOf(...evenTopics), canAdmin: true, notice: null, justMoved: new Set(), leaderReturn: true, nowMs: at }), go() {} });
+  await tick();
+  const took = [...body.querySelectorAll('[data-change] [data-role="took"]')].map((e) => text(e));
+  assert.ok(took[0].includes('trwało 1,8 s'), took[0]);
+  assert.ok(took[1].includes('trwało <1 s'), took[1]);
+});
+
+const change = (topic, partition, toEpoch, atMs, extra = {}) => ({ topic, partition, toEpoch, atMs, fromNode: 'a', toNode: 'b', durationMs: 10, reason: 'manual_transfer', ...extra });
+
+test('the history is every node\'s audit merged, a change both nodes know counted once', () => {
+  const fromA = [change('wyniki', 0, 4, 1000), change('wyniki', 1, 4, 1000), change('faktury', 0, 2, 500)];
+  const fromB = [change('wyniki', 0, 4, 1000), change('przyjecia', 0, 7, 2000, { fromNode: 'b', toNode: 'a' })];
+  const merged = mergeFailovers([fromA, fromB, null, undefined]);
+  assert.equal(merged.length, 4);
+  assert.deepEqual(merged.map((f) => `${f.topic}/${f.partition}@${f.toEpoch}`).sort(), ['faktury/0@2', 'przyjecia/0@7', 'wyniki/0@4', 'wyniki/1@4']);
+  // The same partition and moment under another epoch is another change.
+  assert.equal(mergeFailovers([[change('wyniki', 0, 4, 1000)], [change('wyniki', 0, 5, 1000)]]).length, 2);
+});
+
+test('asking every node for its changes: a node that does not answer breaks nothing, a node that is down is not asked', async () => {
+  const asked = [];
+  const own = [change('wyniki', 0, 4, 1000)];
+  const nodes3 = [A, B, { nodeId: 'c', label: 'Serwer C', reachable: true }, { nodeId: 'd', label: 'Serwer D', reachable: false }];
+  const merged = await collectFailovers({
+    own,
+    nodes: nodes3,
+    read: async (nodeId) => {
+      asked.push(nodeId);
+      if (nodeId === 'c') throw new Error('timed out');
+      return { failovers: [change('przyjecia', 0, 7, 2000), change('wyniki', 0, 4, 1000)] };
+    },
+  });
+  assert.deepEqual(asked.sort(), ['b', 'c'], 'this node and the node that is down are not asked');
+  assert.deepEqual(merged.map((f) => f.topic).sort(), ['przyjecia', 'wyniki']);
+  // Nobody answers: the node\'s own history stands.
+  assert.deepEqual(await collectFailovers({ own, nodes: pair, read: async () => { throw new Error('no'); } }), own);
+});
+
+test('the leadership history costs one call per reachable remote node, whatever the number of topics', async () => {
+  const calls = [];
+  const nodes3 = [A, B, { nodeId: 'c', label: 'Serwer C', reachable: true }, { nodeId: 'd', label: 'Serwer D', reachable: false }];
+  await collectFailovers({ own: [], nodes: nodes3, read: async (nodeId) => { calls.push(nodeId); return { failovers: [] }; } });
+  assert.deepEqual(calls.sort(), ['b', 'c']);
 });

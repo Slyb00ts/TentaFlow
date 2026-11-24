@@ -77,25 +77,35 @@ fn encode_body(body: &MessageBody) -> Result<Vec<u8>, ProtocolError> {
 /// while the screen has one helper (`nodeLabel`) that says "Węzeł bez nazwy"
 /// and keeps the id in a tooltip.
 pub(crate) fn node_display_name(ctx: &HandlerContext, node_id: &str) -> String {
-    if node_id == ctx.state.local_node_id.to_string() {
+    node_display_name_in(&ctx.state, node_id)
+}
+
+/// `node_display_name` for a caller that holds the state rather than the
+/// request (a blocking task: the sync registry is a SQLite read).
+pub(crate) fn node_display_name_in(state: &super::state::AppState, node_id: &str) -> String {
+    if node_id == state.local_node_id.to_string() {
         let local = crate::mesh::node_info_collector::local_hostname();
         if !local.is_empty() && local != "unknown" {
             return local;
         }
     }
-    ctx.state
+    state
         .mesh_peer_store
         .get_hostname(node_id)
         .filter(|n| !n.is_empty())
-        .or_else(|| registry_name(ctx, node_id))
+        .or_else(|| registry_name_in(state, node_id))
         .unwrap_or_default()
 }
 
 /// `sync_nodes.display_name` of one node, when the registry has a non-empty
 /// one. Asked only after the peer store came up empty, so a healthy fleet
 /// never pays for it.
-fn registry_name(ctx: &HandlerContext, node_id: &str) -> Option<String> {
-    crate::db::repository::lookup_sync_node_info(&ctx.state.db, &[node_id.to_string()])
+pub(crate) fn registry_name(ctx: &HandlerContext, node_id: &str) -> Option<String> {
+    registry_name_in(&ctx.state, node_id)
+}
+
+pub(crate) fn registry_name_in(state: &super::state::AppState, node_id: &str) -> Option<String> {
+    crate::db::repository::lookup_sync_node_info(&state.db, &[node_id.to_string()])
         .ok()?
         .remove(node_id)
         .map(|(name, _)| name.trim().to_string())

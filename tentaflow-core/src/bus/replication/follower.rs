@@ -149,6 +149,25 @@ pub struct ExpectedLeader {
     pub topic: String,
     pub partition: u32,
     pub local_node_id: String,
+    /// Where the stream leaves the leader's live in-sync set, as its
+    /// heartbeats report it.
+    pub leader_isr: LeaderIsr,
+}
+
+/// The in-sync set the leader of a followed partition last reported
+/// (`ReplHeartbeat::isr`), shared between the stream task that learns it and
+/// the runner that answers for it. `None` until a heartbeat carried one.
+#[derive(Debug, Clone, Default)]
+pub struct LeaderIsr(Arc<parking_lot::Mutex<Option<Vec<String>>>>);
+
+impl LeaderIsr {
+    pub fn set(&self, isr: Vec<String>) {
+        *self.0.lock() = Some(isr);
+    }
+
+    pub fn get(&self) -> Option<Vec<String>> {
+        self.0.lock().clone()
+    }
 }
 
 /// The local (K-M2-5) stores a follower applies replicated group-offset/
@@ -513,6 +532,9 @@ where
                         batches_since_ack += 1;
                     }
                     ReplFrame::Heartbeat(hb) => {
+                        if let Some(isr) = hb.isr {
+                            expected.leader_isr.set(isr);
+                        }
                         partition.set_high_watermark(hb.hw);
                         if let Some(committed) = hb.committed {
                             partition.set_committed_offset(committed);
@@ -894,6 +916,7 @@ mod tests {
             topic: TOPIC.to_string(),
             partition: PART,
             local_node_id: LOCAL_NODE.to_string(),
+            leader_isr: LeaderIsr::default(),
         }
     }
 
@@ -1332,6 +1355,7 @@ mod tests {
             leader_leo: epoch_start,
             committed: None,
             epoch_start: Some(epoch_start),
+            isr: None,
         })
     }
 
@@ -1652,6 +1676,7 @@ mod tests {
                     leader_leo: 0,
                     committed: None,
                     epoch_start: None,
+                    isr: None,
                 }),
             )
             .await
@@ -2069,6 +2094,7 @@ mod tests {
                 leader_leo: 0,
                 committed: None,
                 epoch_start: None,
+                isr: None,
             }),
         )
         .await
@@ -2147,6 +2173,7 @@ mod tests {
                 leader_leo: 0,
                 committed: None,
                 epoch_start: None,
+                isr: None,
             }),
         )
         .await

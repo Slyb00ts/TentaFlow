@@ -412,6 +412,12 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 /* The pin of a topic's preferred node, inside a copy's chip. */
 .tf-chip .tb-pin { width: 11px; height: 11px; margin-right: 4px; vertical-align: -1px; }
 
+/* Node names are short (a label or 8 characters of the id), but a long label still has to wrap instead of cutting a column off. */
+.tb-route { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; min-width: 0; overflow-wrap: anywhere; }
+.tb-node-ref { overflow-wrap: anywhere; }
+/* The progress of "Rozłóż prowadzenie" is over in well under the alert's fade-in: the alert of the window appears at once, never blank. */
+.tb-rebalance-window .tf-alert { animation: none; }
+
 /* A view that a copy on this node answers may trail the leading node. */
 .tb-replica-note { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 12px; font-size: 12px; color: var(--tf-text-3); }
 .tb-replica-note[hidden] { display: none; }

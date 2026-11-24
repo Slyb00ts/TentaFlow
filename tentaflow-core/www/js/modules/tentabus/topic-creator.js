@@ -295,12 +295,15 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
     return T(`topics.creator.summary_schema_${draft.onMismatch === 'warn' ? 'warn' : 'dlq'}`, { schema });
   };
 
+  // The node is chosen by the instance. The sentence says what its choice counts (the partitions a node is
+  // preferred for, not those it leads now). Before the first poll has named the nodes (the first topic of an
+  // instance) the row still says how the choice is made whenever the copies span several nodes.
   const leaderRow = () => {
-    if (!leaderHint || (!leaderHint.older && !leaderHint.node)) return [];
-    const text = leaderHint.older
-      ? T('topics.creator.summary_leader_old')
-      : T('topics.creator.summary_leader', { node: leaderHint.node, count: fmtCount(leaderHint.partitions), n: leaderHint.partitions });
-    return [[T('topics.creator.leader_label'), escapeHtml(text)]];
+    let text = null;
+    if (leaderHint?.older) text = T('topics.creator.summary_leader_old');
+    else if (leaderHint?.node) text = T('topics.creator.summary_leader', { node: leaderHint.node, count: fmtCount(leaderHint.partitions), n: leaderHint.partitions });
+    else if (plan.kind !== 'single' && plan.kind !== 'unknown' && plan.nodes >= 2) text = T('topics.creator.summary_leader_auto');
+    return text ? [[T('topics.creator.leader_label'), escapeHtml(text)]] : [];
   };
 
   const summary = () => {

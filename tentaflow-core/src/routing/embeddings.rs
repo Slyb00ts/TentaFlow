@@ -358,6 +358,9 @@ pub(crate) fn executor_err_to_core(
             source: None,
         },
         ExecutorError::SttServiceUnavailable => CoreError::SttServiceUnavailable,
+        ExecutorError::FlowFailed { model, error } => {
+            crate::routing::chat::flow_error_to_core(&error, &model)
+        }
         ExecutorError::Sla(e) => crate::routing::dispatch_error_to_core(e, model),
         ExecutorError::Busy {
             backend,

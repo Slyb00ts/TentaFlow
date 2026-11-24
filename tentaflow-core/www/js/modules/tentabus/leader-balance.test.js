@@ -62,3 +62,36 @@ test('the spread waits for an older node, and says nothing of a version when a n
   assert.match(down.reason, /Żaden inny node nie odpowiada/);
   assert.deepEqual(down.older, []);
 });
+
+test('the node card, the table and the preview count the same partitions, with an internal topic present', async () => {
+  const { nodeRows } = await import('./model.js');
+  const { afterBalance } = await import('./rebalance-window.js');
+  const perTopic = [
+    { topic: 'wyniki', partitions: [part(0, 'a', 'b'), part(1, 'a', 'b')], dlqPartitions: [part(0, 'a', 'b')] },
+    { topic: 'faktury', partitions: [part(0, 'b', 'b')], dlqPartitions: [] },
+    { topic: '__bus.metrics', partitions: [part(0, 'a', 'a'), part(1, 'a', 'a'), part(2, 'a', 'a')], dlqPartitions: [] },
+  ];
+  const topics = [{ name: 'wyniki' }, { name: 'faktury' }, { name: '__bus.metrics' }];
+  const units = leadershipUnits({ topics, perTopic });
+  assert.deepEqual(units.map((u) => [u.name, u.partitions]), [['faktury', 1], ['wyniki', 3]], 'the internal topic is no unit');
+  const table = balanceModel({ units, nodes: [A, B] }).rows.map((r) => r.partitions);
+  const card = nodeRows([A, B], perTopic).map((r) => r.leads);
+  assert.deepEqual(table, [3, 1]);
+  assert.deepEqual(card, table, 'the card says what the table says');
+  const moves = [{ topic: 'wyniki', partitions: [0, 1], fromNodeId: 'a', toNodeId: 'b' }];
+  assert.deepEqual(afterBalance({ moves, units, nodes: [A, B] }).map((n) => n.partitions), [0, 4], 'the preview counts the topic with its __dlq and nothing else');
+});
+
+test('which node leads a topic when it is not this one', async () => {
+  const { leaderElsewhere } = await import('./leader-balance.js');
+  const topic = (topicName, ...leaders) => ({ topic: topicName, partitions: leaders.map((l, i) => part(i, l, l)) });
+  const perTopic = [topic('mine', 'a', 'a'), topic('theirs', 'b', 'b'), topic('split', 'b', 'b', 'a')];
+  assert.equal(leaderElsewhere('mine', perTopic, [A, B]), null, 'this node leads it');
+  assert.deepEqual(leaderElsewhere('theirs', perTopic, [A, B]), { nodeId: 'b', node: 'Serwer B' });
+  assert.deepEqual(leaderElsewhere('split', perTopic, [A, B])?.nodeId, 'b', 'the node that leads most of it');
+  assert.equal(leaderElsewhere('unknown', perTopic, [A, B]), null, 'nothing known about the topic');
+  assert.equal(leaderElsewhere('theirs', null, [A, B]), null, 'replica lists not read yet');
+  assert.equal(leaderElsewhere('theirs', perTopic, [{ ...A, isLocal: false }, B]), null, 'no local node known');
+  const unnamed = { nodeId: '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54', label: '' };
+  assert.equal(leaderElsewhere('far', [topic('far', unnamed.nodeId)], [A, unnamed])?.node, '365123c5');
+});

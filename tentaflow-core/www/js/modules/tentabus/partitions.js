@@ -21,6 +21,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, fmtCount, fmtBytes, fmtLagSize, fmtLagSeconds } from '/js/modules/tentabus/format.js';
 import { isOlderNode } from '/js/modules/tentabus/leader-balance.js';
+import { nodeNamer, nodeTitler } from '/js/modules/tentabus/node-label.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-choice-card.js';
@@ -30,19 +31,19 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 /// Longest a transfer waits for the majority (`TRANSFER_MAJORITY_TIMEOUT`).
 export const TRANSFER_WAIT_SECS = 5;
 
-const labelOf = (nodes) => {
-  const map = new Map((nodes || []).map((n) => [n.nodeId, n.label || n.nodeId]));
-  return (id) => (id ? map.get(id) || id : '');
-};
+const labelOf = nodeNamer;
 
 /**
  * The state of each copy of one partition (replica list answer):
  * `leader`, `ok` (in sync), `lag` (catching up, with how far), `out` (not in
  * sync and not reported as catching up — this node does not lead the
- * partition, or the copy lost contact).
+ * partition, or the copy lost contact). The row is the leader's own whenever
+ * this node does not lead the partition (`overlayLeaderRows`): a follower's
+ * view of the in-sync set trails the leader's.
  */
 export function copyStates(p, nodes) {
   const label = labelOf(nodes);
+  const idTitle = nodeTitler(nodes);
   const lagging = new Map((p?.lagging || []).map((l) => [l.nodeId, l]));
   // A pin only means something where there is a choice of nodes.
   const preferredId = (p?.replicas || []).length > 1 ? p?.preferredLeaderNodeId || null : null;
@@ -52,7 +53,7 @@ export function copyStates(p, nodes) {
     else if (lagging.has(id)) state = 'lag';
     else if ((p.isr || []).includes(id)) state = 'ok';
     const lag = lagging.get(id);
-    return { nodeId: id, label: label(id), state, preferred: id === preferredId, lagBytes: Number(lag?.lagBytes) || 0, lagMs: Number(lag?.lagMs) || 0, reason: lag?.reason || '' };
+    return { nodeId: id, label: label(id), idTitle: idTitle(id), state, preferred: id === preferredId, lagBytes: Number(lag?.lagBytes) || 0, lagMs: Number(lag?.lagMs) || 0, reason: lag?.reason || '' };
   });
 }
 
@@ -129,11 +130,73 @@ export async function transferContext({ topic, partition, replica, nodes, readLe
   return { row, blockedNote: blocker ? describeBlocker(blocker) : '' };
 }
 
-/** Why "Przenieś prowadzenie" cannot run for a partition, or `null` when it can. */
+/**
+ * Whether this node's own row of a partition another node leads leaves a
+ * doubt only the leader can settle: a copy that is behind or out of sync, or
+ * no usable leader. A row that shows every copy in sync is taken as it is
+ * (the leader is asked when a move is sent), so a healthy topic costs no
+ * call to another node.
+ */
+export function needsLeaderVerdict(p, nodes) {
+  return Boolean(p?.unavailableReason) || copyStates(p, nodes).some((c) => c.state === 'lag' || c.state === 'out');
+}
+
+/**
+ * Asks the leaders about the partitions this node does not lead.
+ * `lists` = `[{ key, partitions }]` (a topic or its `__dlq.` topic and this
+ * node's rows of it); `read(key, leaderId)` resolves the leader's own replica
+ * list (`{ partitions }`) and may throw. Resolves `Map` key -> `Map` leaderId ->
+ * that leader's rows of the key, or `null` when it did not answer. A list led
+ * wholly by this node, or whose partitions need no verdict (`needsLeaderVerdict`), is not asked about. One call per
+ * list and leader, never more.
+ */
+export async function askLeaders({ lists, localId, nodes, read }) {
+  const asks = [];
+  for (const { key, partitions } of lists) {
+    const leaders = new Set((partitions || []).filter((p) => needsLeaderVerdict(p, nodes)).map((p) => p.leaderNodeId).filter((id) => id && id !== localId));
+    for (const leaderId of leaders) {
+      asks.push(Promise.resolve().then(() => read(key, leaderId)).then(
+        (answer) => ({ key, leaderId, rows: Array.isArray(answer?.partitions) ? answer.partitions : null }),
+        () => ({ key, leaderId, rows: null }),
+      ));
+    }
+  }
+  const answers = new Map();
+  for (const { key, leaderId, rows } of await Promise.all(asks)) {
+    if (!answers.has(key)) answers.set(key, new Map());
+    answers.get(key).set(leaderId, rows);
+  }
+  return answers;
+}
+
+/**
+ * The partitions of one topic as the leaders see them. A partition this node
+ * does not lead is replaced by its leader's own row (the pin falls back to
+ * this node's, as the leader's list may omit it). With no answer yet from
+ * that leader the row is kept and marked `awaitsLeader`; with an answer that
+ * failed, or that does not hold the partition, the row stays as this node
+ * has it. `answers` = one entry of `askLeaders`'s result (leaderId -> rows).
+ */
+export function overlayLeaderRows(partitions, answers, localId, nodes) {
+  return (partitions || []).map((p) => {
+    if (!p.leaderNodeId || p.leaderNodeId === localId || !needsLeaderVerdict(p, nodes)) return p;
+    if (!answers?.has(p.leaderNodeId)) return { ...p, awaitsLeader: true };
+    const row = (answers.get(p.leaderNodeId) || []).find((r) => Number(r.partition) === Number(p.partition) && r.leaderNodeId === p.leaderNodeId);
+    return row ? { ...row, preferredLeaderNodeId: row.preferredLeaderNodeId ?? p.preferredLeaderNodeId } : p;
+  });
+}
+
+/**
+ * Why "Przenieś prowadzenie" cannot run for a partition, or `null` when it can.
+ * A partition another node leads is judged from the leader's own row: until
+ * that answer is in (`awaitsLeader`, see `overlayLeaderRows`) the reason is
+ * the neutral "sprawdzam", never a verdict from this node's trailing view.
+ */
 export function transferBlocker(p, nodes, justMoved = false) {
   if (justMoved) return T('partitions.blocked_just_moved');
   if (!p) return T('partitions.blocked_unknown');
   if (!p.leaderNodeId) return T('partitions.blocked_no_leader');
+  if (p.awaitsLeader) return T('partitions.blocked_checking');
   const choices = transferChoices(p, nodes);
   if (choices.some((c) => c.state === 'ok')) return null;
   if ((p.replicas || []).length <= 1) return T('partitions.blocked_single');
@@ -159,6 +222,7 @@ export function partitionRows({ detailPartitions, replicaPartitions, nodes }) {
       range: next > earliest ? { from: earliest, to: next - 1 } : null,
       leaderId,
       leader: label(leaderId),
+      leaderTitle: nodeTitler(nodes)(leaderId),
       copies: r ? copyStates(r, nodes) : [],
       replica: r,
       unavailable: r?.unavailableReason || null,
@@ -184,6 +248,7 @@ export function attentionRows(perTopic, nodes) {
         partition: Number(p.partition),
         leaderId: p.leaderNodeId || null,
         leader: labelOf(nodes)(p.leaderNodeId),
+        leaderTitle: nodeTitler(nodes)(p.leaderNodeId),
         copies,
         behind,
         replica: p,
@@ -194,13 +259,17 @@ export function attentionRows(perTopic, nodes) {
   return out.sort((a, b) => a.topic.localeCompare(b.topic) || a.partition - b.partition);
 }
 
+/** A node's name in a table cell; a node shown by its short id carries the full id as a tooltip. */
+export function nodeNameHtml(label, title = '') {
+  return `<span class="tf-table__cell--mono tb-node-ref"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(label)}</span>`;
+}
+
 const PIN = '<svg class="icon tb-pin" aria-hidden="true"><use href="#i-pin"/></svg>';
 
 /** The words of a copy's state for its chip; the preferred node's copy carries a pin. */
 export function copyChipHtml(c) {
   const tone = { leader: 'ok', ok: 'ok', lag: 'warn', out: 'warn', down: 'err', old: 'warn' }[c.state] || 'neutral';
-  const title = T(`partitions.copy_${c.state}`);
-  const full = c.preferred ? `${title} · ${T('partitions.copy_preferred')}` : title;
+  const full = [T(`partitions.copy_${c.state}`), c.preferred ? T('partitions.copy_preferred') : '', c.idTitle || ''].filter(Boolean).join(' · ');
   return `<span class="tf-chip tf-chip--outline ${tone}" title="${escapeAttr(full)}">${c.preferred ? PIN : ''}${escapeHtml(c.label)}</span>`;
 }
 

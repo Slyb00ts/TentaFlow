@@ -55,6 +55,12 @@ pub(super) struct ScriptedCoordinator {
     unknown: Mutex<HashMap<(String, u32), bool>>,
     /// Every transfer made, as `topic/partition->target`, in order.
     pub(super) transfers: Mutex<Vec<String>>,
+    /// Every replica order rewritten in place (a reassignment), as
+    /// `topic/partition->replicas`, in order.
+    pub(super) reassigned: Mutex<Vec<String>>,
+    /// When set, every reorder is refused quietly, as for a row that is not
+    /// the one planned from.
+    pub(super) reorders_refused: std::sync::atomic::AtomicBool,
     /// The live state of the partitions this node leads, as the snapshot
     /// reports it: `(topic, partition)` to the in-sync set. A partition with
     /// no entry is not in the snapshot.
@@ -90,8 +96,15 @@ impl ScriptedCoordinator {
             behind_nodes: Mutex::new(HashSet::new()),
             unknown: Mutex::new(HashMap::new()),
             transfers: Mutex::new(Vec::new()),
+            reassigned: Mutex::new(Vec::new()),
+            reorders_refused: std::sync::atomic::AtomicBool::new(false),
             live: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(super) fn refuse_reorders(&self) {
+        self.reorders_refused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) fn leaders_of(&self, topic: &str) -> Vec<String> {
@@ -251,6 +264,7 @@ impl ReplicationCoordinator for ScriptedCoordinator {
                     topic: topic.to_string(),
                     partition,
                     leader: row.leader_node_id.clone(),
+                    leader_epoch: row.leader_epoch,
                 });
             }
         }
@@ -303,6 +317,48 @@ impl ReplicationCoordinator for ScriptedCoordinator {
     }
     fn reassign(&self, _: &str, _: &str, _: Option<u32>, _: &[String]) -> Result<u32, ReplError> {
         Ok(0)
+    }
+    fn reorder_replicas(
+        &self,
+        _: &str,
+        topic: &str,
+        partition: u32,
+        expected_epoch: u32,
+        order: &[String],
+    ) -> Result<Option<u32>, ReplError> {
+        if self
+            .failing
+            .lock()
+            .contains(&(topic.to_string(), partition))
+        {
+            return Err(ReplError::Internal("scripted failure".into()));
+        }
+        if self
+            .reorders_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
+        let mut rows = self.rows.lock();
+        let Some(r) = rows
+            .iter_mut()
+            .find(|r| r.topic == topic && r.partition == partition)
+        else {
+            return Ok(None);
+        };
+        let mut held = r.replicas.clone();
+        let mut wanted = order.to_vec();
+        held.sort();
+        wanted.sort();
+        if r.leader_epoch != expected_epoch || held != wanted || r.replicas == order {
+            return Ok(None);
+        }
+        r.replicas = order.to_vec();
+        r.leader_epoch += 1;
+        self.reassigned
+            .lock()
+            .push(format!("{}/{}->{}", topic, partition, order.join(",")));
+        Ok(Some(r.leader_epoch))
     }
     fn snapshot(&self, _: &str, _: Option<&str>) -> ReplicationSnapshot {
         let live = self.live.lock();

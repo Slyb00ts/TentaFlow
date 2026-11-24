@@ -19,6 +19,7 @@ import { T, fmtCount, fmtDayTime, consumerLabel, isKeyGroup } from '/js/modules/
 import { isLagging, isPausedWithBacklog } from '/js/modules/tentabus/alerts.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { fromReplica, replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
+import { leaderElsewhere } from '/js/modules/tentabus/leader-balance.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-segmented.js';
@@ -107,7 +108,7 @@ export function consumersFooter(rows) {
 }
 
 // Cell markup lives in the tf-table shadow root: only controls.css classes apply there.
-function tableRow(r, maxWaiting, nowMs) {
+function tableRow(r, maxWaiting, nowMs, elsewhere = '') {
   const share = maxWaiting > 0 && r.waiting != null ? Math.round((r.waiting / maxWaiting) * 100) : 0;
   const tone = r.lagging ? 'warning' : 'accent';
   const state = r.paused
@@ -129,6 +130,7 @@ function tableRow(r, maxWaiting, nowMs) {
     _topic: r.topic,
     _paused: r.paused,
     _canAdmin: r.canAdmin,
+    _elsewhere: elsewhere,
   };
 }
 
@@ -199,9 +201,15 @@ function rowActions(ctx) {
       b.setAttribute('icon', row._paused ? 'play' : 'pause');
       b.textContent = T(row._paused ? 'consumers.resume' : 'consumers.pause');
       b.dataset.act = row._paused ? 'resume' : 'pause';
+      // Only the node that leads the topic keeps the pause: elsewhere the button waits, naming that node.
+      if (row._elsewhere) {
+        b.setAttribute('disabled', '');
+        b.title = T('consumers.leader_elsewhere', { node: row._elsewhere });
+      }
       b.addEventListener('click', (e) => {
         e.stopPropagation();
         const r = live();
+        if (r._elsewhere) return;
         ctx.go({ kind: r._paused ? 'resume' : 'pause', group: r._group, topic: r._topic });
       });
       wrap.appendChild(b);
@@ -221,8 +229,8 @@ function rowActions(ctx) {
 
 /**
  * Draws or repaints the tab from `ctx.view()` = `{ groups, error, errorKind,
- * stats, instanceLabel, notice, nowMs }` (`groups` is `null` until the list
- * answered). `ctx.go(action)`: `{ kind: 'open'|'pause'|'resume', group,
+ * stats, instanceLabel, notice, nowMs, nodes, replicaTopics }` (`groups` is `null` until the list
+ * answered; `nodes` and `replicaTopics` say which node leads each topic). `ctx.go(action)`: `{ kind: 'open'|'pause'|'resume', group,
  * topic }`, `{ kind: 'retry' }`. The filter and the search survive a repaint.
  */
 export function drawConsumers(body, ctx) {
@@ -242,7 +250,7 @@ export function drawConsumers(body, ctx) {
       body.__tbQuery = body.__tbQuery || '';
       const table = body.querySelector('[data-role="table"]');
       table.rowActions = rowActions(ctx);
-      table.rowActionsKey = (row) => `${row._key}|${row._paused}|${row._canAdmin}`;
+      table.rowActionsKey = (row) => `${row._key}|${row._paused}|${row._canAdmin}|${row._elsewhere}`;
       table.addEventListener('row-click', (e) => ctx.go({ kind: 'open', group: e.detail.row._group, topic: e.detail.row._topic }));
       body.querySelector('[data-role="filter"]').addEventListener('change', (e) => { body.__tbFilter = e.detail?.value || 'all'; paintList(body, ctx.view()); });
       const search = body.querySelector('[data-role="search"]');
@@ -292,7 +300,7 @@ function paintList(body, view) {
   patchHtml(replicaNote, replicaNoteHtml('values', fromCopy));
   const maxWaiting = rows.reduce((m, r) => Math.max(m, r.waiting || 0), 0);
   const table = body.querySelector('[data-role="table"]');
-  const next = rows.map((r) => tableRow(r, maxWaiting, view.nowMs));
+  const next = rows.map((r) => tableRow(r, maxWaiting, view.nowMs, leaderElsewhere(r.topic, view.replicaTopics, view.nodes)?.node || ''));
   const sig = JSON.stringify(next);
   if (table.__tbSig !== sig) {
     table.__tbSig = sig;

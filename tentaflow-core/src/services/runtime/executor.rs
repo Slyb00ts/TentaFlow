@@ -83,6 +83,11 @@ pub enum ExecutorError {
     FlowDispatcherUnavailable,
     #[error("flow engine returned no result for model='{model}'")]
     FlowEmptyResult { model: String },
+    /// The flow ran and a node failed (`FlowExecutionOutcome::error`). The
+    /// text is the node's own and stays out of `Display`, which reaches
+    /// clients.
+    #[error("flow '{model}' failed")]
+    FlowFailed { model: String, error: String },
     /// `SttRuntime` is not wired yet (DB-less router / `Router::start`
     /// has not run). The caller should fall back to the legacy STT path.
     #[error("STT runtime is not wired yet")]
@@ -198,6 +203,7 @@ impl ExecutorError {
         matches!(
             self,
             Self::FlowDispatcherUnavailable
+                | Self::FlowFailed { .. }
                 | Self::Sla(_)
                 | Self::SttRuntimeUnavailable
                 | Self::SttServiceUnavailable
@@ -1526,6 +1532,14 @@ impl ModelRuntimeExecutor {
                 ctx.leave_flow();
 
                 let outcome = dispatch_result.map_err(ExecutorError::from_dispatch)?;
+                // The dispatcher hands back a run that failed as a result: not
+                // an answer.
+                if let Some(error) = outcome.error {
+                    return Err(ExecutorError::FlowFailed {
+                        model: request.model.clone(),
+                        error,
+                    });
+                }
 
                 // No flow-level metric row here: the flow's internal LLM node
                 // calls back into `ModelRuntimeExecutor::execute_chat`, which

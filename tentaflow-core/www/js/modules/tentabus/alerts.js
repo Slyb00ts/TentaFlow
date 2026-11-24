@@ -13,6 +13,7 @@
 // toward no delay.
 
 import { consumerLabel } from '/js/modules/tentabus/format.js';
+import { nodeNamer } from '/js/modules/tentabus/node-label.js';
 
 export const LAGGING_MIN_RISE_MS = 10 * 60_000;
 export const LAGGING_MIN_WAITING = 1000;
@@ -64,14 +65,14 @@ export function delayedGroups(groups) {
  * `nodes` names the node ids.
  */
 export function laggingReplicas(perTopic, nodes) {
-  const labels = new Map((nodes || []).map((n) => [n.nodeId, n.label || n.nodeId]));
+  const name = nodeNamer(nodes);
   const out = [];
   for (const { topic, partitions } of perTopic || []) {
     for (const p of partitions || []) {
       for (const l of p.lagging || []) {
         out.push({
           nodeId: l.nodeId,
-          nodeLabel: labels.get(l.nodeId) || l.nodeId,
+          nodeLabel: name(l.nodeId),
           topic,
           partition: Number(p.partition),
           lagBytes: Number(l.lagBytes) || 0,

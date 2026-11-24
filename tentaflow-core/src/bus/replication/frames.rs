@@ -426,7 +426,7 @@ pub struct ReplAck {
 /// Leader -> follower keep-alive in the absence of real traffic (PLAN-M2
 /// §1b, every 500 ms) — also the follower's `leader_lease_ms` watchdog
 /// input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplHeartbeat {
     pub leader_epoch: u32,
     pub hw: u64,
@@ -443,6 +443,14 @@ pub struct ReplHeartbeat {
     /// that predates it.
     #[serde(default)]
     pub epoch_start: Option<u64>,
+    /// The leader's live in-sync set (`PartitionLeader::isr_members`), which
+    /// only the leader knows: the replicated assignment row holds the ISR of
+    /// the last placement change, so without this a follower shows the
+    /// replicas of a partition it does not lead as out of sync for as long as
+    /// the placement stays as it is. Appended: `None` from a leader that
+    /// predates it.
+    #[serde(default)]
+    pub isr: Option<Vec<String>>,
 }
 
 /// Leader -> follower tail truncation (PLAN-M2 §1a `Partition::
@@ -1214,7 +1222,7 @@ mod tests {
             committed: Some(8),
         };
         match decode_frame(KIND_HEARTBEAT, &encode_cbor(&old_hb).unwrap(), Bytes::new()).unwrap() {
-            ReplFrame::Heartbeat(hb) => assert_eq!(hb.epoch_start, None),
+            ReplFrame::Heartbeat(hb) => assert_eq!((hb.epoch_start, hb.isr), (None, None)),
             other => panic!("expected Heartbeat, got {other:?}"),
         }
 
@@ -1232,6 +1240,7 @@ mod tests {
             leader_leo: 9,
             committed: Some(8),
             epoch_start: Some(9),
+            isr: Some(vec!["a".to_string()]),
         })
         .unwrap();
         assert_eq!(decode_cbor::<HeartbeatBefore>(&hb).unwrap(), old_hb);
@@ -1705,6 +1714,7 @@ mod tests {
             leader_leo: 100,
             committed: None,
             epoch_start: Some(100),
+            isr: Some(vec!["a".to_string(), "b".to_string()]),
         });
         assert_eq!(roundtrip(hb.clone()).await, hb);
 

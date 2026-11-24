@@ -474,6 +474,10 @@ impl PartitionLeader {
             metrics,
         };
         leader.metrics.record_isr_size(leader.isr_size());
+        // A leader that starts alone (a promotion, a restart) over a log with
+        // a tail no replica ever acknowledged would otherwise keep it hidden
+        // until the next ack or publish; the same rule a later ack applies.
+        leader.recompute_hw();
         leader
     }
 
@@ -952,8 +956,9 @@ impl PartitionLeader {
     /// used to read through `PartitionReader::fetch_raw_from_offset`, bounded by
     /// `high_watermark`, and `hw` is `recompute_hw`'s output — moved by ACKs and
     /// by ISR membership changes (`register_follower`, `remove_follower`, the
-    /// staleness/lag shrink `reconcile_follower` does from a heartbeat tick) and
-    /// NEVER by a local append. So `hw` advanced at moments `leo` had sat still,
+    /// staleness/lag shrink `reconcile_follower` does from a heartbeat tick) and,
+    /// since then, by the first look of a publish waiting for its acks
+    /// (`await_acks_blocking`), but never by the append itself. So `hw` advanced at moments `leo` had sat still,
     /// and a feeder armed only by `subscribe_leo` slept through them. Measured
     /// in that state (3-node harness, `acks=leader`, 6 sequential publishes):
     /// leader `hw == leo == 6`, both followers `leo == 0`, streams and
@@ -990,6 +995,14 @@ impl PartitionLeader {
     ) -> AckOutcome {
         let started = std::time::Instant::now();
         let deadline = started + timeout;
+        // The caller has just appended `next_offset - 1` locally. With no
+        // follower left in the ISR no ack will ever follow to move `hw`, so
+        // the local append itself is the only moment to apply the ISR rule;
+        // for every other state it is the same pure function of the same
+        // inputs a later ack would compute, so the rule is not loosened.
+        if !self.ack_waiters.is_closed() {
+            self.recompute_hw();
+        }
         loop {
             let seen = self.ack_waiters.generation();
             if let Some(outcome) = self.ack_outcome_if_ready(next_offset, required, started) {
@@ -1214,12 +1227,16 @@ async fn feed<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Sends a bare `Heartbeat` and returns the `hw` it carried.
+/// Sends a bare `Heartbeat` and returns the `hw` it carried. It carries the
+/// leader's live in-sync set too, which `isr_sent` records: the follower has
+/// no other way to know it.
 async fn send_heartbeat<W: AsyncWrite + Unpin>(
     writer: &mut W,
     leader: &PartitionLeader,
+    isr_sent: &mut Vec<String>,
 ) -> Result<u64, FollowerStreamError> {
     let hw = leader.high_watermark();
+    let isr = leader.isr_members();
     write_frame(
         writer,
         &ReplFrame::Heartbeat(ReplHeartbeat {
@@ -1228,9 +1245,12 @@ async fn send_heartbeat<W: AsyncWrite + Unpin>(
             leader_leo: leader.log_end_offset(),
             committed: Some(leader.committed_offset()),
             epoch_start: leader.term_start(),
+            isr: Some(isr.clone()),
         }),
     )
     .await?;
+    *isr_sent = isr;
+    isr_sent.sort();
     Ok(hw)
 }
 
@@ -1386,6 +1406,10 @@ where
     // The highest `hw` any frame on this stream has carried: the follower
     // applies it monotonically, so anything at or below it is old news.
     let mut hw_sent: u64 = 0;
+    // The in-sync set the follower was last told (sorted), so a change in it
+    // reaches the follower on the next ISR check, not only in a silence.
+    let mut isr_sent: Vec<String> = leader.isr_members();
+    isr_sent.sort();
     let mut truncate_open = true;
 
     let heartbeat_interval = leader.config().heartbeat_interval;
@@ -1455,7 +1479,7 @@ where
                     ).await?;
                     leader.set_follower_lag_bytes(&follower_node_id, inflight.total());
                     if leader.high_watermark() > hw_sent {
-                        hw_sent = send_heartbeat(&mut writer, &leader).await?;
+                        hw_sent = send_heartbeat(&mut writer, &leader, &mut isr_sent).await?;
                         last_frame_sent_at = Instant::now();
                     }
                 }
@@ -1534,6 +1558,12 @@ where
 
             _ = isr_check_ticker.tick() => {
                 leader.reconcile_follower(&follower_node_id);
+                let mut isr_now = leader.isr_members();
+                isr_now.sort();
+                if isr_now != isr_sent {
+                    hw_sent = send_heartbeat(&mut writer, &leader, &mut isr_sent).await?;
+                    last_frame_sent_at = Instant::now();
+                }
             }
 
             // PLAN-M2 §1b "co 500 ms w ciszy": due exactly `heartbeat_interval`
@@ -1541,7 +1571,7 @@ where
             // tick whenever a frame had gone out less than one interval ago
             // stretched real silences to almost two intervals.
             _ = tokio::time::sleep_until(heartbeat_due) => {
-                hw_sent = send_heartbeat(&mut writer, &leader).await?;
+                hw_sent = send_heartbeat(&mut writer, &leader, &mut isr_sent).await?;
                 last_frame_sent_at = Instant::now();
             }
 
@@ -2507,6 +2537,24 @@ mod tests {
         assert_eq!(outcome.hw, 1);
         assert_eq!(outcome.required, 2);
         assert!(outcome.acked_nodes >= 2);
+    }
+
+    /// A lone RF=2 leader that starts over a log whose tail no replica ever
+    /// acknowledged makes it readable at once, with no publish and no ack.
+    #[test]
+    fn a_lone_leader_starting_over_an_unreplicated_tail_exposes_it() {
+        let part = temp_partition("lone-start");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.append_batch(one_record_batch(1)).unwrap();
+        part.append_batch(one_record_batch(1)).unwrap();
+        let before = part.high_watermark();
+        assert!(before < part.log_end_offset(), "the tail starts hidden");
+        let leader = make_leader(part, &["leader", "f1"], Acks::Leader, fast_config());
+        assert_eq!(
+            leader.high_watermark(),
+            leader.log_end_offset(),
+            "the tail is readable"
+        );
     }
 
     #[test]

@@ -284,6 +284,29 @@ impl Router {
                 .try_dispatch(&request.model, "chat", initial, meta)
                 .await
             {
+                // A node that failed ends the run with `outcome.error` set and
+                // the dispatcher still hands the outcome back as a result. Read
+                // as an answer it is an empty 200: a `bus_publish` the caller's
+                // key was refused looked like a flow that had worked.
+                Ok(outcome) if outcome.error.is_some() => {
+                    let failure = flow_failure_to_core(&outcome, &request.model);
+                    if let Some(event) = compliance_event.as_ref() {
+                        // The audit keeps the node's own words; the caller gets
+                        // the generic answer of `flow_failure_to_core`.
+                        let detail = format!(
+                            "flow '{}' failed: {}",
+                            request.model,
+                            outcome.error.as_deref().unwrap_or("unknown error")
+                        );
+                        if let Err(audit_error) = event.finish_failed(&detail) {
+                            tracing::warn!(
+                                error = %audit_error,
+                                "compliance AI audit failure capture failed"
+                            );
+                        }
+                    }
+                    return Err(failure.into());
+                }
                 Ok(outcome) => {
                     let usage = crate::routing::middleware::TokenUsageMetadata {
                         prompt_tokens: outcome.usage.prompt_tokens,
@@ -637,6 +660,29 @@ pub(crate) fn model_resolves_to_flow(
     false
 }
 
+/// The failure of a flow run that ended with an error. What the failed node
+/// said (a bus error, a path, a permission refusal) is logged and kept as the
+/// source; the caller is told only that the flow failed (`flow.failed`), or
+/// that it ran out of time.
+pub(crate) fn flow_failure_to_core(outcome: &FlowExecutionOutcome, model: &str) -> CoreError {
+    flow_error_to_core(outcome.error.as_deref().unwrap_or("unknown error"), model)
+}
+
+/// `flow_failure_to_core` for the error text alone.
+pub(crate) fn flow_error_to_core(detail: &str, model: &str) -> CoreError {
+    tracing::warn!(flow = %model, error = %detail, "flow run ended with an error");
+    if detail.contains(crate::flow_engine::executor::DEADLINE_EXCEEDED) {
+        return CoreError::Timeout {
+            backend_url: format!("flow:{model}"),
+            timeout_ms: 0,
+        };
+    }
+    CoreError::InternalError {
+        message: "flow.failed: the flow did not complete".to_string(),
+        source: Some(anyhow::anyhow!(detail.to_string())),
+    }
+}
+
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
 pub(crate) fn flow_outcome_to_chat_response(
     outcome: FlowExecutionOutcome,
@@ -666,6 +712,7 @@ pub(crate) fn executor_error_to_core(
             backend,
             retry_after_ms,
         },
+        ExecutorError::FlowFailed { model, error } => flow_error_to_core(&error, &model),
         other => CoreError::InternalError {
             message: format!("direct backend dispatch failed: {other}"),
             source: None,
@@ -947,4 +994,137 @@ pub(crate) fn completion_metrics(
             total_tokens: usage.total_tokens,
         }),
     })
+}
+
+#[cfg(test)]
+mod flow_failure_tests {
+    use crate::compliance::ai_gateway::AiGatewayContext;
+    use crate::error::CoreError;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
+    use crate::processes::runtime::test_support::Fixture;
+
+    /// A fixture with a flow published as `publishing-model` whose
+    /// `bus_publish` fails (the instance is not running).
+    fn fixture_with_a_failing_flow() -> (Fixture, crate::api::openai::types::ChatCompletionRequest)
+    {
+        let fixture = Fixture::new();
+        let graph = serde_json::json!({
+            "nodes": [
+                {"id": "trigger", "type": "trigger", "config": {}},
+                {"id": "publish", "type": "bus_publish",
+                 "config": {"instance_id": "tentabus-0badc0de", "topic": "demo.t1"}},
+                {"id": "output", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "trigger", "to": "publish", "from_port": "text", "to_port": "in"},
+                {"from": "publish", "to": "output", "from_port": "full", "to_port": "text"}
+            ],
+            "variables": []
+        })
+        .to_string();
+        crate::db::repository::create_flow(
+            &fixture.db,
+            &crate::db::models::FlowParams {
+                name: "Publishing flow",
+                description: None,
+                is_default: false,
+                service_type: Some("chat"),
+                flow_json: &graph,
+                status: "active",
+                published_model_name: Some("publishing-model"),
+                actor_user_id: Some(&fixture.owner.user_id),
+            },
+        )
+        .unwrap();
+        fixture
+            .router
+            .catalog_provider()
+            .rebuild(
+                &crate::services::mesh_registry::MeshServicesRegistry::new(),
+                &fixture.db,
+            )
+            .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "publishing-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        (fixture, request)
+    }
+
+    /// What a client is told of a flow failure: the stable code, and neither
+    /// the node's own words nor the bus instance it names.
+    fn assert_generic(error: &CoreError) {
+        let told = error.client_message();
+        assert!(
+            told.contains("flow.failed"),
+            "the client is told the flow failed: {told}"
+        );
+        assert!(
+            !told.contains("bus_publish") && !told.contains("tentabus-0badc0de"),
+            "the node's detail stays out of the answer: {told}"
+        );
+        assert_eq!(error.status_code(), 500);
+    }
+
+    /// A flow whose `bus_publish` fails is a failed call, not a 200 with an
+    /// empty answer, and the caller does not get the node's own error text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flow_whose_bus_publish_fails_answers_with_the_error_not_an_empty_200() {
+        let (fixture, request) = fixture_with_a_failing_flow();
+
+        let result = fixture
+            .router
+            .route_chat_completion(
+                request,
+                None,
+                FlowOrigin::Addon,
+                FlowActor::system(),
+                Some(AiGatewayContext::default()),
+            )
+            .await;
+
+        let Err(error) = result else {
+            panic!("a failed flow must not answer 200");
+        };
+        let core = error
+            .downcast_ref::<CoreError>()
+            .expect("a typed error reaches the edge");
+        assert_generic(core);
+        let source = std::error::Error::source(core)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            source.contains("bus_publish"),
+            "the node's words are kept for the log: {source}"
+        );
+    }
+
+    /// The same flow resolved through the runtime executor (a model that
+    /// resolves to a flow target) is no empty answer either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_runtime_executor_fails_a_flow_whose_node_failed_with_a_generic_error() {
+        let (fixture, request) = fixture_with_a_failing_flow();
+        let executor = fixture.router.executor().expect("executor wired");
+        let mut ctx = crate::services::runtime::context::ExecutionContext::new(
+            None,
+            FlowOrigin::Addon,
+            FlowActor::system(),
+        );
+
+        let result = executor.execute_chat(request, &mut ctx).await;
+
+        let Err(error) = result else {
+            panic!("a failed flow must not answer 200");
+        };
+        let core = super::executor_error_to_core(error, "publishing-model");
+        assert_generic(&core);
+    }
+
+    #[test]
+    fn a_flow_that_ran_out_of_time_is_a_timeout_not_an_internal_error() {
+        let core = super::flow_error_to_core("deadline exceeded", "slow-model");
+        assert_eq!(core.status_code(), 504);
+        assert!(!core.client_message().contains("slow-model"));
+    }
 }

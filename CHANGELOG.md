@@ -13,8 +13,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   .../records` przekazuje cały odczyt (otwarcie konsumenta, pobranie i commit)
   do węzła prowadzącego topik. Lider autoryzuje oryginalnego wywołującego
   jeszcze raz (własnym autoryzatorem i własną kopią członkostw w organizacji;
-  aktora systemowego brokera nie przyjmuje nigdy) i niczego nie przekazuje
-  dalej. Każda odmowa na liderze trafia do audytu razem z węzłem, który
+  aktora systemowego brokera przyjmuje w przekazanym zapisie tylko dla
+  topików `__*`) i niczego nie przekazuje dalej. Każda odmowa na liderze trafia do audytu razem z węzłem, który
   przekazał odczyt (`forwarded_from`). Odczyt jest przekazywany tylko wtedy,
   gdy jeden węzeł prowadzi wszystkie partycje topiku; gdy partycje prowadzi
   kilka węzłów, odpowiedź to 503 `bus_not_leader` z `Retry-After` (stan
@@ -129,7 +129,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   indziej, jest przekazywane do niego (nowa ramka replikacji, rodzaje 13 i 14,
   oraz bit `bus_features` `1<<2`); prosić może każdy węzeł tej samej instancji
   i środowiska, także taki, który nie trzyma repliki. Odmowa lidera dociera do
-  wołającego z własnym kodem (`bus.transfer_refused`), nie jako błąd wewnętrzny.
+  wołającego z własnym kodem (`bus.transfer_refused`), nie jako błąd
+  wewnętrzny. Ten kod pochodzi wyłącznie z warstwy przekazywania
+  (`unknown_instance`, `environment_mismatch`, `handler_failed`); odmowy
+  samego lidera (cel poza ISR, w tyle, wstrzymana grupa, inny lider) mają
+  własne kody.
   Lider sprawdza, że cel jest w żywym ISR i nadąża. Potem zamyka zapisy w
   samej partycji (po tym żaden zapis nie ląduje), czeka na dogonienie celu do
   końca logu (najwyżej ok. 2 s) i dopiero wtedy proponuje wiersz. Gdy cel
@@ -230,7 +234,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   a powrót do węzła preferowanego następuje potem zwykłą regułą. Przeniesienie,
   które zostawiło topik rozdzielony (`failed_partial`), jest ponawiane
   przy następnym przeglądzie jako zebranie; nieudane zebranie czeka dwa
-  przeglądy.
+  przeglądy. Przełącznik automatycznego powrotu wyłącza także to zbieranie,
+  nie tylko powrót po 5 minutach.
 - Przeniesienia nie mogą się już minąć: `TransferForward` niesie
   oczekiwanego lidera i jego epokę (pole opcjonalne; starszy węzeł go nie
   wysyła i nie sprawdza), a lider odmawia (`bus.not_leader`), gdy wiersz
@@ -343,6 +348,76 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `unknown`): node niedostępny albo jeszcze nie sprawdzony nie jest już
   pokazywany jako starsza wersja. `forward_capable` zostaje dla starych
   klientów.
+- Poprawki po przeklikaniu dwóch węzłów (TB-04 K10):
+  - Lider sam w ISR przy RF=2 i `acks=leader` (drugi węzeł nie żyje) udostępnia
+    teraz konsumentom to, co przyjął: znacznik `hw` rośnie razem z lokalnymi
+    zapisami, a nie tylko po potwierdzeniach i zmianach ISR. Wcześniej zapis
+    dostawał 200, a nowa grupa czytała tylko rekordy sprzed awarii. Semantyka
+    RF>=3 oraz `acks=quorum|all` bez zmian.
+  - Ręczne przeniesienie topiku nie ściga się już z elekcją. Węzeł, którego
+    księga ma już nowszy wiersz (przeniesienie, które sondowanie jeszcze nie
+    zastosowało), nie staje do elekcji na starym widoku, a dotychczasowy lider
+    odpowiada na `LeoQuery` epoką przeniesienia, ale tylko wierszem, który
+    rzeczywiście pokazuje przeniesienie (cel na czele, epoka nie niższa), a
+    kandydat tuż przed `propose` czyta księgę jeszcze raz i rezygnuje, gdy
+    trzyma ona już claim na jego epoce lub wyżej, wystawiony przez inną
+    operację (poprzednia próba tego węzła nie przeszkadza). Wiersz, który
+    wygrał termin z późniejszym czasem, jest przejmowany na podstawie
+    tożsamości operacji, nie kolejności replik. Skutek wcześniej: fałszywy
+    wpis `bus.leader.failover reason=lease_expired` i nadpisana kolejność
+    replik (część partycji nadal preferowała stary węzeł).
+  - Węzeł preferowany topiku (z jego DLQ) to ten, który większość partycji
+    wymienia jako pierwszy; remis rozstrzyga węzeł prowadzący najwięcej
+    partycji, potem najniższe id. Dotyczy planera i automatycznego powrotu,
+    więc topik, którego partycje się różnią, nie jest już pomijany na stałe.
+    Topik prowadzony w całości przez swój węzeł preferowany, w którym część
+    partycji nadal wskazuje inny węzeł, dostaje przepisaną kolejność replik
+    tych partycji. Zmienia się tylko kolejność: wiersz jest przepisywany,
+    gdy ma ten sam zestaw węzłów i tę samą epokę, z których liczono (węzeł
+    usunięty w międzyczasie nie wraca, a wiersz, który się zmienił, jest
+    pomijany po cichu). Każda taka zmiana to wpis audytu `bus.leader.align`
+    (aktor systemowy, `reason=preferred_align`), bo zmienia się zapisany węzeł
+    preferowany. Wynik częściowy jest zgłaszany jako `partial`.
+  - Zebranie rozdzielonego topiku następuje od razu na węźle, który prowadzi
+    go najwięcej (najmniej przeniesień, bez zmiany węzła preferowanego, czyli
+    `keep_order`). Gdy wszystkie partycje wskazują jeden węzeł preferowany i
+    każdy lider potwierdzi przeniesienie, zebranie idzie na ten węzeł, jak
+    dotąd. Gdy partycje się różnią, nie ma węzła preferowanego do zebrania:
+    powrót do węzła z większością głosów idzie zwykłą ścieżką z zegarem
+    stabilności, bo ten węzeł mógł dopiero wstać.
+  - Węzeł, który nie prowadzi partycji, pokazuje żywe ISR lidera. Heartbeat
+    niesie nowe pole `isr` (dołączone na końcu ramki; starszy węzeł je
+    ignoruje), a zmiana ISR trafia do followera w ciągu jednego heartbeatu.
+    Wcześniej follower pokazywał ISR z wiersza księgi sprzed ostatniej zmiany
+    rozmieszczenia.
+  - Nazwy węzłów w widoku replik (`BusReplicaNodeWire.label`) to nazwa, którą
+    aplikacja już pokazuje (`node_display_name`: hostname maszyny dla węzła
+    lokalnego, hostname z mesh dla pozostałych, potem nazwa z rejestru sync).
+    Gdy nazwy brak albo dwa węzły na jednej maszynie ją dzielą, etykieta jest
+    pusta, a UI pokazuje krótkie id. Wcześniej etykietą było 64-znakowe id.
+  - Odpowiedź flow, w którym padł węzeł (np. `bus_publish` odmówiony kluczowi
+    użytkownika), jest błędem, a nie pustym 200, także gdy flow rozwiązuje
+    wykonawca modeli, nie tylko `/v1/chat/completions`. Klient dostaje
+    ogólny komunikat ze stabilnym kodem `flow.failed` (przekroczony czas
+    to 504), a tekst węzła trafia do logu i audytu zgodności. Model dostępu
+    bez zmian; nie ma osobnego błędu 403 dla odmowy węzła.
+  - Lider startujący sam nad ogonem logu, którego żadna replika nie
+    potwierdziła, udostępnia go od razu (bez nowego zapisu), a
+    wywołanie `await_acks` na zamkniętym leaderze nie przelicza `hw`.
+  - Przeniesienie nie przypina wpisu starego lidera do wiersza, który
+    przegrał termin z innym claimem.
+  - Lista replik: nazwy węzłów czytane są poza wątkiem obsługi (SQLite), a
+    węzeł z własną, unikalną nazwą hosta nie traci jej, gdy nazwa
+    zastępcza innego węzła jest taka sama.
+  - `bus.not_leader` z przeniesienia i `reassign` podaje
+    `leader_node_id=<id> leader_epoch=<n>` jak odmowa zapisu i odczytu (gdy
+    lider nieznany: `epoch=<n>`). Ramka `TransferForwardReply` niesie epokę
+    jako dodatkową liczbę kodu `bus.not_leader`. Wpis audytu `bus.topic.create`
+    wymienia repliki w kolejności rozmieszczenia, lider pierwszy. Powód
+    `would_not_improve` dopisano do opisu `BusLeaderBlockerWire.reason`.
+  - Skoki epok lidera o 63-64 są zamierzone: każdy węzeł ma stały slot modulo
+    64 (`election::EPOCH_SLOTS`) i podnosi epokę tylko w swoim slocie, żeby
+    dwie niezależne elekcje nigdy nie wybrały tej samej liczby.
 
 ### Limity i SLA usług (TB-03)
 

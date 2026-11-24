@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
 const {
-  copyStates, transferChoices, topicWideBlocker, transferBlocker, partitionRows, attentionRows, behindText, unavailableText, rangeText, openLeaderTransfer, copyChipHtml, preferredLegendHtml,
+  copyStates, transferChoices, topicWideBlocker, transferBlocker, partitionRows, attentionRows, behindText, unavailableText, rangeText, openLeaderTransfer, copyChipHtml, preferredLegendHtml, askLeaders, overlayLeaderRows, nodeNameHtml, needsLeaderVerdict,
 } = await import('./partitions.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ');
@@ -246,4 +246,101 @@ test('a second click while the leader is being asked does nothing', async () => 
   release('opened');
   assert.equal(await first, 'opened');
   assert.equal(await gate(() => 'again'), 'again', 'the gate opens again once the first call finished');
+});
+
+// ---------------------------------------------------------------------------
+// TB-04 K10 (D4): on a node that does not lead, the leader's answer decides.
+// ---------------------------------------------------------------------------
+
+// This node (n-rig) follows n-main. Its own view says only n-main is in sync; the leader sees everyone in sync.
+const staleHere = { partition: 1, leaderNodeId: 'n-main', replicas: ['n-rig', 'n-main'], isr: ['n-main'], lagging: [] };
+const trueOnLeader = { partition: 1, leaderNodeId: 'n-main', replicas: ['n-rig', 'n-main'], isr: ['n-rig', 'n-main'], lagging: [] };
+const pairNodes = [nodes[0], nodes[1]];
+
+test('the leader\'s own rows replace this node\'s trailing view of the partitions it leads', () => {
+  const rows = overlayLeaderRows([staleHere, { ...staleHere, partition: 2, leaderNodeId: 'n-rig' }], new Map([['n-main', [trueOnLeader]]]), 'n-rig');
+  assert.deepEqual(rows[0].isr, ['n-rig', 'n-main']);
+  assert.equal(rows[0].awaitsLeader, undefined);
+  assert.equal(rows[1].isr.length, 1, 'a partition this node leads is its own truth');
+  assert.equal(transferBlocker(rows[0], pairNodes), null, 'the copy here is in sync on the leader, so the move is open');
+  // The pin falls back to this node\'s when the leader\'s list does not carry it.
+  const pinned = overlayLeaderRows([{ ...staleHere, preferredLeaderNodeId: 'n-rig' }], new Map([['n-main', [trueOnLeader]]]), 'n-rig');
+  assert.equal(pinned[0].preferredLeaderNodeId, 'n-rig');
+});
+
+test('until the leader has answered the move says "sprawdzam", never "no node has an in-sync copy"', () => {
+  const [row] = overlayLeaderRows([staleHere], new Map(), 'n-rig');
+  assert.equal(row.awaitsLeader, true);
+  const text = transferBlocker(row, pairNodes);
+  assert.match(text, /Sprawdzam/);
+  assert.doesNotMatch(text, /Żaden inny node nie ma teraz zgodnej kopii/);
+  // The same view without waiting is judged from what it holds (here: the stale answer, which is why the leader is asked first).
+  assert.match(transferBlocker(staleHere, pairNodes), /Żaden inny node nie ma teraz zgodnej kopii/);
+});
+
+test('a leader that did not answer, or does not hold the partition, leaves this node\'s row in place and not waiting', () => {
+  assert.equal(overlayLeaderRows([staleHere], new Map([['n-main', null]]), 'n-rig')[0].awaitsLeader, undefined);
+  assert.equal(overlayLeaderRows([staleHere], new Map([['n-main', [{ ...trueOnLeader, partition: 9 }]]]), 'n-rig')[0], staleHere);
+  // A row the leader reports as led by another node (the leader changed meanwhile) is not taken for the leader\'s own.
+  assert.equal(overlayLeaderRows([staleHere], new Map([['n-main', [{ ...trueOnLeader, leaderNodeId: 'n-mac' }]]]), 'n-rig')[0], staleHere);
+});
+
+test('every partition of a topic gets the same verdict from the leader, so no button stands alone', () => {
+  const stale = (partition) => ({ ...staleHere, partition, isr: partition === 1 ? ['n-rig', 'n-main'] : ['n-main'] });
+  const onLeader = (partition) => ({ ...trueOnLeader, partition });
+  const parts = [0, 1, 2, 3].map(stale);
+  assert.deepEqual(parts.map((p) => transferBlocker(p, pairNodes) === null), [false, true, false, false], 'this node\'s own view: one enabled, three disabled');
+  const decided = overlayLeaderRows(parts, new Map([['n-main', [0, 1, 2, 3].map(onLeader)]]), 'n-rig');
+  assert.deepEqual(decided.map((p) => transferBlocker(p, pairNodes)), [null, null, null, null]);
+});
+
+test('the leaders are asked once per topic and leader, never about what this node leads, and a failure is a null answer', async () => {
+  const asked = [];
+  const lists = [
+    { key: 'wyniki', partitions: [staleHere, { ...staleHere, partition: 2, leaderNodeId: 'n-mac' }] },
+    { key: '__dlq.wyniki', partitions: [{ ...staleHere, leaderNodeId: 'n-rig' }] },
+    { key: 'faktury', partitions: [] },
+  ];
+  const answers = await askLeaders({
+    lists,
+    localId: 'n-rig',
+    read: async (key, leaderId) => {
+      asked.push(`${key}@${leaderId}`);
+      if (leaderId === 'n-mac') throw new Error('timed out');
+      return { partitions: [trueOnLeader] };
+    },
+  });
+  assert.deepEqual(asked.sort(), ['wyniki@n-mac', 'wyniki@n-main']);
+  assert.deepEqual([...answers.keys()], ['wyniki']);
+  assert.equal(answers.get('wyniki').get('n-main')[0].isr.length, 2);
+  assert.equal(answers.get('wyniki').get('n-mac'), null);
+});
+
+test('a node shown by its short id carries the full id as a tooltip in the leader cell and on the copy chip', () => {
+  const hex = '41291e2758d793a2d740f5db7d7c99141f32f02199c1427803d4373636e7ca57';
+  const bare = [{ nodeId: hex, label: '', isLocal: true }, { nodeId: 'b'.repeat(64), label: '' }];
+  const p = { partition: 0, leaderNodeId: hex, replicas: [hex, 'b'.repeat(64)], isr: [hex], lagging: [] };
+  assert.equal(copyStates(p, bare)[0].label, '41291e27');
+  assert.match(copyChipHtml(copyStates(p, bare)[0]), new RegExp(`title="[^"]*${hex}`));
+  assert.match(nodeNameHtml('41291e27', hex), new RegExp(`title="${hex}"[^>]*>41291e27<`));
+  assert.doesNotMatch(nodeNameHtml('rig26'), /title=/);
+});
+
+test('a healthy topic costs no call to another node, a doubtful one costs one per list and leader', async () => {
+  const calls = [];
+  const read = async (key, leaderId) => { calls.push(`${key}@${leaderId}`); return { partitions: [] }; };
+  const healthyRow = (partition) => ({ ...healthy, partition, leaderNodeId: 'n-main' });
+  const lists = [
+    // 20 healthy topics led by another node: nothing is asked.
+    ...Array.from({ length: 20 }, (_, i) => ({ key: `topik-${i}`, partitions: [healthyRow(0), healthyRow(1)] })),
+    // One topic with a copy behind, four partitions: one call, not four.
+    { key: 'wyniki', partitions: [0, 1, 2, 3].map((partition) => ({ ...behind, partition })) },
+  ];
+  assert.equal(needsLeaderVerdict(healthyRow(0), nodes), false);
+  assert.equal(needsLeaderVerdict(behind, nodes), true);
+  assert.equal(needsLeaderVerdict({ ...healthyRow(0), unavailableReason: 'NoIsr' }, nodes), true);
+  await askLeaders({ lists, localId: 'n-rig', nodes, read });
+  assert.deepEqual(calls, ['wyniki@n-main']);
+  // A healthy row is never swapped for an older answer, and is not marked as waiting.
+  assert.equal(overlayLeaderRows([healthyRow(0)], new Map(), 'n-rig', nodes)[0].awaitsLeader, undefined);
 });

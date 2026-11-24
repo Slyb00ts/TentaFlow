@@ -7,6 +7,8 @@
 // and `__bus.*` the broker's internals. Neither is counted or listed as a
 // topic of the reader's.
 
+import { nodeLabel, nodeTitle } from '/js/modules/tentabus/node-label.js';
+
 export const isInternalTopic = (name) => String(name || '').startsWith('__');
 
 /** Topics the reader thinks of as topics (the list without `__*`). */
@@ -93,8 +95,20 @@ export function busiestTopics({ stats, topicList, limit = 5 }) {
 }
 
 /**
- * One row per node of "Stan kopii na nodach", counted over the partitions of
- * the reader's topics (`perTopic` = `[{ topic, partitions }]`, one replica
+ * The partitions a node's load is counted over, from the per-topic replica
+ * snapshots (`[{ topic, partitions, dlqPartitions? }]`): the reader's topics
+ * and the `__dlq.` topic that goes with each, the planner's own rule. The
+ * broker's other `__*` topics (`__bus.metrics`) are never part of it.
+ */
+export function loadPartitions(perTopic) {
+  return (perTopic || [])
+    .filter(({ topic }) => !isInternalTopic(topic))
+    .flatMap(({ partitions, dlqPartitions }) => [...(partitions || []), ...(dlqPartitions || [])]);
+}
+
+/**
+ * One row per node of "Stan kopii na nodach", counted over `loadPartitions`
+ * (`perTopic` = `[{ topic, partitions, dlqPartitions? }]`, one replica
  * snapshot per topic): how many it leads, how many copies of other leaders
  * it holds, and how many of all those are in sync. The node summary on the
  * wire counts the broker's own `__*` topics too, so it is only the source of
@@ -103,9 +117,7 @@ export function busiestTopics({ stats, topicList, limit = 5 }) {
  */
 export function nodeRows(nodes, perTopic) {
   if (!perTopic) return null;
-  const partitions = perTopic
-    .filter(({ topic }) => !isInternalTopic(topic))
-    .flatMap(({ partitions: parts }) => parts || []);
+  const partitions = loadPartitions(perTopic);
   return (nodes || []).map((n) => {
     const id = n.nodeId;
     let leads = 0;
@@ -120,7 +132,8 @@ export function nodeRows(nodes, perTopic) {
     }
     return {
       nodeId: id,
-      label: n.label || id,
+      label: nodeLabel(n),
+      title: nodeTitle(n),
       isLocal: Boolean(n.isLocal),
       reachable: n.reachable !== false,
       leads,

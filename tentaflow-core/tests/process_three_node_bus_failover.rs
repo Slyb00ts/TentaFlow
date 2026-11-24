@@ -1129,10 +1129,16 @@ fn process_three_node_bus_topic_returns_to_the_preferred_node_after_a_restart() 
     let mut a2 = ChildNode::spawn_with_env("a-restart", home_a, &env);
     assert_eq!(a2.node_id, leader_id, "the restart keeps its identity");
     for peer in [&*leader, &*follower] {
+        // The restarted process keeps its trust rows but not the list of
+        // peers its ledger sync loop serves (`TRUST` fills it), so without
+        // this it never pulls the row of the transfer that hands it the
+        // topic, and the survivors take the topic back.
+        a2.command(&format!("TRUST {} {}", peer.node_id, peer.public_key));
         a2.command(&format!(
             "CONNECT {} {} {}",
             peer.node_id, peer.public_key, peer.addr
         ));
+        a2.command(&format!("SET_PEER_ENV {} prod", peer.node_id));
         // The survivors' dial of the restarted node is the step the mesh
         // layer is slow at (POSTEP.md, "transport").
     }

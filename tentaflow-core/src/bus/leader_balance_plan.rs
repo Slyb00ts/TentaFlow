@@ -239,6 +239,31 @@ pub(super) fn majority(led: &BTreeMap<String, u32>) -> String {
         .unwrap_or_default()
 }
 
+/// The preferred node of a unit: the node most of its rows name first
+/// (`firsts`, one entry per row, empty names counted as none). A tie goes to
+/// the node that leads most of the unit (`led`), then to the lowest id, so a
+/// unit whose rows disagree (a transfer that raced an election left some
+/// rows behind) is still read one way, by the planner and by the automatic
+/// return alike.
+pub(super) fn plurality_preferred<'a>(
+    firsts: impl IntoIterator<Item = &'a str>,
+    led: &BTreeMap<String, u32>,
+) -> Option<String> {
+    let mut votes: BTreeMap<&str, u32> = BTreeMap::new();
+    for first in firsts.into_iter().filter(|f| !f.is_empty()) {
+        *votes.entry(first).or_insert(0) += 1;
+    }
+    votes
+        .into_iter()
+        .max_by(|a, b| {
+            let led_of = |node: &str| led.get(node).copied().unwrap_or(0);
+            a.1.cmp(&b.1)
+                .then(led_of(a.0).cmp(&led_of(b.0)))
+                .then(b.0.cmp(a.0))
+        })
+        .map(|(node, _)| node.to_string())
+}
+
 /// Makes the plan for `input`. See the module doc for what it aims at.
 pub fn plan(input: &PlanInput) -> LeaderPlan {
     let mut units = build_units(input);
@@ -415,14 +440,14 @@ fn build_units(input: &PlanInput) -> Vec<Unit> {
             for r in &rows {
                 *led.entry(r.leader.clone()).or_insert(0) += 1;
             }
-            // The preferred node is the one every row names first; rows that
-            // disagree leave the unit with none (the automatic return reads
-            // it the same way, `leader_return::unanimous_preferred`).
-            let mut preferred_votes: BTreeMap<String, u32> = BTreeMap::new();
-            for r in &rows {
-                let first = r.replicas.first().cloned().unwrap_or_default();
-                *preferred_votes.entry(first).or_insert(0) += 1;
-            }
+            // The preferred node is the one most rows name first, a tie going
+            // to the node that leads most (`plurality_preferred`; the
+            // automatic return reads it the same way).
+            let preferred = plurality_preferred(
+                rows.iter()
+                    .map(|r| r.replicas.first().map(String::as_str).unwrap_or("")),
+                &led,
+            );
             let source_partitions: Vec<u32> = rows
                 .iter()
                 .filter(|r| r.topic == topic)
@@ -438,9 +463,7 @@ fn build_units(input: &PlanInput) -> Vec<Unit> {
                 source_partitions,
                 weight: rows.len() as u32,
                 home: majority(&led),
-                preferred: (preferred_votes.len() == 1)
-                    .then(|| majority(&preferred_votes))
-                    .filter(|p| !p.is_empty()),
+                preferred,
                 led,
                 rows: rows
                     .iter()
@@ -1214,18 +1237,46 @@ mod tests {
         );
     }
 
-    /// Rows that disagree on who is preferred leave the unit with none, as
-    /// they do for the automatic return: nothing is returned or counted at
-    /// either node.
+    /// Rows that disagree on who is preferred take the node most of them
+    /// name, as they do for the automatic return; a tie goes to the node
+    /// that leads the unit, so a tied unit stays where it is.
     #[test]
-    fn a_unit_whose_rows_disagree_on_the_preferred_node_has_none() {
+    fn a_unit_whose_rows_disagree_on_the_preferred_node_takes_the_majority() {
         let mut parts = topic("t1", 1, "b", &["a", "b"]);
         let mut other = topic("t1", 1, "b", &["b", "a"]);
         other[0].partition = 1;
         parts.extend(other);
-        let plan = plan(&input(parts));
-        assert!(plan.moves.is_empty(), "{plan:?}");
-        assert!(plan.blockers.is_empty(), "{plan:?}");
+        let tied = plan(&input(parts));
+        assert!(tied.moves.is_empty(), "a tie goes to the leader: {tied:?}");
+        assert!(tied.blockers.is_empty(), "{tied:?}");
+
+        // Three of four rows prefer `a`, so a unit led by `b` returns to it.
+        let mut parts = topic("t1", 4, "b", &["a", "b"]);
+        parts[1].replicas = vec!["b".into(), "a".into()];
+        let majority_plan = plan(&input(parts));
+        assert_eq!(majority_plan.moves.len(), 1, "{majority_plan:?}");
+        assert_eq!(majority_plan.moves[0].to, "a");
+        assert!(majority_plan.moves[0].returns_to_preferred);
+    }
+
+    #[test]
+    fn plurality_preferred_breaks_a_tie_to_the_leader_and_then_the_lowest_id() {
+        let led = |pairs: &[(&str, u32)]| -> BTreeMap<String, u32> {
+            pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+        };
+        assert_eq!(
+            plurality_preferred(["a", "a", "b"], &led(&[("b", 3)])).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            plurality_preferred(["a", "b"], &led(&[("b", 2)])).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            plurality_preferred(["b", "a"], &led(&[("c", 2)])).as_deref(),
+            Some("a")
+        );
+        assert_eq!(plurality_preferred(["", ""], &led(&[])), None);
     }
 
     /// With the automatic return switched off nothing brings the topic back

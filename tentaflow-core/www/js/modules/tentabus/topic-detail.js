@@ -29,7 +29,7 @@ import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { fromReplica, replicaNoteHtml } from '/js/modules/tentabus/replica-note.js';
 import { paintStateSection } from '/js/modules/tentabus/topic-state.js';
 import { settingsHtml, whoCanChange } from '/js/modules/tentabus/topic-settings.js';
-import { partitionRows, transferBlocker, copyChipHtml, preferredLegendHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
+import { partitionRows, transferBlocker, copyChipHtml, nodeNameHtml, preferredLegendHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
 import { paintUnprocessedSection } from '/js/modules/tentabus/unprocessed.js';
 import { paintAccessSection, accessCount } from '/js/modules/tentabus/topic-access.js';
 import { paintHidingSection, hidingCount } from '/js/modules/tentabus/topic-hiding.js';
@@ -320,7 +320,7 @@ function paintPartitionsSection(host, view, ctx) {
     ].join('');
     return {
       partition: `<span class="tf-table__cell-title">${escapeHtml(T('partitions.name', { n: fmtCount(r.partition) }))}</span>${subs}`,
-      leader: r.leader ? `<span class="tf-table__cell--mono">${escapeHtml(r.leader)}</span>` : '—',
+      leader: r.leader ? nodeNameHtml(r.leader, r.leaderTitle) : '—',
       copies: r.copies.length ? r.copies.map(copyChipHtml).join(' ') : '—',
       range: escapeHtml(rangeText(r.range)),
       _key: String(r.partition),

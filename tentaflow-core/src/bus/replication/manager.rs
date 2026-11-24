@@ -455,6 +455,12 @@ pub trait FollowerRunner: Send + Sync {
     fn last_frame_age(&self) -> Option<Duration> {
         None
     }
+    /// The live in-sync set the leader of this stream last reported in a
+    /// heartbeat; `None` until it did, and the default for a runner that does
+    /// not track it. `snapshot` shows it for a partition this node follows.
+    fn leader_isr(&self) -> Option<Vec<String>> {
+        None
+    }
     /// The `ReplReject` reason of the most recent refused `Hello` on this
     /// partition's follower side, if any — the accept path's own record of
     /// WHY the last leader dial-in was turned away (P8 diagnosis aid: the
@@ -828,6 +834,11 @@ pub struct ReplicationManager {
     local_node_id: String,
     local_env: NodeEnvironment,
     registry: DashMap<PartitionKey, PartitionEntry>,
+    /// `updated_at_ms` of the row this node last proposed for each partition
+    /// it stood for: the identity of its own candidacy in the ledger, which
+    /// tells a row that is its own earlier attempt from one another op
+    /// minted for the same term (a manual transfer).
+    own_proposals: DashMap<PartitionKey, i64>,
     transport: Arc<dyn Transport>,
     ledger: Arc<dyn LedgerAdmission>,
     assignments: Arc<dyn AssignmentStore>,
@@ -1095,6 +1106,7 @@ impl ReplicationManager {
             follower_factory: config.follower_factory,
             audit: config.audit,
             leo_query_timeout: config.leo_query_timeout,
+            own_proposals: DashMap::new(),
             majority_await_timeout: config.majority_await_timeout,
             shutdown: CancellationToken::new(),
             assignments_changed: watch::channel(()).0,
@@ -3051,6 +3063,18 @@ impl ReplicationManager {
             return;
         };
 
+        // The canvass ran on the view this node had when the lease ran out;
+        // the ledger may hold a newer claim by now (a transfer's row the
+        // assignment poll has not applied). Proposing over it would give the
+        // stale replica order the later HLC, so the row would be replaced
+        // everywhere, and the failover would be recorded for a handover.
+        if self.yield_to_settled_row(&key, &proposed).await {
+            self.set_promotion(&key, PromotionState::Idle);
+            return;
+        }
+        self.own_proposals
+            .insert(key.clone(), proposed.updated_at_ms);
+
         let majority_deadline = Instant::now() + self.majority_await_timeout;
         let state = match self.assignments.propose(proposed.clone()) {
             Ok(op_id) => {
@@ -3093,6 +3117,49 @@ impl ReplicationManager {
             }
             tokio::time::sleep(Duration::from_millis(20).min(majority_deadline - now)).await;
         }
+    }
+
+    /// Whether the local ledger already holds a claim that this candidacy
+    /// must not propose over: a higher epoch, or the same epoch minted by
+    /// another op for this node (a transfer) or won by a lower node id. The
+    /// claim is applied, as the assignment poll would. A row that is this
+    /// node's own earlier attempt at the term is no obstacle: the candidacy
+    /// is retried.
+    async fn yield_to_settled_row(
+        &self,
+        key: &PartitionKey,
+        proposed: &PartitionAssignment,
+    ) -> bool {
+        let Ok(Some(stored)) = self
+            .assignments
+            .get(&self.instance_id, &key.0, &key.1, key.2)
+        else {
+            return false;
+        };
+        if stored.topic_generation != proposed.topic_generation {
+            return false;
+        }
+        let own = self
+            .own_proposals
+            .get(key)
+            .is_some_and(|ms| *ms == stored.updated_at_ms);
+        let settled = stored.leader_epoch > proposed.leader_epoch
+            || (stored.leader_epoch == proposed.leader_epoch
+                && !own
+                && stored.leader_node_id <= self.local_node_id);
+        if !settled {
+            return false;
+        }
+        tracing::info!(
+            org_id = %key.0, topic = %key.1, partition = key.2,
+            stored_leader = %stored.leader_node_id,
+            stored_epoch = stored.leader_epoch,
+            proposed_epoch = proposed.leader_epoch,
+            "replication: not proposing — the ledger already holds a claim at or above \
+             this candidacy's epoch"
+        );
+        self.apply_assignment(stored).await;
+        true
     }
 
     /// One `LeoQuery` round of `run_election`, `vote` asking every replier —
@@ -3640,6 +3707,26 @@ impl ReplicationManager {
             Ok(stored) => stored,
             Err(_) => None,
         };
+        if let Some(stored) = &stored {
+            // The same term, settled on this node by another op than this
+            // proposal (a manual transfer that landed after the check before
+            // `propose`, with the later HLC): that row stands. The identity of
+            // the op is its `updated_at_ms`, not the order of its replicas.
+            if stored.leader_epoch == assignment.leader_epoch
+                && stored.leader_node_id == self.local_node_id
+                && stored.topic_generation == assignment.topic_generation
+                && stored.updated_at_ms != assignment.updated_at_ms
+            {
+                tracing::info!(
+                    org_id = %key.0, topic = %key.1, partition = key.2,
+                    epoch = stored.leader_epoch,
+                    "replication: yielding promotion — another op already settled this \
+                     term on this node"
+                );
+                self.apply_assignment(stored.clone()).await;
+                return;
+            }
+        }
         if let Some(stored) = stored {
             let beats_this_proposal = stored.leader_epoch > assignment.leader_epoch
                 || (stored.leader_epoch == assignment.leader_epoch
@@ -3848,6 +3935,11 @@ impl ReplicationCoordinator for ReplicationManager {
                 topic: topic.to_string(),
                 partition,
                 leader: String::new(),
+                leader_epoch: self
+                    .registry
+                    .get(&key)
+                    .map(|e| e.assignment.leader_epoch)
+                    .unwrap_or(0),
             });
         }
         let entry = self
@@ -4160,6 +4252,7 @@ impl ReplicationCoordinator for ReplicationManager {
                     topic: key.1.clone(),
                     partition: key.2,
                     leader: assignment.leader_node_id.clone(),
+                    leader_epoch: assignment.leader_epoch,
                 });
             }
             let isr_before = assignment.isr.len();
@@ -4192,6 +4285,45 @@ impl ReplicationCoordinator for ReplicationManager {
         Ok(touched)
     }
 
+    fn reorder_replicas(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        expected_epoch: u32,
+        order: &[String],
+    ) -> Result<Option<u32>, ReplError> {
+        let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
+        let _serial = self.reconfiguring.lock();
+        let Some(mut assignment) = self.current_row(&key) else {
+            return Ok(None);
+        };
+        let same_nodes = {
+            let mut held = assignment.replicas.clone();
+            let mut wanted = order.to_vec();
+            held.sort();
+            wanted.sort();
+            held == wanted
+        };
+        if assignment.leader_node_id != self.local_node_id
+            || assignment.leader_epoch != expected_epoch
+            || !same_nodes
+            || assignment.replicas == order
+        {
+            return Ok(None);
+        }
+        let slots = assignment.resolved_epoch_slots();
+        assignment.replicas = order.to_vec();
+        assignment
+            .claim_epoch_slots(slots)
+            .map_err(|_| slots_exhausted(&key))?;
+        assignment.leader_epoch = self.next_term(&key, &assignment, &assignment.leader_node_id)?;
+        assignment.updated_at_ms = now_ms();
+        let epoch = assignment.leader_epoch;
+        self.assignments.propose(assignment)?;
+        Ok(Some(epoch))
+    }
+
     fn snapshot(&self, org: &str, topic: Option<&str>) -> ReplicationSnapshot {
         let mut partitions = Vec::new();
         let mut nodes: BTreeMap<String, ReplicaNodeInfo> = BTreeMap::new();
@@ -4217,7 +4349,18 @@ impl ReplicationCoordinator for ReplicationManager {
                     .as_ref()
                     .map(|l| (l.isr(), l.lagging()))
                     .unwrap_or_else(|| (a.isr.clone(), Vec::new())),
-                _ => (a.isr.clone(), Vec::new()),
+                // The leader's own report, while its stream is alive: the
+                // row's `isr` is the one of the last placement change.
+                LocalRole::Follower => (
+                    entry
+                        .follower
+                        .as_ref()
+                        .filter(|f| !f.lease_expired())
+                        .and_then(|f| f.leader_isr())
+                        .unwrap_or_else(|| a.isr.clone()),
+                    Vec::new(),
+                ),
+                LocalRole::NotReplica => (a.isr.clone(), Vec::new()),
             };
             for node_id in &a.replicas {
                 let info = nodes
@@ -4553,6 +4696,7 @@ impl ReplicationManager {
             return Err(ReplError::NotPartitionLeader {
                 topic: topic.to_string(),
                 partition,
+                leader_epoch: assignment.leader_epoch,
                 leader: assignment.leader_node_id,
             });
         }
@@ -4564,6 +4708,7 @@ impl ReplicationManager {
             return Err(ReplError::NotPartitionLeader {
                 topic: topic.to_string(),
                 partition,
+                leader_epoch: assignment.leader_epoch,
                 leader: assignment.leader_node_id,
             });
         }
@@ -4677,6 +4822,14 @@ impl ReplicationManager {
         // abdicates the old epoch, becomes a follower with no leader, and
         // stands in the normal election on the next lease tick (a new term,
         // from the replica that holds the most, never the old epoch again).
+        // The row that shows the move, read before the entry is locked (it
+        // reads the registry too). Only a row that names the target at the
+        // proposed epoch or later is adopted: an admitted proposal may still
+        // have lost to another claim, and the entry must not be pinned to a
+        // row that did.
+        let shown_move = self.current_row(key).filter(|row| {
+            row.leader_node_id == target && row.leader_epoch >= proposed.leader_epoch
+        });
         if let Some(mut entry) = self.registry.get_mut(key) {
             if entry.role == LocalRole::Leader {
                 if let Some(leader) = entry.leader.take() {
@@ -4684,6 +4837,14 @@ impl ReplicationManager {
                 }
                 entry.leadership = self.next_leadership();
                 if fate_known {
+                    // The entry names the new term from here on, until the
+                    // poll applies the row: a candidate querying this node
+                    // in between (`answer_leo_query`) must see an epoch newer
+                    // than its own and defer, not a leaderless old one it
+                    // would stand over.
+                    if let Some(row) = shown_move {
+                        entry.assignment = row;
+                    }
                     entry.role = LocalRole::NotReplica;
                 } else {
                     entry.abdicated_epoch = Some(entry.assignment.leader_epoch);
@@ -4884,10 +5045,11 @@ fn repl_error_to_wire(e: &ReplError) -> ForwardError {
             topic,
             partition,
             leader,
+            leader_epoch,
         } => (
             CODE_NOT_LEADER,
             vec![topic.clone(), leader.clone()],
-            vec![u64::from(*partition)],
+            vec![u64::from(*partition), u64::from(*leader_epoch)],
         ),
         ReplError::TransferTargetBehind {
             topic,
@@ -4969,6 +5131,8 @@ fn repl_error_from_wire(error: ForwardError) -> ReplError {
                         topic,
                         partition,
                         leader,
+                        // Appended: a leader that predates it sends none.
+                        leader_epoch: number(1).unwrap_or(0),
                     },
                 )
         }
@@ -6126,10 +6290,14 @@ mod tests {
             let admitted = match rows.get(&key) {
                 _ if assignment.topic_generation < deleted_generation => false,
                 None => true,
+                // The materializer's order: a higher epoch, a lower node id on
+                // a tie, and on the same epoch and leader the later write.
                 Some(stored) => {
                     assignment.leader_epoch > stored.leader_epoch
                         || (assignment.leader_epoch == stored.leader_epoch
-                            && assignment.leader_node_id < stored.leader_node_id)
+                            && (assignment.leader_node_id < stored.leader_node_id
+                                || (assignment.leader_node_id == stored.leader_node_id
+                                    && assignment.updated_at_ms >= stored.updated_at_ms)))
                 }
             };
             if admitted {
@@ -12421,5 +12589,255 @@ mod tests {
 
         let ack = hello_roundtrip(Arc::clone(&fx.manager), hello_from(&a)).await;
         assert!(ack.accepted, "{:?}", ack.reject);
+    }
+
+    // ---- a manual transfer racing the election (TB-04 K10, D3) -------------
+
+    /// The ledger already holds the row a transfer minted for this node (its
+    /// replica order differs), the assignment poll has not applied it and the
+    /// lease ran out: the candidacy runs on the old view and must not propose
+    /// over the row. The store orders same-epoch, same-leader rows by the later
+    /// write, like the materializer, so a proposal would replace the transfer's
+    /// row and be recorded as a failover.
+    #[tokio::test]
+    async fn a_candidacy_does_not_propose_over_the_row_a_transfer_minted_for_its_term() {
+        let fx = build("f1");
+        let old = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            5,
+        );
+        fx.assignments.seed(old.clone());
+        fx.manager.apply_assignment(old).await;
+        let mut transfer = assignment(
+            "org",
+            "orders",
+            0,
+            "f1",
+            &["f1", "l", "f2"],
+            &["f1", "l", "f2"],
+            64,
+        );
+        transfer.updated_at_ms = 1_000;
+        fx.assignments.seed(transfer.clone());
+        fx.transport.set_script(
+            "f2",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: true,
+            },
+        );
+
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        fx.manager.run_election(key.clone()).await;
+
+        assert_eq!(
+            fx.assignments.stored(&key),
+            Some(transfer),
+            "the transfer's row, replica order and all, is still the ledger's"
+        );
+        assert_eq!(*fx.audit.failovers.lock(), 0, "a transfer is no failover");
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 },
+            "the row is applied as the poll would"
+        );
+    }
+
+    /// The same term settled by another op after the check before `propose`:
+    /// the transfer's row has the later write, so it wins the ledger, and the
+    /// promotion adopts it instead of recording a failover.
+    #[tokio::test]
+    async fn a_promotion_adopts_the_row_of_another_op_that_won_its_term() {
+        let fx = build("f1");
+        let old = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            5,
+        );
+        fx.assignments.seed(old.clone());
+        fx.manager.apply_assignment(old.clone()).await;
+        let mut transfer = assignment(
+            "org",
+            "orders",
+            0,
+            "f1",
+            &["f1", "l", "f2"],
+            &["f1", "l", "f2"],
+            64,
+        );
+        transfer.updated_at_ms = 2_000;
+        fx.assignments.seed(transfer.clone());
+        // This node's proposal is the earlier write of the same term (a
+        // different op, here with the SAME replica order as the transfer).
+        let proposed = PartitionAssignment {
+            leader_node_id: "f1".to_string(),
+            leader_epoch: 64,
+            replicas: transfer.replicas.clone(),
+            updated_at_ms: 1_000,
+            ..old
+        };
+
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        fx.manager
+            .promote(
+                &key,
+                &proposed,
+                vec![
+                    PromotionAction::SetLeaderEpoch(64),
+                    PromotionAction::StartFeeders,
+                ],
+            )
+            .await;
+
+        assert_eq!(fx.assignments.stored(&key), Some(transfer));
+        assert_eq!(*fx.audit.failovers.lock(), 0, "a transfer is no failover");
+    }
+
+    /// The old leader of a finished transfer answers a candidate with the
+    /// term the transfer minted, which makes a candidate on an older view
+    /// defer, not with the leaderless old one it would stand over.
+    #[tokio::test]
+    async fn a_leader_that_handed_over_reports_the_new_term_until_the_row_is_applied() {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            4,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        for raw in 1u8..=4 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f1".to_string()]);
+        }
+
+        let epoch = fx
+            .manager
+            .transfer_leader("org", "orders", 0, "f1")
+            .expect("transfer succeeds");
+
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let held = fx.manager.registry.get(&key).unwrap().assignment.clone();
+        assert_eq!(
+            (held.leader_node_id.as_str(), held.leader_epoch),
+            ("f1", epoch)
+        );
+    }
+
+    /// A transfer acknowledged by the replicas whose row lost the term to
+    /// another claim in the ledger: the old leader steps down, but its entry
+    /// is not pinned to the row that lost.
+    #[tokio::test]
+    async fn a_transfer_whose_row_lost_the_term_does_not_pin_the_entry_to_it() {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            4,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        for raw in 1u8..=4 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f1".to_string()]);
+        }
+        let store = Arc::clone(&fx.assignments);
+        *fx.assignments.on_propose.lock() = Some(Box::new(move || {
+            // Another claim, of a higher epoch, takes the row right after.
+            store.seed(assignment(
+                "org",
+                "orders",
+                0,
+                "f2",
+                &["f2", "l", "f1"],
+                &["f2", "l", "f1"],
+                200,
+            ));
+        }));
+
+        fx.manager
+            .transfer_leader("org", "orders", 0, "f1")
+            .expect("the proposal was admitted by its replicas");
+
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let held = fx.manager.registry.get(&key).unwrap().assignment.clone();
+        assert_eq!(
+            (held.leader_node_id.as_str(), held.leader_epoch),
+            ("l", 4),
+            "the entry keeps its old view until the poll applies the winner"
+        );
+    }
+
+    /// Only the order changes, and only on the row planned from: a node that
+    /// left, or a row that has moved on, is not undone.
+    #[tokio::test]
+    async fn reorder_replicas_rewrites_the_order_only_of_the_row_it_was_planned_from() {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["f1", "l", "f2"],
+            &["f1", "l", "f2"],
+            4,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let order = |nodes: &[&str]| nodes.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+
+        // A node that is no longer in the row: refused.
+        assert_eq!(
+            fx.manager
+                .reorder_replicas("org", "orders", 0, 4, &order(&["l", "f1", "f2", "f3"]))
+                .unwrap(),
+            None
+        );
+        // Planned from another epoch: refused.
+        assert_eq!(
+            fx.manager
+                .reorder_replicas("org", "orders", 0, 3, &order(&["l", "f1", "f2"]))
+                .unwrap(),
+            None
+        );
+        // Not the leader of the row: refused.
+        assert_eq!(
+            fx.manager
+                .reorder_replicas("org", "orders", 9, 4, &order(&["l", "f1", "f2"]))
+                .unwrap(),
+            None
+        );
+        assert_eq!(fx.assignments.stored(&key).unwrap().leader_epoch, 4);
+
+        let epoch = fx
+            .manager
+            .reorder_replicas("org", "orders", 0, 4, &order(&["l", "f1", "f2"]))
+            .unwrap()
+            .expect("reordered");
+        let row = fx.assignments.stored(&key).unwrap();
+        assert_eq!(row.replicas, order(&["l", "f1", "f2"]));
+        assert_eq!(
+            (row.leader_node_id.as_str(), row.leader_epoch),
+            ("l", epoch)
+        );
+        assert!(epoch > 4);
     }
 }

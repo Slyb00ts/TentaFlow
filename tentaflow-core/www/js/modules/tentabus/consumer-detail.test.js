@@ -47,7 +47,7 @@ const stats = {
 };
 const samples = [{ atMs: NOW - 2 * MIN, lagTotal: 2500, committedTotal: 10 }, { atMs: NOW - MIN, lagTotal: 3000, committedTotal: 20 }];
 
-function mount({ nodes = [], section = 'state', access = topicDetail.access, adminLabels = [], data, error = null, statsOverride, justMoved = new Set(), notice = null } = {}) {
+function mount({ nodes = [], section = 'state', access = topicDetail.access, adminLabels = [], data, error = null, statsOverride, justMoved = new Set(), notice = null, replicaTopics = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -67,6 +67,7 @@ function mount({ nodes = [], section = 'state', access = topicDetail.access, adm
     notice,
     justMoved,
     nodes,
+    replicaTopics,
     busy: false,
     instanceLabel: 'Produkcja',
     nowMs: NOW,
@@ -245,4 +246,39 @@ test('Stan: a reading that runs here has no leader notice, and a poll keeps the 
   const kept = other.body.querySelector('[data-role="leader-notice"] tf-alert');
   other.redraw();
   assert.equal(other.body.querySelector('[data-role="leader-notice"] tf-alert'), kept);
+});
+
+// Another node leads the topic: pause, resume and the reading place are the leader's to change.
+const ledBy = (leader) => [{ topic: 'wyniki-badan', partitions: [0, 1].map((partition) => ({ partition, leaderNodeId: leader, replicas: ['here', 'there'] })) }];
+const twoNodes = [{ nodeId: 'here', label: 'Serwer A', isLocal: true }, { nodeId: 'there', label: 'Serwer B' }];
+
+test('on a node that does not lead the topic, pause and the reading place are disabled and name the leader', () => {
+  const away = mount({ nodes: twoNodes, replicaTopics: ledBy('there'), section: 'state' });
+  const toggle = away.body.querySelector('[data-role="toggle"]');
+  assert.equal(toggle.hasAttribute('disabled'), true);
+  assert.equal(toggle.getAttribute('title'), 'Ten topik prowadzi node Serwer B — odbiorcę wstrzymasz i wznowisz tam.');
+  away.body.querySelector('[data-role="toggle"]').click();
+  assert.deepEqual(away.moves, []);
+
+  const position = mount({ nodes: twoNodes, replicaTopics: ledBy('there'), section: 'position' });
+  const table = position.body.querySelector('[data-section="position"] [data-role="table"]');
+  const button = table.rowActions(table.rows[0], 0, () => table.rows[0]);
+  assert.equal(button.hasAttribute('disabled'), true);
+  assert.equal(button.title, 'Ten topik prowadzi node Serwer B — miejsce czytania przesuniesz tam.');
+  button.click();
+  assert.deepEqual(position.moves, [], 'a disabled move sends nothing');
+
+  const home = mount({ nodes: twoNodes, replicaTopics: ledBy('here'), section: 'position' });
+  assert.equal(home.body.querySelector('[data-role="toggle"]').hasAttribute('disabled'), false);
+  const homeTable = home.body.querySelector('[data-section="position"] [data-role="table"]');
+  assert.equal(homeTable.rowActions(homeTable.rows[0], 0, () => homeTable.rows[0]).hasAttribute('disabled'), false);
+  // Replica lists not read yet: nothing is known, so nothing is held back.
+  assert.equal(mount({ nodes: twoNodes, replicaTopics: null }).body.querySelector('[data-role="toggle"]').hasAttribute('disabled'), false);
+});
+
+test('a leader known only by id is named by its short id', () => {
+  const hex = '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54';
+  const notice = withLeader({ state: 'waiting', reason: 'not_leader', leaderNodeId: hex, leaderNodeName: hex });
+  const shown = mount({ data: notice });
+  assert.match(shown.body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title'), /prowadzi node 365123c5 /);
 });

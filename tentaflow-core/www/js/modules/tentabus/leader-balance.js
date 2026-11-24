@@ -12,6 +12,7 @@
 
 import { T } from '/js/modules/tentabus/format.js';
 import { userTopics } from '/js/modules/tentabus/model.js';
+import { nodeLabel, nodeNamer, nodeTitle } from '/js/modules/tentabus/node-label.js';
 
 /** The `settings` key of the per-instance switch of the automatic return (K6); absent means on. */
 export const leaderReturnKey = (instanceId) => `bus.leader_return:${instanceId}`;
@@ -84,7 +85,8 @@ export function balanceModel({ units, nodes }) {
   const list = nodes || [];
   const rows = list.map((n) => ({
     nodeId: n.nodeId,
-    label: n.label || n.nodeId,
+    label: nodeLabel(n),
+    title: nodeTitle(n),
     reachable: n.reachable !== false,
     partitions: units.reduce((sum, u) => sum + (u.led.get(n.nodeId) || 0), 0),
     topics: units.filter((u) => u.leaderId === n.nodeId).map((u) => u.name),
@@ -128,13 +130,31 @@ export const pluralNumber = (value) => (Number.isInteger(value) ? value : 5);
  */
 export function rebalanceAvailability(nodes) {
   const list = nodes || [];
-  const older = list.filter(isOlderNode).map((n) => n.label || n.nodeId);
+  const older = list.filter(isOlderNode).map(nodeLabel);
   if (older.length) {
     return { reason: T(older.length === 1 ? 'replication.balance_blocked_old_one' : 'replication.balance_blocked_old_many', { nodes: older.join(', ') }), older };
   }
   if (list.length < 2) return { reason: T('replication.balance_blocked_single'), older };
   if (!list.some((n) => !n.isLocal && n.reachable !== false)) return { reason: T('replication.balance_blocked_down'), older };
   return { reason: null, older };
+}
+
+/**
+ * The node that leads `topic` when it is not this one: `{ nodeId, node }`
+ * (the node that leads most of its partitions, by name), or `null` when this
+ * node leads it, no node is known to, or the replica lists are not read yet.
+ * What only the leading node can do (pause a consumer, move its reading
+ * place) is offered by it alone.
+ */
+export function leaderElsewhere(topic, perTopic, nodes) {
+  const local = (nodes || []).find((n) => n.isLocal)?.nodeId;
+  const parts = (perTopic || []).find((t) => t.topic === topic)?.partitions || [];
+  if (!local || !parts.length) return null;
+  const led = new Map();
+  for (const p of parts) if (p.leaderNodeId) led.set(p.leaderNodeId, (led.get(p.leaderNodeId) || 0) + 1);
+  const leaderId = [...led.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+  if (!leaderId || led.has(local) && led.get(local) >= led.get(leaderId)) return null;
+  return { nodeId: leaderId, node: nodeNamer(nodes)(leaderId) };
 }
 
 /**
@@ -152,7 +172,7 @@ export function leastLoadedNode({ perTopic, nodes }) {
       if (id) counts.set(id, (counts.get(id) || 0) + 1);
     }
   }
-  const rows = (nodes || []).filter((n) => n.reachable !== false).map((n) => ({ nodeId: n.nodeId, label: n.label || n.nodeId, partitions: counts.get(n.nodeId) || 0 }));
+  const rows = (nodes || []).filter((n) => n.reachable !== false).map((n) => ({ nodeId: n.nodeId, label: nodeLabel(n), partitions: counts.get(n.nodeId) || 0 }));
   if (!rows.length) return null;
   return rows.sort((a, b) => a.partitions - b.partitions || a.nodeId.localeCompare(b.nodeId))[0];
 }

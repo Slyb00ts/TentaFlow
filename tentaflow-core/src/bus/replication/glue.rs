@@ -51,7 +51,7 @@ use tentaflow_bus::{HwTracking, Partition};
 use crate::bus::replication::assignment::PartitionAssignment;
 use crate::bus::replication::election::LogPosition;
 use crate::bus::replication::follower::{
-    self, ExpectedLeader, FollowerConfig, FollowerExit, FollowerStores,
+    self, ExpectedLeader, FollowerConfig, FollowerExit, FollowerStores, LeaderIsr,
 };
 use crate::bus::replication::frames::{ReplHello, ReplProducerMark, ReplReject};
 use crate::bus::replication::leader::{
@@ -1095,11 +1095,13 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         partition.set_hw_tracking(HwTracking::Manual);
         let partition = Arc::new(partition);
         let stores = provider.follower_stores();
+        let leader_isr = LeaderIsr::default();
         let expected = ExpectedLeader {
             org_id: assignment.org_id.clone(),
             topic: assignment.topic.clone(),
             partition: assignment.partition,
             local_node_id: self.local_node_id.clone(),
+            leader_isr: leader_isr.clone(),
         };
 
         let disconnect_hint = Arc::new(Notify::new());
@@ -1196,6 +1198,7 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
             lease_expired,
             last_reject,
             last_frame,
+            leader_isr,
             stopped,
             task: Mutex::new(Some(task)),
         }))
@@ -1231,6 +1234,7 @@ struct GlueFollowerRunner {
     lease_expired: Arc<AtomicBool>,
     last_reject: Arc<Mutex<Option<ReplReject>>>,
     last_frame: Arc<Mutex<Option<Instant>>>,
+    leader_isr: LeaderIsr,
     #[allow(dead_code)]
     // reserved: mirrors `GlueLeaderShared::stopped`'s shape for symmetry/future use.
     stopped: Arc<AtomicBool>,
@@ -1268,6 +1272,10 @@ impl FollowerRunner for GlueFollowerRunner {
 
     fn last_frame_age(&self) -> Option<Duration> {
         self.last_frame.lock().map(|at| at.elapsed())
+    }
+
+    fn leader_isr(&self) -> Option<Vec<String>> {
+        self.leader_isr.get()
     }
 
     fn stop(&self) {

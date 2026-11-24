@@ -45,10 +45,11 @@ import { policyRows, topicFormat, fieldSource, previewAvailable } from '/js/modu
 import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
 import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
-import { openLeaderTransfer, transferChoices, transferContext, exclusive } from '/js/modules/tentabus/partitions.js';
+import { openLeaderTransfer, transferChoices, transferContext, exclusive, askLeaders, overlayLeaderRows } from '/js/modules/tentabus/partitions.js';
 import { openRebalanceWindow, blockerText } from '/js/modules/tentabus/rebalance-window.js';
 import { leaderReturnEnabled, leaderReturnKey, leaderReturnValue, leastLoadedNode, isOlderNode } from '/js/modules/tentabus/leader-balance.js';
-import { drawReplication } from '/js/modules/tentabus/replication.js';
+import { nodeLabel, nodeTitle, nodeNamer } from '/js/modules/tentabus/node-label.js';
+import { drawReplication, collectFailovers } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey, consumerRows } from '/js/modules/tentabus/consumers.js';
 import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
 import { loadConsumerSla } from '/js/modules/tentabus/consumer-sla.js';
@@ -171,7 +172,7 @@ function busErrorCode(message) {
 // back to the raw server message when no i18n entry exists for the code yet
 // (`I18n.t` returns the lookup path itself on a miss — compared against here
 // so an untranslated code degrades to information instead of a dotted key).
-function mapBusErrorMessage(message, translate) {
+function mapBusErrorMessage(message, translate, nodeName = (id) => id) {
   const code = busErrorCode(message);
   if (code) {
     const key = `errors.${code}`;
@@ -189,7 +190,7 @@ function mapBusErrorMessage(message, translate) {
       if (code === 'not_leader' || code === 'dlq_retry_source_not_leader') {
         const hintNode = extractNotLeaderHint(message);
         if (hintNode) {
-          const hintText = translate('errors.not_leader_hint', { node: hintNode });
+          const hintText = translate('errors.not_leader_hint', { node: nodeName(hintNode) });
           if (hintText !== 'tentabus.errors.not_leader_hint') return `${translated} ${hintText}`;
         }
       }
@@ -256,6 +257,13 @@ function buildLeaderTransferRequest(instanceId, topic, partition, targetNodeId) 
 function extractNotLeaderHint(message) {
   const m = /(?<![a-zA-Z_])leader[_ ]?(?:node[_ ]?id)?\s*(?:is)?\s*[:=]?\s*["']?([a-zA-Z0-9._-]{2,})["']?/i.exec(String(message || ''));
   return m ? m[1] : null;
+}
+
+// The node a refusal names: a node this page knows by its name, a bare node id by its short form, anything else as it came.
+function hintNodeName(hint) {
+  const nodes = state.shell?.nodes || [];
+  if (nodes.some((n) => n.nodeId === hint) || /^[0-9a-f]{16,}$/i.test(hint)) return nodeNamer(nodes)(hint);
+  return hint;
 }
 
 const state = {
@@ -381,6 +389,8 @@ function freshShellState() {
     nodes: null,
     replicaTopics: null,
     failovers: [],
+    // The leaders' own replica lists of the last poll (`Map` topic → leaderId → rows, see `askLeaders`).
+    leaderAnswers: new Map(),
     replicaLags: [],
     // The switch of the automatic return of topics to their preferred node: `null` until the settings were read.
     leaderReturn: null,
@@ -753,7 +763,10 @@ function paintShell() {
   setAttr(dlqBadge, 'label', counts.dlq != null ? T('shell.badge_dlq', { count: fmtCount(counts.dlq), n: counts.dlq }) : null);
   setAttr(dlqBadge, 'status', counts.dlq ? 'warn' : 'neutral');
   setAttr(badges.querySelector('[data-role="schemas"]'), 'label', counts.schemas != null ? T('shell.badge_schemas', { count: fmtCount(counts.schemas), n: counts.schemas }) : null);
-  setAttr(badges.querySelector('[data-role="node-list"]'), 'label', sh.nodes?.length ? T('shell.badge_nodes', { list: sh.nodes.map((n) => n.label || n.nodeId).join(' · ') }) : null);
+  const nodeList = badges.querySelector('[data-role="node-list"]');
+  setAttr(nodeList, 'label', sh.nodes?.length ? T('shell.badge_nodes', { list: sh.nodes.map(nodeLabel).join(' · ') }) : null);
+  // A node named by its short id: the full ids, one per line.
+  setAttr(nodeList, 'title', (sh.nodes || []).filter(nodeTitle).map((n) => `${nodeLabel(n)}: ${nodeTitle(n)}`).join('\n') || null);
   setClass(badges, 'is-stale', stale);
 
   const select = byId('tb-instance-select');
@@ -1064,6 +1077,26 @@ async function refreshLeaderReturn(instanceId) {
   }
 }
 
+// A read from another node (a leader's own replica list, another node's leadership changes) must not hold the 10 s cycle for long.
+const REMOTE_READ_MS = 8000;
+
+// The topic list moves with the other nodes' work (a topic created there appears here), so every replica cycle reads it again.
+// A failed read keeps the list the screen has; `true` when the list changed.
+async function syncTopicList(instanceId) {
+  let fresh;
+  try {
+    fresh = userTopics((await busCall('busTopicListRequest', { instanceId: requireInstanceId(instanceId) })).topics);
+  } catch {
+    return false;
+  }
+  if (state.instanceId !== instanceId) return false;
+  const signature = (list) => JSON.stringify(list.map((t) => [t.name, t.partitions]));
+  if (signature(fresh) === signature(state.topics)) return false;
+  state.topics = fresh;
+  state.topicsError = null;
+  return true;
+}
+
 async function refreshReplicas() {
   const instanceId = state.instanceId;
   if (!instanceId || !state.topicsLoaded) return;
@@ -1073,8 +1106,11 @@ async function refreshReplicas() {
   } catch {
     return;
   }
+  const topicsChanged = await syncTopicList(instanceId);
+  if (state.instanceId !== instanceId) return;
   const names = state.topics.map((t) => t.name);
   const nodes = all?.nodes || [];
+  const localId = nodes.find((n) => n.isLocal)?.nodeId || null;
   // A topic's `__dlq.` partitions move with it and weigh into what a node leads, so they are read too, but
   // only where the leadership card is shown (two nodes); a topic without unprocessed messages has none.
   const withDlq = nodes.length >= 2;
@@ -1091,23 +1127,66 @@ async function refreshReplicas() {
     if (n.reachable === false) since.delete(n.nodeId);
     else if (known.get(n.nodeId) === false && !since.has(n.nodeId)) since.set(n.nodeId, Date.now());
   }
-  state.shell.nodes = nodes;
-  state.shell.replicaTopics = perTopic;
-  state.shell.failovers = all?.failovers || [];
-  state.shell.replicaLags = laggingReplicas(perTopic, nodes);
+  // A node's own view of a partition it does not lead trails the leader's (its in-sync set above all): the
+  // leaders' answers decide the copies and the moves of those partitions. Until a leader has answered, its
+  // partitions are marked and the moves wait on "sprawdzam" instead of a verdict from this node's view.
+  const keyed = (topic, partitions, dlq) => ({ key: dlq ? `__dlq.${topic}` : topic, partitions });
+  const lists = perTopic.flatMap((t) => [keyed(t.topic, t.partitions, false), keyed(t.topic, t.dlqPartitions, true)]);
+  const overlaid = (answers) => perTopic.map((t) => ({
+    ...t,
+    partitions: overlayLeaderRows(t.partitions, answers.get(t.topic), localId, nodes),
+    dlqPartitions: overlayLeaderRows(t.dlqPartitions, answers.get(`__dlq.${t.topic}`), localId, nodes),
+  }));
+  const publish = (view) => {
+    state.shell.nodes = nodes;
+    state.shell.replicaTopics = view;
+    state.shell.replicaLags = laggingReplicas(view, nodes);
+  };
+  const repaint = (full) => {
+    paintShell();
+    rebalanceHandle?.refresh();
+    if (state.view?.kind === 'topic-detail') {
+      // The page's partition numbers and sizes move with the log; they come
+      // with the topic's own answer, asked again on the replica cadence.
+      if (full) loadTopicDetail(state.view.name);
+      return;
+    }
+    if (state.view?.kind === 'consumer-detail') return;
+    if (!state.view && (state.tab === 'overview' || state.tab === 'replication' || state.tab === 'groups' || (topicsChanged && state.tab === 'topics'))) renderPanel();
+  };
+  const previous = state.shell.leaderAnswers;
+  const firstView = overlaid(previous);
+  const waiting = firstView.some((t) => [...t.partitions, ...t.dlqPartitions].some((p) => p.awaitsLeader));
+  if (waiting) {
+    publish(firstView);
+    repaint(false);
+  }
+  // Other nodes are only asked while a screen that shows what they say is open: Przegląd and "Kopie i nody"
+  // (copies, leaders), a topic's "Partycje i kopie" (the moves); the leadership history is only on "Kopie i nody".
+  const onTab = (tab) => !state.view && state.tab === tab;
+  const watching = onTab('overview') || onTab('replication') || state.view?.kind === 'topic-detail';
+  const [answers, failovers] = await Promise.all([
+    !watching ? previous : askLeaders({
+      lists,
+      localId,
+      nodes,
+      read: (key, leaderId) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, key), { targetNodeId: leaderId, timeoutMs: REMOTE_READ_MS }),
+    }),
+    // The audit log is kept per node: a move started from another node is in that node's history only.
+    !onTab('replication') ? state.shell.failovers : collectFailovers({
+      own: all?.failovers || [],
+      nodes,
+      read: (nodeId) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, ''), { targetNodeId: nodeId, timeoutMs: REMOTE_READ_MS }),
+    }),
+  ]);
+  if (state.instanceId !== instanceId) return;
+  state.shell.leaderAnswers = answers;
+  publish(overlaid(answers));
+  state.shell.failovers = failovers;
   if (state.tab === 'replication' && !state.view) await refreshLeaderReturn(instanceId);
   await refreshLagSeries(instanceId);
   if (state.instanceId !== instanceId) return;
-  paintShell();
-  rebalanceHandle?.refresh();
-  if (state.view?.kind === 'topic-detail') {
-    // The page's partition numbers and sizes move with the log; they come
-    // with the topic's own answer, asked again on the replica cadence.
-    loadTopicDetail(state.view.name);
-    return;
-  }
-  if (state.view?.kind === 'consumer-detail') return;
-  if (!state.view && (state.tab === 'overview' || state.tab === 'replication')) renderPanel();
+  repaint(true);
 }
 
 function sprite(id) {
@@ -1164,7 +1243,7 @@ const topicsContext = {
 };
 
 const describeBusDetail = (err) => busRefusalDetail(err?.message);
-const describeBusError = (err) => schemaKindMismatchText(err?.message) || busRefusalText(err?.message) || mapBusErrorMessage(err?.message, T);
+const describeBusError = (err) => schemaKindMismatchText(err?.message) || busRefusalText(err?.message) || mapBusErrorMessage(err?.message, T, hintNodeName);
 
 function topicByName(name) {
   return state.topics.find((t) => t.name === name) || null;
@@ -1827,7 +1906,7 @@ async function openPartitionTransfer(topic, partition, from) {
   if (!replica) return;
   const instanceId = state.instanceId;
   const nodes = state.shell.nodes || [];
-  const label = (id) => nodes.find((n) => n.nodeId === id)?.label || id;
+  const label = nodeNamer(nodes);
   // The answer from the leader can take a moment: a line says so, and a second click meanwhile opens nothing.
   const context = await transferGate(async () => {
     const busy = toastBusy(T('partitions.checking_leader'));
@@ -2009,6 +2088,8 @@ const consumersContext = {
       stats: state.stats,
       instanceLabel: state.instanceLabel,
       notice: null,
+      nodes: state.shell.nodes || [],
+      replicaTopics: state.shell.replicaTopics,
       nowMs: Date.now(),
     };
   },
@@ -2146,6 +2227,7 @@ const consumerContext = {
       notice: state.consumerNotice,
       justMoved: state.consumerMoved,
       nodes: state.shell.nodes || [],
+      replicaTopics: state.shell.replicaTopics,
       busy: state.consumerBusy,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),

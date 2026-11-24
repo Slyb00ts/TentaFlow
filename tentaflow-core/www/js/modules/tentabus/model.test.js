@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { userTopics, shellCounts, overviewKpis, busiestTopics, nodeRows } from './model.js';
+import { userTopics, shellCounts, overviewKpis, busiestTopics, nodeRows, loadPartitions } from './model.js';
 
 const topicList = [
   { name: 'wyniki-badan', partitions: 6, contentType: 'application/hl7-v2', isDlq: false },
@@ -81,4 +81,23 @@ test('node rows count the partitions of the reader\'s topics, not the broker\'s'
   assert.deepEqual([a.label, a.leads, a.holds, a.total, a.inSync, a.reachable], ['rig26', 1, 1, 2, 1, true]);
   assert.deepEqual([b.label, b.leads, b.holds, b.total, b.inSync, b.reachable], ['mac-studio', 1, 1, 2, 2, false]);
   assert.equal(nodeRows(nodes, null), null, 'unknown until the per-topic answers arrive');
+});
+
+test('node rows count a topic\'s __dlq partitions with it and never the broker\'s __bus.* topics', () => {
+  const nodes = [{ nodeId: 'a', label: 'rig26' }, { nodeId: 'b', label: 'mac-studio' }];
+  const p = (partition, leader) => ({ partition, leaderNodeId: leader, replicas: ['a', 'b'], isr: ['a', 'b'] });
+  const perTopic = [
+    { topic: 'wyniki-badan', partitions: [p(0, 'a'), p(1, 'b')], dlqPartitions: [p(0, 'b'), p(1, 'b')] },
+    { topic: '__bus.metrics', partitions: [p(0, 'a'), p(1, 'a'), p(2, 'a')], dlqPartitions: [p(0, 'a')] },
+  ];
+  const [a, b] = nodeRows(nodes, perTopic);
+  assert.deepEqual([a.leads, a.holds, a.total], [1, 3, 4]);
+  assert.deepEqual([b.leads, b.holds, b.total], [3, 1, 4]);
+  assert.deepEqual(loadPartitions(perTopic).length, 4);
+});
+
+test('a node without a label is shown by its short id, with the full id for a tooltip', () => {
+  const hex = '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54';
+  const [row] = nodeRows([{ nodeId: hex, label: '' }], []);
+  assert.deepEqual([row.label, row.title], ['365123c5', hex]);
 });

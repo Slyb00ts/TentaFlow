@@ -369,12 +369,12 @@ function paintAlerts(body, alerts, nowMs) {
   body.querySelector('[data-role="alerts-none"]').hidden = alerts.length > 0;
 }
 
-function nodeRowSkeleton(nodeId, label) {
+function nodeRowSkeleton(nodeId, label, title) {
   return `
     <div class="job-row clickable" role="link" tabindex="0" data-go="tab" data-tab="replication" data-node="${escapeAttr(nodeId)}">
       <div class="job-ico">${sprite('cpu')}</div>
       <div class="job-main">
-        <div class="job-name"><span class="mono">${escapeHtml(label)}</span> <tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
+        <div class="job-name"><span class="mono"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(label)}</span> <tf-chip size="sm" variant="outline" dot data-role="state"></tf-chip></div>
         <div class="job-sub"><span data-role="leads"></span><span data-role="holds"></span></div>
       </div>
       <tf-chip size="sm" variant="outline" data-role="sync"></tf-chip>
@@ -392,7 +392,7 @@ function paintNodes(body, nodes, replicaTopics) {
     return;
   }
   setText(body.querySelector('[data-role="nodes-sub"]'), rows.length === 1 ? T('overview.nodes_sub_single') : T('overview.nodes_sub'));
-  patchKeyedList(host, rows.map((r) => ({ key: r.nodeId, html: nodeRowSkeleton(r.nodeId, r.label) })));
+  patchKeyedList(host, rows.map((r) => ({ key: r.nodeId, html: nodeRowSkeleton(r.nodeId, r.label, r.title) })));
   rows.forEach((r, i) => {
     const row = host.children[i];
     if (!row) return;

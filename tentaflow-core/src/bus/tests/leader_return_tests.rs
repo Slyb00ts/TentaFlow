@@ -469,20 +469,134 @@ fn an_instance_of_one_node_has_nothing_to_return_to() {
     assert_eq!(tick(&svc, &clock, 0), LeaderReturnTick::SingleNode);
 }
 
+/// Rows that disagree on the preferred node still have one: the node most of
+/// them name, and with no majority the one that leads the topic, else the
+/// lowest id. The topic is returned to it like any other, and moving it makes
+/// that node the preferred one of every row again.
 #[test]
-fn rows_that_disagree_on_the_preferred_node_leave_the_topic_where_it_is() {
+fn rows_that_disagree_on_the_preferred_node_return_to_the_majority_one() {
     let rows = vec![
         row("orders", 0, "n2", &["n1", "n2", "n3"]),
         row("orders", 1, "n2", &["n3", "n2", "n1"]),
+        row("orders", 2, "n2", &["n1", "n2", "n3"]),
     ];
     let (_dir, svc, coordinator, clock) = start(rows);
-    assert!(run(&svc, &clock, 0, 900).is_empty());
-    assert!(coordinator.transfers.lock().is_empty());
+    let moves = run(&svc, &clock, 0, 300);
+    assert_eq!(moves, vec![(300, returned("orders"))], "{moves:?}");
+    assert!(coordinator.leaders_of("orders").iter().all(|l| l == "n1"));
+    assert!(
+        coordinator
+            .rows
+            .lock()
+            .iter()
+            .all(|r| r.replicas.first().map(String::as_str) == Some("n1")),
+        "every row names the node first again"
+    );
+}
+
+#[test]
+fn rows_that_tie_on_the_preferred_node_settle_on_the_leader_when_it_is_one_of_them() {
+    let rows = vec![
+        row("orders", 0, "n2", &["n1", "n2", "n3"]),
+        row("orders", 1, "n2", &["n2", "n1", "n3"]),
+    ];
+    let (_dir, svc, coordinator, clock) = start_on("n2", rows);
+    assert_eq!(
+        tick(&svc, &clock, 0),
+        LeaderReturnTick::Aligned {
+            org: ORG.to_string(),
+            topic: "orders".to_string()
+        }
+    );
+    assert_eq!(
+        coordinator.reassigned.lock().clone(),
+        vec!["orders/0->n2,n1,n3".to_string()]
+    );
+    assert!(coordinator.transfers.lock().is_empty(), "nothing moved");
+}
+
+/// A topic led by its preferred node whose other rows still name another node
+/// first (a transfer that raced an election left them) has the replica order
+/// of those rows rewritten, with no clock and no move.
+#[test]
+fn a_topic_led_by_its_majority_preferred_node_has_its_stray_rows_aligned() {
+    let rows = vec![
+        row("orders", 0, "n2", &["n2", "n1", "n3"]),
+        row("orders", 1, "n2", &["n1", "n2", "n3"]),
+        row("orders", 2, "n2", &["n2", "n1", "n3"]),
+        row("__dlq.orders", 1, "n2", &["n1", "n2", "n3"]),
+    ];
+    let (_dir, svc, coordinator, clock) = start_on("n2", rows);
+    assert_eq!(
+        tick(&svc, &clock, 0),
+        LeaderReturnTick::Aligned {
+            org: ORG.to_string(),
+            topic: "orders".to_string()
+        }
+    );
+    let mut reassigned = coordinator.reassigned.lock().clone();
+    reassigned.sort();
+    assert_eq!(
+        reassigned,
+        vec![
+            "__dlq.orders/1->n2,n1,n3".to_string(),
+            "orders/1->n2,n1,n3".to_string()
+        ]
+    );
+    assert!(coordinator.transfers.lock().is_empty(), "nothing moved");
+    let mut audited = audit_details(&svc, "bus.leader.align");
+    audited.sort();
+    assert_eq!(audited.len(), 2, "{audited:?}");
+    assert!(audited.iter().all(|d| d.contains("reason=preferred_align")
+        && d.contains("preferred_node_id=n2")
+        && d.contains("replicas=n2,n1,n3")));
+    assert_eq!(
+        tick(&svc, &clock, 30),
+        LeaderReturnTick::Idle,
+        "nothing left to align"
+    );
+}
+
+/// A row that fails to reorder after another was rewritten is reported as a
+/// partial result, and the rewritten one is audited.
+#[test]
+fn an_align_that_fails_after_a_row_was_rewritten_reports_a_partial_result() {
+    let rows = vec![
+        row("orders", 0, "n2", &["n2", "n1", "n3"]),
+        row("orders", 1, "n2", &["n2", "n1", "n3"]),
+        row("orders", 2, "n2", &["n2", "n1", "n3"]),
+        row("orders", 3, "n2", &["n1", "n2", "n3"]),
+        row("__dlq.orders", 1, "n2", &["n1", "n2", "n3"]),
+    ];
+    let (_dir, svc, coordinator, clock) = start_on("n2", rows);
+    coordinator.failing.lock().insert(("orders".to_string(), 3));
+    let done = tick(&svc, &clock, 0);
+    assert!(
+        matches!(&done, LeaderReturnTick::Failed { partial: true, .. }),
+        "{done:?}"
+    );
+    assert_eq!(audit_details(&svc, "bus.leader.align").len(), 1);
+}
+
+/// Nothing to rewrite (the row is no longer the one planned from) is not a
+/// success: no result, no audit row.
+#[test]
+fn an_align_whose_rows_were_all_refused_quietly_is_not_reported() {
+    let rows = vec![
+        row("orders", 0, "n2", &["n2", "n1", "n3"]),
+        row("orders", 1, "n2", &["n2", "n1", "n3"]),
+        row("orders", 2, "n2", &["n1", "n2", "n3"]),
+    ];
+    let (_dir, svc, coordinator, clock) = start_on("n2", rows);
+    coordinator.refuse_reorders();
+    assert_eq!(tick(&svc, &clock, 0), LeaderReturnTick::Idle);
+    assert!(audit_details(&svc, "bus.leader.align").is_empty());
 }
 
 /// For a split topic the disagreement matters: with no node every row names
 /// first, there is no preferred node to gather on, so the strays go to the
-/// node that leads most of the topic.
+/// node that leads most of the topic (one move), and the way to the plurality
+/// preferred node is the return, with its clock.
 #[test]
 fn a_split_topic_whose_rows_disagree_on_the_preferred_node_is_gathered_on_the_majority() {
     let rows = vec![
@@ -495,6 +609,9 @@ fn a_split_topic_whose_rows_disagree_on_the_preferred_node_is_gathered_on_the_ma
     for topic in ["orders", "__dlq.orders"] {
         assert!(coordinator.leaders_of(topic).iter().all(|l| l == "n2"));
     }
+    let transfers = audit_details(&svc, "bus.leader.transfer");
+    assert_eq!(transfers.len(), 1, "only the stray moved: {transfers:?}");
+    assert!(transfers[0].contains(&format!("reason={SPLIT_GATHER_REASON}")));
 }
 
 #[test]

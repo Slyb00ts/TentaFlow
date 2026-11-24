@@ -25,6 +25,8 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, patchKeyedList, paintStatCards, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtSince, fmtWhen, fmtDuration, contentTypeLabel, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
+import { nodeLabel, nodeTitle, shortNodeId } from '/js/modules/tentabus/node-label.js';
+import { leaderElsewhere } from '/js/modules/tentabus/leader-balance.js';
 import { CONSUMER_SECTIONS } from '/js/modules/tentabus/routes.js';
 import { isLagging, isPausedWithBacklog, lagWording } from '/js/modules/tentabus/alerts.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
@@ -231,7 +233,11 @@ function paintPage(body, view, ctx) {
   patchHtml(actions, canAdmin
     ? `<tf-button variant="secondary" icon="${paused ? 'play' : 'pause'}" data-go="${paused ? 'resume' : 'pause'}" data-role="toggle">${escapeHtml(T(paused ? 'consumers.resume' : 'consumers.pause'))}</tf-button>`
     : `<div class="tb-title-note">${escapeHtml(whoCanChangeConsumer(view.topic, topicDetail?.adminLabels))}</div>`);
-  setAttr(actions.querySelector('[data-role="toggle"]'), 'disabled', view.busy === true);
+  // Only the node that leads the topic keeps the pause and the reading places: elsewhere the controls wait, naming that node.
+  const elsewhere = leaderElsewhere(view.topic, view.replicaTopics, view.nodes)?.node || '';
+  const toggle = actions.querySelector('[data-role="toggle"]');
+  setAttr(toggle, 'disabled', view.busy === true || Boolean(elsewhere));
+  setAttr(toggle, 'title', elsewhere ? T('consumers.leader_elsewhere', { node: elsewhere }) : null);
 
   const menu = body.querySelector('[data-role="menu"]');
   setAttr(menu.querySelector('tf-tab#position'), 'count', fmtCount((detail.partitions || []).length));
@@ -247,7 +253,7 @@ function paintPage(body, view, ctx) {
   for (const s of CONSUMER_SECTIONS) body.querySelector(`.tb-section > [data-section="${s}"]`).hidden = s !== section;
   const host = body.querySelector(`.tb-section > [data-section="${section}"]`);
   const notice = view.notice?.section === section ? view.notice : null;
-  const sectionView = { ...view, live, paused, canAdmin, access, notice };
+  const sectionView = { ...view, live, paused, canAdmin, access, notice, elsewhere };
   if (section === 'state') paintStateSection(host, sectionView);
   else if (section === 'position') paintPositionSection(host, sectionView, ctx);
   else patchHtml(host, settingsHtml(sectionView));
@@ -378,8 +384,11 @@ function alertTexts(a, k, nowMs) {
 export function otherNodeNotice(data, topic, nodes = []) {
   const local = data?.sla?.local;
   if (!local || local.reason !== 'not_leader') return null;
-  // The label this page knows the node by, else the name the server sent (to an administrator), else its id.
-  const node = nodes.find((n) => n.nodeId === local.leaderNodeId)?.label || local.leaderNodeName || local.leaderNodeId || '';
+  // The name this page knows the node by, else the name the server sent (to an administrator), else its short id.
+  const known = nodes.find((n) => n.nodeId === local.leaderNodeId);
+  const sent = String(local.leaderNodeName || '').trim();
+  const labelled = known && !nodeTitle(known) ? nodeLabel(known) : '';
+  const node = labelled || (sent && sent !== local.leaderNodeId ? sent : shortNodeId(local.leaderNodeId));
   return {
     title: node ? T('consumer.other_node_title', { node }) : T('consumer.other_node_title_unnamed'),
     text: [T('consumer.other_node_text', { topic }), data.fromReplica ? T('consumer.other_node_replica') : '', T('consumer.other_node_only_there')].filter(Boolean).join(' '),
@@ -480,7 +489,7 @@ function paintPositionSection(host, view, ctx) {
     host.__tbPosition = 'built';
     patchHtml(host, positionSkeleton());
   }
-  const { data, canAdmin, justMoved } = view;
+  const { data, canAdmin, justMoved, elsewhere } = view;
   patchHtml(host.querySelector('[data-role="notice"]'), noticeHtml(view.notice));
   const rows = positionRows({ detail: data.detail, topicPartitions: data.topicDetail?.partitions });
   const moved = justMoved || new Set();
@@ -497,9 +506,10 @@ function paintPositionSection(host, view, ctx) {
       _key: String(r.partition),
       _partition: r.partition,
       _moved: moved.has(r.partition),
+      _elsewhere: elsewhere,
     };
   });
-  table.rowActionsKey = (row) => `${row._partition}|${row._moved}|${canAdmin}`;
+  table.rowActionsKey = (row) => `${row._partition}|${row._moved}|${canAdmin}|${row._elsewhere}`;
   if (table.__tbAdmin !== canAdmin) {
     table.__tbAdmin = canAdmin;
     table.rowActions = canAdmin ? (row, idx, currentRow) => {
@@ -513,10 +523,13 @@ function paintPositionSection(host, view, ctx) {
       if (row._moved) {
         b.setAttribute('disabled', '');
         b.title = T('position.moved_blocked');
+      } else if (row._elsewhere) {
+        b.setAttribute('disabled', '');
+        b.title = T('position.leader_elsewhere', { node: row._elsewhere });
       }
       b.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (!live()._moved) ctx.go({ kind: 'move', partition: live()._partition });
+        if (!live()._moved && !live()._elsewhere) ctx.go({ kind: 'move', partition: live()._partition });
       });
       return b;
     } : null;

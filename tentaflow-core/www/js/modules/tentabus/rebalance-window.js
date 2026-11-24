@@ -25,6 +25,7 @@ import { I18n } from '/js/i18n.js';
 import { patchHtml, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtLagSize } from '/js/modules/tentabus/format.js';
 import { balanceModel, leadershipUnits } from '/js/modules/tentabus/leader-balance.js';
+import { nodeNamer, nodeTitler } from '/js/modules/tentabus/node-label.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-table.js';
@@ -85,21 +86,26 @@ export function moveErrorText(code, nodeLabel, nodeId, { detail = '', lagBytes =
   return hasKey(`rebalance.${key}`) ? t(key, { node: nodeLabel(nodeId) }) : t('error_other');
 }
 
-/** What each node leads once `moves` are done: `[{ nodeId, label, partitions, topics }]`. */
-export function afterBalance({ moves, perNode = [], units, nodes }) {
+/**
+ * What each node leads once `moves` are done: `[{ nodeId, label, partitions, topics }]`.
+ * Counted over the same units as the table of "Rozkład prowadzenia" (a topic's
+ * partitions and its `__dlq.` ones, never the broker's own `__bus.*`): a moved
+ * topic takes all of its partitions to the target. The plan's own per-node
+ * totals are not used, so the sentence can never disagree with the table.
+ */
+export function afterBalance({ moves, units, nodes }) {
   const model = balanceModel({ units, nodes });
   const after = new Map(model.rows.map((r) => [r.nodeId, { nodeId: r.nodeId, label: r.label, partitions: r.partitions, topics: new Set(r.topics) }]));
   for (const move of moves) {
     const unit = units.find((u) => u.name === move.topic);
     const target = after.get(move.toNodeId);
     if (!unit || !target) continue;
-    for (const node of after.values()) node.topics.delete(unit.name);
+    for (const node of after.values()) {
+      node.partitions -= unit.led.get(node.nodeId) || 0;
+      node.topics.delete(unit.name);
+    }
+    target.partitions += unit.partitions;
     target.topics.add(unit.name);
-  }
-  // The server's own count of partitions after the plan (a topic with its `__dlq.` partitions) replaces any recount here.
-  for (const load of perNode) {
-    const node = after.get(load.nodeId);
-    if (node && Number.isFinite(Number(load.partitionsAfter))) node.partitions = Number(load.partitionsAfter);
   }
   return [...after.values()].map((n) => ({ ...n, topics: n.topics.size }));
 }
@@ -128,7 +134,7 @@ export function moveProgress(move, snapshot) {
 }
 
 /**
- * Opens the window. `loadPlan()` resolves `{ moves, perNode, blockers }` (may
+ * Opens the window. `loadPlan()` resolves `{ moves, blockers }` (may
  * throw); `apply(moves)` resolves `results` (may throw); `observe()` =
  * `{ nodes, replicaTopics, topics, leaderReturn, pausedConsumers }` of the shell's latest poll;
  * `describeError(err)` words a failure; `onDone({ results, moved, total })`
@@ -137,9 +143,12 @@ export function moveProgress(move, snapshot) {
  */
 export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, describeError, onDone }) {
   const state = { phase: 'loading', plan: null, results: null, notice: null, error: '', busy: false };
-  const nodeLabel = (id) => {
-    const node = (observe().nodes || []).find((n) => n.nodeId === id);
-    return node?.label || id || t('node_unknown');
+  const nodeLabel = (id) => (id ? nodeNamer(observe().nodes)(id) : t('node_unknown'));
+  const nodeTitle = (id) => nodeTitler(observe().nodes)(id);
+  /** A node in the route cell: its name, as one unbreakable piece with the full id as a tooltip when it is shown shortened. */
+  const routeNode = (id) => {
+    const title = nodeTitle(id);
+    return `<span style="white-space:nowrap"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(nodeLabel(id))}</span>`;
   };
 
   const win = document.createElement('tf-window');
@@ -202,7 +211,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
     const base = (m) => ({
       topic: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(m.topic)}</span></span>`,
       parts: String(m.partitions.length),
-      route: `<span style="white-space:nowrap">${escapeHtml(t('route', { from: nodeLabel(m.fromNodeId), to: nodeLabel(m.toNodeId) }))}</span>`,
+      route: `<span class="tb-route">${routeNode(m.fromNodeId)} → ${routeNode(m.toNodeId)}</span>`,
       _key: m.topic,
     });
     const moves = state.plan.moves;
@@ -229,7 +238,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
       // No answer says how each move ended: only the polled replica lists do.
       return moves.map((m) => {
         const p = moveProgress(m, view);
-        if (p.done >= p.total) return { ...base(m), detail: chip('ok', t('state_moved')) };
+        if (p.done >= p.total) return { ...base(m), detail: chip('ok', t('state_moved_progress', { done: fmtCount(p.done), total: fmtCount(p.total) })) };
         return { ...base(m), detail: state.phase === 'unknown' ? chip('neutral', t('state_checking')) : chip('neutral', t('state_failed')) };
       });
     }
@@ -239,7 +248,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
       let detail = chip('neutral', t('state_not_attempted'));
       if (!r || r.status === 'not_attempted') {
         detail += firstFailed ? sub(t('state_not_attempted_sub', { topic: firstFailed.topic })) : '';
-      } else if (r.status === 'moved') detail = chip('ok', t('state_moved'));
+      } else if (r.status === 'moved') detail = chip('ok', t('state_moved_progress', { done: fmtCount(m.partitions.length), total: fmtCount(m.partitions.length) }));
       else {
         const behind = (view.replicaTopics.find((x) => x.topic === m.topic)?.partitions || []);
         const partition = /'\/(\d+)/.exec(String(r.detail || ''))?.[1];
@@ -276,7 +285,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
   const impactHtml = () => {
     const view = snapshot();
     const units = leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
-    const parts = [afterSentence(afterBalance({ moves: state.plan.moves, perNode: state.plan.perNode, units, nodes: view.nodes }))];
+    const parts = [afterSentence(afterBalance({ moves: state.plan.moves, units, nodes: view.nodes }))];
     const stays = [...new Set(state.plan.blockers.map((b) => b.topic))].map((name) => units.find((u) => u.name === name)).filter(Boolean);
     if (stays.length === 1) parts.push(t('after_stays_one', { topic: stays[0].name, node: nodeLabel(stays[0].leaderId) }));
     else if (stays.length > 1) parts.push(t('after_stays_many', { list: stays.map((u) => u.name).join(', ') }));
@@ -369,7 +378,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
     paint();
     try {
       const plan = await loadPlan();
-      state.plan = { moves: plan?.moves || [], perNode: plan?.perNode || [], blockers: plan?.blockers || [] };
+      state.plan = { moves: plan?.moves || [], blockers: plan?.blockers || [] };
       state.phase = 'preview';
     } catch (err) {
       state.error = t('load_error', { error: describeError(err) });
