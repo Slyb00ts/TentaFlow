@@ -301,6 +301,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   const leaderRow = () => {
     let text = null;
     if (leaderHint?.older) text = T('topics.creator.summary_leader_old');
+    else if (leaderHint?.tied?.length > 1) text = T('topics.creator.summary_leader_tie', { nodes: leaderHint.tied.slice(0, -1).join(', '), last: leaderHint.tied[leaderHint.tied.length - 1], count: fmtCount(leaderHint.partitions), n: leaderHint.partitions });
     else if (leaderHint?.node) text = T('topics.creator.summary_leader', { node: leaderHint.node, count: fmtCount(leaderHint.partitions), n: leaderHint.partitions });
     else if (plan.kind !== 'single' && plan.kind !== 'unknown' && plan.nodes >= 2) text = T('topics.creator.summary_leader_auto');
     return text ? [[T('topics.creator.leader_label'), escapeHtml(text)]] : [];

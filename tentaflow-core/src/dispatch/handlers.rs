@@ -2364,7 +2364,19 @@ impl<'a> ConsumerStatuses<'a> {
                 .leader_names
                 .entry(leader.to_string())
                 .or_insert_with(|| {
-                    Some(super::app_route::node_display_name(self.ctx, leader))
+                    // Judged against every node of the mesh, as the replica
+                    // list is: a leader that shares its hostname with this
+                    // node or with any other would only show the reader a
+                    // name that tells nothing.
+                    let mut ids = vec![self.ctx.state.local_node_id.to_string()];
+                    if let Some(security) = self.ctx.state.mesh_security.as_ref() {
+                        ids.extend(security.trusted_node_ids_snapshot().iter().cloned());
+                    }
+                    ids.push(leader.to_string());
+                    ids.sort();
+                    ids.dedup();
+                    super::bus::node_labels(&self.ctx.state, &ids)
+                        .remove(leader)
                         .filter(|name| !name.is_empty())
                 })
                 .clone(),

@@ -12211,6 +12211,7 @@
         "leader_label": "Node prowadzący",
         "summary_leader": "dobierze instancja — node preferowany dla najmniejszej liczby partycji (teraz {node}: {count} {n|partycja|partycje|partycji})",
         "summary_leader_auto": "dobierze instancja — node preferowany dla najmniejszej liczby partycji",
+        "summary_leader_tie": "dobierze instancja — jeden z nodów: {nodes} albo {last} (każdy preferowany dla {count} {n|partycja|partycje|partycji})",
         "summary_leader_old": "node, na którym powstaje topik — instancja dobierze go sama dopiero po aktualizacji wszystkich nodów"
       },
       "delete": {
@@ -12531,10 +12532,12 @@
       "choice_lag_leader": "kopia w tyle według nodu prowadzącego {owner} — nie może przejąć, dopóki nie dogoni",
       "choice_out_leader": "kopia niezgodna według nodu prowadzącego {owner} — nie może przejąć",
       "choice_old": "node ma starszą wersję TentaFlow — nie może przejąć",
-      "checking_leader": "Pytam node prowadzący o stan kopii…"
+      "checking_leader": "Sprawdzam u nodu prowadzącego stan kopii…",
+      "leader_silent": "Node prowadzący nie odpowiedział w ciągu {secs} s, więc stan kopii pochodzi z tego nodu i może być nieaktualny. Node prowadzący i tak odrzuci przeniesienie na kopię, która jest w tyle."
     },
     "replication": {
       "nodes_title": "Nody",
+      "no_nodes": "Nody pojawią się tu, gdy w instancji powstanie pierwszy topik — dopiero jego kopie mówią, na których nodach leży.",
       "nodes_sub": "Każda partycja ma jeden node prowadzący, który przyjmuje zapisy, i kopie na innych nodach. Kopia zgodna ma wszystkie wiadomości; kopia w tyle jeszcze je dogania.",
       "nodes_sub_single": "Ta instancja ma jeden node — każda partycja ma jedną kopię, na tym nodzie.",
       "node_leads": "Prowadzi partycji",
@@ -12601,6 +12604,11 @@
       "balance_away_eta": "najwcześniej za ok. {min} min",
       "balance_away_now": "Możesz też rozłożyć prowadzenie teraz.",
       "balance_away_catching": "kopie {list} jeszcze doganiają",
+      "balance_down_title": "Node {node} nie odpowiada — {count} {n|topik prowadzi|topiki prowadzą|topików prowadzi} inny node.",
+      "balance_down_text": "Prowadzenie wróci na {node} samo, gdy odpowie, a jego kopie będą zgodne nieprzerwanie przez 5 min.",
+      "balance_split_title": "{count} {n|topik jest rozdzielony|topiki są rozdzielone|topików jest rozdzielonych} między nody.",
+      "balance_split_text": "Partycje takiego topiku albo jego kolejkę niedostarczonych wiadomości prowadzą różne nody. Rozłóż prowadzenie, żeby je zebrać.",
+      "balance_away_split_item": "{name} (rozdzielony: {nodes})",
       "balance_away_manual": "Automatyczny powrót do preferowanego nodu jest wyłączony, więc te topiki zostaną tam, gdzie są, dopóki nie rozłożysz prowadzenia.",
       "return_title": "Automatyczny powrót do preferowanego nodu",
       "return_sub": "Gdy kopia topiku na jego preferowanym nodzie jest zgodna nieprzerwanie przez 5 min, prowadzenie wraca tam samo — najwyżej jeden topik co 30 s. Ustawienie dotyczy całej instancji; każdy powrót zapisuje się w dzienniku audytu.",

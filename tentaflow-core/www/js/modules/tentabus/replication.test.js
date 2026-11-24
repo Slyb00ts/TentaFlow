@@ -476,3 +476,46 @@ test('the leadership history costs one call per reachable remote node, whatever 
   await collectFailovers({ own: [], nodes: nodes3, read: async (nodeId) => { calls.push(nodeId); return { failovers: [] }; } });
   assert.deepEqual(calls.sort(), ['b', 'c']);
 });
+
+test('a node that does not answer is the first thing the warning says, and the catching-up text is only for a reachable one', async () => {
+  const lagging = [led('wyniki', 6, 'a', 'b', ['b']), led('wizyty', 4, 'a', 'b', ['b']), led('odczyty', 12, 'a', 'a')];
+  const down = mountBalance({ nodesList: [A, { ...B, reachable: false }], perTopic: lagging });
+  await tick();
+  const alert = down.body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.equal(alert.getAttribute('title'), 'Node Serwer B nie odpowiada — 2 topiki prowadzą inny node.');
+  assert.doesNotMatch(alert.getAttribute('message'), /doganiają|Możesz też/);
+  assert.match(alert.getAttribute('message'), /Prowadzenie wróci na Serwer B samo, gdy odpowie/);
+  const up = mountBalance({ nodesList: pair, perTopic: lagging, reachableSince: new Map([['b', Date.now() - 600_000]]) });
+  await tick();
+  assert.match(up.body.querySelector('[data-role="balance-alert"] tf-alert').getAttribute('message'), /doganiają/, 'a reachable node keeps the catching-up text');
+});
+
+test('a topic whose partitions and dead-letter partitions are led by different nodes is split: counted away, named and warned about', async () => {
+  // The topic's own partitions are led by its preferred node and the majority, its dead-letter partitions by the other: no majority shows it.
+  const split = { ...led('demo.t4', 3, 'b', 'b'), dlqPartitions: led('__dlq.demo.t4', 1, 'a', 'b').partitions };
+  const rest = led('demo.t1', 4, 'b', 'b');
+  const { body } = mountBalance({ perTopic: [split, rest] });
+  await tick();
+  const alert = body.querySelector('[data-role="balance-alert"] tf-alert');
+  assert.ok(alert, 'a split raises the warning');
+  assert.equal(alert.getAttribute('title'), '1 topik jest rozdzielony między nody.');
+  const rows = body.querySelector('[data-role="balance"]').rows;
+  assert.match(plain(rows[1].away), /1 topik.*demo\.t4 \(rozdzielony: Serwer A, Serwer B\)/, 'under "poza preferowanym" of the node it prefers');
+  assert.equal(rows[0].away, '0');
+  const whole = mountBalance({ perTopic: [{ ...led('demo.t4', 2, 'b', 'b'), dlqPartitions: led('__dlq.demo.t4', 2, 'b', 'b').partitions }, rest] });
+  await tick();
+  assert.equal(whole.body.querySelector('[data-role="balance-alert"] tf-alert'), null, 'one leader for all, no warning');
+});
+
+test('without any node to name, the tab says why and does not draw empty cards', async () => {
+  const { body, state, repaint } = mountBalance({ nodesList: [], perTopic: [] });
+  await tick();
+  assert.match(text(body.querySelector('[data-role="no-nodes"]')), /Nody pojawią się tu, gdy w instancji powstanie pierwszy topik/);
+  assert.equal(body.querySelector('[data-role="nodes"]'), null);
+  state.nodesList = pair;
+  state.perTopic = evenTopics;
+  repaint();
+  await tick();
+  assert.equal(body.querySelector('[data-role="no-nodes"]'), null);
+  assert.equal(body.querySelectorAll('.tb-node-card').length, 2);
+});

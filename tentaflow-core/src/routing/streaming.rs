@@ -59,21 +59,31 @@ fn envelope_stream_to_chunk_stream(
         .unwrap_or(0);
 
     if !include_usage {
-        // Pre-Etap-3a path — detached log, brak tail chunk.
+        // Pre-Etap-3a path — no usage tail chunk. The outcome is still read
+        // when the stream ends: a node that failed (a `bus_publish` the key
+        // was refused) ends the stream cleanly, so without it the caller
+        // would see an ordinary empty answer. A detached task awaits it, so
+        // the completion is logged also when the client left before the end.
+        let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             match outcome.await {
-                Ok(o) => tracing::info!(
-                    latency_ms = o.total_latency_ms,
-                    prompt_tokens = o.usage.prompt_tokens,
-                    completion_tokens = o.usage.completion_tokens,
-                    error = ?o.error,
-                    "flow streaming completed"
-                ),
+                Ok(o) => {
+                    tracing::info!(
+                        latency_ms = o.total_latency_ms,
+                        prompt_tokens = o.usage.prompt_tokens,
+                        completion_tokens = o.usage.completion_tokens,
+                        error = ?o.error,
+                        "flow streaming completed"
+                    );
+                    let _ = verdict_tx.send(o);
+                }
                 Err(_) => tracing::warn!("flow finalizer dropped without outcome"),
             }
         });
         let id_for_map = id;
-        let model_for_map = model;
+        let model_for_map = model.clone();
+        let errored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let errored_in_map = errored.clone();
         let mapped = stream.filter_map(move |item| {
             futures::future::ready(match item {
                 Ok(EnvelopeDelta::Llm(c)) => {
@@ -84,14 +94,27 @@ fn envelope_stream_to_chunk_stream(
                 // stream alive instead of aborting mid-reply. Audio surfaces
                 // (FlowInvoke / /v1/audio) consume the same flow's audio.
                 Ok(EnvelopeDelta::Audio(_)) => None,
-                Err(e) => Some(Err(crate::error::CoreError::InternalError {
-                    message: format!("flow stream error: {e}"),
-                    source: None,
+                Err(e) => {
+                    errored_in_map.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Some(Err(crate::error::CoreError::InternalError {
+                        message: format!("flow stream error: {e}"),
+                        source: None,
+                    }
+                    .into()))
                 }
-                .into())),
             })
         });
-        return Box::pin(mapped);
+        let verdict = futures::stream::once(async move {
+            let o = verdict_rx.await.ok()?;
+            if o.error.is_some() && !errored.load(std::sync::atomic::Ordering::Relaxed) {
+                return Some(Err(
+                    crate::routing::chat::flow_failure_to_core(&o, &model).into()
+                ));
+            }
+            None
+        })
+        .filter_map(futures::future::ready);
+        return Box::pin(mapped.chain(verdict));
     }
 
     // include_usage=true: po stream EOF awaiting outcome, emit tail chunk z usage
@@ -142,6 +165,11 @@ fn envelope_stream_to_chunk_stream(
                         }
                         None => {
                             break match outcome.await {
+                                Ok(o) if o.error.is_some() => Some((
+                                    Err(crate::routing::chat::flow_failure_to_core(&o, &model)
+                                        .into()),
+                                    SplitState::Done,
+                                )),
                                 Ok(o) => {
                                     let tail = build_flow_tail_chunk(&o, &id, created, &model);
                                     Some((Ok(tail), SplitState::Done))

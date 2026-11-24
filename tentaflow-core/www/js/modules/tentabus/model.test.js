@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { userTopics, shellCounts, overviewKpis, busiestTopics, nodeRows, loadPartitions } from './model.js';
+import { userTopics, shellCounts, instanceNodes, overviewKpis, busiestTopics, nodeRows, loadPartitions } from './model.js';
 
 const topicList = [
   { name: 'wyniki-badan', partitions: 6, contentType: 'application/hl7-v2', isDlq: false },
@@ -100,4 +100,17 @@ test('a node without a label is shown by its short id, with the full id for a to
   const hex = '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54';
   const [row] = nodeRows([{ nodeId: hex, label: '' }], []);
   assert.deepEqual([row.label, row.title], ['365123c5', hex]);
+});
+
+test('an instance without a topic does not count the node a replica list happens to name', () => {
+  const one = [{ nodeId: 'a' }];
+  const two = [{ nodeId: 'a' }, { nodeId: 'b' }];
+  const topics = [{ name: 'wyniki' }];
+  assert.deepEqual(instanceNodes(one, []), [], 'no topic: one node is no list');
+  assert.deepEqual(instanceNodes([], []), []);
+  assert.deepEqual(instanceNodes(two, []), two, 'two nodes are a real list');
+  assert.deepEqual(instanceNodes(one, topics), one, 'a topic makes the list the replicas');
+  assert.deepEqual(instanceNodes(one, [{ name: '__bus.metrics' }]), [], 'the broker\'s own topics are no topic');
+  assert.equal(instanceNodes(null, []), null);
+  assert.equal(shellCounts({ stats: null, topicList: null, subjects: null, nodes: [] }).nodes, null, 'no node is left out, not shown as 0');
 });

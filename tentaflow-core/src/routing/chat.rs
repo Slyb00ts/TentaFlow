@@ -1100,6 +1100,48 @@ mod flow_failure_tests {
         );
     }
 
+    /// The streaming path ends a failed flow the way the blocking one does: an
+    /// error, not a clean end of stream the server turns into `[DONE]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_flow_whose_bus_publish_fails_ends_with_the_error() {
+        use futures::StreamExt;
+        for include_usage in [false, true] {
+            let (fixture, mut request) = fixture_with_a_failing_flow();
+            request.stream = true;
+            if include_usage {
+                request.stream_options = Some(crate::api::openai::types::StreamOptions {
+                    include_usage: true,
+                });
+            }
+            let streamed = fixture
+                .router
+                .route_chat_completion_stream(
+                    request,
+                    None,
+                    FlowOrigin::Addon,
+                    FlowActor::system(),
+                    Some(AiGatewayContext::default()),
+                    crate::routing::streaming::ChatFlowSelector::Auto,
+                )
+                .await;
+            let items: Vec<_> = match streamed {
+                Ok(result) => result.response.collect().await,
+                Err(error) => vec![Err(error)],
+            };
+            let last = items
+                .into_iter()
+                .last()
+                .expect("a failed flow answers with something");
+            let Err(error) = last else {
+                panic!("a failed flow must end its stream with an error (usage={include_usage})");
+            };
+            let core = error
+                .downcast_ref::<CoreError>()
+                .expect("a typed error reaches the edge");
+            assert_generic(core);
+        }
+    }
+
     /// The same flow resolved through the runtime executor (a model that
     /// resolves to a flow target) is no empty answer either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

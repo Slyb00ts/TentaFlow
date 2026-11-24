@@ -77,6 +77,21 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// calls its lease expired (`FollowerRunnerFactory::undialed_lease`).
 const UNDIALED_CONNECT_MARGIN: Duration = Duration::from_secs(2);
 
+/// How long after the process started a replica that has not heard its leader
+/// since, and that no other replica answered, keeps from standing
+/// (`FollowerRunnerFactory::restart_stand_grace`). Long enough for a link
+/// that is slow to come up (a relay-only path, a QUIC connection that has to
+/// time out and redial) to deliver one answer; a leader that is truly gone is
+/// replaced once it has passed. Extended up to twice over while the mesh still
+/// vouches for the leader (`ReplicationManager::within_restart_grace`).
+const RESTART_STAND_GRACE: Duration = Duration::from_secs(60);
+
+/// How long a candidate no replica answered within the `LeoQuery` budget asks
+/// more (`FollowerRunnerFactory::lone_candidate_probe`), on the dial already
+/// running: the time a QUIC dial over a poor path needs to deliver one answer
+/// from a live leader. A crashed leader's failover is that much later.
+const LONE_CANDIDATE_PROBE: Duration = Duration::from_secs(3);
+
 /// Mirrors `dispatch/bus.rs`'s private `BUS_FAILOVER_AUDIT_ACTION` (agent
 /// P) byte-for-byte — that constant is not `pub` (it lives in a different
 /// crate-internal module this file must not otherwise depend on), so the
@@ -982,6 +997,8 @@ pub struct GlueFollowerFactory {
     /// this must be `Weak`, not `Arc`.
     provider: Weak<dyn PartitionProvider>,
     config: FollowerConfig,
+    restart_stand_grace: Duration,
+    lone_candidate_probe: Duration,
 }
 
 impl GlueFollowerFactory {
@@ -996,7 +1013,18 @@ impl GlueFollowerFactory {
             local_env,
             provider: Arc::downgrade(&provider),
             config,
+            restart_stand_grace: RESTART_STAND_GRACE,
+            lone_candidate_probe: LONE_CANDIDATE_PROBE,
         }
+    }
+
+    /// Replaces the delays before a replica no other replica answered stands
+    /// (`restart_stand_grace`, `lone_candidate_probe`); a cluster built in
+    /// one go by a test has no restart to wait out.
+    pub fn with_stand_delays(mut self, restart_stand_grace: Duration, probe: Duration) -> Self {
+        self.restart_stand_grace = restart_stand_grace;
+        self.lone_candidate_probe = probe;
+        self
     }
 }
 
@@ -1025,6 +1053,14 @@ fn log_position(partition: &Partition) -> LogPosition {
 impl FollowerRunnerFactory for GlueFollowerFactory {
     fn undialed_lease(&self) -> Duration {
         self.config.leader_lease + RECONNECT_BACKOFF_MAX + UNDIALED_CONNECT_MARGIN
+    }
+
+    fn restart_stand_grace(&self) -> Duration {
+        self.restart_stand_grace
+    }
+
+    fn lone_candidate_probe(&self) -> Duration {
+        self.lone_candidate_probe
     }
 
     fn local_log_position(

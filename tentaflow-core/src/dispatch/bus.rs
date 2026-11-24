@@ -5080,20 +5080,29 @@ fn replica_node_wire(n: &ReplicaNodeInfo) -> BusReplicaNodeWire {
 ///
 /// Reads the sync registry (SQLite), so it runs on the blocking pool.
 fn label_nodes(state: &super::state::AppState, nodes: &mut [BusReplicaNodeWire]) {
-    let names: Vec<(String, String)> = nodes
-        .iter()
-        .map(|n| {
-            (
-                n.node_id.clone(),
-                super::app_route::node_display_name_in(state, &n.node_id),
-            )
-        })
-        .collect();
-    let labels =
-        disambiguate_node_labels(names, |id| super::app_route::registry_name_in(state, id));
+    let ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    let labels = node_labels(state, &ids);
     for node in nodes {
         node.label = labels.get(&node.node_id).cloned().unwrap_or_default();
     }
+}
+
+/// The display label of each of `node_ids`, empty where a name would not tell
+/// the node apart from another of them (see `disambiguate_node_labels`).
+pub(super) fn node_labels(
+    state: &super::state::AppState,
+    node_ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    let names: Vec<(String, String)> = node_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                super::app_route::node_display_name_in(state, id),
+            )
+        })
+        .collect();
+    disambiguate_node_labels(names, |id| super::app_route::registry_name_in(state, id))
 }
 
 /// Two nodes on one machine share its hostname, and a label that cannot tell

@@ -111,6 +111,49 @@ pub(crate) fn with_retry_after(
     response
 }
 
+/// What a mid-stream failure tells the client: the same message the JSON path
+/// would, not the raw `Display` of the error.
+pub(crate) fn stream_error_message(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<CoreError>() {
+        Some(core) => core.client_message(),
+        None => "Internal server error".to_string(),
+    }
+}
+
+/// The `error.type` the JSON path reports for `err`.
+fn error_type_of(err: &CoreError) -> &'static str {
+    match err {
+        CoreError::ModelNotFound { .. } => "model_not_found",
+        CoreError::InvalidRequest { .. } => "invalid_request_error",
+        CoreError::AllBackendsUnavailable { .. }
+        | CoreError::SttServiceUnavailable
+        | CoreError::BackendBusy { .. } => "service_unavailable",
+        CoreError::Timeout { .. } => "timeout_error",
+        CoreError::Overloaded { .. } => "rate_limit_exceeded",
+        _ => "internal_error",
+    }
+}
+
+/// The SSE `data:` line for a failure after the stream began (the status is
+/// already 200): the body of an error response, `{"error": {...}}`.
+fn stream_error_line(e: &anyhow::Error) -> String {
+    let error_type = e
+        .downcast_ref::<CoreError>()
+        .map_or("internal_error", error_type_of);
+    let body = ErrorResponse {
+        error: ErrorDetail {
+            error_type: error_type.to_string(),
+            message: stream_error_message(e),
+            param: None,
+            code: Some(error_type.to_string()),
+        },
+    };
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
 /// Mapuje dowolny anyhow::Error (potencjalnie CoreError) na error response z odpowiednim HTTP status.
 /// The full error goes to the log here; the client receives `client_message`.
 fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
@@ -118,16 +161,7 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
     let core_error = e.downcast_ref::<CoreError>();
     if let Some(err) = core_error {
         let status = StatusCode::from_u16(err.status_code()).unwrap();
-        let error_type = match err {
-            CoreError::ModelNotFound { .. } => "model_not_found",
-            CoreError::InvalidRequest { .. } => "invalid_request_error",
-            CoreError::AllBackendsUnavailable { .. }
-            | CoreError::SttServiceUnavailable
-            | CoreError::BackendBusy { .. } => "service_unavailable",
-            CoreError::Timeout { .. } => "timeout_error",
-            CoreError::Overloaded { .. } => "rate_limit_exceeded",
-            _ => "internal_error",
-        };
+        let error_type = error_type_of(err);
         let client_msg = err.client_message();
         let response = error_response(status, error_type, client_msg);
         match err.retry_after_secs() {
@@ -572,6 +606,34 @@ pub async fn handle_request(
     response
 }
 
+/// The SSE body of a chat stream: one `data:` event per chunk, an error event
+/// for a failure after the stream began, and the closing `[DONE]`. The status
+/// is 200 by then, so the error rides in the body.
+fn chat_chunks_to_sse(
+    chunk_stream: impl Stream<Item = crate::error::Result<ChatCompletionChunk>> + Send + 'static,
+) -> impl Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send {
+    chunk_stream
+        .map(|chunk_result| match chunk_result {
+            Ok(mut chunk) => {
+                // Normalizuj reasoning_content -> content dla kompatybilnosci z OpenAI API
+                for choice in &mut chunk.choices {
+                    if choice.delta.reasoning_content.is_some() && choice.delta.content.is_none() {
+                        choice.delta.content = choice.delta.reasoning_content.take();
+                    }
+                }
+                let json = serde_json::to_string(&chunk).unwrap();
+                Ok(Frame::data(Bytes::from(format!("data: {}\n\n", json))))
+            }
+            Err(e) => {
+                error!("Blad w streaming chunk: {}", e);
+                Ok(Frame::data(Bytes::from(stream_error_line(&e))))
+            }
+        })
+        .chain(futures::stream::once(async {
+            Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
+        }))
+}
+
 /// Handler dla /v1/chat/completions
 ///
 /// Obsluguje zarowno non-streaming (JSON response) jak i streaming (SSE).
@@ -659,37 +721,7 @@ async fn handle_chat_completions(
                 );
 
                 // Konwertuj Stream<Result<ChatCompletionChunk>> -> Stream SSE
-                let sse_stream = prefix_stream
-                    .chain(chunk_stream.map(|chunk_result| {
-                        match chunk_result {
-                            Ok(mut chunk) => {
-                                // Normalizuj reasoning_content -> content dla kompatybilnosci z OpenAI API
-                                for choice in &mut chunk.choices {
-                                    if choice.delta.reasoning_content.is_some()
-                                        && choice.delta.content.is_none()
-                                    {
-                                        choice.delta.content =
-                                            choice.delta.reasoning_content.take();
-                                    }
-                                }
-
-                                let json = serde_json::to_string(&chunk).unwrap();
-                                let sse_line = format!("data: {}\n\n", json);
-                                Ok(Frame::data(Bytes::from(sse_line)))
-                            }
-                            Err(e) => {
-                                error!("Blad w streaming chunk: {}", e);
-                                let error_chunk = format!(
-                                    "data: {}\n\n",
-                                    serde_json::json!({ "error": e.to_string() })
-                                );
-                                Ok(Frame::data(Bytes::from(error_chunk)))
-                            }
-                        }
-                    }))
-                    .chain(futures::stream::once(async {
-                        Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
-                    }));
+                let sse_stream = prefix_stream.chain(chat_chunks_to_sse(chunk_stream));
 
                 let boxed_stream: Pin<
                     Box<
@@ -3684,6 +3716,48 @@ mod body_limit_tests {
         assert_eq!(
             status(hyper::Method::POST, "/v1/embeddings", None),
             Some(StatusCode::LENGTH_REQUIRED)
+        );
+    }
+}
+
+#[cfg(test)]
+mod chat_sse_tests {
+    use super::*;
+
+    async fn wire(items: Vec<crate::error::Result<ChatCompletionChunk>>) -> String {
+        let body = StreamBody::new(chat_chunks_to_sse(futures::stream::iter(items)));
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A flow that failed after the stream began: the client reads the error
+    /// as an OpenAI error object in an event, then the stream closes.
+    #[tokio::test]
+    async fn a_failed_flow_ends_the_sse_body_with_an_error_event() {
+        let failure: anyhow::Error = CoreError::InternalError {
+            message: "flow.failed: the flow did not complete".into(),
+            source: Some(anyhow::anyhow!("bus_publish refused for tentabus-0badc0de")),
+        }
+        .into();
+        let body = wire(vec![Err(failure)]).await;
+        let events: Vec<&str> = body.split("\n\n").filter(|e| !e.is_empty()).collect();
+        assert_eq!(events.last(), Some(&"data: [DONE]"));
+        let error = events[events.len() - 2]
+            .strip_prefix("data: ")
+            .expect("an error event");
+        let json: serde_json::Value = serde_json::from_str(error).unwrap();
+        assert_eq!(json["error"]["type"], "internal_error");
+        assert_eq!(json["error"]["code"], "internal_error");
+        assert_eq!(
+            json["error"]["message"],
+            "Internal error: flow.failed: the flow did not complete"
+        );
+        assert!(
+            !body.contains("bus_publish") && !body.contains("tentabus-0badc0de"),
+            "the node's own words stay out of the wire: {body}"
         );
     }
 }

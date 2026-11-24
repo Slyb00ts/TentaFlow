@@ -282,3 +282,13 @@ test('a leader known only by id is named by its short id', () => {
   const shown = mount({ data: notice });
   assert.match(shown.body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title'), /prowadzi node 365123c5 /);
 });
+
+test('a hostname the server sends is no name when the node list names the node, or another node has the same one', () => {
+  const idB = 'cae6aeee11112222333344445555666677778888999900001111222233334444';
+  const idA = 'd9531877aaaabbbbccccddddeeeeffff000011112222333344445555666677';
+  const title = (data, nodes) => mount({ data: withLeader(data), nodes }).body.querySelector('[data-role="leader-notice"] tf-alert').getAttribute('title');
+  const sent = { state: 'waiting', reason: 'not_leader', leaderNodeId: idB, leaderNodeName: 'minim4' };
+  assert.match(title(sent, [{ nodeId: idA, label: '' }, { nodeId: idB, label: '' }]), /prowadzi node cae6aeee /, 'the listed node has no label: its short id, not the hostname');
+  assert.match(title(sent, [{ nodeId: idA, label: 'minim4' }]), /prowadzi node cae6aeee /, 'another node already goes by that name');
+  assert.match(title(sent, []), /prowadzi node minim4 /, 'an unlisted node with a name of its own keeps it');
+});

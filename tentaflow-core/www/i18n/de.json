@@ -11137,6 +11137,7 @@
         "leader_label": "Führender Node",
         "summary_leader": "wählt die Instanz — der Node, der für die wenigsten Partitionen bevorzugt ist (derzeit {node}: {count} {n|Partition|Partitionen})",
         "summary_leader_auto": "wählt die Instanz — der Node, der für die wenigsten Partitionen bevorzugt ist",
+        "summary_leader_tie": "wählt die Instanz — einer der Nodes {nodes} oder {last} (jeder für {count} {n|Partition|Partitionen} bevorzugt)",
         "summary_leader_old": "der Node, auf dem das Topic angelegt wird — die Instanz wählt erst nach der Aktualisierung aller Nodes selbst"
       },
       "delete": {
@@ -11457,10 +11458,12 @@
       "choice_lag_leader": "Kopie laut führendem Node {owner} im Rückstand — kann erst übernehmen, wenn sie aufgeholt hat",
       "choice_out_leader": "Kopie laut führendem Node {owner} nicht aktuell — kann nicht übernehmen",
       "choice_old": "Node hat eine ältere TentaFlow-Version — kann nicht übernehmen",
-      "checking_leader": "Der führende Node wird nach dem Stand der Kopien gefragt …"
+      "checking_leader": "Der Stand der Kopien wird beim führenden Node geprüft …",
+      "leader_silent": "Der führende Node hat nicht innerhalb von {secs} s geantwortet; der Stand der Kopien stammt daher von diesem Node und kann veraltet sein. Der führende Node lehnt die Verschiebung auf eine zurückliegende Kopie trotzdem ab."
     },
     "replication": {
       "nodes_title": "Nodes",
+      "no_nodes": "Die Nodes erscheinen hier, sobald die Instanz ihr erstes Topic hat — erst dessen Kopien sagen, auf welchen Nodes es liegt.",
       "nodes_sub": "Jede Partition hat einen führenden Node, der die Schreibvorgänge annimmt, und Kopien auf anderen Nodes. Eine synchrone Kopie hat alle Nachrichten; eine zurückliegende holt noch auf.",
       "nodes_sub_single": "Diese Instanz hat einen Node — jede Partition hat eine Kopie, auf diesem Node.",
       "node_leads": "Führt Partitionen",
@@ -11527,6 +11530,11 @@
       "balance_away_eta": "frühestens in etwa {min} Min.",
       "balance_away_now": "Sie können die Führung auch jetzt verteilen.",
       "balance_away_catching": "die Kopien von {list} holen noch auf",
+      "balance_down_title": "Node {node} antwortet nicht — {count} {n|Topic wird|Topics werden} von einem anderen Node geführt.",
+      "balance_down_text": "Die Führung kehrt von selbst zu {node} zurück, sobald er antwortet und seine Kopien 5 Min. lang ununterbrochen synchron sind.",
+      "balance_split_title": "{count} {n|Topic ist|Topics sind} auf mehrere Nodes aufgeteilt.",
+      "balance_split_text": "Die Partitionen eines solchen Topics oder seine Warteschlange nicht zugestellter Nachrichten werden von verschiedenen Nodes geführt. Verteile die Führung, um sie zusammenzuführen.",
+      "balance_away_split_item": "{name} (aufgeteilt: {nodes})",
       "balance_away_manual": "Die automatische Rückkehr zum bevorzugten Node ist ausgeschaltet, diese Topics bleiben daher, wo sie sind, bis Sie die Führung verteilen.",
       "return_title": "Automatische Rückkehr zum bevorzugten Node",
       "return_sub": "Wenn die Kopie eines Topics auf seinem bevorzugten Node 5 Min. lang ununterbrochen aktuell ist, kehrt die Führung von selbst dorthin zurück — höchstens ein Topic alle 30 s. Die Einstellung gilt für die ganze Instanz; jede Rückkehr wird im Audit-Protokoll festgehalten.",

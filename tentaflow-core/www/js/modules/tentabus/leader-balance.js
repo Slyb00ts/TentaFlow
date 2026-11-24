@@ -69,6 +69,8 @@ export function leadershipUnits({ topics, perTopic }) {
       led,
       leaderId,
       preferredId: named.size === 1 ? [...named][0] : null,
+      // Partitions and dead-letter partitions led by different nodes: no single node can be named the leader.
+      split: led.size > 1,
     });
   }
   return units.sort((a, b) => a.name.localeCompare(b.name));
@@ -90,7 +92,7 @@ export function balanceModel({ units, nodes }) {
     reachable: n.reachable !== false,
     partitions: units.reduce((sum, u) => sum + (u.led.get(n.nodeId) || 0), 0),
     topics: units.filter((u) => u.leaderId === n.nodeId).map((u) => u.name),
-    away: units.filter((u) => u.preferredId === n.nodeId && u.leaderId && u.leaderId !== n.nodeId),
+    away: units.filter((u) => u.preferredId === n.nodeId && u.leaderId && (u.leaderId !== n.nodeId || u.split)),
   }));
   const total = rows.reduce((s, r) => s + r.partitions, 0);
   const mean = rows.length ? total / rows.length : 0;
@@ -101,7 +103,7 @@ export function balanceModel({ units, nodes }) {
   let verdict = 'uneven';
   if (gap < smallest || units.length === 0) verdict = 'less';
   else if (gap === smallest) verdict = 'equal';
-  return { rows, total, mean, gap, smallest, verdict, away: rows.reduce((s, r) => s + r.away.length, 0) };
+  return { rows, total, mean, gap, smallest, verdict, away: rows.reduce((s, r) => s + r.away.length, 0), split: units.filter((u) => u.split) };
 }
 
 /** `17.5` → "17,5", whole numbers without a fraction, in the reader's language. */
@@ -174,5 +176,9 @@ export function leastLoadedNode({ perTopic, nodes }) {
   }
   const rows = (nodes || []).filter((n) => n.reachable !== false).map((n) => ({ nodeId: n.nodeId, label: nodeLabel(n), partitions: counts.get(n.nodeId) || 0 }));
   if (!rows.length) return null;
-  return rows.sort((a, b) => a.partitions - b.partitions || a.nodeId.localeCompare(b.nodeId))[0];
+  rows.sort((a, b) => a.partitions - b.partitions || a.nodeId.localeCompare(b.nodeId));
+  // The server breaks a tie by hashing the topic name onto a ring of the tied nodes (K4). The name is not hashed here, so a tie is
+  // reported as the set of tied nodes instead of a guess at one of them.
+  const tied = rows.filter((r) => r.partitions === rows[0].partitions);
+  return tied.length > 1 ? { ...rows[0], tied: tied.map((r) => r.label) } : rows[0];
 }

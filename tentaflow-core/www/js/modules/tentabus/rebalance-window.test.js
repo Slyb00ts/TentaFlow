@@ -339,3 +339,13 @@ test('a node without a label is named by its short id in the route, with the ful
   assert.doesNotMatch(plain(w.q('impact').innerHTML), new RegExp(hexA.slice(0, 20)));
   assert.match(plain(w.q('impact').innerHTML), /41291e27 będzie prowadził/);
 });
+
+test('the result of a split topic says how many partitions moved against all the topic has', async () => {
+  const splitMove = { ...moves[0], partitions: [0, 1, 3] };
+  const w = setup({ loadPlan: async () => ({ ...plan, moves: [splitMove] }), apply: async () => [{ ...splitMove, status: 'moved' }] });
+  await tick();
+  w.act('apply').click();
+  await tick();
+  await tick();
+  assert.deepEqual(w.q('moves').rows.map((r) => plain(r.detail)), ['przeniesiono 3 z 4']);
+});

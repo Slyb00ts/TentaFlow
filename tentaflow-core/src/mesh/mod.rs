@@ -7,6 +7,7 @@ pub mod admin_ops;
 pub mod bandwidth_probe;
 pub mod cbor;
 pub mod cluster_probe;
+pub mod command_tasks;
 pub mod cluster_rdma;
 pub mod command_executor;
 pub mod command_policy;

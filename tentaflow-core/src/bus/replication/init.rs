@@ -446,6 +446,7 @@ pub fn stop(manager: &Arc<ReplicationManager>) {
 /// starts an election for it (`ReplicationManager::check_leases`'s own
 /// doc). Ends when `manager.shutdown_token()` is cancelled.
 fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) {
+    let manager_for_elections = manager.clone();
     let shutdown = manager.shutdown_token();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -454,15 +455,28 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    // One question — "is the role this node holds still
-                    // valid?" — on one tick: a follower whose leader stopped
-                    // refreshing the lease elects, a leader a peer has
-                    // proved stale steps down, and so does a leader that no
-                    // quorum has acknowledged for a whole lease.
-                    manager.check_leases().await;
+                    // "Is the role this node holds still valid?": a leader a
+                    // peer has proved stale steps down, and so does a leader
+                    // that no quorum has acknowledged for a whole lease. (A
+                    // follower whose leader stopped refreshing the lease
+                    // elects in its own loop below.)
                     manager.check_stale_leadership().await;
                     manager.check_quorum_leases().await;
                 }
+            }
+        }
+    });
+    // Elections get their own loop: one waits for a silent peer for seconds,
+    // and a leader a peer has proved stale must step down on time, not behind
+    // it.
+    let shutdown = manager_for_elections.shutdown_token();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => manager_for_elections.check_leases().await,
             }
         }
     });

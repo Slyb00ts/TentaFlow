@@ -227,12 +227,12 @@ function changeRowSkeleton(key) {
  */
 export function drawReplication(body, ctx) {
   const view = ctx.view();
-  const mode = view.nodes == null ? 'loading' : 'full';
+  const mode = view.nodes == null ? 'loading' : view.nodes.length ? 'full' : 'empty';
   if (body.__tbMode !== mode) {
     body.__tbMode = mode;
     patchHtml(body, mode === 'loading'
       ? `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('shell.loading'))}</div>`
-      : skeleton());
+      : mode === 'empty' ? `<div class="tb-state" data-role="no-nodes">${escapeHtml(T('replication.no_nodes'))}</div>` : skeleton());
     if (!body.__tbWired) {
       body.__tbWired = true;
       body.addEventListener('click', (e) => {
@@ -282,7 +282,17 @@ function balanceAlert(model, view, availability, name) {
   if (availability.older.length) {
     return { tone: 'info', title: T('replication.balance_old_info_title', { nodes: availability.older.join(', ') }), message: T('replication.balance_old_info_text') };
   }
-  if (!model.away) return null;
+  const pluralCount = (n) => ({ count: fmtCount(n), n });
+  if (!model.away && !model.split.length) return null;
+  // A node that does not answer is the first thing to say: whatever it is preferred for cannot go back before it is there again.
+  const down = model.rows.find((r) => !r.reachable && r.away.length > 0);
+  if (down) {
+    const title = T('replication.balance_down_title', { node: down.label, ...pluralCount(down.away.length) });
+    return { tone: 'warning', title, message: view.leaderReturn === false ? T('replication.balance_away_manual') : T('replication.balance_down_text', { node: down.label }) };
+  }
+  if (!model.away) {
+    return { tone: 'warning', title: T('replication.balance_split_title', pluralCount(model.split.length)), message: T('replication.balance_split_text') };
+  }
   const idle = model.rows.find((r) => r.reachable && r.partitions === 0 && r.away.length > 0);
   const away = model.rows.flatMap((r) => r.away);
   const since = idle ? view.reachableSince?.get(idle.nodeId) : null;
@@ -291,6 +301,7 @@ function balanceAlert(model, view, availability, name) {
   if (idle && upFor != null && upFor < 60_000) title = T('replication.balance_idle_just_now_title', { node: idle.label });
   else if (idle && upFor != null) title = T('replication.balance_idle_since_title', { node: idle.label, since: fmtSince(since, view.nowMs) });
   else if (idle) title = T('replication.balance_idle_title', { node: idle.label });
+  else if (model.split.length) title = T('replication.balance_split_title', pluralCount(model.split.length));
   else title = T('replication.balance_away_title', { count: fmtCount(away.length), n: away.length });
   if (view.leaderReturn === false) return { tone: 'warning', title, message: T('replication.balance_away_manual') };
   const where = [...new Set(away.map((u) => name(u.preferredId)))].join(', ');
@@ -341,11 +352,15 @@ function paintBalance(body, view) {
   const rows = model.rows.map((r) => {
     const awayNames = r.away.map((u) => u.name);
     const leaders = new Set(r.away.map((u) => u.leaderId));
+    const hasSplit = r.away.some((u) => u.split);
+    const where = (u) => [...u.led.keys()].sort().map(name).join(', ');
     let awayCell = '0';
     if (awayNames.length) {
-      const where = leaders.size === 1 ? name([...leaders][0]) : '';
-      const list = leaders.size === 1
-        ? T(awayNames.length === 1 ? 'replication.balance_away_one' : 'replication.balance_away_many', { list: awayNames.join(', '), node: where })
+      const leader = leaders.size === 1 ? name([...leaders][0]) : '';
+      const list = hasSplit
+        ? r.away.map((u) => (u.split ? T('replication.balance_away_split_item', { name: u.name, nodes: where(u) }) : `${u.name} (${name(u.leaderId)})`)).join(', ')
+        : leaders.size === 1
+        ? T(awayNames.length === 1 ? 'replication.balance_away_one' : 'replication.balance_away_many', { list: awayNames.join(', '), node: leader })
         : r.away.map((u) => `${u.name} (${name(u.leaderId)})`).join(', ');
       awayCell = `<span class="tf-chip tf-chip--outline warn">${escapeHtml(T('replication.balance_away_chip', { count: fmtCount(awayNames.length), n: awayNames.length }))}</span> <span class="tf-table__cell-sub">${escapeHtml(list)}</span>`;
     }

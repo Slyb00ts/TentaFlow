@@ -790,12 +790,12 @@ fn build_node(
         leader_config(),
         metrics,
     ));
-    let follower_factory = Arc::new(GlueFollowerFactory::new(
-        id,
-        env,
-        Arc::clone(&provider),
-        follower_config(),
-    ));
+    // The cluster is built in one go and its leader killed on purpose: there
+    // is no restart whose link to wait for.
+    let follower_factory = Arc::new(
+        GlueFollowerFactory::new(id, env, Arc::clone(&provider), follower_config())
+            .with_stand_delays(Duration::ZERO, Duration::ZERO),
+    );
     let audit = Arc::new(AuditLogReplAudit::new(db.clone(), id));
     let ledger = Arc::new(NodeLedger {
         node: id.to_string(),

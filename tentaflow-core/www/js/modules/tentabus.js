@@ -27,7 +27,7 @@ import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
 import { fmtCount, fmtElapsed, loadErrorKind, consumerLabel } from '/js/modules/tentabus/format.js';
 import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams, carriedParams } from '/js/modules/tentabus/routes.js';
-import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
+import { shellCounts, instanceNodes, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
@@ -45,7 +45,7 @@ import { policyRows, topicFormat, fieldSource, previewAvailable } from '/js/modu
 import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
 import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
-import { openLeaderTransfer, transferChoices, transferContext, exclusive, askLeaders, overlayLeaderRows } from '/js/modules/tentabus/partitions.js';
+import { openLeaderTransfer, transferChoices, transferContext, LEADER_WAIT_MS, exclusive, askLeaders, overlayLeaderRows } from '/js/modules/tentabus/partitions.js';
 import { openRebalanceWindow, blockerText } from '/js/modules/tentabus/rebalance-window.js';
 import { leaderReturnEnabled, leaderReturnKey, leaderReturnValue, leastLoadedNode, isOlderNode } from '/js/modules/tentabus/leader-balance.js';
 import { nodeLabel, nodeTitle, nodeNamer } from '/js/modules/tentabus/node-label.js';
@@ -725,7 +725,8 @@ function paintShell() {
   const root = byId('tb-root');
   if (!root || !byId('tb-head-chips')) return;
   const sh = state.shell;
-  const counts = shellCounts({ stats: state.stats, topicList: state.topicsLoaded ? state.topics : null, subjects: sh.subjects, nodes: sh.nodes });
+  const listedNodes = shellNodes();
+  const counts = shellCounts({ stats: state.stats, topicList: state.topicsLoaded ? state.topics : null, subjects: sh.subjects, nodes: listedNodes });
   const errorKind = sh.statsError ? loadErrorKind(sh.statsError) : null;
   const stale = Boolean(state.stats && errorKind);
   let status;
@@ -756,7 +757,7 @@ function paintShell() {
     counts.topics != null ? '<tf-chip size="sm" variant="outline" status="accent" icon="share" data-role="topics"></tf-chip>' : '',
     counts.dlq != null ? '<tf-chip size="sm" variant="outline" status="neutral" icon="inbox" data-role="dlq"></tf-chip>' : '',
     counts.schemas != null ? '<tf-chip size="sm" variant="outline" status="neutral" icon="file-code" data-role="schemas"></tf-chip>' : '',
-    sh.nodes?.length ? '<tf-chip size="sm" variant="outline" status="info" icon="cpu" data-role="node-list"></tf-chip>' : '',
+    listedNodes?.length ? '<tf-chip size="sm" variant="outline" status="info" icon="cpu" data-role="node-list"></tf-chip>' : '',
   ].join(''));
   setAttr(badges.querySelector('[data-role="topics"]'), 'label', counts.topics != null ? T('shell.badge_topics', { count: fmtCount(counts.topics), n: counts.topics }) : null);
   const dlqBadge = badges.querySelector('[data-role="dlq"]');
@@ -764,9 +765,9 @@ function paintShell() {
   setAttr(dlqBadge, 'status', counts.dlq ? 'warn' : 'neutral');
   setAttr(badges.querySelector('[data-role="schemas"]'), 'label', counts.schemas != null ? T('shell.badge_schemas', { count: fmtCount(counts.schemas), n: counts.schemas }) : null);
   const nodeList = badges.querySelector('[data-role="node-list"]');
-  setAttr(nodeList, 'label', sh.nodes?.length ? T('shell.badge_nodes', { list: sh.nodes.map(nodeLabel).join(' · ') }) : null);
+  setAttr(nodeList, 'label', listedNodes?.length ? T('shell.badge_nodes', { list: listedNodes.map(nodeLabel).join(' · ') }) : null);
   // A node named by its short id: the full ids, one per line.
-  setAttr(nodeList, 'title', (sh.nodes || []).filter(nodeTitle).map((n) => `${nodeLabel(n)}: ${nodeTitle(n)}`).join('\n') || null);
+  setAttr(nodeList, 'title', (listedNodes || []).filter(nodeTitle).map((n) => `${nodeLabel(n)}: ${nodeTitle(n)}`).join('\n') || null);
   setClass(badges, 'is-stale', stale);
 
   const select = byId('tb-instance-select');
@@ -780,6 +781,12 @@ function paintShell() {
       setAttr(tabs.querySelector(`tf-tab#${id}`), 'count', value != null ? fmtCount(value) : null);
     }
   }
+}
+
+// The nodes the screens show: what the replica list names, but not the one-node (or no-node) list of an instance without a topic,
+// which differs from node to node.
+function shellNodes() {
+  return state.topicsLoaded ? instanceNodes(state.shell.nodes, state.topics) : state.shell.nodes;
 }
 
 // Navigation, crumbs and the address follow every view change; the header
@@ -1255,7 +1262,7 @@ function leaderHint() {
   const nodes = state.shell.nodes || [];
   if (nodes.length < 2 || !state.shell.replicaTopics) return null;
   const least = leastLoadedNode({ perTopic: state.shell.replicaTopics, nodes });
-  return { node: least ? least.label : null, partitions: least ? least.partitions : 0, older: nodes.some(isOlderNode) };
+  return { node: least ? least.label : null, tied: least?.tied || null, partitions: least ? least.partitions : 0, older: nodes.some(isOlderNode) };
 }
 
 function openCreator() {
@@ -1916,8 +1923,8 @@ async function openPartitionTransfer(topic, partition, from) {
         partition,
         replica,
         nodes,
-        readLeader: () => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic), { targetNodeId: replica.leaderNodeId }),
-        readPlan: () => busCall('busLeaderBalancePlanRequest', { instanceId: requireInstanceId(instanceId), topic }),
+        readLeader: () => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic), { targetNodeId: replica.leaderNodeId, timeoutMs: LEADER_WAIT_MS }),
+        readPlan: () => busCall('busLeaderBalancePlanRequest', { instanceId: requireInstanceId(instanceId), topic }, { timeoutMs: LEADER_WAIT_MS }),
         describeBlocker: (blocker) => blockerText(blocker, label, pausedConsumers()),
       });
     } finally {
@@ -1925,12 +1932,13 @@ async function openPartitionTransfer(topic, partition, from) {
     }
   });
   if (!context || state.instanceId !== instanceId) return;
-  const { row, blockedNote } = context;
+  const { row, blockedNote, leaderSilent } = context;
   openLeaderTransfer({
     topic,
     partition,
     choices: transferChoices(row, nodes),
     blockedNote,
+    leaderSilent,
     transfer: (target) => busCall('busLeaderTransferRequest', buildLeaderTransferRequest(instanceId, topic, partition, target)),
     describeError: describeBusError,
     onDone: async ({ label }) => {
@@ -2037,7 +2045,7 @@ const replicationContext = {
   view() {
     const sh = state.shell;
     return {
-      nodes: sh.nodes,
+      nodes: shellNodes(),
       replicaTopics: sh.replicaTopics,
       failovers: sh.failovers,
       topics: state.topics,

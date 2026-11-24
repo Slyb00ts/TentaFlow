@@ -208,6 +208,12 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
   /** The cells of the moves table in the current phase. */
   const moveRows = () => {
     const view = snapshot();
+    const units = leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
+    // What moved, of everything the topic has: a split topic moves only the partitions that were elsewhere.
+    const movedChip = (m) => chip('ok', t('state_moved_progress', {
+      done: fmtCount(m.partitions.length),
+      total: fmtCount(Math.max(units.find((u) => u.name === m.topic)?.partitions || 0, m.partitions.length)),
+    }));
     const base = (m) => ({
       topic: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(m.topic)}</span></span>`,
       parts: String(m.partitions.length),
@@ -238,7 +244,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
       // No answer says how each move ended: only the polled replica lists do.
       return moves.map((m) => {
         const p = moveProgress(m, view);
-        if (p.done >= p.total) return { ...base(m), detail: chip('ok', t('state_moved_progress', { done: fmtCount(p.done), total: fmtCount(p.total) })) };
+        if (p.done >= p.total) return { ...base(m), detail: movedChip(m) };
         return { ...base(m), detail: state.phase === 'unknown' ? chip('neutral', t('state_checking')) : chip('neutral', t('state_failed')) };
       });
     }
@@ -248,7 +254,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
       let detail = chip('neutral', t('state_not_attempted'));
       if (!r || r.status === 'not_attempted') {
         detail += firstFailed ? sub(t('state_not_attempted_sub', { topic: firstFailed.topic })) : '';
-      } else if (r.status === 'moved') detail = chip('ok', t('state_moved_progress', { done: fmtCount(m.partitions.length), total: fmtCount(m.partitions.length) }));
+      } else if (r.status === 'moved') detail = movedChip(m);
       else {
         const behind = (view.replicaTopics.find((x) => x.topic === m.topic)?.partitions || []);
         const partition = /'\/(\d+)/.exec(String(r.detail || ''))?.[1];

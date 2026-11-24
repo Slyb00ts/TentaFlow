@@ -1214,6 +1214,159 @@ fn process_three_node_bus_topic_returns_to_the_preferred_node_after_a_restart() 
     }
 }
 
+/// A follower that restarts must not depose the live leader it rejoins (RF=2:
+/// one replica may act alone, so a lease that runs out before the leader's
+/// dial lands is all it would take). Watched for longer than the follower's
+/// undialed lease (lease + backoff + margin): the leader keeps its term and
+/// takes the follower back. The slow-link case itself is covered by the
+/// manager's own tests (`a_live_leader_behind_a_slow_link_is_not_deposed`,
+/// `a_restarted_rf2_follower_that_never_heard_its_leader_does_not_stand`):
+/// the children find each other through local discovery, so a link that stays
+/// down cannot be staged here.
+#[test]
+fn process_two_node_bus_a_restarted_follower_does_not_depose_a_live_leader() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("root");
+    let home_b = root.path().join("b");
+    let mut a = ChildNode::spawn("a", root.path().join("a"));
+    let mut b = ChildNode::spawn("b", home_b.clone());
+    connect_nodes(&mut a, &mut b);
+    create_topic_everywhere(&mut a, &mut [&mut b]);
+    let leader_id = a.node_id.clone();
+    let replicas = vec![a.node_id.clone(), b.node_id.clone()];
+    assign_and_wait(
+        &mut a,
+        &mut [&mut b],
+        &leader_id,
+        &replicas,
+        Duration::from_secs(30),
+    );
+    wait_live_isr(&mut a, &replicas, Duration::from_secs(30));
+    let epoch_before = leader_epoch_of(&role_of(&mut a));
+
+    b.kill();
+    let b_id = b.node_id.clone();
+    drop(b);
+    let mut b2 = ChildNode::spawn("b-restart", home_b);
+    assert_eq!(b2.node_id, b_id, "the restart keeps its identity");
+    b2.command(&format!("TRUST {} {}", a.node_id, a.public_key));
+    b2.command(&format!(
+        "CONNECT {} {} {}",
+        a.node_id, a.public_key, a.addr
+    ));
+    b2.command(&format!("SET_PEER_ENV {} prod", a.node_id));
+    a.command(&format!(
+        "CONNECT {} {} {}",
+        b2.node_id, b2.public_key, b2.addr
+    ));
+
+    let until = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < until {
+        let line = role_of(&mut b2);
+        assert!(
+            !line.contains("Leader {"),
+            "the restarted follower stood against a live leader: {line}"
+        );
+        let line = role_of(&mut a);
+        assert!(
+            line.contains("Leader {") && leader_epoch_of(&line) == epoch_before,
+            "the live leader lost its term: {line}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    wait_live_isr(&mut a, &replicas, Duration::from_secs(60));
+    let line = wait_role(&mut b2, "Follower", Duration::from_secs(30));
+    assert!(line.contains(&leader_id), "{line}");
+}
+
+/// Two nodes, RF=2, eight partitions led by one of them, PRODUCTION election
+/// settings (probe, grace, lease): the leader is killed and every partition is
+/// taken over by the survivor within 15 s. The elections of one dead leader's
+/// partitions run together; sitting out a silent dial one partition at a time
+/// would take minutes.
+#[test]
+fn process_two_node_bus_eight_partitions_of_a_killed_leader_move_within_fifteen_seconds() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    const EIGHT: &str = "chaos.eight";
+    const PARTITIONS: u32 = 8;
+    let root = tempfile::tempdir().expect("root");
+    let mut a = ChildNode::spawn("a", root.path().join("a"));
+    let mut b = ChildNode::spawn("b", root.path().join("b"));
+    connect_nodes(&mut a, &mut b);
+    a.command(&format!(
+        "CREATE_TOPIC {ORG_ID} {EIGHT} {PARTITIONS} 2 quorum standard"
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let line = b.command(&format!("TOPIC_STATE {ORG_ID} {EIGHT}"));
+        if line.split_whitespace().nth(3) == Some("1") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the topic row never reached b");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let replicas = format!("{},{}", a.node_id, b.node_id);
+    for p in 0..PARTITIONS {
+        a.command(&format!(
+            "ASSIGN {ORG_ID} {EIGHT} {p} {} {replicas}",
+            a.node_id
+        ));
+    }
+    let term = format!("epoch: {ASSIGN_EPOCH}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    'settled: loop {
+        let mut all = true;
+        for p in 0..PARTITIONS {
+            let on_b = b.command(&format!("ROLE {ORG_ID} {EIGHT} {p}"));
+            let on_a = a.command(&format!("ROLE {ORG_ID} {EIGHT} {p}"));
+            let isr = a.command(&format!("ISR {ORG_ID} {EIGHT} {p}"));
+            all &= on_b.contains("Follower")
+                && on_b.contains(&term)
+                && on_a.contains("Leader")
+                && isr.contains(&b.node_id);
+        }
+        if all {
+            break 'settled;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the eight partitions never settled on a"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    a.kill();
+    let killed = Instant::now();
+    drop(a);
+    let deadline = killed + Duration::from_secs(15);
+    loop {
+        let mut moved = 0;
+        for p in 0..PARTITIONS {
+            if b.command(&format!("ROLE {ORG_ID} {EIGHT} {p}"))
+                .contains("Leader {")
+            {
+                moved += 1;
+            }
+        }
+        if moved == PARTITIONS {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {moved} of {PARTITIONS} partitions moved to the survivor within 15 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "failover: all {PARTITIONS} partitions led by the survivor {:?} after the kill",
+        killed.elapsed()
+    );
+}
+
 // ===== Topic re-creation across nodes (non-ignored) =========================
 //
 // A topic deleted on one node and created again under the same name is a

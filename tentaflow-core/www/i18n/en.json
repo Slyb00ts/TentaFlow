@@ -12211,6 +12211,7 @@
         "leader_label": "Leading node",
         "summary_leader": "chosen by the instance — the node preferred for the fewest partitions (now {node}: {count} {n|partition|partitions})",
         "summary_leader_auto": "chosen by the instance — the node preferred for the fewest partitions",
+        "summary_leader_tie": "chosen by the instance — one of the nodes {nodes} or {last} (each preferred for {count} {n|partition|partitions})",
         "summary_leader_old": "the node the topic is created on — the instance will choose by itself only once all nodes are updated"
       },
       "delete": {
@@ -12531,10 +12532,12 @@
       "choice_lag_leader": "copy behind according to the leading node {owner} — cannot take over until it catches up",
       "choice_out_leader": "copy out of sync according to the leading node {owner} — cannot take over",
       "choice_old": "node runs an older version of TentaFlow — cannot take over",
-      "checking_leader": "Asking the leading node about the copies…"
+      "checking_leader": "Checking the copies with the leading node…",
+      "leader_silent": "The leading node did not answer within {secs} s, so the state of the copies comes from this node and may be out of date. The leading node still refuses a move to a copy that is behind."
     },
     "replication": {
       "nodes_title": "Nodes",
+      "no_nodes": "The nodes appear here once the instance has its first topic — only the copies of a topic say which nodes it lives on.",
       "nodes_sub": "Every partition has one leading node, which takes the writes, and copies on other nodes. A copy in sync has every message; a copy behind is still catching up.",
       "nodes_sub_single": "This instance has one node — every partition has one copy, on this node.",
       "node_leads": "Leads partitions",
@@ -12601,6 +12604,11 @@
       "balance_away_eta": "at the earliest in about {min} min",
       "balance_away_now": "You can also spread leadership now.",
       "balance_away_catching": "the copies of {list} are still catching up",
+      "balance_down_title": "Node {node} is not responding — {count} {n|topic is|topics are} led by another node.",
+      "balance_down_text": "Leadership returns to {node} by itself once it answers and its copies have been in sync without a break for 5 min.",
+      "balance_split_title": "{count} {n|topic is|topics are} split between nodes.",
+      "balance_split_text": "The partitions of such a topic, or its queue of undelivered messages, are led by different nodes. Spread the leadership to gather them.",
+      "balance_away_split_item": "{name} (split: {nodes})",
       "balance_away_manual": "Automatic return to the preferred node is off, so these topics stay where they are until you spread leadership.",
       "return_title": "Automatic return to the preferred node",
       "return_sub": "When a topic’s copy on its preferred node has been in sync without a break for 5 min, leadership returns there on its own — at most one topic every 30 s. The setting applies to the whole instance; every return is written to the audit log.",

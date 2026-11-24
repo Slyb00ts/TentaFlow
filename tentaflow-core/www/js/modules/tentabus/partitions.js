@@ -109,25 +109,36 @@ export function exclusive() {
   };
 }
 
+/** How long the leader is waited for before the window opens with this node's own view. */
+export const LEADER_WAIT_MS = 2000;
+
+/** `promise`'s value, or `null` when it fails or has not settled within `ms`. */
+function withinMs(promise, ms) {
+  let timer;
+  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); });
+  return Promise.race([promise.catch(() => null), late]).finally(() => clearTimeout(timer));
+}
+
 /**
  * What the window "Przenieś prowadzenie" is built from. On the node that leads the partition its own row is
  * the truth. On any other node the leader is asked for its row (`readLeader()`: the leader's own replica list,
  * with the lag of every copy in bytes) and for a plan of the topic (`readPlan()`: its blockers), and the
  * answers replace what this node can see. Either read failing (or answering nothing) leaves the window to open
- * with what this node has: the leader still refuses a copy that is behind when the move is sent.
+ * with what this node has: the leader still refuses a copy that is behind when the move is sent. Neither read is
+ * waited for longer than `waitMs`; when the leader's row did not arrive, `leaderSilent` says so for the window.
  * `describeBlocker(blocker)` words the reason a topic as a whole cannot move; only a paused consumer is one.
  */
-export async function transferContext({ topic, partition, replica, nodes, readLeader, readPlan, describeBlocker }) {
+export async function transferContext({ topic, partition, replica, nodes, readLeader, readPlan, describeBlocker, waitMs = LEADER_WAIT_MS }) {
   const local = (nodes || []).find((n) => n.isLocal);
-  if (!local || !replica?.leaderNodeId || local.nodeId === replica.leaderNodeId) return { row: replica, blockedNote: '' };
+  if (!local || !replica?.leaderNodeId || local.nodeId === replica.leaderNodeId) return { row: replica, blockedNote: '', leaderSilent: false };
   const [leaders, plan] = await Promise.all([
-    Promise.resolve().then(readLeader).catch(() => null),
-    Promise.resolve().then(readPlan).catch(() => null),
+    withinMs(Promise.resolve().then(readLeader), waitMs),
+    withinMs(Promise.resolve().then(readPlan), waitMs),
   ]);
   const leaderRow = (leaders?.partitions || []).find((p) => Number(p.partition) === Number(partition));
   const row = leaderRow ? { ...leaderRow, preferredLeaderNodeId: leaderRow.preferredLeaderNodeId ?? replica.preferredLeaderNodeId } : replica;
   const blocker = topicWideBlocker(plan?.blockers, topic);
-  return { row, blockedNote: blocker ? describeBlocker(blocker) : '' };
+  return { row, blockedNote: blocker ? describeBlocker(blocker) : '', leaderSilent: !leaderRow };
 }
 
 /**
@@ -303,11 +314,12 @@ export function rangeText(range) {
  * Opens "Przenieś prowadzenie" from one partition of `topic`; the whole topic
  * moves, so the window says the topic's name and what goes with it. `choices` =
  * `transferChoices(...)`; `blockedNote` (optional) = a reason that stops the
- * whole topic, shown instead of an offer to move; `transfer(nodeId)` sends the
+ * whole topic, shown instead of an offer to move; `leaderSilent` = the leader did not answer, so the window is built from this
+ * node's own view and says so; `transfer(nodeId)` sends the
  * request (may throw: the window stays with `describeError(err)`);
  * `onDone({ nodeId, label })` runs after the window closed.
  */
-export function openLeaderTransfer({ topic, partition, choices, blockedNote = '', transfer, describeError, onDone }) {
+export function openLeaderTransfer({ topic, partition, choices, blockedNote = '', leaderSilent = false, transfer, describeError, onDone }) {
   const pick = choices.find((c) => c.state === 'ok') || null;
   let selected = pick?.nodeId || '';
   const win = document.createElement('tf-window');
@@ -333,6 +345,7 @@ export function openLeaderTransfer({ topic, partition, choices, blockedNote = ''
   win.innerHTML = `
     <div slot="body" class="stack">
       <div class="tb-explain-box">${escapeHtml(T('partitions.transfer_explain', { topic }))}</div>
+      ${leaderSilent ? `<div class="tb-explain-box" data-role="leader-silent">${escapeHtml(T('partitions.leader_silent', { secs: LEADER_WAIT_MS / 1000 }))}</div>` : ''}
       <tf-choice-group id="tb-transfer-target" value="${escapeAttr(selected)}" columns="1" aria-label="${escapeAttr(T('partitions.transfer_target'))}">
         ${choices.map((c) => `<tf-choice-card value="${escapeAttr(c.nodeId)}" icon="cpu" heading="${escapeAttr(headingOf(c))}" description="${escapeAttr(noteOf(c))}" ${c.state === 'ok' && !blockedNote ? '' : 'disabled'}></tf-choice-card>`).join('')}
       </tf-choice-group>

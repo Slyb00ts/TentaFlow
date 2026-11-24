@@ -44,6 +44,8 @@ test('the node a new topic goes to is the one the fewest partitions prefer, what
   assert.equal(leastLoadedNode({ perTopic, nodes: [] }), null);
   const tie = leastLoadedNode({ perTopic: [], nodes: [B, A] });
   assert.equal(tie.nodeId, 'a', 'equal load: by node id');
+  assert.deepEqual(tie.tied, ['Serwer A', 'Serwer B'], 'a tie names every tied node, since the server picks by the topic name');
+  assert.equal(leastLoadedNode({ perTopic, nodes: [A, B] }).tied, undefined, 'no tie, no list');
 });
 
 test('the switch reads on, off, absent (on) and unreadable (off)', () => {

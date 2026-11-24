@@ -33,6 +33,18 @@ export function userRate(stats) {
 }
 
 /**
+ * The nodes of the instance as far as the replica list tells. The list is
+ * built from the replicas of its topics, so an instance without a topic
+ * names none or only the node asked, which differs from node to node; one or
+ * no node with no topic is therefore "not known yet" (`[]`), not a count.
+ * Two or more nodes are a real list whatever the topics. `null` stays `null`.
+ */
+export function instanceNodes(nodes, topicList) {
+  if (!Array.isArray(nodes)) return null;
+  return nodes.length >= 2 || userTopics(topicList).length ? nodes : [];
+}
+
+/**
  * The counters shared by the header badges and the tab strip. A figure whose
  * source has not answered yet is `null` — the caller leaves it out rather
  * than printing a zero it does not know.
@@ -44,7 +56,7 @@ export function shellCounts({ stats, topicList, subjects, nodes }) {
     groups: stats ? (stats.groups || []).length : null,
     dlq: stats ? Number(stats.totalDlqDepth) || 0 : null,
     schemas: subjects ? subjects.length : null,
-    nodes: nodes ? nodes.length : null,
+    nodes: nodes?.length ? nodes.length : null,
   };
 }
 

@@ -116,6 +116,71 @@ pub(crate) fn registry_name_in(state: &super::state::AppState, node_id: &str) ->
 // Origin side — the proxy
 // =============================================================================
 
+/// Whether a forwarded request only reads: `...ListRequest`, `...GetRequest`,
+/// and the like. A dashboard polls these every few seconds, so their origin
+/// audit rows are thinned (`audit_forward`).
+fn is_read_only_variant(variant: &str) -> bool {
+    [
+        "List", "Get", "Detail", "Status", "Snapshot", "Search", "Preview",
+    ]
+    .iter()
+    .any(|verb| variant.contains(verb))
+}
+
+/// How long a read-only forward by one user to one node is audited once.
+const READ_ONLY_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a read-only forward `(user, node, variant)` was audited within
+/// `READ_ONLY_AUDIT_WINDOW`; records it when it was not.
+fn read_only_forward_is_new(user: &str, node: &str, variant: &str) -> bool {
+    static SEEN: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(String, String, String), std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock();
+    let now = std::time::Instant::now();
+    seen.retain(|_, at| now.duration_since(*at) < READ_ONLY_AUDIT_WINDOW);
+    let key = (user.to_string(), node.to_string(), variant.to_string());
+    if seen.contains_key(&key) {
+        return false;
+    }
+    seen.insert(key, now);
+    true
+}
+
+/// Origin-side audit of a forward the executing node answered: WHERE the user
+/// sent which request from, and how it ended. The executing node writes its
+/// own authoritative entry (`app.route.execute`, with its gate outcome); a
+/// request that never got an answer leaves no row here, only the error the
+/// caller gets. A read-only request is audited once per user, node and
+/// variant per `READ_ONLY_AUDIT_WINDOW`, so a polling page does not fill the
+/// table.
+fn audit_forward(
+    ctx: &HandlerContext,
+    org: &crate::services::rbac::OrgContext,
+    node_id: &str,
+    variant: &str,
+    outcome: &str,
+) {
+    if is_read_only_variant(variant) && !read_only_forward_is_new(&org.user_id, node_id, variant) {
+        return;
+    }
+    let _ = crate::db::repository::log_audit_full(
+        &ctx.state.db,
+        Some(&org.user_id),
+        None,
+        "app.route.forward",
+        Some("mesh_node"),
+        Some(node_id),
+        Some(&format!("{variant}: {outcome}")),
+        "info",
+        "B",
+        None,
+        Some(&org.org_id),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+}
+
 /// Forward one dashboard request (the envelope's raw `MessageBody` CBOR) to
 /// `node_id` and return the executing node's response body.
 ///
@@ -174,23 +239,9 @@ pub async fn forward_to_node(
     })
     .map_err(|e| remote_proxy::assertion_denied(&e))?;
 
-    // Origin-side audit: the executing node writes the authoritative entry
-    // (with its own gate outcome); this records WHERE the user sent it from.
-    let _ = crate::db::repository::log_audit_full(
-        &ctx.state.db,
-        Some(&org.user_id),
-        None,
-        "app.route.forward",
-        Some("mesh_node"),
-        Some(node_id),
-        None,
-        "info",
-        "B",
-        None,
-        Some(&org.org_id),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
+    let variant = decode_body(&body_cbor)
+        .map(|body| crate::dispatch::variant_name_of(&body))
+        .unwrap_or("unknown");
 
     let response = iroh
         .send_command_and_wait(
@@ -210,8 +261,14 @@ pub async fn forward_to_node(
             payload_cbor,
             error,
         } => match error {
-            Some(error) => Err(error),
-            None => decode_body(&payload_cbor),
+            Some(error) => {
+                audit_forward(ctx, org, node_id, variant, &format!("{:?}", error.code));
+                Err(error)
+            }
+            None => {
+                audit_forward(ctx, org, node_id, variant, "ok");
+                decode_body(&payload_cbor)
+            }
         },
         _ => Err(unreachable(
             node_id,
@@ -223,6 +280,32 @@ pub async fn forward_to_node(
 // =============================================================================
 // Executing side
 // =============================================================================
+
+/// A forwarded request whose assertion did not verify (forged, expired, signed
+/// by a key this node does not know) is worth a line in the log: on a healthy
+/// mesh it never happens. Once per `(peer, user)` per minute, so a poll that
+/// keeps failing does not repeat it.
+fn warn_refused_assertion(peer: &str, user: &str, error: &assertion::AssertionError) {
+    static LAST: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock();
+    let now = std::time::Instant::now();
+    let key = (peer.to_string(), user.to_string());
+    if last
+        .get(&key)
+        .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(60))
+    {
+        return;
+    }
+    last.insert(key, now);
+    tracing::warn!(
+        peer,
+        user,
+        error = %error,
+        "app route: a forwarded request carried an assertion that did not verify"
+    );
+}
 
 pub async fn execute_remote_side(
     from_node_id: &str,
@@ -263,8 +346,10 @@ async fn execute_remote_side_inner(
     {
         remote_proxy::fetch_peer_assertion_keys(from_node_id, iroh).await;
     }
-    let verified = assertion::verify(&state.db, assertion_in, &verify_input)
-        .map_err(|e| remote_proxy::assertion_denied(&e))?;
+    let verified = assertion::verify(&state.db, assertion_in, &verify_input).map_err(|e| {
+        warn_refused_assertion(from_node_id, &assertion_in.sub, &e);
+        remote_proxy::assertion_denied(&e)
+    })?;
 
     // Domain separation: this assertion must have been minted FOR app routing.
     if verified.workspace_id != APP_ROUTE_SCOPE {

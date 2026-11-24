@@ -1210,7 +1210,7 @@ fn anthropic_sse_response(
                 error!("Anthropic SSE chunk: {}", e);
                 let ev = serde_json::json!({
                     "type": "error",
-                    "error": { "type": "api_error", "message": e.to_string() }
+                    "error": { "type": "api_error", "message": super::server::stream_error_message(&e) }
                 });
                 vec![Ok(sse_frame("error", &ev))]
             }

@@ -235,6 +235,20 @@ test('when the leader cannot be asked the window still opens, with this node\'s 
   assert.equal(empty.row, followerView, 'a leader answer without this partition is no answer');
 });
 
+test('a leader that does not answer within the cap lets the window open with the note, and an answering one does not', async () => {
+  const never = () => new Promise(() => {});
+  const started = Date.now();
+  const silent = await transferContext(ctxArgs({ readLeader: never, readPlan: never, waitMs: 40 }));
+  assert.ok(Date.now() - started < 1000, 'the wait is bounded by the cap');
+  assert.equal(silent.row, followerView);
+  assert.equal(silent.leaderSilent, true);
+  assert.equal((await transferContext(ctxArgs())).leaderSilent, false);
+  assert.equal((await transferContext(ctxArgs({ replica: { ...healthy, leaderNodeId: 'n-rig' } }))).leaderSilent, false, 'nothing was asked on the leader');
+  const { win } = open({ choices: transferChoices(healthy, nodes), leaderSilent: true });
+  assert.match(win.querySelector('[data-role="leader-silent"]').textContent, /nie odpowiedział w ciągu 2 s/);
+  assert.equal(open({ choices: transferChoices(healthy, nodes) }).win.querySelector('[data-role="leader-silent"]'), null);
+});
+
 test('a second click while the leader is being asked does nothing', async () => {
   const gate = exclusive();
   let release;

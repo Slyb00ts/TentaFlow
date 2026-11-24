@@ -36,6 +36,10 @@ class TfSelect extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._prefixObserver) {
+      this._prefixObserver.disconnect();
+      this._prefixObserver = null;
+    }
     if (this._observer) {
       this._observer.disconnect();
       this._observer = null;
@@ -198,15 +202,22 @@ class TfSelect extends HTMLElement {
     else if (this.hasAttribute('wrap-selected') && this.getAttribute('label')) this._select.setAttribute('aria-label', this.getAttribute('label'));
     else if (this._select.getAttribute('aria-label') && !this.hasAttribute('aria-label')) this._select.removeAttribute('aria-label');
     if (!on) { this._select.style.paddingLeft = ''; this._selectedEl.style.paddingLeft = ''; return; }
-    const measure = () => {
-      const w = this._prefixEl.offsetWidth;
-      if (w > 0) {
-        this._select.style.paddingLeft = `${w + 22}px`;
-        this._selectedEl.style.paddingLeft = `${w + 22}px`;
-      }
-    };
-    measure();
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
+    this._measurePrefix();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => this._measurePrefix());
+    // A select built while hidden (display: none) measures a prefix of no width; the padding follows once it is shown.
+    if (!this._prefixObserver && typeof ResizeObserver === 'function') {
+      this._prefixObserver = new ResizeObserver(() => this._measurePrefix());
+      this._prefixObserver.observe(this._prefixEl);
+    }
+  }
+
+  _measurePrefix() {
+    if (!this._wrap.classList.contains('tf-select-wrap--prefix')) return;
+    const w = this._prefixEl.offsetWidth;
+    if (w > 0) {
+      this._select.style.paddingLeft = `${w + 22}px`;
+      this._selectedEl.style.paddingLeft = `${w + 22}px`;
+    }
   }
 
   _onChange(e) {

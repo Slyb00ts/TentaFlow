@@ -418,6 +418,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   - Skoki epok lidera o 63-64 są zamierzone: każdy węzeł ma stały slot modulo
     64 (`election::EPOCH_SLOTS`) i podnosi epokę tylko w swoim slocie, żeby
     dwie niezależne elekcje nigdy nie wybrały tej samej liczby.
+  - Węzeł, który wstał po restarcie albo któremu padło łącze, nie odbiera już
+    prowadzenia żywemu liderowi. Przy RF≤2 jedna replika może działać sama
+    (`availability_quorum`), więc cisza na łączu, które dopiero się podnosi
+    (połączenie QUIC przez relay trzeba odbudować, trwa to sekundy, a budżet
+    `LeoQuery` to 300 ms), wyglądała jak śmierć lidera i kończyła się fałszywym
+    `lease_expired`. Teraz: (1) w pre-vote przy RF≤2 kandydat, któremu nikt
+    nie odpowiedział, czeka na ten sam, już trwający dial jeszcze 3 s
+    (łącznie 300 ms + 3 s od pierwszego dialu, bez ponownego dialu); wynik
+    dla danego peera jest wspólny dla jego partycji. Runda głosowania nie
+    czeka. Awaria lidera jest więc przejmowana po ok. 6–12 s (dzierżawa 3 s,
+    pre-vote, głosowanie), a nie po 3–9 s; (2) węzeł, który od startu
+    procesu ani razu nie przyjął `Hello` od lidera i któremu nikt nie
+    odpowiedział, nie staje do elekcji przez 60 s od startu; do 120 s, dopóki
+    mesh pokazuje lidera jako połączonego albo wysyłającego heartbeat albo
+    lider odpowiedział jako lider w ciągu 15 s. Bez takiego dowodu karencja
+    kończy się po 60 s. `Hello` lidera przyjęty w trakcie elekcji przerywa ją
+    przed obietnicą terminu i przed propozycją.
+  - Elekcje partycji jednego węzła działają równolegle i we własnej pętli;
+    kontrole `check_stale_leadership` i `check_quorum_leases` nie czekają za
+    nimi, więc przestarzały lider RF=2 oddaje prowadzenie na czas.
+  - Wywołania dashboardu kierowane na inny węzeł (`targetNodeId`) kończyły się
+    po 5 s błędem `no assertion key ... known for node`. Pętla zdarzeń mesh
+    obsługiwała polecenie od peera w miejscu: `AppRouteOp` prosiło nadawcę o
+    klucze asercji, a odpowiedź na to pytanie przychodzi tą samą pętlą, więc
+    czekała, aż pytanie wygaśnie. Polecenia peerów działają teraz we własnych
+    zadaniach, ograniczonych do 32 na peera i 256 na węzeł (kolejne dostaje od
+    razu odpowiedź „busy”); kończą się z pętlą, z rozłączeniem peera i z
+    utratą zaufania do niego.
+  - Audyt `app.route.forward` powstaje tylko dla przekazania, na które węzeł
+    docelowy odpowiedział, z nazwą wariantu i wynikiem. Zapytania tylko do
+    odczytu (`*List`, `*Get` i podobne) są audytowane raz na 10 min dla
+    kombinacji użytkownik, węzeł, wariant, żeby odpytywanie co 10 s nie
+    zalewało tabeli. Asercja, która nie przeszła weryfikacji (sfałszowana,
+    wygasła, nieznany klucz), trafia na węźle wykonującym do logu na poziomie
+    warn, najwyżej raz na minutę na parę (peer, użytkownik).
+  - Strumieniowy `/v1/chat/completions` kończy flow, w którym padł węzeł,
+    zdarzeniem błędu SSE w kształcie OpenAI (`data: {"error": {"message",
+    "type", "code"}}`) z ogólnym komunikatem `flow.failed`, po którym idzie
+    `[DONE]`. Status odpowiedzi pozostaje 200, bo strumień już ruszył;
+    błąd jest w treści. Ta sama funkcja `client_message` obsługuje strumień
+    Anthropic. Komunikaty błędów wewnętrznych dla klienta są po angielsku
+    (`Internal error: ...`). Zakończenie flow strumieniowego jest logowane
+    także wtedy, gdy klient rozłączył się wcześniej.
+  - Powiadomienie konsumenta o liderze (`leader_node_name`) przechodzi przez tę
+    samą logikę etykiet co lista replik, w odniesieniu do wszystkich zaufanych
+    węzłów: gdy lider dzieli nazwę hosta z którymkolwiek z nich, nazwa jest
+    pusta, a UI pokazuje krótkie id.
 
 ### Limity i SLA usług (TB-03)
 

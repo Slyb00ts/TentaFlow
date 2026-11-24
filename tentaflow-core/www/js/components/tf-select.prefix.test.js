@@ -100,3 +100,24 @@ test('wrapped caption follows the real native selection, options, and disabled s
   assert.equal(el.querySelector('.tf-select-wrap').classList.contains('tf-select-wrap--wrap-selected'), false);
   assert.equal(native.value, 'async');
 });
+
+test('a select built while hidden pads for its prefix once the prefix has a width', () => {
+  const saved = globalThis.ResizeObserver;
+  const observers = [];
+  globalThis.ResizeObserver = class {
+    constructor(cb) { this.cb = cb; observers.push(this); }
+    observe() {}
+    disconnect() {}
+  };
+  try {
+    const el = mount({ prefix: 'Sekcja' });
+    const field = el.querySelector('select');
+    assert.equal(field.style.paddingLeft, '', 'a hidden prefix measures 0 wide: no padding yet');
+    Object.defineProperty(el.querySelector('.tf-select-prefix'), 'offsetWidth', { value: 48 });
+    observers.forEach((o) => o.cb());
+    assert.equal(field.style.paddingLeft, '70px', 'shown: the field clears the prefix');
+    el.remove();
+  } finally {
+    globalThis.ResizeObserver = saved;
+  }
+});

@@ -985,6 +985,7 @@ async fn handle_peer_disconnected(
     qm_events: Arc<IrohMeshManager>,
     mesh_security: Option<Arc<MeshSecurity>>,
     last_sync_sent: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    command_tasks: Arc<crate::mesh::command_tasks::CommandTasks>,
 ) {
     // Po disconnect czyscimy cooldown — przy reconnecie od razu zsynchronizujemy klucze.
     last_sync_sent.remove(&node_id);
@@ -1000,6 +1001,8 @@ async fn handle_peer_disconnected(
     peer_store.set_quic_connected(&node_id, false);
     peer_store.set_status(&node_id, "disconnected");
     peer_store.clear_heartbeat(&node_id);
+    // What the peer asked is no longer wanted: nobody is there to answer.
+    command_tasks.cancel_peer(&node_id);
     info!(peer_id = %node_id, "QUIC peer rozlaczony");
 
     // F1b P3.B — disconnected peer's HMAC keys are no longer trustworthy
@@ -1073,6 +1076,8 @@ fn spawn_quic_event_handler(
 ) {
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
+    // Ends with the loop below: dropped with it, it cancels what is running.
+    let command_tasks = Arc::new(crate::mesh::command_tasks::CommandTasks::new());
 
     // [SCALE] last_sync_sent wspoldzielony Arc<DashMap> — debouncowany
     // handler PeerConnected wyrzucony do tokio::spawn potrzebuje dostepu
@@ -1690,6 +1695,7 @@ fn spawn_quic_event_handler(
                     let qm_events_c = qm_events.clone();
                     let mesh_security_c = mesh_security.clone();
                     let last_sync_sent_c = last_sync_sent.clone();
+                    let command_tasks_c = command_tasks.clone();
                     tokio::spawn(async move {
                         let _guard = peer_lock.lock().await;
                         handle_peer_disconnected(
@@ -1698,6 +1704,7 @@ fn spawn_quic_event_handler(
                             qm_events_c,
                             mesh_security_c,
                             last_sync_sent_c,
+                            command_tasks_c,
                         )
                         .await;
                     });
@@ -2142,6 +2149,7 @@ fn spawn_quic_event_handler(
                                 // Drop their advertised robots so the resolver stops
                                 // routing to a node we no longer trust.
                                 crate::mesh::robot_dispatch::global().remove_node(trusted_id);
+                                command_tasks.cancel_peer(trusted_id);
                                 revoke_code_studio_peer(
                                     trusted_id,
                                     &format!("removed from mesh by {}", node_id),
@@ -2194,6 +2202,7 @@ fn spawn_quic_event_handler(
                             // Drop the revoked node's advertised robots so the
                             // resolver stops routing commands to an untrusted owner.
                             crate::mesh::robot_dispatch::global().remove_node(&revoked_node_id);
+                            command_tasks.cancel_peer(&revoked_node_id);
                             revoke_code_studio_peer(
                                 &revoked_node_id,
                                 &format!("trust revoked, propagated by {}", node_id),
@@ -2407,9 +2416,26 @@ fn spawn_quic_event_handler(
                     command,
                 }) => {
                     debug!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
-                    qm_events
-                        .handle_command_received(&from_node_id, &command)
-                        .await;
+                    // Own task: a command may itself ask the sender something
+                    // (an assertion key pull) and the answer arrives through
+                    // THIS loop as a MeshCommandResponseReceived event. Awaiting
+                    // the handler inline would hold that answer back until the
+                    // pull timed out.
+                    match command_tasks.try_start(&from_node_id) {
+                        Some(slot) => {
+                            let qm = qm_events.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = slot.cancel.cancelled() => {}
+                                    _ = qm.handle_command_received(&from_node_id, &command) => {}
+                                }
+                            });
+                        }
+                        None => {
+                            warn!(from = %from_node_id, "Odrzucono komende: za duzo polecen w toku");
+                            qm_events.respond_command_busy(&from_node_id, &command).await;
+                        }
+                    }
                 }
                 Ok(IrohMeshEvent::MeshCommandResponseReceived { from_node_id, data }) => {
                     qm_events

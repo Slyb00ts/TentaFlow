@@ -195,6 +195,7 @@ impl CoreError {
             | CoreError::BackendBusy { .. } => {
                 "Service is busy. Please try again later.".to_string()
             }
+            CoreError::InternalError { message, .. } => format!("Internal error: {message}"),
             _ => self.to_string(),
         }
     }
@@ -263,6 +264,18 @@ mod overloaded_tests {
         assert_eq!(
             busy.client_message(),
             "Service is busy. Please try again later."
+        );
+    }
+
+    #[test]
+    fn an_internal_error_is_worded_in_english_for_the_client() {
+        let internal = CoreError::InternalError {
+            message: "flow.failed: the flow did not complete".into(),
+            source: None,
+        };
+        assert_eq!(
+            internal.client_message(),
+            "Internal error: flow.failed: the flow did not complete"
         );
     }
 }

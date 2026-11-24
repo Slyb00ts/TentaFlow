@@ -11137,6 +11137,7 @@
         "leader_label": "Node principal",
         "summary_leader": "choisi par l’instance — le node préféré pour le moins de partitions (actuellement {node} : {count} {n|partition|partitions})",
         "summary_leader_auto": "choisi par l’instance — le node préféré pour le moins de partitions",
+        "summary_leader_tie": "choisi par l'instance — l'un des nœuds {nodes} ou {last} (chacun préféré pour {count} {n|partition|partitions})",
         "summary_leader_old": "le node où le topic est créé — l’instance ne choisira elle-même qu’une fois tous les nodes mis à jour"
       },
       "delete": {
@@ -11457,10 +11458,12 @@
       "choice_lag_leader": "copie en retard selon le node principal {owner} — ne peut pas reprendre tant qu’elle n’a pas rattrapé",
       "choice_out_leader": "copie non conforme selon le node principal {owner} — ne peut pas reprendre",
       "choice_old": "le node utilise une version plus ancienne de TentaFlow — ne peut pas reprendre",
-      "checking_leader": "Interrogation du node principal sur l’état des copies…"
+      "checking_leader": "Vérification des copies auprès du node qui mène…",
+      "leader_silent": "Le node qui mène n'a pas répondu en {secs} s : l'état des copies vient donc de ce node et peut être périmé. Le node qui mène refuse de toute façon le transfert vers une copie en retard."
     },
     "replication": {
       "nodes_title": "Nodes",
+      "no_nodes": "Les nodes apparaîtront ici dès que l'instance aura son premier topic : seules les copies d'un topic indiquent sur quels nodes il se trouve.",
       "nodes_sub": "Chaque partition a un node principal, qui reçoit les écritures, et des copies sur d’autres nodes. Une copie synchronisée a tous les messages ; une copie en retard rattrape encore.",
       "nodes_sub_single": "Cette instance a un seul node — chaque partition a une copie, sur ce node.",
       "node_leads": "Partitions menées",
@@ -11527,6 +11530,11 @@
       "balance_away_eta": "au plus tôt dans environ {min} min",
       "balance_away_now": "Vous pouvez aussi répartir le rôle de node principal maintenant.",
       "balance_away_catching": "les copies de {list} rattrapent encore leur retard",
+      "balance_down_title": "Le node {node} ne répond pas — {count} {n|topic est mené|topics sont menés} par un autre node.",
+      "balance_down_text": "Le leadership reviendra sur {node} tout seul dès qu'il répondra et que ses copies seront synchronisées sans interruption pendant 5 min.",
+      "balance_split_title": "{count} {n|topic est réparti|topics sont répartis} entre plusieurs nodes.",
+      "balance_split_text": "Les partitions d'un tel topic, ou sa file de messages non distribués, sont menées par des nodes différents. Répartis le leadership pour les rassembler.",
+      "balance_away_split_item": "{name} (réparti : {nodes})",
       "balance_away_manual": "Le retour automatique au node préféré est désactivé : ces topics restent où ils sont tant que vous ne répartissez pas le rôle de node principal.",
       "return_title": "Retour automatique au node préféré",
       "return_sub": "Quand la copie d’un topic sur son node préféré est à jour sans interruption pendant 5 min, le rôle de node principal y revient de lui-même — au plus un topic toutes les 30 s. Le réglage s’applique à toute l’instance ; chaque retour est écrit dans le journal d’audit.",

@@ -11137,6 +11137,7 @@
         "leader_label": "Nodo principal",
         "summary_leader": "lo elige la instancia: el nodo preferido para menos particiones (ahora {node}: {count} {n|partición|particiones})",
         "summary_leader_auto": "lo elige la instancia: el nodo preferido para menos particiones",
+        "summary_leader_tie": "lo elige la instancia — uno de los nodos {nodes} o {last} (cada uno preferido para {count} {n|partición|particiones})",
         "summary_leader_old": "el nodo donde se crea el topic: la instancia elegirá sola solo cuando todos los nodos estén actualizados"
       },
       "delete": {
@@ -11457,10 +11458,12 @@
       "choice_lag_leader": "copia atrasada según el nodo principal {owner}: no puede asumir hasta que se ponga al día",
       "choice_out_leader": "copia no sincronizada según el nodo principal {owner}: no puede asumir",
       "choice_old": "el nodo tiene una versión anterior de TentaFlow: no puede asumir",
-      "checking_leader": "Preguntando al nodo principal por el estado de las copias…"
+      "checking_leader": "Comprobando las copias con el nodo líder…",
+      "leader_silent": "El nodo líder no respondió en {secs} s, así que el estado de las copias procede de este nodo y puede estar desactualizado. El nodo líder igualmente rechaza el traslado a una copia que va por detrás."
     },
     "replication": {
       "nodes_title": "Nodos",
+      "no_nodes": "Los nodos aparecerán aquí cuando la instancia tenga su primer topic: solo las copias de un topic dicen en qué nodos está.",
       "nodes_sub": "Cada partición tiene un nodo principal, que recibe las escrituras, y copias en otros nodos. Una copia sincronizada tiene todos los mensajes; una retrasada aún los está alcanzando.",
       "nodes_sub_single": "Esta instancia tiene un nodo: cada partición tiene una copia, en este nodo.",
       "node_leads": "Particiones principales",
@@ -11527,6 +11530,11 @@
       "balance_away_eta": "como pronto en unos {min} min",
       "balance_away_now": "También puedes repartir el rol de nodo principal ahora.",
       "balance_away_catching": "las copias de {list} aún se están poniendo al día",
+      "balance_down_title": "El nodo {node} no responde — {count} {n|topic lo lleva|topics los lleva} otro nodo.",
+      "balance_down_text": "El liderazgo volverá a {node} por sí solo cuando responda y sus copias estén sincronizadas sin interrupción durante 5 min.",
+      "balance_split_title": "{count} {n|topic está dividido|topics están divididos} entre nodos.",
+      "balance_split_text": "Las particiones de un topic así, o su cola de mensajes no entregados, las lideran nodos distintos. Reparte el liderazgo para reunirlas.",
+      "balance_away_split_item": "{name} (dividido: {nodes})",
       "balance_away_manual": "El regreso automático al nodo preferido está desactivado, así que estos topics se quedarán donde están hasta que repartas el rol de nodo principal.",
       "return_title": "Regreso automático al nodo preferido",
       "return_sub": "Cuando la copia de un topic en su nodo preferido está al día sin interrupción durante 5 min, el rol de nodo principal vuelve allí solo, como máximo un topic cada 30 s. El ajuste vale para toda la instancia; cada regreso se registra en el diario de auditoría.",

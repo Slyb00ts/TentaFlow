@@ -2803,6 +2803,41 @@ impl IrohMeshManager {
     /// `MeshCommandExecutor` (z weryfikacja trust), serializuje wynik i odsyla
     /// peerowi przez `MESH_MSG_COMMAND_RESPONSE`. Wire format jest symetryczny
     /// z `send_command`/`send_command_and_wait`.
+    /// Answers a command at once with "busy", without running it: the node
+    /// has no slot for it (`mesh::command_tasks`). The sender's wait ends with
+    /// an error instead of its timeout.
+    pub async fn respond_command_busy(&self, from_node_id: &str, data: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct CommandId {
+            command_id: String,
+        }
+        #[derive(serde::Serialize)]
+        struct Busy<'a> {
+            command_id: &'a str,
+            ok: bool,
+            payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
+            error: &'a str,
+        }
+        let Ok(CommandId { command_id }) = crate::mesh::cbor::decode(data) else {
+            return;
+        };
+        let reply = Busy {
+            command_id: &command_id,
+            ok: false,
+            payload: tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
+            error: "busy: too many commands in flight",
+        };
+        if let Ok(bytes) = crate::mesh::cbor::encode(&reply) {
+            let _ = self
+                .send_ufp2_to_peer(
+                    from_node_id,
+                    tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
+                    &bytes,
+                )
+                .await;
+        }
+    }
+
     pub async fn handle_command_received(&self, from_node_id: &str, data: &[u8]) {
         #[derive(serde::Deserialize)]
         struct RequestEnvelope {

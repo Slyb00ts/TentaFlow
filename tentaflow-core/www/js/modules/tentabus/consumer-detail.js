@@ -384,11 +384,12 @@ function alertTexts(a, k, nowMs) {
 export function otherNodeNotice(data, topic, nodes = []) {
   const local = data?.sla?.local;
   if (!local || local.reason !== 'not_leader') return null;
-  // The name this page knows the node by, else the name the server sent (to an administrator), else its short id.
+  // The name the node list gives it wins (its label, else the short id). The name the server sent (to an administrator) is only used
+  // for a node the list does not know, and not when another node of the list has the same name: a hostname two nodes share names neither.
   const known = nodes.find((n) => n.nodeId === local.leaderNodeId);
   const sent = String(local.leaderNodeName || '').trim();
-  const labelled = known && !nodeTitle(known) ? nodeLabel(known) : '';
-  const node = labelled || (sent && sent !== local.leaderNodeId ? sent : shortNodeId(local.leaderNodeId));
+  const shared = nodes.some((n) => n.nodeId !== local.leaderNodeId && nodeLabel(n) === sent);
+  const node = known ? nodeLabel(known) : sent && sent !== local.leaderNodeId && !shared ? sent : shortNodeId(local.leaderNodeId);
   return {
     title: node ? T('consumer.other_node_title', { node }) : T('consumer.other_node_title_unnamed'),
     text: [T('consumer.other_node_text', { topic }), data.fromReplica ? T('consumer.other_node_replica') : '', T('consumer.other_node_only_there')].filter(Boolean).join(' '),
