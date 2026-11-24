@@ -42,7 +42,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -292,12 +292,18 @@ async fn queue_group_snapshot(
     with_commits: bool,
     pending_commits: &mut Vec<(String, u32, u64, u32)>,
     pending_groups: &mut Option<Vec<ReplGroup>>,
+    groups_seen: &mut u64,
 ) {
+    // Read before the rows are: a change made while they are read is newer
+    // than this snapshot and keeps the stream from being counted as flushed.
+    let generation = leader.groups_gen.load(Ordering::SeqCst);
     let Some(lookup) = leader.group_snapshot_lookup() else {
+        *groups_seen = generation;
         return;
     };
     match tokio::task::spawn_blocking(move || lookup(with_commits)).await {
         Ok(snapshot) => {
+            *groups_seen = generation;
             pending_commits
                 .retain(|(group, ..)| !snapshot.commits.iter().any(|(g, ..)| g == group));
             pending_commits.extend(snapshot.commits);
@@ -413,6 +419,22 @@ pub struct PartitionLeader {
     /// Where a follower stream reads the group state it sends when it opens,
     /// after it lagged, and when the rows change. Installed by the glue.
     group_snapshot: Mutex<Option<GroupSnapshotLookup>>,
+    /// Bumped by every `note_groups_changed`: what a stream has to have sent
+    /// to be sure a change made before a handover reached its follower.
+    groups_gen: AtomicU64,
+    /// Per follower: the `groups_gen` its stream had read and sent the rows
+    /// of (`mark_groups_sent`).
+    groups_sent: DashMap<String, u64>,
+    /// Per follower: the `groups_gen` it reported applying
+    /// (`ReplAck::groups_applied`). Absent for a follower that has not said,
+    /// which falls back on what was sent.
+    groups_applied: DashMap<String, u64>,
+    /// Followers whose acks carry no `groups_applied` (they predate it): for
+    /// them "sent" is all a leader can know.
+    groups_legacy: dashmap::DashSet<String>,
+    /// Asks every stream to send what it has queued now instead of at the
+    /// next coalescing tick (`request_offsets_flush`).
+    flush_tx: watch::Sender<u64>,
     /// Wakes every feeder task whenever `recompute_hw` actually moves the
     /// engine-visible `high_watermark` — see `subscribe_hw`'s doc.
     hw_tx: watch::Sender<u64>,
@@ -469,6 +491,11 @@ impl PartitionLeader {
             events_tx: broadcast::channel(64).0,
             offset_notes_tx: broadcast::channel(1024).0,
             group_snapshot: Mutex::new(None),
+            groups_gen: AtomicU64::new(0),
+            groups_sent: DashMap::new(),
+            groups_applied: DashMap::new(),
+            groups_legacy: dashmap::DashSet::new(),
+            flush_tx: watch::channel(0).0,
             hw_tx,
             config,
             metrics,
@@ -807,7 +834,41 @@ impl PartitionLeader {
     /// A consumer-group row of this partition's topic was written: every open
     /// stream sends the rows again on its next coalescing tick.
     pub fn note_groups_changed(&self) {
+        self.groups_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.offset_notes_tx.send(OffsetNote::GroupsChanged);
+    }
+
+    /// Makes every follower stream send its queued commits and group rows
+    /// now, not at its next coalescing tick.
+    pub fn request_offsets_flush(&self) {
+        self.flush_tx.send_modify(|n| *n += 1);
+    }
+
+    /// Whether the stream to `follower` has sent the group rows as of every
+    /// `note_groups_changed` so far. A follower with no stream never has.
+    pub fn groups_flushed_to(&self, follower: &str) -> bool {
+        let wanted = self.groups_gen.load(Ordering::SeqCst);
+        match self.groups_applied.get(follower) {
+            Some(applied) => *applied >= wanted,
+            None => {
+                self.groups_legacy.contains(follower)
+                    && self
+                        .groups_sent
+                        .get(follower)
+                        .is_some_and(|sent| *sent >= wanted)
+            }
+        }
+    }
+
+    fn mark_groups_applied(&self, follower: &str, generation: u64) {
+        self.groups_applied
+            .entry(follower.to_string())
+            .and_modify(|g| *g = (*g).max(generation))
+            .or_insert(generation);
+    }
+
+    fn mark_groups_sent(&self, follower: &str, generation: u64) {
+        self.groups_sent.insert(follower.to_string(), generation);
     }
 
     pub fn set_group_snapshot(&self, lookup: GroupSnapshotLookup) {
@@ -1104,6 +1165,8 @@ pub enum FollowerStreamError {
     Engine(BusError),
     #[error("partition detached")]
     Detached,
+    #[error("the follower did not answer Hello within {0:?}")]
+    HelloAckTimeout(Duration),
     #[error("requested offset {requested} is below the earliest retained offset {earliest}")]
     OffsetOutOfRange { requested: u64, earliest: u64 },
     #[error("index floor invariant violated: follower leo {expected}, batch base_offset {got}")]
@@ -1267,6 +1330,9 @@ async fn send_heartbeat<W: AsyncWrite + Unpin>(
 /// ends the stream. The caller (manager.rs, agent EL) owns reconnect
 /// backoff and is expected to call this again with a fresh transport for
 /// every `Err` other than `Detached`.
+/// How long a leader waits for the `HelloAck` of a stream it opened.
+pub const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn run_follower_stream<R, W>(
     leader: Arc<PartitionLeader>,
     follower_node_id: String,
@@ -1308,7 +1374,15 @@ where
     // sits in a `select!`, so its read must survive cancellation (see
     // `FrameReader`'s doc).
     let mut frames = FrameReader::new(reader);
-    let ack = match frames.next_frame().await? {
+    // Bounded: a stream whose peer never answers (a connection that took the
+    // handshake and then carried nothing) would otherwise sit here until the
+    // QUIC idle timeout killed it, 40 s, and then wait out the reconnect
+    // backoff again. The receiving side answers or drops a stream within
+    // `FIRST_FRAME_TIMEOUT` + `ASSIGNMENT_AWAIT`.
+    let first = tokio::time::timeout(HELLO_ACK_TIMEOUT, frames.next_frame())
+        .await
+        .map_err(|_| FollowerStreamError::HelloAckTimeout(HELLO_ACK_TIMEOUT))??;
+    let ack = match first {
         ReplFrame::HelloAck(a) => a,
         other => {
             return Err(FollowerStreamError::UnexpectedFrame {
@@ -1401,7 +1475,16 @@ where
     // A replica that was away (or never saw an idle group's last commit)
     // would otherwise keep a stale offset until the group commits again.
     let mut pending_groups: Option<Vec<ReplGroup>> = None;
-    queue_group_snapshot(&leader, true, &mut pending_commits, &mut pending_groups).await;
+    let mut groups_seen: u64 = 0;
+    let mut flush_rx = leader.flush_tx.subscribe();
+    queue_group_snapshot(
+        &leader,
+        true,
+        &mut pending_commits,
+        &mut pending_groups,
+        &mut groups_seen,
+    )
+    .await;
     let mut last_frame_sent_at = Instant::now();
     // The highest `hw` any frame on this stream has carried: the follower
     // applies it monotonically, so anything at or below it is old news.
@@ -1490,6 +1573,14 @@ where
                     ReplFrame::Ack(a) => {
                         let lag = inflight.ack(a.follower_leo);
                         leader.record_ack(&follower_node_id, &a, lag);
+                        match a.groups_applied {
+                            Some(applied) => {
+                                leader.mark_groups_applied(&follower_node_id, applied)
+                            }
+                            None => {
+                                leader.groups_legacy.insert(follower_node_id.clone());
+                            }
+                        }
                     }
                     other => {
                         return Err(FollowerStreamError::UnexpectedFrame {
@@ -1510,7 +1601,7 @@ where
                     }
                     Ok(OffsetNote::GroupsChanged) => {
                         queue_group_snapshot(
-                            &leader, false, &mut pending_commits, &mut pending_groups,
+                            &leader, false, &mut pending_commits, &mut pending_groups, &mut groups_seen,
                         )
                         .await;
                     }
@@ -1531,7 +1622,7 @@ where
                         // The same goes for commits and group rows: the
                         // lost notes are not replayed, the state is re-read.
                         queue_group_snapshot(
-                            &leader, true, &mut pending_commits, &mut pending_groups,
+                            &leader, true, &mut pending_commits, &mut pending_groups, &mut groups_seen,
                         )
                         .await;
                     }
@@ -1576,37 +1667,76 @@ where
             }
 
             _ = offsets_ticker.tick() => {
-                if !pending_commits.is_empty()
-                    || !pending_discards.is_empty()
-                    || pending_groups.is_some()
-                {
-                    let partition = leader.partition_id();
-                    let discards: Vec<(u32, u64)> = std::mem::take(&mut pending_discards)
-                        .into_iter()
-                        .map(|offset| (partition, offset))
-                        .collect();
-                    let mut commits = std::mem::take(&mut pending_commits);
-                    let mut groups = pending_groups.take().unwrap_or_default();
-                    let mut rest = discards.as_slice();
-                    loop {
-                        let (chunk, tail) =
-                            rest.split_at(rest.len().min(DISCARDS_PER_OFFSETS_FRAME));
-                        write_frame(&mut writer, &ReplFrame::Offsets(ReplOffsets {
-                            leader_epoch: leader.epoch(),
-                            commits: std::mem::take(&mut commits),
-                            discarded: chunk.to_vec(),
-                            groups: std::mem::take(&mut groups),
-                        })).await?;
-                        rest = tail;
-                        if rest.is_empty() {
-                            break;
-                        }
+                send_pending_offsets(
+                    &leader, &mut writer, &mut pending_commits, &mut pending_discards,
+                    &mut pending_groups, groups_seen, &mut last_frame_sent_at,
+                ).await?;
+                if pending_groups.is_none() {
+                    leader.mark_groups_sent(&follower_node_id, groups_seen);
+                }
+            }
+
+            changed = flush_rx.changed() => {
+                if changed.is_ok() {
+                    send_pending_offsets(
+                        &leader, &mut writer, &mut pending_commits, &mut pending_discards,
+                        &mut pending_groups, groups_seen, &mut last_frame_sent_at,
+                    ).await?;
+                    if pending_groups.is_none() {
+                        leader.mark_groups_sent(&follower_node_id, groups_seen);
                     }
-                    last_frame_sent_at = Instant::now();
                 }
             }
         }
     }
+}
+
+/// Sends the commits, handled-record markers and group rows a stream has
+/// queued, in as many `Offsets` frames as the discards need.
+async fn send_pending_offsets<W: AsyncWrite + Unpin>(
+    leader: &Arc<PartitionLeader>,
+    writer: &mut W,
+    pending_commits: &mut Vec<(String, u32, u64, u32)>,
+    pending_discards: &mut BTreeSet<u64>,
+    pending_groups: &mut Option<Vec<ReplGroup>>,
+    groups_seen: u64,
+    last_frame_sent_at: &mut Instant,
+) -> Result<(), FollowerStreamError> {
+    if !pending_commits.is_empty() || !pending_discards.is_empty() || pending_groups.is_some() {
+        let partition = leader.partition_id();
+        let discards: Vec<(u32, u64)> = std::mem::take(pending_discards)
+            .into_iter()
+            .map(|offset| (partition, offset))
+            .collect();
+        let mut commits = std::mem::take(pending_commits);
+        let mut groups_gen = if pending_groups.is_some() {
+            groups_seen
+        } else {
+            0
+        };
+        let mut groups = pending_groups.take().unwrap_or_default();
+        let mut rest = discards.as_slice();
+        loop {
+            let (chunk, tail) = rest.split_at(rest.len().min(DISCARDS_PER_OFFSETS_FRAME));
+            write_frame(
+                writer,
+                &ReplFrame::Offsets(ReplOffsets {
+                    leader_epoch: leader.epoch(),
+                    commits: std::mem::take(&mut commits),
+                    discarded: chunk.to_vec(),
+                    groups: std::mem::take(&mut groups),
+                    groups_gen: std::mem::take(&mut groups_gen),
+                }),
+            )
+            .await?;
+            rest = tail;
+            if rest.is_empty() {
+                break;
+            }
+        }
+        *last_frame_sent_at = Instant::now();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1691,6 +1821,30 @@ mod tests {
     }
 
     // ===== handshake =====
+
+    /// A peer that takes the stream and never answers frees it after the
+    /// handshake bound, not after the transport's idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_that_never_answers_hello_ends_the_stream_at_the_handshake_bound() {
+        let part = temp_partition("silent-ack");
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let ((leader_r, leader_w), (mut foll_r, _foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        assert!(matches!(
+            read_frame(&mut foll_r).await.unwrap(),
+            ReplFrame::Hello(_)
+        ));
+        let started = tokio::time::Instant::now();
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(FollowerStreamError::HelloAckTimeout(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() <= HELLO_ACK_TIMEOUT + Duration::from_secs(1));
+    }
 
     #[tokio::test]
     async fn hello_ack_handshake_accepts_and_registers_follower() {
@@ -2122,6 +2276,7 @@ mod tests {
                 follower_leo: 3,
                 follower_hw: 0,
                 follower_log_epoch: Some(TEST_EPOCH - 2),
+                groups_applied: None,
             },
             0,
         );
@@ -2153,6 +2308,7 @@ mod tests {
                 follower_leo: 3,
                 follower_hw: 0,
                 follower_log_epoch: Some(TEST_EPOCH),
+                groups_applied: None,
             },
             0,
         );
@@ -2184,6 +2340,7 @@ mod tests {
                     follower_leo: leo,
                     follower_hw: 0,
                     follower_log_epoch: log_epoch,
+                    groups_applied: None,
                 },
                 0,
             );
@@ -2392,6 +2549,7 @@ mod tests {
                 follower_leo: 2,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             }),
         )
         .await
@@ -2463,6 +2621,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             },
             0,
         );
@@ -2485,6 +2644,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             },
             0,
         );
@@ -2501,6 +2661,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             },
             0,
         );
@@ -2527,6 +2688,7 @@ mod tests {
                     follower_leo: 1,
                     follower_hw: 0,
                     follower_log_epoch: None,
+                    groups_applied: None,
                 },
                 0,
             );
@@ -2603,6 +2765,7 @@ mod tests {
                         follower_leo: round,
                         follower_hw: 0,
                         follower_log_epoch: None,
+                        groups_applied: None,
                     },
                     0,
                 );
@@ -2738,6 +2901,7 @@ mod tests {
                 follower_leo: 0,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             },
             0, // caught up again
         );
@@ -2800,6 +2964,7 @@ mod tests {
                 follower_leo: 0,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             },
             0, // caught up: no bytes in flight anymore
         );
@@ -2945,6 +3110,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             }),
         )
         .await
@@ -3012,6 +3178,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 0,
                 follower_log_epoch: None,
+                groups_applied: None,
             }),
         )
         .await
@@ -3252,6 +3419,84 @@ mod tests {
             "a row change resends no offsets"
         );
         assert_eq!(changed.groups, vec![group_row("g1", true)]);
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    /// A pause or a resume noted just before a handover is on the follower
+    /// when the leader stops, not after the next coalescing tick that never
+    /// comes: a flush sends it at once and tells the leader it has.
+    #[tokio::test]
+    async fn a_flush_sends_a_changed_group_row_before_the_coalescing_tick() {
+        let part = temp_partition("group-flush");
+        let mut config = fast_config();
+        config.heartbeat_interval = Duration::from_secs(10);
+        config.offsets_coalesce_interval = Duration::from_secs(3600);
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        let paused = Arc::new(AtomicBool::new(false));
+        let read = Arc::clone(&paused);
+        leader.set_group_snapshot(Arc::new(move |_| GroupSnapshot {
+            commits: Vec::new(),
+            groups: vec![group_row("g1", read.load(Ordering::SeqCst))],
+        }));
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(&mut foll_w, &ack_hello(TEST_EPOCH))
+            .await
+            .unwrap();
+        // The first tick is immediate and sends the opening snapshot.
+        let opened = next_offsets(&mut foll_r, "the snapshot").await;
+        assert_eq!(opened.groups, vec![group_row("g1", false)]);
+
+        paused.store(true, Ordering::SeqCst);
+        leader.note_groups_changed();
+        assert!(!leader.groups_flushed_to("f1"), "nothing has gone out yet");
+        leader.request_offsets_flush();
+        let changed = loop {
+            // The note may still be on its way to the stream: ask again.
+            leader.request_offsets_flush();
+            if let Ok(frame) = tokio::time::timeout(
+                Duration::from_millis(50),
+                next_offsets(&mut foll_r, "the flushed rows"),
+            )
+            .await
+            {
+                break frame;
+            }
+        };
+        assert_eq!(changed.groups, vec![group_row("g1", true)]);
+        assert_eq!(changed.groups_gen, 1);
+        assert!(
+            !leader.groups_flushed_to("f1"),
+            "written to the stream is not applied by the follower"
+        );
+        let ack = ReplAck {
+            leader_epoch: TEST_EPOCH,
+            follower_leo: 0,
+            follower_hw: 0,
+            follower_log_epoch: None,
+            groups_applied: Some(changed.groups_gen),
+        };
+        write_frame(&mut foll_w, &ReplFrame::Ack(ack))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if leader.groups_flushed_to("f1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            leader.groups_flushed_to("f1"),
+            "the follower's ack says applied"
+        );
 
         drop(foll_r);
         drop(foll_w);

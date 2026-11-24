@@ -35,6 +35,29 @@ export function leaderReturnEnabled(entries, instanceId) {
 /** The value to store for the switch. */
 export const leaderReturnValue = (enabled) => (enabled ? 'on' : 'off');
 
+/** A node whose last heartbeat is older than this is taken as not responding, whatever the mesh still says. */
+export const SILENT_AFTER_MS = 10_000;
+
+/**
+ * The mesh takes about 20 s to mark a node that stopped as unreachable, and the screens would call it "odpowiada" and
+ * offer to move topics to it meanwhile. A node other than this one is treated as not responding (`reachable: false`,
+ * `silent: true`) as soon as its last heartbeat is older than 10 s or a partition it leads has no usable leader
+ * (`unavailableReason`). Everything that reads `reachable` then says the same.
+ */
+export function markSilent(nodes, perTopic) {
+  const unavailable = new Set();
+  for (const t of perTopic || []) {
+    for (const p of [...(t.partitions || []), ...(t.dlqPartitions || [])]) {
+      if (p.unavailableReason && p.leaderNodeId) unavailable.add(p.leaderNodeId);
+    }
+  }
+  return (nodes || []).map((n) => {
+    if (n.isLocal || n.reachable === false) return n;
+    const stale = Number(n.lastHeartbeatMsAgo) > SILENT_AFTER_MS;
+    return stale || unavailable.has(n.nodeId) ? { ...n, reachable: false, silent: true } : n;
+  });
+}
+
 /**
  * Whether a node is of an older build that cannot take part in moving leaders.
  * The server names three states (`forwarding`: capable, lacking, unknown): only

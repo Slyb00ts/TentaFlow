@@ -1026,6 +1026,30 @@ impl BusService {
             .chain(std::iter::once(local.clone()))
             .collect();
         if members.len() < 2 {
+            // A fresh install has no topic from before the upgrade: a topic
+            // created from now on gets its leader from the balanced
+            // placement. Marked at once, or the first restart after a second
+            // node joined would run an "after upgrade" spread over topics
+            // that were never from before the upgrade. An install that has
+            // topics, all on this node, still waits for a second one.
+            if rows.is_empty() {
+                // A node that has just joined a cluster sees no rows until its
+                // ledger has synced, and would mark itself done over topics
+                // that did exist before the upgrade. With trusted peers the
+                // marker waits: the spread finds nothing to move when the
+                // topics are balanced and then marks itself.
+                let has_peers = crate::db::repository::list_trusted_nodes(&self.db)
+                    .map(|nodes| !nodes.is_empty())
+                    .unwrap_or(true);
+                if has_peers {
+                    return SpreadStatus::NotYet("peers_not_synced");
+                }
+                if let Err(e) = crate::db::repository::set_setting(&self.db, &key, "done") {
+                    tracing::warn!(error = %e, "leader spread: could not record the marker");
+                    return SpreadStatus::NotYet("single_node");
+                }
+                return SpreadStatus::Done;
+            }
             return SpreadStatus::NotYet("single_node");
         }
         let peers: Vec<String> = members.iter().filter(|n| **n != local).cloned().collect();

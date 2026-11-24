@@ -3225,7 +3225,9 @@ async fn acl_set_v1(
             if written {
                 Ok(())
             } else {
-                Err(map_bus_error(BusServiceError::TopicNotFound { name: topic2 }))
+                Err(map_bus_error(BusServiceError::TopicNotFound {
+                    name: topic2,
+                }))
             }
         }
     })
@@ -3464,7 +3466,8 @@ async fn field_policy_set_v1(
     let hashed_set: Option<std::collections::BTreeSet<String>> =
         hashed_fields.map(|v| v.into_iter().collect());
     let mask_count = |set: &Option<std::collections::BTreeSet<String>>| {
-        set.as_ref().map_or_else(|| "kept".to_string(), |set| set.len().to_string())
+        set.as_ref()
+            .map_or_else(|| "kept".to_string(), |set| set.len().to_string())
     };
     let (masks, hashed_count) = (mask_count(&masked_set), mask_count(&hashed_set));
     let svc = g.svc.clone();
@@ -4196,7 +4199,9 @@ async fn field_policy_preview(
         let rule = subject_rule
             .as_ref()
             .map(|rule| preview_rule_over(caller_rule.as_ref(), rule));
-        let hash_key = rule.as_ref().and_then(|rule| rule.hash_key(svc.field_hash_keys(), &org_id));
+        let hash_key = rule
+            .as_ref()
+            .and_then(|rule| rule.hash_key(svc.field_hash_keys(), &org_id));
         if let Some(rule) = &rule {
             key_missing |= !rule.hashed_fields.is_empty() && hash_key.is_none();
         }
@@ -4239,7 +4244,12 @@ async fn field_policy_preview(
             (Some(_), None) => true,
             (Some(caller), Some(subject)) => preview_is_limited(caller, subject),
         };
-        Ok((record_to_preview(&rec), applied, limited_by_caller, key_missing))
+        Ok((
+            record_to_preview(&rec),
+            applied,
+            limited_by_caller,
+            key_missing,
+        ))
     })
     .await?;
     Ok(BusPayload::FieldPolicyPreviewResponse {
@@ -5029,7 +5039,10 @@ async fn capabilities_v1(
             .iter()
             .map(|t| t.as_str().to_string())
             .collect(),
-        field_actions: FIELD_ACTIONS.iter().map(|a| a.as_str().to_string()).collect(),
+        field_actions: FIELD_ACTIONS
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
         binary_field_actions: BINARY_FIELD_ACTIONS
             .iter()
             .map(|a| a.as_str().to_string())
@@ -5118,10 +5131,16 @@ fn disambiguate_node_labels(
     };
     let mut labels = names;
     let before = labels.clone();
+    let hostnames: std::collections::HashSet<&str> =
+        before.iter().map(|(_, name)| name.as_str()).collect();
     let mut fell_back = std::collections::HashSet::new();
     for (id, name) in labels.iter_mut() {
         if shared(&before, name) {
-            *name = registry_name(id).unwrap_or_default();
+            // A registry name that is the shared hostname (or any node's
+            // hostname) is that hostname again: it tells nothing apart.
+            *name = registry_name(id)
+                .filter(|candidate| !hostnames.contains(candidate.as_str()))
+                .unwrap_or_default();
             fell_back.insert(id.clone());
         }
     }
@@ -5236,8 +5255,11 @@ fn transfer_failover_reason(audit_reason: Option<&str>) -> String {
     use crate::bus::leader_return::{PREFERRED_RESTORE_REASON, SPLIT_GATHER_REASON};
     match audit_reason {
         Some(
-            reason @ (POST_UPGRADE_SPREAD_REASON | PREFERRED_RESTORE_REASON | SPLIT_GATHER_REASON
-            | "rebalance" | "rollback"),
+            reason @ (POST_UPGRADE_SPREAD_REASON
+            | PREFERRED_RESTORE_REASON
+            | SPLIT_GATHER_REASON
+            | "rebalance"
+            | "rollback"),
         ) => reason.to_string(),
         _ => LEADER_TRANSFER_REASON.to_string(),
     }
@@ -6054,6 +6076,13 @@ mod tests {
         let clash = disambiguate_node_labels(ids(&[("a", "mini"), ("b", "mini")]), same);
         assert_eq!((clash["a"].as_str(), clash["b"].as_str()), ("", ""));
 
+        // A registry name that is the very hostname the nodes share names
+        // nobody: the other node's registry (which has no name for itself)
+        // would otherwise show one of them under the shared name.
+        let echoes = |id: &str| (id == "a").then(|| "mini".to_string());
+        let echoed = disambiguate_node_labels(ids(&[("a", "mini"), ("b", "mini")]), echoes);
+        assert_eq!((echoed["a"].as_str(), echoed["b"].as_str()), ("", ""));
+
         // A fallback that lands on another node's own, unique hostname gives
         // way; the node that owns the hostname keeps it.
         let lands_on_c = |id: &str| (id == "a").then(|| "node C".to_string());
@@ -6171,7 +6200,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .expect("bus init");
             // Kept alive for the process (mirrors `locked_env_fixture`'s own
@@ -8668,23 +8699,26 @@ mod tests {
                 follower_count: 0,
                 isr_count: 3,
             }],
-            partitions: vec![bus::PartitionReplicaInfo {
-                topic: topic_name.clone(),
-                partition: 0,
-                leader_node_id: Some("gcm-core-01".to_string()),
-                leader_epoch: 5,
-                replicas: vec!["gcm-core-01".to_string(), "gczd-edge-02".to_string()],
-                isr: vec!["gcm-core-01".to_string()],
-                lagging: vec![bus::ReplicaLagInfo {
-                    node_id: "gczd-edge-02".to_string(),
-                    lag_bytes: 100,
-                    lag_ms: 10,
-                    reason: "lag 100 B > 64 MiB".to_string(),
-                }],
-                high_watermark: 42,
-                log_end_offset: 44,
-                unavailable_reason: None,
-            }, closed_partition],
+            partitions: vec![
+                bus::PartitionReplicaInfo {
+                    topic: topic_name.clone(),
+                    partition: 0,
+                    leader_node_id: Some("gcm-core-01".to_string()),
+                    leader_epoch: 5,
+                    replicas: vec!["gcm-core-01".to_string(), "gczd-edge-02".to_string()],
+                    isr: vec!["gcm-core-01".to_string()],
+                    lagging: vec![bus::ReplicaLagInfo {
+                        node_id: "gczd-edge-02".to_string(),
+                        lag_bytes: 100,
+                        lag_ms: 10,
+                        reason: "lag 100 B > 64 MiB".to_string(),
+                    }],
+                    high_watermark: 42,
+                    log_end_offset: 44,
+                    unavailable_reason: None,
+                },
+                closed_partition,
+            ],
             failovers: vec![],
         };
         rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(&db).await;
@@ -8787,8 +8821,14 @@ mod tests {
             BusPayload::ReplicaListResponse { failovers, .. } => failovers,
             other => panic!("unexpected response: {other:?}"),
         };
-        assert!(failovers.iter().any(|f| f.topic == topic_name), "{failovers:?}");
-        assert!(failovers.iter().all(|f| f.topic != closed_topic), "{failovers:?}");
+        assert!(
+            failovers.iter().any(|f| f.topic == topic_name),
+            "{failovers:?}"
+        );
+        assert!(
+            failovers.iter().all(|f| f.topic != closed_topic),
+            "{failovers:?}"
+        );
 
         // Asking for the refused topic itself is refused, as without a
         // coordinator.
@@ -9087,12 +9127,20 @@ mod tests {
 
         let admin_id = format!("u-fp-admin-{}", uuid::Uuid::new_v4());
         let admin_org = seed_membership(&db, &admin_id, "org_admin");
-        let admin = handler_ctx(db.clone(), org_context(&admin_org, &admin_id, &["org.admin"]));
+        let admin = handler_ctx(
+            db.clone(),
+            org_context(&admin_org, &admin_id, &["org.admin"]),
+        );
         let (own, other) = ("fp.list.own".to_string(), "fp.list.other".to_string());
         for topic in [&own, &other] {
-            topic_create_v1(&admin, instance.as_str(), topic.clone(), BusTopicOptionsWire::default())
-                .await
-                .expect("topic create");
+            topic_create_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                BusTopicOptionsWire::default(),
+            )
+            .await
+            .expect("topic create");
         }
         field_policy_list_v1(&admin, instance.as_str(), own.clone())
             .await
@@ -9125,9 +9173,13 @@ mod tests {
         let user_id = format!("u-fp-matrix-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
         let ctx = handler_ctx(db, org_context(&org_id, &user_id, &[]));
-        let err = field_policy_list_v1(&ctx, fixture_instance_id().as_str(), "patients.updated".to_string())
-            .await
-            .expect_err("matrix admin without org.admin");
+        let err = field_policy_list_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "patients.updated".to_string(),
+        )
+        .await
+        .expect_err("matrix admin without org.admin");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
     }
 
@@ -9387,7 +9439,11 @@ mod tests {
         let err = crate::dispatch::handlers::iam_dispatch(&iam_clear, &site_admin)
             .expect_err("topic entries are cleared in TentaBus only");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{err:?}");
-        assert_eq!(remaining(&operator, &topic).await, 2, "the IAM path cleared nothing");
+        assert_eq!(
+            remaining(&operator, &topic).await,
+            2,
+            "the IAM path cleared nothing"
+        );
         for (subject, action) in [
             ("u-patient-reader", "read"),
             (operator_id.as_str(), "admin"),
@@ -11098,15 +11154,25 @@ mod tests {
     async fn source_high_watermark(ctx: &HandlerContext, topic: &str) -> u64 {
         let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
         let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.to_string());
-        tokio::task::spawn_blocking(move || svc.partition_stats(&bctx, &t, 0).unwrap().high_watermark)
-            .await
-            .unwrap()
+        tokio::task::spawn_blocking(move || {
+            svc.partition_stats(&bctx, &t, 0).unwrap().high_watermark
+        })
+        .await
+        .unwrap()
     }
 
     async fn dlq_depth(ctx: &HandlerContext, topic: &str) -> u64 {
-        match stats_snapshot_v1(ctx, fixture_instance_id().as_str()).await.unwrap() {
+        match stats_snapshot_v1(ctx, fixture_instance_id().as_str())
+            .await
+            .unwrap()
+        {
             BusPayload::StatsSnapshotResponse { snapshot } => {
-                snapshot.topics.iter().find(|t| t.topic == topic).unwrap().dlq_depth
+                snapshot
+                    .topics
+                    .iter()
+                    .find(|t| t.topic == topic)
+                    .unwrap()
+                    .dlq_depth
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -11146,7 +11212,11 @@ mod tests {
         let err = dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
             .await
             .expect_err("a retried record is not retried again");
-        assert!(err.message.contains("bus.dlq_record_handled"), "{}", err.message);
+        assert!(
+            err.message.contains("bus.dlq_record_handled"),
+            "{}",
+            err.message
+        );
         assert_eq!(source_high_watermark(&ctx, &topic).await, 4);
 
         assert_eq!(retry_all(&ctx, &topic, 10).await, (2, 0, 0));
@@ -11214,7 +11284,11 @@ mod tests {
         let err = dlq_retry_all_v1(&ctx, inst.as_str(), topic.clone(), 10)
             .await
             .expect_err("refused");
-        assert!(err.message.contains("bus.permission_denied"), "{}", err.message);
+        assert!(
+            err.message.contains("bus.permission_denied"),
+            "{}",
+            err.message
+        );
         assert_eq!(source_high_watermark(&ctx, &topic).await, 2);
     }
 
@@ -11235,9 +11309,18 @@ mod tests {
             let ctx = &ctx;
             let topic = topic.clone();
             async move {
-                match dlq_list_v1(ctx, fixture_instance_id().as_str(), topic, None, from, 3, None, true)
-                    .await
-                    .expect("dlq list")
+                match dlq_list_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    None,
+                    from,
+                    3,
+                    None,
+                    true,
+                )
+                .await
+                .expect("dlq list")
                 {
                     BusPayload::DlqListResponse { result } => result,
                     other => panic!("unexpected response: {other:?}"),
@@ -11245,15 +11328,24 @@ mod tests {
             }
         };
         let first = page(vec![]).await;
-        assert_eq!(first.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(
+            first.records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
         assert!(first.has_more);
         let next = first
             .partitions
             .iter()
-            .map(|p| BusPartitionOffsetWire { partition: p.partition, offset: p.next_offset })
+            .map(|p| BusPartitionOffsetWire {
+                partition: p.partition,
+                offset: p.next_offset,
+            })
             .collect();
         let second = page(next).await;
-        assert_eq!(second.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            second.records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![0]
+        );
         assert!(!second.has_more);
     }
 
@@ -11413,7 +11505,9 @@ mod tests {
                     &t,
                     topics::TopicOptions {
                         schema_id,
-                        validation: validation.as_deref().and_then(topics::ValidationMode::parse),
+                        validation: validation
+                            .as_deref()
+                            .and_then(topics::ValidationMode::parse),
                         ..Default::default()
                     },
                 )
@@ -12325,9 +12419,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let allowed = leader_transfer_v1(&ctx, inst.as_str(), topic.clone(), 0, "node-b".to_string())
-            .await
-            .expect_err("no replication in this fixture");
+        let allowed =
+            leader_transfer_v1(&ctx, inst.as_str(), topic.clone(), 0, "node-b".to_string())
+                .await
+                .expect_err("no replication in this fixture");
         assert!(
             !allowed.message.contains("bus.permission_denied"),
             "an allowed administrator must get past the topic check: {}",
@@ -12349,7 +12444,11 @@ mod tests {
             .await
             .expect_err("denied administration");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
-        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+        assert!(
+            denied.message.contains("bus.permission_denied"),
+            "{}",
+            denied.message
+        );
     }
 
     /// Choosing which nodes hold a topic's copies is administration of that
@@ -12376,8 +12475,14 @@ mod tests {
         // Without a coordinator the call then stops at "replication
         // disabled"; with the one another test in this binary installs
         // (a one-way door) it succeeds. Either way it passed the topic check.
-        if let Err(allowed) =
-            replica_reassign_v1(&ctx, inst.as_str(), topic.clone(), None, vec!["node-b".to_string()]).await
+        if let Err(allowed) = replica_reassign_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            None,
+            vec!["node-b".to_string()],
+        )
+        .await
         {
             assert!(
                 !allowed.message.contains("bus.permission_denied"),
@@ -12397,11 +12502,16 @@ mod tests {
         )
         .await
         .expect("acl set");
-        let denied = replica_reassign_v1(&ctx, inst.as_str(), topic, None, vec!["node-b".to_string()])
-            .await
-            .expect_err("denied administration");
+        let denied =
+            replica_reassign_v1(&ctx, inst.as_str(), topic, None, vec!["node-b".to_string()])
+                .await
+                .expect_err("denied administration");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
-        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+        assert!(
+            denied.message.contains("bus.permission_denied"),
+            "{}",
+            denied.message
+        );
     }
 
     /// The RF=1 node-wide replica view answers a caller refused reading one
@@ -12439,10 +12549,11 @@ mod tests {
         .await
         .expect("acl set");
 
-        let BusPayload::ReplicaListResponse { nodes, partitions, .. } =
-            replica_list_v1(&ctx, inst.as_str(), None)
-                .await
-                .expect("the node-wide view answers")
+        let BusPayload::ReplicaListResponse {
+            nodes, partitions, ..
+        } = replica_list_v1(&ctx, inst.as_str(), None)
+            .await
+            .expect("the node-wide view answers")
         else {
             panic!("expected ReplicaListResponse");
         };
@@ -12561,9 +12672,14 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        assert!(topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe(&"x".repeat(501)))
-            .await
-            .is_err());
+        assert!(topic_update_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            describe(&"x".repeat(501))
+        )
+        .await
+        .is_err());
         match topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe(""))
             .await
             .expect("topic update")
@@ -12574,10 +12690,18 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
-        topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe("Wyniki RTG i USG"))
+        topic_update_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            describe("Wyniki RTG i USG"),
+        )
+        .await
+        .expect("topic update");
+        match topic_detail_v1(&ctx, inst.as_str(), topic.clone())
             .await
-            .expect("topic update");
-        match topic_detail_v1(&ctx, inst.as_str(), topic.clone()).await.unwrap() {
+            .unwrap()
+        {
             BusPayload::TopicDetailResponse { topic: cfg, .. } => {
                 assert_eq!(cfg.description, "Wyniki RTG i USG");
                 assert_eq!(cfg.created_by_label.as_deref(), Some("Anna Kowalska"));
@@ -13311,9 +13435,16 @@ mod tests {
     async fn field_policy_preview_shows_masked_and_hashed_fields() {
         let (_guard, db) = bus_fixture();
         let f = preview_fixture(&db).await;
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .expect("group rule");
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .expect("group rule");
 
         let (payload, applied, limited) = preview(&f, "group", &f.group).await.unwrap();
         assert_eq!(
@@ -13342,9 +13473,16 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let f = preview_fixture(&db).await;
         let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
-        set_rule(&f, "user", &caller, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .expect("caller's own rule");
+        set_rule(
+            &f,
+            "user",
+            &caller,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .expect("caller's own rule");
 
         // The subject sees every field clear, the caller only masked/hashed.
         let (payload, applied, limited) = preview(&f, "user", &f.own_rule).await.unwrap();
@@ -13367,9 +13505,16 @@ mod tests {
         // The same forms as the caller's: not limited, and the caller's own
         // hash and mask ARE the subject's value — never hashed or masked a
         // second time (a hash of a hash matches no hash anywhere).
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .unwrap();
         let (payload, applied, limited) = preview(&f, "group", &f.group).await.unwrap();
         assert!(!limited);
         assert_eq!(
@@ -13387,23 +13532,39 @@ mod tests {
         );
         // A hash where the caller reads a mask: a hash of a mask is no hash,
         // so the mask stays and the view is flagged.
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &[],
+            &["name", "pesel"],
+        )
+        .await
+        .unwrap();
         let (payload, _, limited) = preview(&f, "group", &f.group).await.unwrap();
         assert!(limited);
         assert_eq!(payload["pesel"], "********345", "not a hash of the mask");
         assert_eq!(payload["name"], org_key_hash(&f.org_id, "Anna Kowalska"));
         // A mask where the caller reads a hash: the hash stays, not a mask of it.
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["name", "pesel"], &[])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &["name", "pesel"],
+            &[],
+        )
+        .await
+        .unwrap();
         let (payload, _, limited) = preview(&f, "group", &f.group).await.unwrap();
         assert!(limited);
         assert_eq!(payload["name"], org_key_hash(&f.org_id, "Anna Kowalska"));
         assert_eq!(payload["pesel"], "********345");
         // A subject that sees less than the caller is never limited by it.
-        set_rule(&f, "group", &f.group, &["id"], &[], &[]).await.unwrap();
+        set_rule(&f, "group", &f.group, &["id"], &[], &[])
+            .await
+            .unwrap();
         assert!(!preview(&f, "group", &f.group).await.unwrap().2);
     }
 
@@ -13440,11 +13601,20 @@ mod tests {
         )
         .await
         .expect("topic create");
-        let payload = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
+        let payload = [
+            vec![0x08, 5],
+            vec![0x12, 3],
+            b"bee".to_vec(),
+            vec![0x1a, 3],
+            b"sea".to_vec(),
+        ]
+        .concat();
         let g = gate_read(&ctx, inst.as_str()).expect("gate");
         let (svc, bctx, t) = (g.svc.clone(), bus_ctx(&g), topic.clone());
         tokio::task::spawn_blocking(move || {
-            svc.local_partition(&bctx, &t, 0).expect("partition").open_leader_writes();
+            svc.local_partition(&bctx, &t, 0)
+                .expect("partition")
+                .open_leader_writes();
             svc.publish(
                 &bctx,
                 &t,
@@ -13475,12 +13645,15 @@ mod tests {
         };
         seed_user(db, &f.own_rule, "Własna zasada");
         seed_org_member(db, &f.org_id, &f.own_rule);
-        set_rule(&f, "user", &caller, &["a", "b"], &[], &[]).await.expect("caller rule");
+        set_rule(&f, "user", &caller, &["a", "b"], &[], &[])
+            .await
+            .expect("caller rule");
         f
     }
 
     #[tokio::test]
-    async fn field_policy_binary_topic_rules_name_pattern_fields_and_refuse_masks_and_foreign_names() {
+    async fn field_policy_binary_topic_rules_name_pattern_fields_and_refuse_masks_and_foreign_names(
+    ) {
         let (_guard, db) = bus_fixture();
         let f = binary_fixture(&db).await;
         let refusal = |err: ProtocolError| {
@@ -13488,11 +13661,21 @@ mod tests {
             err.message
         };
         let own = f.own_rule.clone();
-        assert!(refusal(set_rule(&f, "user", &own, &["a", "zzz"], &[], &[]).await.unwrap_err())
-            .contains(field_policies::FIELD_NOT_IN_PATTERN));
-        assert!(refusal(set_rule(&f, "user", &own, &["a"], &["a"], &[]).await.unwrap_err())
-            .contains(field_policies::BINARY_TOPIC_NO_MASK_HASH));
-        set_rule(&f, "user", &own, &["a", "c"], &[], &[]).await.expect("fields of the pattern");
+        assert!(refusal(
+            set_rule(&f, "user", &own, &["a", "zzz"], &[], &[])
+                .await
+                .unwrap_err()
+        )
+        .contains(field_policies::FIELD_NOT_IN_PATTERN));
+        assert!(refusal(
+            set_rule(&f, "user", &own, &["a"], &["a"], &[])
+                .await
+                .unwrap_err()
+        )
+        .contains(field_policies::BINARY_TOPIC_NO_MASK_HASH));
+        set_rule(&f, "user", &own, &["a", "c"], &[], &[])
+            .await
+            .expect("fields of the pattern");
     }
 
     #[tokio::test]
@@ -13500,13 +13683,26 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let f = binary_fixture(&db).await;
         let own = f.own_rule.clone();
-        set_rule(&f, "user", &own, &["a", "c"], &[], &[]).await.unwrap();
+        set_rule(&f, "user", &own, &["a", "c"], &[], &[])
+            .await
+            .unwrap();
         let answer = field_policy_preview_v1(
-            &f.ctx, fixture_instance_id().as_str(), f.topic.clone(), 0, 0, "user".to_string(), own.clone(),
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            0,
+            0,
+            "user".to_string(),
+            own.clone(),
         )
         .await
         .unwrap();
-        let BusPayload::FieldPolicyPreviewResponse { record, applied, limited_by_caller, hash_key_missing } = answer
+        let BusPayload::FieldPolicyPreviewResponse {
+            record,
+            applied,
+            limited_by_caller,
+            hash_key_missing,
+        } = answer
         else {
             panic!("unexpected response");
         };
@@ -13515,7 +13711,8 @@ mod tests {
         assert_ne!(record.schema_ref_id, 0);
         assert!(limited_by_caller, "the caller hides c from itself");
         assert!(!hash_key_missing);
-        let mut applied: Vec<(String, String)> = applied.into_iter().map(|a| (a.field, a.action)).collect();
+        let mut applied: Vec<(String, String)> =
+            applied.into_iter().map(|a| (a.field, a.action)).collect();
         applied.sort();
         assert_eq!(
             applied,
@@ -13535,62 +13732,131 @@ mod tests {
         seed_user(&db, &caller, "Admin");
         seed_org_member(&db, &f.org_id, &caller);
         let answer = field_policy_preview_v1(
-            &f.ctx, fixture_instance_id().as_str(), f.topic.clone(), 0, 0, "user".to_string(), caller,
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            0,
+            0,
+            "user".to_string(),
+            caller,
         )
         .await
         .unwrap();
-        let BusPayload::FieldPolicyPreviewResponse { record, applied, limited_by_caller, .. } = answer
+        let BusPayload::FieldPolicyPreviewResponse {
+            record,
+            applied,
+            limited_by_caller,
+            ..
+        } = answer
         else {
             panic!("unexpected response");
         };
         // The caller's rule shows a and b: the record is shorter by c, which
         // is neither listed nor changed by the subject's (identical) rule.
-        assert_eq!(record.payload_preview, [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat());
+        assert_eq!(
+            record.payload_preview,
+            [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat()
+        );
         assert!(applied.iter().all(|a| a.field != "c"));
-        assert!(limited_by_caller, "the shorter record is the caller's own rule at work");
+        assert!(
+            limited_by_caller,
+            "the shorter record is the caller's own rule at work"
+        );
     }
 
     #[tokio::test]
-    async fn field_policy_binary_schema_of_a_record_is_the_readers_sub_schema_and_the_fields_come_from_the_pattern() {
+    async fn field_policy_binary_schema_of_a_record_is_the_readers_sub_schema_and_the_fields_come_from_the_pattern(
+    ) {
         let (_guard, db) = bus_fixture();
         let f = binary_fixture(&db).await;
         let inst = fixture_instance_id();
         // The caller reads through its own rule (a, b): the browse carries the
         // id of that sub-schema.
-        let browse = messages_browse_v1(&f.ctx, inst.as_str(), f.topic.clone(), None, vec![], 10, None, None)
-            .await
-            .expect("browse");
-        let BusPayload::MessagesBrowseResponse { result } = browse else { panic!("unexpected") };
+        let browse = messages_browse_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            None,
+            vec![],
+            10,
+            None,
+            None,
+        )
+        .await
+        .expect("browse");
+        let BusPayload::MessagesBrowseResponse { result } = browse else {
+            panic!("unexpected")
+        };
         let record = &result.records[0];
-        assert_eq!(record.payload_preview, [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat());
+        assert_eq!(
+            record.payload_preview,
+            [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec()].concat()
+        );
         assert_ne!(record.schema_ref_id, 0);
-        let answer = schema_for_record_get_v1(&f.ctx, inst.as_str(), f.topic.clone(), record.schema_ref_id)
-            .await
-            .expect("the reader's sub-schema");
-        let BusPayload::SchemaForRecordGetResponse { schema } = answer else { panic!("unexpected") };
+        let answer =
+            schema_for_record_get_v1(&f.ctx, inst.as_str(), f.topic.clone(), record.schema_ref_id)
+                .await
+                .expect("the reader's sub-schema");
+        let BusPayload::SchemaForRecordGetResponse { schema } = answer else {
+            panic!("unexpected")
+        };
         assert!(schema.derived);
         assert_eq!(schema.schema_type, "protobuf");
         assert_eq!(schema.schema_ref_id, record.schema_ref_id);
-        assert!(schema.schema_text.contains("string b = 2") && !schema.schema_text.contains("string c"));
-        let err = schema_for_record_get_v1(&f.ctx, inst.as_str(), f.topic.clone(), record.schema_ref_id ^ 1)
-            .await
-            .unwrap_err();
+        assert!(
+            schema.schema_text.contains("string b = 2") && !schema.schema_text.contains("string c")
+        );
+        let err = schema_for_record_get_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            record.schema_ref_id ^ 1,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::NotFound, "{}", err.message);
 
         let subject = {
-            let t = topics::get_topic(&f.ctx.state.db, inst.as_str(), &f.org_id, &f.topic).unwrap().unwrap();
+            let t = topics::get_topic(&f.ctx.state.db, inst.as_str(), &f.org_id, &f.topic)
+                .unwrap()
+                .unwrap();
             t.schema_id.unwrap()
         };
-        let fields = schema_fields_get_v1(&f.ctx, inst.as_str(), subject.clone(), None).await.unwrap();
-        let BusPayload::SchemaFieldsGetResponse { schema_type, version, fields, .. } = fields else { panic!("unexpected") };
-        assert_eq!((schema_type.as_str(), version, fields), ("protobuf", 1, vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        let fields = schema_fields_get_v1(&f.ctx, inst.as_str(), subject.clone(), None)
+            .await
+            .unwrap();
+        let BusPayload::SchemaFieldsGetResponse {
+            schema_type,
+            version,
+            fields,
+            ..
+        } = fields
+        else {
+            panic!("unexpected")
+        };
+        assert_eq!(
+            (schema_type.as_str(), version, fields),
+            (
+                "protobuf",
+                1,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            )
+        );
         // A text pattern names no fields of binary messages.
         schema_registry::registry::register(
-            &f.ctx.state.db, inst.as_str(), &f.org_id, "t.json", schema_registry::SchemaType::JsonSchema,
-            r#"{"type":"object"}"#, None, None,
+            &f.ctx.state.db,
+            inst.as_str(),
+            &f.org_id,
+            "t.json",
+            schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            None,
+            None,
         )
         .unwrap();
-        let err = schema_fields_get_v1(&f.ctx, inst.as_str(), "t.json".to_string(), None).await.unwrap_err();
+        let err = schema_fields_get_v1(&f.ctx, inst.as_str(), "t.json".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
     }
 
@@ -13656,9 +13922,16 @@ mod tests {
     async fn field_policy_list_returns_the_masked_and_hashed_fields() {
         let (_guard, db) = bus_fixture();
         let f = preview_fixture(&db).await;
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .unwrap();
         match field_policy_list_v1(&f.ctx, fixture_instance_id().as_str(), f.topic.clone())
             .await
             .unwrap()
@@ -13752,16 +14025,26 @@ mod tests {
         assert!(err.message.starts_with("bus.field_hash_key_not_found"));
 
         // A mask alone makes no key.
-        set_rule(&f, "group", &f.group, &["id", "pesel"], &["pesel"], &[]).await.unwrap();
+        set_rule(&f, "group", &f.group, &["id", "pesel"], &["pesel"], &[])
+            .await
+            .unwrap();
         assert!(!key_info(&f.ctx).await.exists);
 
-        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"]).await.unwrap();
-        set_rule(&f, "user", &f.own_rule, &["id", "name"], &[], &["name"]).await.unwrap();
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
+            .await
+            .unwrap();
+        set_rule(&f, "user", &f.own_rule, &["id", "name"], &[], &["name"])
+            .await
+            .unwrap();
         let info = key_info(&f.ctx).await;
         assert!(info.exists);
         assert_eq!(info.key_version, 1);
         assert_eq!(
-            (info.hashing_rules, info.hashing_topics, info.hashing_instances),
+            (
+                info.hashing_rules,
+                info.hashing_topics,
+                info.hashing_instances
+            ),
             (2, 1, 1)
         );
         let hash = preview(&f, "group", &f.group).await.unwrap().0["name"].clone();
@@ -13809,12 +14092,20 @@ mod tests {
         assert_eq!(ours.len(), 5, "the refused attempts leave a row too");
         let ok = ours
             .iter()
-            .filter(|r| r.details.as_deref().is_some_and(|d| d.starts_with("outcome=ok")))
+            .filter(|r| {
+                r.details
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("outcome=ok"))
+            })
             .count();
         assert_eq!(ok, 1);
         let done = ours
             .iter()
-            .find(|r| r.details.as_deref().is_some_and(|d| d.starts_with("outcome=ok")))
+            .find(|r| {
+                r.details
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("outcome=ok"))
+            })
             .unwrap();
         assert_eq!(
             done.details.as_deref(),
@@ -13830,7 +14121,10 @@ mod tests {
             .unwrap()
             .key_hex;
         assert!(rows.iter().all(|r| {
-            !r.details.as_deref().unwrap_or_default().contains(key_hex.as_str())
+            !r.details
+                .as_deref()
+                .unwrap_or_default()
+                .contains(key_hex.as_str())
         }));
     }
 
@@ -13865,7 +14159,10 @@ mod tests {
         fn new(db: &DbPool) -> Self {
             db.write()
                 .unwrap()
-                .execute("UPDATE sync_nodes SET operator = 0 WHERE node_id = 'test-node'", [])
+                .execute(
+                    "UPDATE sync_nodes SET operator = 0 WHERE node_id = 'test-node'",
+                    [],
+                )
                 .unwrap();
             Self(db.clone())
         }
@@ -13873,22 +14170,29 @@ mod tests {
 
     impl Drop for DemotedNode {
         fn drop(&mut self) {
-            let _ = self
-                .0
-                .write()
-                .unwrap()
-                .execute("UPDATE sync_nodes SET operator = 1 WHERE node_id = 'test-node'", []);
+            let _ = self.0.write().unwrap().execute(
+                "UPDATE sync_nodes SET operator = 1 WHERE node_id = 'test-node'",
+                [],
+            );
         }
     }
 
-    async fn rule_on(f: &PreviewFixture, subject_type: &str, subject_id: &str) -> BusFieldPolicyWire {
+    async fn rule_on(
+        f: &PreviewFixture,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> BusFieldPolicyWire {
         match field_policy_list_v1(&f.ctx, fixture_instance_id().as_str(), f.topic.clone())
             .await
             .unwrap()
         {
             BusPayload::FieldPolicyListResponse { policies } => policies
                 .into_iter()
-                .find(|p| p.subject_type == subject_type && p.subject_id == subject_id && p.direction == "read")
+                .find(|p| {
+                    p.subject_type == subject_type
+                        && p.subject_id == subject_id
+                        && p.direction == "read"
+                })
                 .expect("the rule"),
             other => panic!("unexpected response: {other:?}"),
         }
@@ -13928,9 +14232,16 @@ mod tests {
     async fn field_policy_set_from_a_client_that_knows_no_masks_keeps_the_stored_ones() {
         let (_guard, db) = bus_fixture();
         let f = preview_fixture(&db).await;
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .unwrap();
 
         // The stale editor re-saves the same fields.
         set_rule_marks(&f, &f.group, &["id", "name", "pesel"], None, None)
@@ -13938,7 +14249,10 @@ mod tests {
             .unwrap();
         let rule = rule_on(&f, "group", &f.group).await;
         assert_eq!(rule.fields, ["id", "name", "pesel"]);
-        assert_eq!((rule.masked_fields, rule.hashed_fields), (vec!["pesel".to_string()], vec!["name".to_string()]));
+        assert_eq!(
+            (rule.masked_fields, rule.hashed_fields),
+            (vec!["pesel".to_string()], vec!["name".to_string()])
+        );
         assert_eq!(
             preview(&f, "group", &f.group).await.unwrap().0["pesel"],
             "********345",
@@ -13952,25 +14266,42 @@ mod tests {
             .unwrap();
         let rule = rule_on(&f, "group", &f.group).await;
         assert_eq!(rule.fields, ["extra", "id", "pesel"]);
-        assert_eq!((rule.masked_fields, rule.hashed_fields), (vec!["pesel".to_string()], vec![]));
+        assert_eq!(
+            (rule.masked_fields, rule.hashed_fields),
+            (vec!["pesel".to_string()], vec![])
+        );
 
         // A client that names one list keeps the other.
-        set_rule_marks(&f, &f.group, &["id", "pesel", "extra"], Some(&["extra"]), None)
-            .await
-            .unwrap();
+        set_rule_marks(
+            &f,
+            &f.group,
+            &["id", "pesel", "extra"],
+            Some(&["extra"]),
+            None,
+        )
+        .await
+        .unwrap();
         let rule = rule_on(&f, "group", &f.group).await;
         assert_eq!(rule.masked_fields, ["extra"]);
 
         // Only `Some(empty)` removes them.
-        set_rule_marks(&f, &f.group, &["id", "pesel", "extra"], Some(&[]), Some(&[]))
-            .await
-            .unwrap();
+        set_rule_marks(
+            &f,
+            &f.group,
+            &["id", "pesel", "extra"],
+            Some(&[]),
+            Some(&[]),
+        )
+        .await
+        .unwrap();
         let rule = rule_on(&f, "group", &f.group).await;
         assert!(rule.masked_fields.is_empty() && rule.hashed_fields.is_empty());
         assert_eq!(rule.fields, ["extra", "id", "pesel"]);
 
         // A rule that is new to the stale client has nothing to keep.
-        set_rule_marks(&f, "g-new", &["id"], None, None).await.unwrap();
+        set_rule_marks(&f, "g-new", &["id"], None, None)
+            .await
+            .unwrap();
         let new_rule = rule_on(&f, "group", "g-new").await;
         assert!(new_rule.masked_fields.is_empty() && new_rule.hashed_fields.is_empty());
     }
@@ -13989,12 +14320,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
-        assert!(err.message.starts_with("bus.operator_node_required"), "{}", err.message);
-        assert!(!err.message.contains("test-node"), "the text names no node: {}", err.message);
-        assert!(!key_info(&f.ctx).await.exists, "no key was made");
-        assert!(!key_info(&f.ctx).await.can_rotate_here, "the window is told this node cannot rotate");
         assert!(
-            rule_on(&f, "group", &f.group).await.hashed_fields.is_empty(),
+            err.message.starts_with("bus.operator_node_required"),
+            "{}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("test-node"),
+            "the text names no node: {}",
+            err.message
+        );
+        assert!(!key_info(&f.ctx).await.exists, "no key was made");
+        assert!(
+            !key_info(&f.ctx).await.can_rotate_here,
+            "the window is told this node cannot rotate"
+        );
+        assert!(
+            rule_on(&f, "group", &f.group)
+                .await
+                .hashed_fields
+                .is_empty(),
             "no rule was left behind"
         );
         // A mask needs no key, so it is not refused.
@@ -14022,7 +14367,11 @@ mod tests {
 
         let err = rotate_request(&f.ctx, 1).await.unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
-        assert!(err.message.starts_with("bus.operator_node_required"), "{}", err.message);
+        assert!(
+            err.message.starts_with("bus.operator_node_required"),
+            "{}",
+            err.message
+        );
         assert_eq!(key_info(&f.ctx).await.key_version, 1, "nothing rotated");
 
         drop(demoted);
@@ -14042,35 +14391,71 @@ mod tests {
     /// the key is on its way (not that the node is no operator) because the
     /// organization already hashes with one.
     #[tokio::test]
-    async fn field_policy_an_edit_keeping_its_hashes_is_not_held_up_by_a_key_that_has_not_arrived() {
+    async fn field_policy_an_edit_keeping_its_hashes_is_not_held_up_by_a_key_that_has_not_arrived()
+    {
         let (_guard, db) = bus_fixture();
         let f = preview_fixture(&db).await;
         set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
             .await
             .expect("an operator node makes the key");
         // The key has not reached this node (a replicated rule, no key).
-        db.write().unwrap().execute("DELETE FROM bus_field_hash_keys", []).unwrap();
+        db.write()
+            .unwrap()
+            .execute("DELETE FROM bus_field_hash_keys", [])
+            .unwrap();
         let demoted = DemotedNode::new(&db);
 
         // Another field of the same rule changes; the hash stays.
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name"])
-            .await
-            .expect("an edit that adds no hashed field goes through");
-        assert_eq!(rule_on(&f, "group", &f.group).await.fields, ["id", "name", "pesel"]);
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &[],
+            &["name"],
+        )
+        .await
+        .expect("an edit that adds no hashed field goes through");
+        assert_eq!(
+            rule_on(&f, "group", &f.group).await.fields,
+            ["id", "name", "pesel"]
+        );
 
         // A new hashed field needs the key: refused as "not synced", not as "no operator".
-        let err = set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
-            .await
-            .unwrap_err();
+        let err = set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &[],
+            &["name", "pesel"],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
-        assert!(err.message.starts_with("bus.hash_key_not_synced"), "{}", err.message);
+        assert!(
+            err.message.starts_with("bus.hash_key_not_synced"),
+            "{}",
+            err.message
+        );
         assert!(!err.message.contains("test-node"), "{}", err.message);
         // The same on an operator node: a key made here would be a second key.
         drop(demoted);
-        let err = set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
-            .await
-            .unwrap_err();
-        assert!(err.message.starts_with("bus.hash_key_not_synced"), "{}", err.message);
+        let err = set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &[],
+            &["name", "pesel"],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.starts_with("bus.hash_key_not_synced"),
+            "{}",
+            err.message
+        );
         assert!(!key_info(&f.ctx).await.exists, "no key was made");
 
         // What the screen learns: rules hash, no key, so the key is on its way.
@@ -14079,8 +14464,14 @@ mod tests {
         let (payload, applied, _, key_missing) =
             preview_with_key_flag(&f, "group", &f.group).await.unwrap();
         assert!(key_missing);
-        assert!(payload.get("name").is_none(), "the hashed field is hidden: {payload}");
-        assert!(applied.contains(&("name".to_string(), "hide".to_string())), "{applied:?}");
+        assert!(
+            payload.get("name").is_none(),
+            "the hashed field is hidden: {payload}"
+        );
+        assert!(
+            applied.contains(&("name".to_string(), "hide".to_string())),
+            "{applied:?}"
+        );
 
         // Once the key arrives the field can be added.
         let svc = bus::instance(&fixture_instance_id()).expect("fixture instance");
@@ -14094,12 +14485,23 @@ mod tests {
                 key_hex: zeroize::Zeroizing::new("cd".repeat(32)),
             })
             .unwrap());
-        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
-            .await
-            .unwrap();
-        let (_, applied, _, key_missing) = preview_with_key_flag(&f, "group", &f.group).await.unwrap();
+        set_rule(
+            &f,
+            "group",
+            &f.group,
+            &["id", "name", "pesel"],
+            &[],
+            &["name", "pesel"],
+        )
+        .await
+        .unwrap();
+        let (_, applied, _, key_missing) =
+            preview_with_key_flag(&f, "group", &f.group).await.unwrap();
         assert!(!key_missing);
-        assert!(applied.contains(&("name".to_string(), "hash".to_string())), "{applied:?}");
+        assert!(
+            applied.contains(&("name".to_string(), "hash".to_string())),
+            "{applied:?}"
+        );
     }
 
     /// F4 B7 review R2 P3-6: a request that is refused makes no key.
@@ -14125,13 +14527,20 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
-        assert!(!key_info(&f.ctx).await.exists, "a refused request left a key behind");
+        assert!(
+            !key_info(&f.ctx).await.exists,
+            "a refused request left a key behind"
+        );
         // Nor does a hashed field outside the shown ones.
-        let err = set_rule(&f, "group", &f.group, &["id"], &[], &["name"]).await.unwrap_err();
+        let err = set_rule(&f, "group", &f.group, &["id"], &[], &["name"])
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
         assert!(!key_info(&f.ctx).await.exists);
         // A valid one does.
-        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"]).await.unwrap();
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
+            .await
+            .unwrap();
         assert!(key_info(&f.ctx).await.exists);
     }
 
@@ -14198,9 +14607,16 @@ mod tests {
         })
         .await
         .unwrap();
-        set_rule(&f, "user", &caller, &["id", "name", "pesel"], &["pesel"], &["name"])
-            .await
-            .unwrap();
+        set_rule(
+            &f,
+            "user",
+            &caller,
+            &["id", "name", "pesel"],
+            &["pesel"],
+            &["name"],
+        )
+        .await
+        .unwrap();
 
         let listed = dlq_list_payloads(&f).await;
         assert_eq!(listed.len(), 1);
@@ -14225,7 +14641,11 @@ mod tests {
         let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
         // Written under the service, as a peer's ledger operation lands: no
         // key is made with it.
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+        let names = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
         field_policies::set_policy(
             &db,
             fixture_instance_id().as_str(),
@@ -14244,7 +14664,10 @@ mod tests {
         assert!(!key_info(&f.ctx).await.exists);
         let (payload, _, _, key_missing) = preview_with_key_flag(&f, "any", "*").await.unwrap();
         assert_eq!(payload, serde_json::json!({"id": "b-1"}));
-        assert!(key_missing, "the caller's hashed field is not readable here yet, and the answer says why");
+        assert!(
+            key_missing,
+            "the caller's hashed field is not readable here yet, and the answer says why"
+        );
         assert!(!key_info(&f.ctx).await.exists, "a read made no key");
     }
 

@@ -12562,6 +12562,7 @@
       "changes_title": "Leadership changes",
       "changes_sub": "When the leading node stops answering, another node with an in-sync copy takes over. Moves made by hand are listed here too.",
       "changes_none": "There have been no leadership changes yet.",
+      "changes_partial": "This list may be incomplete: another node's history could not be read, so the last known entries are shown.",
       "change_name": "{topic} · partition {partition}: leadership moved from {from} to {to}",
       "change_took": "took {secs} s",
       "change_took_short": "took <1 s",

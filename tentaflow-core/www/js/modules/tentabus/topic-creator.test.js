@@ -402,7 +402,7 @@ const toSummary = (overrides) => {
 
 test('step 3 says which node will lead the new topic', () => {
   assert.match(toSummary({ leaderHint: { node: 'Serwer B', partitions: 17, older: false } }), /Node prowadzący dobierze instancja — node preferowany dla najmniejszej liczby partycji \(teraz Serwer B: 17 partycji\)/);
-  assert.match(toSummary({ leaderHint: { node: 'Serwer A', tied: ['Serwer A', 'Serwer B'], partitions: 4, older: false } }), /Node prowadzący dobierze instancja — jeden z nodów: Serwer A albo Serwer B \(każdy preferowany dla 4 partycje\)/);
+  assert.match(toSummary({ leaderHint: { node: 'Serwer A', tied: ['Serwer A', 'Serwer B'], partitions: 4, older: false } }), /Node prowadzący dobierze instancja — jeden z nodów: Serwer A albo Serwer B \(każdy preferowany dla 4 partycji\)/);
   assert.match(toSummary({ leaderHint: { node: 'Serwer B', partitions: 17, older: true } }), /Node prowadzący node, na którym powstaje topik — instancja dobierze go sama dopiero po aktualizacji wszystkich nodów/);
   // The first topic of an instance: the poll has not named the nodes yet, but the copies span several, so the row says how the node is chosen.
   assert.match(toSummary({ leaderHint: null }), /Node prowadzący dobierze instancja — node preferowany dla najmniejszej liczby partycji(?! \()/);

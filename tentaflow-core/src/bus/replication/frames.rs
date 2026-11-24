@@ -421,6 +421,12 @@ pub struct ReplAck {
     /// record of the leader's term.
     #[serde(default)]
     pub follower_log_epoch: Option<u32>,
+    /// The `ReplOffsets::groups_gen` of the newest frame of group rows this
+    /// follower has applied, so a leader that hands the partition over knows
+    /// the rows arrived and not merely left. Appended: `None` from a follower
+    /// that predates it.
+    #[serde(default)]
+    pub groups_applied: Option<u64>,
 }
 
 /// Leader -> follower keep-alive in the absence of real traffic (PLAN-M2
@@ -572,6 +578,15 @@ pub struct ReplLeoReply {
     /// that predates it, so only a current build can say so.
     #[serde(default)]
     pub instance_unhosted: bool,
+    /// The reply carries the replying node's real log of this partition: it
+    /// hosts the instance, has the partition registered and read its log. A
+    /// node that does not (the router's answer for an instance not registered
+    /// yet, a registry entry not replayed yet, a manager shut down) answers
+    /// with zeros that look like an empty log, which proves nothing about
+    /// what a leader acknowledged. Appended: `false` from a peer that
+    /// predates it, whose reply a node that has not caught up cannot count.
+    #[serde(default)]
+    pub log_known: bool,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -591,6 +606,11 @@ pub struct ReplOffsets {
     /// updated_at_ms)` is not older than what it holds.
     #[serde(default)]
     pub groups: Vec<ReplGroup>,
+    /// Which change of the group rows `groups` reflects (the leader's own
+    /// counter; 0 when the frame carries no rows). Echoed back in
+    /// `ReplAck::groups_applied`. Appended: 0 from a leader that predates it.
+    #[serde(default)]
+    pub groups_gen: u64,
 }
 
 /// One `bus_groups` row of the topic a stream replicates. The topic is not
@@ -749,6 +769,12 @@ pub struct ConsumeForward {
     /// stated); see `ProduceForward::partitions`.
     #[serde(default)]
     pub partitions: u32,
+    /// The partitions to read, when the topic's partitions are led by several
+    /// nodes and this node serves only the ones it leads. Empty: all of them.
+    /// A receiver that does not know the field reads the whole topic and
+    /// refuses with `NotLeader`, which the sender reports as it would have.
+    #[serde(default)]
+    pub only_partitions: Vec<u32>,
 }
 
 /// One record a forwarded read returns, already projected through the
@@ -1231,6 +1257,7 @@ mod tests {
             follower_leo: 9,
             follower_hw: 8,
             follower_log_epoch: Some(4),
+            groups_applied: None,
         })
         .unwrap();
         assert_eq!(decode_cbor::<AckBefore>(&ack).unwrap(), old_ack);
@@ -1579,6 +1606,7 @@ mod tests {
             max_wait_ms: 250,
             topic_generation: 41,
             partitions: 3,
+            only_partitions: vec![0, 2],
         };
         assert_eq!(
             roundtrip(ReplFrame::ConsumeForward(request.clone())).await,
@@ -1705,6 +1733,7 @@ mod tests {
             follower_leo: 100,
             follower_hw: 90,
             follower_log_epoch: Some(7),
+            groups_applied: None,
         });
         assert_eq!(roundtrip(ack.clone()).await, ack);
 
@@ -1747,6 +1776,7 @@ mod tests {
             promised_epoch: Some(8),
             promises: true,
             instance_unhosted: false,
+            log_known: false,
             bus_features: 0,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
@@ -1762,6 +1792,7 @@ mod tests {
                 created_at_ms: 10,
                 updated_at_ms: 20,
             }],
+            groups_gen: 0,
         });
         assert_eq!(roundtrip(off.clone()).await, off);
     }
@@ -1776,6 +1807,7 @@ mod tests {
                 follower_leo: 1,
                 follower_hw: 1,
                 follower_log_epoch: None,
+                groups_applied: None,
             }),
         )
         .await
@@ -1802,6 +1834,7 @@ mod tests {
             follower_leo: 1_000,
             follower_hw: 990,
             follower_log_epoch: None,
+            groups_applied: None,
         })
     }
 
@@ -1963,6 +1996,7 @@ mod tests {
             follower_leo: 1,
             follower_hw: 1,
             follower_log_epoch: None,
+            groups_applied: None,
         })
         .unwrap();
         client.write_u32(cbor.len() as u32).await.unwrap();
@@ -2159,6 +2193,7 @@ mod tests {
                 promised_epoch: None,
                 promises: false,
                 instance_unhosted: false,
+                log_known: false,
                 bus_features: 0,
             }
         );

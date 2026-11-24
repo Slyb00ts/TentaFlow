@@ -4,7 +4,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { isOlderNode, leadershipUnits, balanceModel, leastLoadedNode, leaderReturnEnabled, rebalanceAvailability } = await import('./leader-balance.js');
+const { markSilent, isOlderNode, leadershipUnits, balanceModel, leastLoadedNode, leaderReturnEnabled, rebalanceAvailability } = await import('./leader-balance.js');
 
 const part = (partition, leader, preferred) => ({ partition, leaderNodeId: leader, replicas: [preferred, leader === preferred ? 'b' : preferred], preferredLeaderNodeId: preferred });
 const A = { nodeId: 'a', label: 'Serwer A', reachable: true, isLocal: true, forwarding: 'capable', forwardCapable: true };
@@ -96,4 +96,19 @@ test('which node leads a topic when it is not this one', async () => {
   assert.equal(leaderElsewhere('theirs', perTopic, [{ ...A, isLocal: false }, B]), null, 'no local node known');
   const unnamed = { nodeId: '365123c5d3d331c7ddff1a60767636af18b66eb8dba890b57cbeebba600f6a54', label: '' };
   assert.equal(leaderElsewhere('far', [topic('far', unnamed.nodeId)], [A, unnamed])?.node, '365123c5');
+});
+
+test('a node whose heartbeat is old, or that leads a partition without a usable leader, is taken as not responding', () => {
+  const local = { nodeId: 'a', isLocal: true, reachable: true, lastHeartbeatMsAgo: 0 };
+  const peer = (over = {}) => ({ nodeId: 'b', reachable: true, lastHeartbeatMsAgo: 400, ...over });
+  const parts = (over = {}) => [{ topic: 't', partitions: [{ partition: 0, leaderNodeId: 'b', ...over }], dlqPartitions: [] }];
+  const silent = (nodes, perTopic) => markSilent(nodes, perTopic).map((n) => n.reachable !== false);
+  assert.deepEqual(silent([local, peer()], parts()), [true, true], 'a fresh heartbeat and a leader that works');
+  assert.deepEqual(silent([local, peer({ lastHeartbeatMsAgo: 10_001 })], parts()), [true, false], 'heartbeat older than 10 s');
+  assert.deepEqual(silent([local, peer({ lastHeartbeatMsAgo: 10_000 })], parts()), [true, true], '10 s exactly still answers');
+  assert.deepEqual(silent([local, peer()], parts({ unavailableReason: 'no_isr' })), [true, false], 'its partition has no usable leader');
+  assert.deepEqual(silent([local, peer()], [{ topic: 't', partitions: [], dlqPartitions: [{ partition: 0, leaderNodeId: 'b', unavailableReason: 'epoch_fenced' }] }]), [true, false], 'also by its dead-letter partition');
+  assert.deepEqual(silent([{ ...local, lastHeartbeatMsAgo: 60_000 }, peer()], parts({ leaderNodeId: 'a', unavailableReason: 'no_isr' })), [true, true], 'this node is never marked');
+  assert.equal(markSilent([local, peer({ lastHeartbeatMsAgo: 20_000 })], []).at(1).silent, true);
+  assert.equal(markSilent([peer({ reachable: false })], [])[0].silent, undefined, 'already unreachable: unchanged');
 });

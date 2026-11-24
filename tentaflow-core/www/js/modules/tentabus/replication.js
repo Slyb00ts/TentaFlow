@@ -84,13 +84,20 @@ export function mergeFailovers(lists) {
 /**
  * The leadership changes of the whole instance: this node's own (`own`) and
  * those every other node that answers has in its audit log (`read(nodeId)`
- * resolves that node's replica list, `{ failovers }`). A node that is down or
- * does not answer adds nothing and breaks nothing.
+ * resolves that node's replica list, `{ failovers }`). A node that does not
+ * answer or is not reachable yet breaks nothing, but its entries are then
+ * missing: the `previous` merged list (the last poll's) is kept in the result
+ * instead of dropping to what is left, and `incomplete` says so.
+ * Resolves `{ failovers, incomplete }`.
  */
-export async function collectFailovers({ own, nodes, read }) {
-  const others = (nodes || []).filter((n) => !n.isLocal && n.reachable !== false);
-  const lists = await Promise.all(others.map((n) => Promise.resolve().then(() => read(n.nodeId)).then((r) => r?.failovers || [], () => [])));
-  return mergeFailovers([own, ...lists]);
+export async function collectFailovers({ own, nodes, read, previous = [] }) {
+  const remote = (nodes || []).filter((n) => !n.isLocal);
+  const asked = await Promise.all(remote.map((n) => (n.reachable === false
+    ? Promise.resolve(null)
+    : Promise.resolve().then(() => read(n.nodeId)).then((r) => r?.failovers || [], () => null))));
+  const incomplete = asked.some((list) => list === null);
+  const lists = asked.filter(Boolean);
+  return { failovers: mergeFailovers([own, ...lists, ...(incomplete ? [previous] : [])]), incomplete };
 }
 
 /** Leadership changes of the reader's topics, newest first. */
@@ -171,6 +178,7 @@ function skeleton() {
       <div class="section-card-head"><div class="title">${sprite('clock')} ${escapeHtml(T('replication.changes_title'))} <span data-role="changes-count"></span></div></div>
       <div class="section-sub">${escapeHtml(T('replication.changes_sub'))}</div>
       <div data-role="changes"></div>
+      <div class="muted" data-role="changes-partial" hidden>${escapeHtml(T('replication.changes_partial'))}</div>
       <div class="muted" data-role="changes-none" hidden>${escapeHtml(T('replication.changes_none'))}</div>
     </div>`;
 }
@@ -499,6 +507,7 @@ function paint(body, view, ctx) {
   const changes = readerFailovers(view.failovers, view.topics);
   countChip(body.querySelector('[data-role="changes-count"]'), changes.length);
   body.querySelector('[data-role="changes-none"]').hidden = changes.length > 0;
+  body.querySelector('[data-role="changes-partial"]').hidden = !view.failoversIncomplete;
   const changesHost = body.querySelector('[data-role="changes"]');
   const name = nodeNamer(nodes);
   const titleOf = nodeTitler(nodes);

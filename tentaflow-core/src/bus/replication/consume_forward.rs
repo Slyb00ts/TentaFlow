@@ -178,6 +178,14 @@ fn fit_to_reply(
     Ok(records)
 }
 
+/// The partitions of one topic that one node leads: this node (`leader:
+/// None`) or another.
+struct ReadLeg {
+    leader: Option<String>,
+    epoch: u32,
+    partitions: Vec<u32>,
+}
+
 impl BusService {
     /// One stateless read of `topic` for `group`: opens a consumer, fetches up
     /// to `max_bytes` and `max_records` (waiting up to `max_wait_ms` for
@@ -188,8 +196,11 @@ impl BusService {
     /// (at-most-once, reported as `ForwardOutcomeUnknown`).
     ///
     /// On a node that does not lead the topic the whole read runs on its
-    /// leader (`ConsumeForward`) when that is one node and can take it;
-    /// otherwise the read is refused with `NotLeader` naming the leader.
+    /// leader (`ConsumeForward`) when that is one node and can take it. A
+    /// topic whose partitions are led by several nodes is read one leader at
+    /// a time, each for the partitions it leads (`consume_split`). Otherwise,
+    /// when some partition has no known leader, the read is refused with
+    /// `NotLeader` naming the leader.
     /// Blocking, like `open_consumer` and `fetch`: callers on an async
     /// runtime hand it to `block_in_place` or `spawn_blocking`.
     pub fn consume_once(
@@ -202,6 +213,29 @@ impl BusService {
         max_wait_ms: u32,
     ) -> Result<Vec<FetchedRecordMeta>, BusServiceError> {
         if let Some(coordinator) = self.replication() {
+            if let Some(legs) = self.split_read_legs(&coordinator, ctx, topic) {
+                if let Err(e) = self.check_consume_access(ctx, topic, group) {
+                    if matches!(e, BusServiceError::PermissionDenied { .. }) {
+                        self.audit_windowed(
+                            ctx,
+                            "bus.consume.denied",
+                            Some(topic),
+                            Some(&format!("group={group}")),
+                        );
+                    }
+                    return Err(e);
+                }
+                return self.consume_split(
+                    &coordinator,
+                    ctx,
+                    group,
+                    topic,
+                    max_bytes,
+                    max_records,
+                    max_wait_ms,
+                    legs,
+                );
+            }
             if let Some((leader, epoch)) = self.sole_foreign_leader(&coordinator, ctx, topic) {
                 // The refusals `open_consumer` makes first, so a caller who
                 // may not read the topic learns nothing about where it
@@ -227,13 +261,150 @@ impl BusService {
                     max_wait_ms,
                     &leader,
                     epoch,
+                    &[],
                 );
             }
         }
         let (handle, records) =
-            self.read_batch(ctx, group, topic, max_bytes, max_records, max_wait_ms)?;
+            self.read_batch(ctx, group, topic, max_bytes, max_records, max_wait_ms, None)?;
         self.commit_read(&handle, group, topic, &records);
         Ok(records)
+    }
+
+    /// A topic whose partitions are led by several nodes, every one of them
+    /// known: the partitions each leader serves, this node's own first. `None`
+    /// when one node leads them all (this one, or another: `sole_foreign_leader`
+    /// and the plain read cover those) or when some partition has no known
+    /// leader, which the read refuses as it always has.
+    fn split_read_legs(
+        &self,
+        coordinator: &Arc<dyn ReplicationCoordinator>,
+        ctx: &BusCallContext,
+        topic: &str,
+    ) -> Option<Vec<ReadLeg>> {
+        let cfg = self.topic_config(&ctx.org_id, topic).ok()?;
+        let local_node = coordinator.local_node_id();
+        let mut here: Vec<u32> = Vec::new();
+        let mut remote: Vec<ReadLeg> = Vec::new();
+        for partition in 0..cfg.partitions {
+            match route(coordinator, &local_node, &ctx.org_id, topic, partition) {
+                Route::Here => here.push(partition),
+                Route::Remote { leader, epoch } => {
+                    match remote
+                        .iter_mut()
+                        .find(|leg| leg.leader.as_deref() == Some(&leader))
+                    {
+                        Some(leg) => leg.partitions.push(partition),
+                        None => remote.push(ReadLeg {
+                            leader: Some(leader),
+                            epoch,
+                            partitions: vec![partition],
+                        }),
+                    }
+                }
+                Route::Unknown => return None,
+            }
+        }
+        if remote.len() + usize::from(!here.is_empty()) < 2 {
+            return None;
+        }
+        let mut legs = Vec::with_capacity(remote.len() + 1);
+        if !here.is_empty() {
+            legs.push(ReadLeg {
+                leader: None,
+                epoch: 0,
+                partitions: here,
+            });
+        }
+        legs.extend(remote);
+        Some(legs)
+    }
+
+    /// The read of a split topic: every leg asked without waiting, over and
+    /// over until something comes back or `max_wait_ms` is spent, so that a
+    /// partition with records is not held up by one without. A leg that cannot
+    /// be served fails the read as the whole topic's read would have.
+    #[allow(clippy::too_many_arguments)]
+    fn consume_split(
+        &self,
+        coordinator: &Arc<dyn ReplicationCoordinator>,
+        ctx: &BusCallContext,
+        group: &str,
+        topic: &str,
+        max_bytes: usize,
+        max_records: usize,
+        max_wait_ms: u32,
+        legs: Vec<ReadLeg>,
+    ) -> Result<Vec<FetchedRecordMeta>, BusServiceError> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(u64::from(max_wait_ms));
+        // Each leg's share of one pass: a leg listed first must not use up the
+        // pass and leave the others never asked while it has records to give.
+        let share_records = max_records.div_ceil(legs.len()).max(1);
+        let share_bytes = max_bytes.div_ceil(legs.len()).max(1);
+        // Opened once for the whole call: opening a consumer writes the group
+        // row and replicates it, which every 50 ms pass must not repeat.
+        let mut local: Option<ConsumerHandle> = None;
+        loop {
+            let mut collected: Vec<FetchedRecordMeta> = Vec::new();
+            let mut bytes_left = max_bytes;
+            for leg in &legs {
+                let records_left = max_records.saturating_sub(collected.len());
+                if records_left == 0 || bytes_left == 0 {
+                    break;
+                }
+                let leg_records = records_left.min(share_records);
+                let leg_bytes = bytes_left.min(share_bytes);
+                // A leg that fails after another returned records ends the
+                // pass with what was read: those records are committed by
+                // their leaders already, and an error would drop them.
+                let served = (|| match &leg.leader {
+                    None => {
+                        if local.is_none() {
+                            local = Some(self.open_consumer_scoped(
+                                ctx,
+                                group,
+                                &[topic.to_string()],
+                                ConsumerConfig {
+                                    commit_mode: CommitMode::Explicit,
+                                },
+                                Some(&leg.partitions),
+                            )?);
+                        }
+                        let handle = local.as_ref().expect("opened above");
+                        let records = handle.fetch_up_to(leg_bytes, leg_records, 0)?.records;
+                        self.commit_read(handle, group, topic, &records);
+                        Ok(records)
+                    }
+                    Some(leader) => self.forward_consume(
+                        coordinator,
+                        ctx,
+                        group,
+                        topic,
+                        leg_bytes,
+                        leg_records,
+                        0,
+                        leader,
+                        leg.epoch,
+                        &leg.partitions,
+                    ),
+                })();
+                let got = match served {
+                    Ok(got) => got,
+                    Err(e) if collected.is_empty() => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(topic, error = %e, "bus read: a leg of a split topic failed after another returned records");
+                        break;
+                    }
+                };
+                let used: usize = got.iter().map(|r| r.payload.len()).sum();
+                bytes_left = bytes_left.saturating_sub(used.max(1));
+                collected.extend(got);
+            }
+            if !collected.is_empty() || std::time::Instant::now() >= deadline {
+                return Ok(collected);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// The open and fetch of `consume_once`, on this node's own partitions:
@@ -247,14 +418,16 @@ impl BusService {
         max_bytes: usize,
         max_records: usize,
         max_wait_ms: u32,
+        only: Option<&[u32]>,
     ) -> Result<(ConsumerHandle, Vec<FetchedRecordMeta>), BusServiceError> {
-        let handle = self.open_consumer(
+        let handle = self.open_consumer_scoped(
             ctx,
             group,
             &[topic.to_string()],
             ConsumerConfig {
                 commit_mode: CommitMode::Explicit,
             },
+            only,
         )?;
         let batch = handle.fetch_up_to(max_bytes, max_records, max_wait_ms)?;
         Ok((handle, batch.records))
@@ -339,6 +512,7 @@ impl BusService {
         max_wait_ms: u32,
         leader: &str,
         epoch: u32,
+        only_partitions: &[u32],
     ) -> Result<Vec<FetchedRecordMeta>, BusServiceError> {
         let fallback = BusServiceError::NotLeader {
             leader_node_id: Some(leader.to_string()),
@@ -360,6 +534,7 @@ impl BusService {
             max_wait_ms,
             topic_generation: sender_cfg.generation,
             partitions: sender_cfg.partitions,
+            only_partitions: only_partitions.to_vec(),
         };
         let timeout = Duration::from_millis(u64::from(max_wait_ms)) + REPLY_MARGIN;
         let still_led_by_target = || coordinator.node_reachable(leader);
@@ -501,6 +676,7 @@ impl BusService {
         let max_records = request
             .max_records
             .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let only = (!request.only_partitions.is_empty()).then_some(&request.only_partitions[..]);
         let (handle, records) = self.read_batch(
             &ctx,
             &group,
@@ -508,6 +684,7 @@ impl BusService {
             max_bytes,
             max_records,
             request.max_wait_ms.min(MAX_FORWARDED_WAIT_MS),
+            only,
         )?;
         // Sized and converted before the commit: the commit covers what the
         // reply carries, no more.

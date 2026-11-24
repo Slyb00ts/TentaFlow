@@ -141,8 +141,8 @@ use tentaflow_core::bus::replication::glue::{
 };
 use tentaflow_core::bus::replication::leader::LeaderConfig;
 use tentaflow_core::bus::replication::manager::{
-    AssignmentStore, BusRecv, BusSend, LedgerAdmission, PartitionKey, ReplicationManager,
-    ReplicationManagerConfig, Transport,
+    AssignmentStore, BusRecv, BusSend, FollowerRunnerFactory, LedgerAdmission, PartitionKey,
+    ReplicationManager, ReplicationManagerConfig, Transport,
 };
 use tentaflow_core::bus::replication::metrics::LeaderMetrics;
 use tentaflow_core::bus::topics::{Acks, TopicOptions};
@@ -679,6 +679,7 @@ struct TestNode {
     db: DbPool,
     svc: Arc<BusService>,
     manager: Arc<ReplicationManager>,
+    follower_factory: Arc<GlueFollowerFactory>,
     ledger: Arc<NodeLedger>,
     /// While set, this node's authorizer refuses `Produce`.
     deny_produce: Arc<AtomicBool>,
@@ -746,7 +747,19 @@ fn build_node(
     let db: DbPool = tentaflow_core::db::init(&db_path).expect("db init");
     tentaflow_core::services::environment::set_node_environment(&db, env)
         .expect("set_node_environment");
+    build_node_on(id, env, ledger, registry, bus_dir, db_dir, db)
+}
 
+/// A node on a disk it already has: what a restarted process finds.
+fn build_node_on(
+    id: &str,
+    env: NodeEnvironment,
+    ledger: Arc<SharedLedger>,
+    registry: Arc<TransportRegistry>,
+    bus_dir: TempDir,
+    db_dir: TempDir,
+    db: DbPool,
+) -> TestNode {
     let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
     tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
@@ -810,7 +823,7 @@ fn build_node(
         ledger: Arc::clone(&ledger) as Arc<dyn LedgerAdmission>,
         assignments: Arc::clone(&ledger) as Arc<dyn AssignmentStore>,
         leader_factory,
-        follower_factory,
+        follower_factory: Arc::clone(&follower_factory) as Arc<dyn FollowerRunnerFactory>,
         audit,
         leo_query_timeout: Duration::from_millis(150),
         majority_await_timeout: Duration::from_millis(500),
@@ -825,6 +838,7 @@ fn build_node(
         db,
         svc,
         manager,
+        follower_factory,
         ledger,
         deny_produce,
         deny_consume,
@@ -1127,6 +1141,22 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The nodes of a cluster built by `build_cluster_placed` stand for replicas
+/// that followed the epoch-1 leader before it went away: a node that has not
+/// caught up with a leader since it started does not stand over one it cannot
+/// reach (`ReplicationManager::in_sync_since_start`).
+async fn followed_the_first_leader(nodes: &[TestNode], partitions: u32) {
+    for p in 0..partitions {
+        for node in nodes {
+            let key = (ORG.to_string(), TOPIC.to_string(), p);
+            let row = node.ledger.shared.rows.lock().get(&key).cloned();
+            if let Some(row) = row {
+                node.follower_factory.note_led(&row);
+            }
+        }
     }
 }
 
@@ -3849,6 +3879,7 @@ async fn two_candidacies_from_one_term_leave_one_leader_per_epoch(
 ) {
     let (nodes, ledger, registry) =
         build_cluster_placed(1, Acks::Quorum, &["A", "B", "C"], "D").await;
+    followed_the_first_leader(&nodes, 1).await;
     for node in &nodes {
         spawn_assignment_poll_loop(node);
     }
@@ -3974,6 +4005,7 @@ async fn two_candidacies_from_one_term_leave_one_leader_per_epoch_when_b_is_held
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_rf2_split_where_both_replicas_lead_heals_onto_one_chain() {
     let (nodes, ledger, registry) = build_cluster_placed(1, Acks::All, &["A", "B"], "C").await;
+    followed_the_first_leader(&nodes, 1).await;
     for node in &nodes {
         spawn_assignment_poll_loop(node);
     }
@@ -4432,6 +4464,7 @@ async fn a_forwarded_read_never_accepts_the_system_actor() {
                 max_wait_ms: 0,
                 topic_generation: 0,
                 partitions: 0,
+                only_partitions: Vec::new(),
             },
         );
         let error = reply.error.unwrap_or_else(|| {
@@ -5639,5 +5672,472 @@ async fn a_topic_split_by_a_failover_is_gathered_at_once_and_goes_back_to_its_pr
         "{:?}",
         audit_details_of(find_node(&nodes, "C"), "bus.leader.transfer")
     );
+    shutdown_all(&nodes);
+}
+
+/// What a restarted node did to a leader that was alive and ahead of it.
+///
+/// RF=2, acks=leader. B goes down, A keeps acknowledging writes alone (its
+/// in-sync set shrinks to itself, but the replicated row still names B).
+/// B comes back on its old log with every link to A down, and no grace left
+/// to wait out: before the in-sync gate it stood over the live leader, won
+/// without anyone's consent, and A cut its log back to B's — every write
+/// acknowledged in between was gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_restarted_behind_a_live_leader_does_not_take_its_partition_and_no_acked_write_is_lost(
+) {
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let isr_of = |node: &TestNode| -> Vec<String> {
+        node.manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .map(|info| info.isr.clone())
+            .unwrap_or_default()
+    };
+    {
+        let a = find_node(&nodes, "A");
+        assert!(
+            wait_until(Duration::from_secs(10), || isr_of(a)
+                .iter()
+                .any(|m| m == "B"))
+            .await,
+            "the follower never joined the in-sync set"
+        );
+    }
+    let mut acked: Vec<String> = Vec::new();
+    for i in 0..20 {
+        let payload = format!("pre-{i}");
+        publish_text(find_node(&nodes, "A"), Some(0), &payload)
+            .await
+            .expect("publish before B goes down");
+        acked.push(payload);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            log_end_offset(find_node(&nodes, "B"), 0) >= 20
+        })
+        .await,
+        "B never caught up before going down"
+    );
+
+    // B goes down, its disk stays.
+    registry.peers.lock().remove("B");
+    let b_pos = nodes.iter().position(|n| n.id == "B").expect("node B");
+    let down = nodes.remove(b_pos);
+    down.manager.shutdown();
+    let TestNode {
+        db: b_db,
+        _bus_dir: b_bus_dir,
+        _db_dir: b_db_dir,
+        svc: b_svc,
+        manager: b_manager,
+        ..
+    } = down;
+    drop(b_manager);
+    drop(b_svc);
+
+    let a = find_node(&nodes, "A");
+    assert!(
+        wait_until(Duration::from_secs(10), || !isr_of(a)
+            .iter()
+            .any(|m| m == "B"))
+        .await,
+        "A never dropped the dead follower from its in-sync set"
+    );
+    for i in 0..30 {
+        let payload = format!("alone-{i}");
+        publish_text(a, Some(0), &payload)
+            .await
+            .unwrap_or_else(|e| panic!("publish {i} with B down: {e:?}"));
+        acked.push(payload);
+    }
+    assert_eq!(log_end_offset(a, 0), 50);
+
+    // B returns on its old log; no link between the two works.
+    registry.cut("A", "B");
+    let back = build_node_on(
+        "B",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+        b_bus_dir,
+        b_db_dir,
+        b_db,
+    );
+    spawn_background_loops(&back);
+    nodes.push(back);
+
+    // Long enough for B's lease on a leader that never dials to run out, for
+    // its elections to run, and for A to react to anything B claimed.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let b = find_node(&nodes, "B");
+    assert!(
+        !matches!(b.manager.role(ORG, TOPIC, 0), PartitionRole::Leader { .. }),
+        "the restarted node took the partition over a live leader"
+    );
+    let a = find_node(&nodes, "A");
+    assert!(
+        matches!(a.manager.role(ORG, TOPIC, 0), PartitionRole::Leader { .. }),
+        "A lost its leadership"
+    );
+    assert_eq!(log_end_offset(a, 0), 50, "A's log was cut back");
+    let held: Vec<String> = read_all_payloads(a, 0)
+        .into_iter()
+        .map(|p| String::from_utf8(p).expect("utf8 payload"))
+        .collect();
+    for payload in &acked {
+        assert!(
+            held.contains(payload),
+            "acknowledged write {payload} is gone from the leader"
+        );
+    }
+
+    // The links come back: B catches up from A and the logs agree.
+    registry.heal();
+    assert!(
+        wait_until(Duration::from_secs(20), || log_end_offset(
+            find_node(&nodes, "B"),
+            0
+        ) == 50)
+        .await,
+        "B never caught up once the links were back"
+    );
+    assert_eq!(
+        read_all_payloads(find_node(&nodes, "A"), 0),
+        read_all_payloads(find_node(&nodes, "B"), 0)
+    );
+    shutdown_all(&nodes);
+}
+
+/// The leader's stale row must not stand in for catching up.
+///
+/// RF=2, acks=leader. L crashes and F wins and acknowledges W alone. L comes
+/// back on its stale row (the row it led under is replayed at startup) and
+/// starts catching up from F, which then dies mid-catch-up. L is in F's live
+/// in-sync set from the moment it reconnects, but its log lacks part of W:
+/// standing alone at RF=2 would replace the only copy that has it. L must not
+/// stand, and when F returns every record of W is on both nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_restarted_on_its_stale_row_does_not_stand_when_the_new_leader_dies_mid_catch_up()
+{
+    const PRE: usize = 20;
+    const W: usize = 1200;
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let isr_of = |node: &TestNode| -> Vec<String> {
+        node.manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .map(|info| info.isr.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || isr_of(find_node(&nodes, "A"))
+            .iter()
+            .any(|m| m == "B"))
+        .await,
+        "the follower never joined the in-sync set"
+    );
+    let mut acked: Vec<String> = Vec::new();
+    for i in 0..PRE {
+        let payload = format!("pre-{i}");
+        publish_text(find_node(&nodes, "A"), Some(0), &payload)
+            .await
+            .expect("publish before the crash");
+        acked.push(payload);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || log_end_offset(
+            find_node(&nodes, "B"),
+            0
+        ) >= PRE as u64)
+        .await,
+        "B never caught up before the crash"
+    );
+    let key = (ORG.to_string(), TOPIC.to_string(), 0u32);
+    let stale_row = ledger
+        .rows
+        .lock()
+        .get(&key)
+        .cloned()
+        .expect("the row A led under");
+
+    // 1. A crashes, its disk stays; B wins and acknowledges W alone.
+    registry.peers.lock().remove("A");
+    let a_pos = nodes.iter().position(|n| n.id == "A").expect("node A");
+    let down = nodes.remove(a_pos);
+    down.manager.shutdown();
+    let TestNode {
+        db: a_db,
+        _bus_dir: a_bus_dir,
+        _db_dir: a_db_dir,
+        svc: a_svc,
+        manager: a_manager,
+        ..
+    } = down;
+    drop(a_manager);
+    drop(a_svc);
+    assert!(
+        wait_until(Duration::from_secs(30), || matches!(
+            find_node(&nodes, "B").manager.role(ORG, TOPIC, 0),
+            PartitionRole::Leader { .. }
+        ))
+        .await,
+        "B never took over from the crashed leader"
+    );
+    let b = find_node(&nodes, "B");
+    for batch in 0..(W / 50) {
+        let mut payloads = Vec::new();
+        let records: Vec<PublishRecord> = (0..50)
+            .map(|n| {
+                let payload = format!("w-{:04}-{}", batch * 50 + n, "x".repeat(32 * 1024));
+                payloads.push(payload.clone());
+                binary_record("w", payload.into_bytes())
+            })
+            .collect();
+        publish_records(b, Some(0), records)
+            .await
+            .unwrap_or_else(|e| panic!("publish batch {batch} on the new leader: {e:?}"));
+        acked.extend(payloads);
+    }
+    let total = (PRE + W) as u64;
+    assert_eq!(log_end_offset(b, 0), total);
+    // B's win left the row's in-sync set at [B]. Any later row that lists A
+    // again (a membership change, a transfer) makes it eligible to stand, which
+    // is the case the catch-up gate exists for.
+    if let Some(row) = ledger.rows.lock().get_mut(&key) {
+        row.isr = vec!["A".to_string(), "B".to_string()];
+    }
+
+    // 2. A restarts on its stale row and starts catching up from B.
+    let back = build_node_on(
+        "A",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+        a_bus_dir,
+        a_db_dir,
+        a_db,
+    );
+    back.manager.apply_assignment(stale_row).await;
+    spawn_background_loops(&back);
+    nodes.push(back);
+
+    // 3. B dies as soon as A has taken part of W and not all of it.
+    let a = find_node(&nodes, "A");
+    let started = tokio::time::Instant::now();
+    while log_end_offset(a, 0) <= PRE as u64 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "A never started catching up"
+        );
+        tokio::task::yield_now().await;
+    }
+    registry.peers.lock().remove("B");
+    let b_pos = nodes.iter().position(|n| n.id == "B").expect("node B");
+    let down = nodes.remove(b_pos);
+    down.manager.shutdown();
+    let TestNode {
+        db: b_db,
+        _bus_dir: b_bus_dir,
+        _db_dir: b_db_dir,
+        svc: b_svc,
+        manager: b_manager,
+        ..
+    } = down;
+    drop(b_manager);
+    drop(b_svc);
+    let a = find_node(&nodes, "A");
+    assert!(
+        log_end_offset(a, 0) < total,
+        "A had caught up before B died; the scenario needs a larger W"
+    );
+
+    // 4. A must not stand, for as long as its lease and elections run.
+    let stood = wait_until(Duration::from_secs(20), || {
+        matches!(a.manager.role(ORG, TOPIC, 0), PartitionRole::Leader { .. })
+    })
+    .await;
+    assert!(
+        !stood,
+        "the restarted node stood with a log that lacks acknowledged writes"
+    );
+
+    // 5. B returns: every record of W is on both nodes.
+    let returned = build_node_on(
+        "B",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+        b_bus_dir,
+        b_db_dir,
+        b_db,
+    );
+    spawn_background_loops(&returned);
+    nodes.push(returned);
+    assert!(
+        wait_until(Duration::from_secs(40), || log_end_offset(
+            find_node(&nodes, "A"),
+            0
+        ) == total
+            && log_end_offset(find_node(&nodes, "B"), 0) == total)
+        .await,
+        "the logs never agreed on {total} records: A {} B {}",
+        log_end_offset(find_node(&nodes, "A"), 0),
+        log_end_offset(find_node(&nodes, "B"), 0)
+    );
+    for node in nodes.iter().filter(|n| n.id == "A" || n.id == "B") {
+        let held: std::collections::HashSet<String> = read_all_payloads(node, 0)
+            .into_iter()
+            .map(|p| String::from_utf8(p).expect("utf8 payload"))
+            .collect();
+        for payload in &acked {
+            assert!(
+                held.contains(payload),
+                "acknowledged write {} is gone from node {}",
+                &payload[..payload.len().min(12)],
+                node.id
+            );
+        }
+    }
+    shutdown_all(&nodes);
+}
+
+/// A node that restarts on the row it led under takes no writes before it
+/// knows nobody leads above it.
+///
+/// RF=2, acks=leader. A leads and crashes; B wins the next epoch and
+/// acknowledges W alone. A restarts and replays its old row, which names it
+/// leader: with its writes open it would acknowledge a client write that B's
+/// fence then cuts away. The write is refused instead (retryable), and once
+/// the poll has A follow B nothing acknowledged by anyone is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_restarted_on_its_stale_row_refuses_writes_until_it_knows_nobody_leads_above() {
+    let (mut nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Leader, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            find_node(&nodes, "A")
+                .manager
+                .snapshot(ORG, Some(TOPIC))
+                .partitions
+                .iter()
+                .any(|p| p.partition == 0 && p.isr.iter().any(|n| n == "B"))
+        })
+        .await,
+        "the follower never joined the in-sync set"
+    );
+    let mut acked: Vec<String> = Vec::new();
+    for i in 0..20 {
+        let payload = format!("pre-{i}");
+        publish_text(find_node(&nodes, "A"), Some(0), &payload)
+            .await
+            .expect("publish before the crash");
+        acked.push(payload);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || log_end_offset(
+            find_node(&nodes, "B"),
+            0
+        ) >= 20)
+        .await,
+        "B never caught up before the crash"
+    );
+    let key = (ORG.to_string(), TOPIC.to_string(), 0u32);
+    let stale_row = ledger.rows.lock().get(&key).cloned().expect("A's row");
+
+    registry.peers.lock().remove("A");
+    let a_pos = nodes.iter().position(|n| n.id == "A").expect("node A");
+    let down = nodes.remove(a_pos);
+    down.manager.shutdown();
+    let TestNode {
+        db: a_db,
+        _bus_dir: a_bus_dir,
+        _db_dir: a_db_dir,
+        svc: a_svc,
+        manager: a_manager,
+        ..
+    } = down;
+    drop(a_manager);
+    drop(a_svc);
+    assert!(
+        wait_until(Duration::from_secs(30), || matches!(
+            find_node(&nodes, "B").manager.role(ORG, TOPIC, 0),
+            PartitionRole::Leader { .. }
+        ))
+        .await,
+        "B never took over from the crashed leader"
+    );
+    for i in 0..30 {
+        let payload = format!("w-{i}");
+        publish_text(find_node(&nodes, "B"), Some(0), &payload)
+            .await
+            .unwrap_or_else(|e| panic!("publish {i} on the new leader: {e:?}"));
+        acked.push(payload);
+    }
+
+    // A restarts and replays the row it led under, before any poll has told
+    // it better.
+    let back = build_node_on(
+        "A",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+        a_bus_dir,
+        a_db_dir,
+        a_db,
+    );
+    back.manager.apply_assignment(stale_row).await;
+    for i in 0..5 {
+        let refused = publish_text(&back, Some(0), &format!("stale-{i}")).await;
+        assert!(
+            refused.is_err(),
+            "the restarted node acknowledged a write on a stale row: {refused:?}"
+        );
+    }
+    spawn_background_loops(&back);
+    nodes.push(back);
+
+    let total = acked.len() as u64;
+    assert!(
+        wait_until(Duration::from_secs(30), || log_end_offset(
+            find_node(&nodes, "A"),
+            0
+        ) == total
+            && log_end_offset(find_node(&nodes, "B"), 0) == total)
+        .await,
+        "the logs never agreed on {total} records: A {} B {}",
+        log_end_offset(find_node(&nodes, "A"), 0),
+        log_end_offset(find_node(&nodes, "B"), 0)
+    );
+    for node in nodes.iter().filter(|n| n.id == "A" || n.id == "B") {
+        let held: Vec<String> = read_all_payloads(node, 0)
+            .into_iter()
+            .map(|p| String::from_utf8(p).expect("utf8 payload"))
+            .collect();
+        for payload in &acked {
+            assert!(held.contains(payload), "{payload} is gone from {}", node.id);
+        }
+        assert!(
+            !held.iter().any(|p| p.starts_with("stale-")),
+            "a refused write landed on {}",
+            node.id
+        );
+    }
     shutdown_all(&nodes);
 }

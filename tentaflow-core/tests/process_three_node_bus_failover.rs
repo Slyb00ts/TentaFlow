@@ -1339,6 +1339,10 @@ fn process_two_node_bus_eight_partitions_of_a_killed_leader_move_within_fifteen_
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // The survivor stands only once it has caught up with a leader since it
+    // started, which a heartbeat (500 ms) tells it; a leader killed in the
+    // instant the replica joined the in-sync set leaves the partition waiting.
+    std::thread::sleep(Duration::from_millis(1500));
     a.kill();
     let killed = Instant::now();
     drop(a);

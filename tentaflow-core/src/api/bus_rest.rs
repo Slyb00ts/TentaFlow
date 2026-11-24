@@ -1289,7 +1289,8 @@ fn serve_record_schema<B>(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    if let Err(resp) = precheck_api_key(db, &actor, Some(instance), topic, BusAction::Consume, facts)
+    if let Err(resp) =
+        precheck_api_key(db, &actor, Some(instance), topic, BusAction::Consume, facts)
     {
         return resp;
     }
@@ -1611,7 +1612,9 @@ pub(crate) mod test_support {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus init_instance");
         (dir, id, svc)
@@ -2675,7 +2678,9 @@ mod tests {
     #[test]
     fn parse_bus_record_schema_path_matches_only_the_instance_scoped_shape() {
         assert_eq!(
-            parse_bus_record_schema_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/42"),
+            parse_bus_record_schema_path(
+                "/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/42"
+            ),
             Some(("tentabus-0000abcd", "orders", 42))
         );
         for bad in [
@@ -2690,7 +2695,10 @@ mod tests {
         ] {
             assert_eq!(parse_bus_record_schema_path(bad), None, "{bad}");
         }
-        assert_eq!(parse_bus_records_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/1"), None);
+        assert_eq!(
+            parse_bus_records_path("/v1/bus/instances/tentabus-0000abcd/topics/orders/schemas/1"),
+            None
+        );
     }
 
     /// F4 B6: a key reads a Protobuf topic through a rule; the record carries
@@ -2703,8 +2711,14 @@ mod tests {
         let key = fx.key(&["read"]);
         let text = "syntax = \"proto3\"; message X { int32 a = 1; string b = 2; string c = 3; }";
         registry::register(
-            &fx.state.db, fx.instance.as_str(), ORG, "x.proto", SchemaType::Protobuf, text,
-            Some(Compatibility::None), None,
+            &fx.state.db,
+            fx.instance.as_str(),
+            ORG,
+            "x.proto",
+            SchemaType::Protobuf,
+            text,
+            Some(Compatibility::None),
+            None,
         )
         .unwrap();
         fx.svc
@@ -2722,19 +2736,40 @@ mod tests {
             .unwrap();
         let resource_id = topic_acl_resource_id(fx.instance.as_str(), ORG, "bytes");
         assert!(crate::db::repository::resource_permissions::set_topic_rule(
-            &fx.state.db, &resource_id, "api_key", &key, "read", "allow",
+            &fx.state.db,
+            &resource_id,
+            "api_key",
+            &key,
+            "read",
+            "allow",
         )
         .unwrap());
         let names = |n: &[&str]| -> std::collections::BTreeSet<String> {
             n.iter().map(|s| s.to_string()).collect()
         };
         field_policies::set_policy(
-            &fx.state.db, fx.instance.as_str(), ORG, "bytes", "any", field_policies::SUBJECT_ANY,
-            field_policies::Direction::Read, &names(&["a", "c"]), &names(&[]), &names(&[]), &names(&[]),
+            &fx.state.db,
+            fx.instance.as_str(),
+            ORG,
+            "bytes",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &names(&["a", "c"]),
+            &names(&[]),
+            &names(&[]),
+            &names(&[]),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
-        let full = [vec![0x08, 5], vec![0x12, 3], b"bee".to_vec(), vec![0x1a, 3], b"sea".to_vec()].concat();
+        let full = [
+            vec![0x08, 5],
+            vec![0x12, 3],
+            b"bee".to_vec(),
+            vec![0x1a, 3],
+            b"sea".to_vec(),
+        ]
+        .concat();
         fx.svc
             .publish(
                 &fx.user_ctx("u-admin"),
@@ -2753,15 +2788,25 @@ mod tests {
             )
             .expect("publish");
         let consumed = fx.send_to(
-            fx.instance.as_str(), "bytes", "GET", key_principal(&key), &own_group_query(&key), "",
+            fx.instance.as_str(),
+            "bytes",
+            "GET",
+            key_principal(&key),
+            &own_group_query(&key),
+            "",
         );
         assert_eq!(consumed.status, StatusCode::OK, "{}", consumed.json);
         let record = &consumed.json["records"][0];
         let payload = base64::engine::general_purpose::STANDARD
             .decode(record["payload"].as_str().unwrap())
             .unwrap();
-        assert_eq!(payload, [vec![0x08, 5], vec![0x1a, 3], b"sea".to_vec()].concat());
-        let schema_id = record["schema_id"].as_u64().expect("the id of the sub-schema") as u32;
+        assert_eq!(
+            payload,
+            [vec![0x08, 5], vec![0x1a, 3], b"sea".to_vec()].concat()
+        );
+        let schema_id = record["schema_id"]
+            .as_u64()
+            .expect("the id of the sub-schema") as u32;
         assert_ne!(schema_id, 0);
 
         let fetch_schema = |id: u32, principal: Option<Principal>| {
@@ -2782,11 +2827,12 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let resp = tokio::spawn(async move {
-                    record_schema(req, &db, &instance, "bytes", id).await
-                })
-                .await
-                .unwrap();
+                let resp =
+                    tokio::spawn(
+                        async move { record_schema(req, &db, &instance, "bytes", id).await },
+                    )
+                    .await
+                    .unwrap();
                 let status = resp.status();
                 let bytes = resp.into_body().collect().await.unwrap().to_bytes();
                 Reply {
@@ -2803,8 +2849,14 @@ mod tests {
         assert_eq!(served.json["schema_id"], schema_id);
         assert_eq!(served.json["schema_type"], "protobuf");
         let sub = served.json["schema"].as_str().unwrap();
-        assert!(sub.contains("int32 a = 1") && sub.contains("string c = 3"), "{sub}");
-        assert!(!sub.contains("string b"), "the hidden field is not in the sub-schema: {sub}");
+        assert!(
+            sub.contains("int32 a = 1") && sub.contains("string c = 3"),
+            "{sub}"
+        );
+        assert!(
+            !sub.contains("string b"),
+            "the hidden field is not in the sub-schema: {sub}"
+        );
         let missing = fetch_schema(schema_id.wrapping_add(1), key_principal(&key));
         assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.json);
         // A key with no right on the topic learns nothing.
@@ -2910,7 +2962,9 @@ mod tests {
                     records: vec![PublishRecord {
                         key: None,
                         headers: vec![],
-                        payload: Bytes::from_static(br#"{"id":1,"name":"Jan","pesel":"44051401359"}"#),
+                        payload: Bytes::from_static(
+                            br#"{"id":1,"name":"Jan","pesel":"44051401359"}"#,
+                        ),
                         timestamp_ms: chrono::Utc::now().timestamp_millis(),
                         schema_id: 0,
                     }],
@@ -3766,14 +3820,10 @@ mod tests {
         // The leader holds the same incarnation of the topic the follower
         // does, as a cluster's nodes do (the row is replicated, generation
         // included): a forwarded write states it and the leader checks it.
-        let mut row = crate::db::repository::bus_topic_get(
-            &fx.db(),
-            fx.svc.instance_id(),
-            ORG,
-            TOPIC,
-        )
-        .expect("read the follower's topic")
-        .expect("the follower's topic");
+        let mut row =
+            crate::db::repository::bus_topic_get(&fx.db(), fx.svc.instance_id(), ORG, TOPIC)
+                .expect("read the follower's topic")
+                .expect("the follower's topic");
         row.instance_id = leader.instance_id().to_string();
         crate::db::repository::bus_topic_create(&fx.db(), &row).expect("the leader's topic");
         leader
@@ -4151,28 +4201,63 @@ mod tests {
         assert!(message.contains("earliest retained offset 1"), "{message}");
     }
 
-    /// A topic whose partitions are led by different nodes is not handed to
-    /// one of them: the read is refused as before, nothing is sent.
-    #[test]
-    fn a_read_of_a_topic_led_by_several_nodes_is_not_forwarded() {
-        let fx = key_fixture("cccc4105");
-        let (_dir, leader_id, leader) = start_test_instance(&fx.state, "dddd4105");
+    /// `wide`, two partitions led by two other nodes, the first holding
+    /// `on_first` records and the second one.
+    fn split_topic(
+        suffix_a: &str,
+        suffix_b: &str,
+        on_first: usize,
+    ) -> (
+        KeyFixture,
+        BusCallContext,
+        std::sync::Arc<LoopbackCoordinator>,
+        tempfile::TempDir,
+    ) {
+        let fx = key_fixture(suffix_a);
+        let (_dir, leader_id, leader) = start_test_instance(&fx.state, suffix_b);
         let admin = fx.user_ctx("u-admin");
         let wide = TopicOptions {
             partitions: Some(2),
             ..TopicOptions::default()
         };
-        fx.svc.create_topic(&admin, "wide", wide.clone()).unwrap();
+        fx.svc.create_topic(&admin, "wide", wide).unwrap();
+        let leader_ctx = BusCallContext {
+            instance_id: leader_id,
+            ..admin.clone()
+        };
+        // The leader holds the same incarnation of the topic, as a cluster's
+        // nodes do.
+        let mut row =
+            crate::db::repository::bus_topic_get(&fx.db(), fx.svc.instance_id(), ORG, "wide")
+                .expect("read the topic")
+                .expect("the topic");
+        row.instance_id = leader.instance_id().to_string();
+        crate::db::repository::bus_topic_create(&fx.db(), &row).expect("the leader's topic");
         leader
-            .create_topic(
-                &BusCallContext {
-                    instance_id: leader_id,
-                    ..admin.clone()
-                },
-                "wide",
-                wide,
-            )
-            .unwrap();
+            .ensure_topic_incarnation(ORG, "wide", row.generation)
+            .expect("the leader's incarnation");
+        for partition in 0..2u32 {
+            let count = if partition == 0 { on_first } else { 1 };
+            leader
+                .publish(
+                    &leader_ctx,
+                    "wide",
+                    PublishBatch {
+                        partition: Some(partition),
+                        producer: None,
+                        records: (0..count)
+                            .map(|n| PublishRecord {
+                                key: None,
+                                headers: vec![],
+                                payload: Bytes::from(format!("p{partition}-{n}")),
+                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                schema_id: 0,
+                            })
+                            .collect(),
+                    },
+                )
+                .unwrap();
+        }
         let coordinator = LoopbackCoordinator::new(
             leader,
             vec![
@@ -4189,13 +4274,68 @@ mod tests {
         );
         fx.svc.set_replication(coordinator.clone());
         fx.grant("u-admin", "bus.read");
+        {
+            // The leaders ask again whether the user belongs to the organisation.
+            let conn = fx.state.db.write().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO user_accounts (id, username, password_hash, display_name) \
+                 VALUES ('u-admin', 'admin', 'x', 'Admin')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+                 VALUES (?1, 'u-admin', 'role-supervisor', '2026-09-29T00:00:00Z', 'test')",
+                rusqlite::params![ORG],
+            )
+            .unwrap();
+        }
+        (fx, admin, coordinator, _dir)
+    }
 
-        let err = fx
+    /// A topic whose partitions are led by different nodes is read one leader
+    /// at a time: each is asked for the partitions it leads, and the caller
+    /// gets the records of all of them (not a `bus_not_leader` while every
+    /// partition has a live leader).
+    #[test]
+    fn a_read_of_a_topic_led_by_several_nodes_is_served_by_each_leader_for_its_partitions() {
+        let (fx, admin, coordinator, _dir) = split_topic("cccc4105", "dddd4105", 1);
+        let records = fx
             .svc
             .consume_once(&admin, "reader-group", "wide", 1024, usize::MAX, 0)
-            .unwrap_err();
-        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
-        assert_eq!(LoopbackCoordinator::calls(&coordinator.consume_calls), 0);
+            .expect("a split topic is read, every partition having a leader");
+        let mut payloads: Vec<_> = records.iter().map(|r| r.payload.to_vec()).collect();
+        payloads.sort();
+        assert_eq!(payloads, vec![b"p0-0".to_vec(), b"p1-0".to_vec()]);
+        assert_eq!(
+            LoopbackCoordinator::calls(&coordinator.consume_calls),
+            2,
+            "one request per leader"
+        );
+        let again = fx
+            .svc
+            .consume_once(&admin, "reader-group", "wide", 1024, usize::MAX, 0)
+            .unwrap();
+        assert!(again.is_empty(), "each leader committed what it returned");
+    }
+
+    /// A partition that has many records must not keep another leader's from
+    /// being read: each leg gets its share of a read, not what is left of it.
+    #[test]
+    fn a_busy_partition_does_not_starve_the_other_leaders_of_a_split_topic() {
+        let (fx, admin, _coordinator, _dir) = split_topic("cccc4190", "dddd4190", 5);
+        let records = fx
+            .svc
+            .consume_once(&admin, "reader-group", "wide", 1024, 4, 0)
+            .expect("a split topic is read");
+        assert!(
+            records.iter().any(|r| r.payload.as_ref() == b"p1-0"),
+            "the second leader's record is in the first read of four: {:?}",
+            records
+                .iter()
+                .map(|r| r.payload.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The caller who may not read the topic is refused on the node it asked,

@@ -11488,6 +11488,7 @@
       "changes_title": "Cambios de nodo principal",
       "changes_sub": "Cuando el nodo principal deja de responder, otro nodo con una copia sincronizada toma el relevo. Aquí aparecen también los cambios hechos a mano.",
       "changes_none": "Aún no ha habido cambios de nodo principal.",
+      "changes_partial": "Esta lista puede estar incompleta: no se pudo leer el historial de otro nodo, por lo que se muestran las últimas entradas conocidas.",
       "change_name": "{topic} · partición {partition}: el nodo principal pasó de {from} a {to}",
       "change_took": "tardó {secs} s",
       "change_took_short": "tardó <1 s",

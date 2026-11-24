@@ -11488,6 +11488,7 @@
       "changes_title": "Führungswechsel",
       "changes_sub": "Wenn der führende Node nicht mehr antwortet, übernimmt ein anderer Node mit synchroner Kopie. Hier stehen auch manuelle Verschiebungen.",
       "changes_none": "Es gab noch keine Führungswechsel.",
+      "changes_partial": "Diese Liste ist möglicherweise unvollständig: Der Verlauf eines anderen Nodes konnte nicht gelesen werden, daher werden die zuletzt bekannten Einträge gezeigt.",
       "change_name": "{topic} · Partition {partition}: Führung ging von {from} auf {to} über",
       "change_took": "dauerte {secs} s",
       "change_took_short": "dauerte <1 s",

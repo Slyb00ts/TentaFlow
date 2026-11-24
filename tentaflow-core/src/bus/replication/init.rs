@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tentaflow_protocol::environment::NodeEnvironment;
 
@@ -215,17 +215,20 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         LeaderConfig::default(),
         Arc::clone(&metrics),
     ));
-    let follower_factory = Arc::new(GlueFollowerFactory::new(
-        cfg.local_node_id.clone(),
-        cfg.local_env,
-        Arc::clone(&cfg.provider),
-        FollowerConfig::default(),
-    ));
     let audit = Arc::new(AuditLogReplAudit::for_instance(
         cfg.db.clone(),
         cfg.local_node_id.clone(),
         cfg.instance_id.as_str(),
     ));
+    let follower_factory = Arc::new(
+        GlueFollowerFactory::new(
+            cfg.local_node_id.clone(),
+            cfg.local_env,
+            Arc::clone(&cfg.provider),
+            FollowerConfig::default(),
+        )
+        .with_audit(audit.clone()),
+    );
 
     // `cfg.instance_id` (checked against `cfg.provider.instance_id()`
     // above) is the ONE source of instance identity from here down —
@@ -446,7 +449,6 @@ pub fn stop(manager: &Arc<ReplicationManager>) {
 /// starts an election for it (`ReplicationManager::check_leases`'s own
 /// doc). Ends when `manager.shutdown_token()` is cancelled.
 fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) {
-    let manager_for_elections = manager.clone();
     let shutdown = manager.shutdown_token();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -457,26 +459,15 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
                 _ = ticker.tick() => {
                     // "Is the role this node holds still valid?": a leader a
                     // peer has proved stale steps down, and so does a leader
-                    // that no quorum has acknowledged for a whole lease. (A
-                    // follower whose leader stopped refreshing the lease
-                    // elects in its own loop below.)
+                    // that no quorum has acknowledged for a whole lease.
                     manager.check_stale_leadership().await;
                     manager.check_quorum_leases().await;
+                    // A follower whose leader stopped refreshing the lease
+                    // elects. Each election runs in a task of its own
+                    // (`check_leases` only starts them), so one that waits
+                    // for a silent peer holds back none of the checks above.
+                    manager.check_leases().await;
                 }
-            }
-        }
-    });
-    // Elections get their own loop: one waits for a silent peer for seconds,
-    // and a leader a peer has proved stale must step down on time, not behind
-    // it.
-    let shutdown = manager_for_elections.shutdown_token();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => manager_for_elections.check_leases().await,
             }
         }
     });
@@ -527,6 +518,57 @@ fn spawn_peer_liveness_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMesh
     });
 }
 
+/// How long a registered partition must stay out of the ledger's listing
+/// before it is forgotten. A joining replica's stream can adopt an entry from
+/// a `Hello` seconds ahead of its row reaching this node's ledger, and
+/// forgetting it then tears the stream down for a redial.
+const UNLISTED_FORGET_AFTER: Duration = Duration::from_secs(10);
+
+/// Partitions that stayed out of the ledger's listing for this node for
+/// `UNLISTED_FORGET_AFTER`, over at least two polls. The poll's own record of
+/// what it applied misses a partition another path applied (a `Hello` that
+/// read its row from the ledger, a promotion), and a topic deleted right after
+/// such an apply left an entry nothing ever dropped: the node kept electing
+/// for a topic that no longer existed.
+///
+/// Forgetting resets what the node earned for the partition (its catch-up
+/// flag), which is acceptable: it only makes a node that restarted before
+/// the others prove again that it holds what they acknowledged, and at RF 3
+/// and up a majority of logs decides anyway.
+#[derive(Default)]
+struct UnlistedPartitions {
+    since: HashMap<manager_mod::PartitionKey, Instant>,
+}
+
+impl UnlistedPartitions {
+    fn forgettable(
+        &mut self,
+        now: Instant,
+        registered: impl IntoIterator<Item = manager_mod::PartitionKey>,
+        listed: &std::collections::HashSet<manager_mod::PartitionKey>,
+    ) -> Vec<manager_mod::PartitionKey> {
+        let unlisted: std::collections::HashSet<_> = registered
+            .into_iter()
+            .filter(|key| !listed.contains(key))
+            .collect();
+        self.since.retain(|key, _| unlisted.contains(key));
+        let mut forget = Vec::new();
+        for key in unlisted {
+            match self.since.get(&key) {
+                Some(first) if now.saturating_duration_since(*first) >= UNLISTED_FORGET_AFTER => {
+                    self.since.remove(&key);
+                    forget.push(key);
+                }
+                Some(_) => {}
+                None => {
+                    self.since.insert(key, now);
+                }
+            }
+        }
+        forget
+    }
+}
+
 /// How long after start the node first looks at whether the one-off spread of
 /// existing topics is due: the replication streams and the peers' features
 /// need a moment to be known.
@@ -555,7 +597,7 @@ fn leader_spread_pause(
     use crate::bus::leader_balance::SpreadStatus;
     match status {
         SpreadStatus::Done => None,
-        SpreadStatus::NotTheRunner | SpreadStatus::NotYet("single_node" | "no_replication") => {
+        SpreadStatus::NotTheRunner | SpreadStatus::NotYet("no_replication") => {
             Some(LEADER_SPREAD_IDLE_INTERVAL)
         }
         SpreadStatus::NotYet(_) => Some(LEADER_SPREAD_LOOK_INTERVAL),
@@ -670,6 +712,7 @@ fn spawn_assignment_poll_loop(
     let shutdown = manager.shutdown_token();
     tokio::spawn(async move {
         let mut known: HashMap<manager_mod::PartitionKey, (u32, i64)> = HashMap::new();
+        let mut unlisted = UnlistedPartitions::default();
         let mut ticker = tokio::time::interval(ASSIGNMENT_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -708,6 +751,10 @@ fn spawn_assignment_poll_loop(
                         .cloned()
                         .collect();
                     for key in dropped {
+                        known.remove(&key);
+                        manager.forget_partition(&key);
+                    }
+                    for key in unlisted.forgettable(Instant::now(), manager.registered_partitions(), &listed) {
                         known.remove(&key);
                         manager.forget_partition(&key);
                     }
@@ -912,7 +959,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("init_instance must start the test engine");
         (dir, db, svc)
@@ -993,6 +1042,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_partition_is_forgotten_only_after_it_stayed_unlisted_for_a_while() {
+        let key = |p: u32| ("org".to_string(), "t".to_string(), p);
+        let t0 = Instant::now();
+        let mut tracker = UnlistedPartitions::default();
+        let listed: std::collections::HashSet<_> = [key(1)].into_iter().collect();
+        assert!(tracker
+            .forgettable(t0, [key(0), key(1)], &listed)
+            .is_empty());
+        // A second poll a second later: an entry adopted ahead of its row
+        // is still waiting for the ledger.
+        assert!(tracker
+            .forgettable(t0 + Duration::from_secs(1), [key(0), key(1)], &listed)
+            .is_empty());
+        assert!(tracker
+            .forgettable(t0 + Duration::from_secs(9), [key(0), key(1)], &listed)
+            .is_empty());
+        assert_eq!(
+            tracker.forgettable(t0 + UNLISTED_FORGET_AFTER, [key(0), key(1)], &listed),
+            vec![key(0)]
+        );
+        // Listed again in between: the wait starts over.
+        let both: std::collections::HashSet<_> = [key(0), key(1)].into_iter().collect();
+        let t1 = t0 + Duration::from_secs(20);
+        assert!(tracker
+            .forgettable(t1, [key(0), key(1)], &listed)
+            .is_empty());
+        assert!(tracker
+            .forgettable(t1 + Duration::from_secs(8), [key(0), key(1)], &both)
+            .is_empty());
+        assert!(tracker
+            .forgettable(t1 + Duration::from_secs(12), [key(0), key(1)], &listed)
+            .is_empty());
+        // Gone from the registry: nothing left to forget.
+        assert!(tracker
+            .forgettable(t1 + Duration::from_secs(40), [key(1)], &listed)
+            .is_empty());
+    }
+
     /// A run that left something to try again backs off 1, 2, 4 ... minutes up
     /// to half an hour; a node with nothing to do about the spread looks
     /// rarely, and one that is done looks no more.
@@ -1008,7 +1096,11 @@ mod tests {
         assert_eq!(steps, vec![1, 2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(minutes(SpreadStatus::Done, 3), None);
         assert_eq!(minutes(SpreadStatus::NotTheRunner, 0), Some(10));
-        assert_eq!(minutes(SpreadStatus::NotYet("single_node"), 0), Some(10));
+        assert_eq!(
+            leader_spread_pause(&SpreadStatus::NotYet("single_node"), 0),
+            Some(LEADER_SPREAD_LOOK_INTERVAL),
+            "a second node that joins is noticed within a look, not ten minutes"
+        );
         assert_eq!(
             leader_spread_pause(&SpreadStatus::NotYet("a_node_lacks_the_feature"), 0),
             Some(LEADER_SPREAD_LOOK_INTERVAL)

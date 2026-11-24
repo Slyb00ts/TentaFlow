@@ -424,28 +424,173 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     (połączenie QUIC przez relay trzeba odbudować, trwa to sekundy, a budżet
     `LeoQuery` to 300 ms), wyglądała jak śmierć lidera i kończyła się fałszywym
     `lease_expired`. Teraz: (1) w pre-vote przy RF≤2 kandydat, któremu nikt
-    nie odpowiedział, czeka na ten sam, już trwający dial jeszcze 3 s
-    (łącznie 300 ms + 3 s od pierwszego dialu, bez ponownego dialu); wynik
-    dla danego peera jest wspólny dla jego partycji. Runda głosowania nie
-    czeka. Awaria lidera jest więc przejmowana po ok. 6–12 s (dzierżawa 3 s,
-    pre-vote, głosowanie), a nie po 3–9 s; (2) węzeł, który od startu
-    procesu ani razu nie przyjął `Hello` od lidera i któremu nikt nie
-    odpowiedział, nie staje do elekcji przez 60 s od startu; do 120 s, dopóki
-    mesh pokazuje lidera jako połączonego albo wysyłającego heartbeat albo
-    lider odpowiedział jako lider w ciągu 15 s. Bez takiego dowodu karencja
-    kończy się po 60 s. `Hello` lidera przyjęty w trakcie elekcji przerywa ją
-    przed obietnicą terminu i przed propozycją.
-  - Elekcje partycji jednego węzła działają równolegle i we własnej pętli;
-    kontrole `check_stale_leadership` i `check_quorum_leases` nie czekają za
-    nimi, więc przestarzały lider RF=2 oddaje prowadzenie na czas.
+    nie odpowiedział, czeka jeszcze 3 s (łącznie 300 ms + 3 s od pierwszego
+    dialu); próba, która kończy się od razu odmową połączenia (restartujący
+    się peer), jest ponawiana co 250 ms do końca tego czasu, zamiast uznać
+    ciszę za śmierć. Partycje pytające ten sam węzeł w tym samym czasie
+    dzielą jeden dial na rundę (jedna próba na peera, jej wynik, także
+    porażka, dostają wszystkie). Runda głosowania nie czeka. Awaria lidera
+    jest więc przejmowana po ok. 6–12 s (dzierżawa 3 s, pre-vote,
+    głosowanie), a nie po 3–9 s; (2) węzeł, który od startu procesu ani razu
+    nie przyjął `Hello` od lidera i któremu nikt nie odpowiedział, nie staje
+    do elekcji przez 60 s od startu procesu (nie od przebudowania managera);
+    do 120 s, dopóki lider ma dowód życia: mesh pokazuje go jako połączonego
+    i świeżo słyszanego (sygnał w ciągu 15 s) albo lider odpowiedział jako
+    lider w ciągu 15 s. Bez takiego dowodu karencja kończy się po 60 s. Węzeł,
+    który przestał prowadzić partycję, zaczyna od zera: nie liczy się jako
+    „słyszał lidera”. Elekcję przerywa tylko lider, którego strumień do tego
+    węzła żyje w chwili decyzji, sprawdzony pod tym samym zamkiem co
+    rezerwacja obietnicy terminu; lider restartujący się w pętli, którego
+    strumień już się skończył, nie wstrzymuje przejęcia na zawsze.
+  - **Utrata potwierdzonych zapisów po restarcie repliki (krytyczne).** Węzeł,
+    który wstał po przerwie dłuższej niż kilkadziesiąt sekund, przy RF=2
+    stawał do elekcji po upływie karencji (120 s) nad żywym liderem, wygrywał
+    bez niczyjej zgody (jedna replika działa sama) i wymuszał na liderze
+    obcięcie logu do swojej, krótszej kopii. Zapisy przyjęte przez lidera w
+    czasie jego nieobecności (potwierdzone kodem 200) znikały, a skróty logów
+    na obu węzłach były równe. Bramka „jest w ISR” czytała zapisany wiersz
+    przydziału, a skurczenie ISR przez lidera jest lokalne i do wiersza nie
+    trafia, więc wiersz nadal wymieniał węzeł, który nie żył. Teraz węzeł
+    staje do elekcji tylko wtedy, gdy od startu procesu dogonił lidera (jego
+    log doszedł do znacznika high watermark, który lider zgłosił, albo sam
+    prowadził partycję), a ostatni zbiór ISR zgłoszony przez lidera, jeśli
+    taki był, wymienia ten węzeł. Zapis do wiersza nie jest możliwy w tej
+    postaci: ta sama epoka i ten sam lider nie są przyjmowane przez
+    materializer, a przy RF=2 większość to oba węzły, więc zmiana ISR nie
+    mogłaby się potwierdzić właśnie wtedy, gdy replika nie żyje. Skutek:
+    jeśli lider będący w ISR padnie, a drugi węzeł jeszcze nie nadrobił,
+    partycja zostaje bez lidera do powrotu repliki, która ma pełny log (świadomy
+    wybór zamiast cichej utraty danych). Obcięcie logu zrzekającego się
+    lidera, które odrzuca zapisy powyżej znacznika zatwierdzonego, jest
+    teraz zapisywane na poziomie error i w audycie `bus.leader.tail_discarded`.
+    Nie ma odmowy po stronie starego lidera: `Hello` nie niesie pozycji logu
+    nowego lidera, a leczenie rozdwojenia RF=2 opiera się na obcięciu.
+  - **Audyt `bus.leader.tail_discarded`.** Gdy zrzekający się lider obcina log do
+    znacznika zatwierdzonego i traci przy tym rekordy, które miał ponad nim,
+    dostaje to wpis na poziomie error i wiersz audytu z liczbą odrzuconych
+    rekordów i nowym końcem logu. Rekordy, których nie ma na żadnej innej
+    replice, są wtedy stracone; wpis jest sposobem, by to zobaczyć. Ten sam
+    zapis nie rozstrzyga, czy któryś z nich był potwierdzony kodem 200.
+  - **Kompromis bramki „dogonił lidera”.** Węzeł, który nie dogonił lidera od
+    startu procesu i nie może się skontaktować z którąś repliką, nie staje do
+    elekcji: partycja czeka bez lidera na replikę z pełnym logiem, zamiast
+    zgubić potwierdzone zapisy. Dotyczy to też RF=2, w którym drugi węzeł
+    zniknął na dłużej niż do pierwszego kontaktu. Restart wszystkich replik
+    naraz nie blokuje: gdy odpowiedzą wszystkie, a żadna nie prowadzi, węzeł staje.
+  - **Bramka „dogonił lidera” – poprawki po przeglądzie.** Odpowiedź peera,
+    który nie ma jeszcze zarejestrowanej instancji busa, wpisu w rejestrze albo
+    jest po zamknięciu managera, ma zera wyglądające jak pusty log. Nie liczy
+    się już jako odpowiedź: `ReplLeoReply` niesie pole `log_known`, a starszy
+    peer bez niego też nie liczy się węzłowi, który nie dogonił. W głosowaniu
+    odpowiedź musi być związana z tą epoką. To samo dotyczy okresu łaski po
+    restarcie. Flaga „dogonił” jest przypisana do epoki lidera, w której
+    została zdobyta, nie jest ustawiana przez odtworzenie starego wiersza po
+    starcie i znika z wyjściem partycji z rejestru. Cel dogonienia jest
+    zamrożony przy pierwszej ramce strumienia, więc węzeł dogania także pod
+    stałym obciążeniem zapisami. Reguła „odpowiedziały wszystkie repliki”
+    dotyczy tylko RF<=2; od RF=3 decyduje większość logów związanych z epoką.
+    Ponowna inicjalizacja replikacji zeruje flagi, co jest akceptowalne.
+  - **Zapisy lidera po restarcie są wstrzymane do potwierdzenia.** Węzeł, który
+    po starcie procesu dostaje wiersz wskazujący go jako lidera (to może być
+    stary wiersz odtworzony z księgi) i ma w partycji rekordy, nie przyjmuje
+    zapisów, dopóki nie wie, że nikt nie prowadzi partycji w nowszej epoce:
+    albo follower przyjął jego `Hello` w tej epoce, albo większość replik
+    (liczył się on sam) odpowiedziała własnym logiem i żadna nie obiecała ani
+    nie zna wyższej epoki. Do tego czasu publikacja kończy się ponawialnym
+    `NotLeader`. Bez tego lider po restarcie przy RF=2 potwierdzał zapisy
+    (acks=leader), które potem obcinał nowy lider. Pełny restart klastra nie
+    blokuje: gdy wszystkie repliki odpowiedzą i nikt nie jest dalej, zapisy
+    otwierają się przy pierwszej rundzie pytań (250 ms). Partycja bez rekordów
+    jest prowadzona od razu. Czas od restartu do otwarcia zapisów zapisuje log
+    `replication: leader writes opened after the restart check`.
+  - **Przekazanie lidera czeka, aż follower zastosuje wiersze grup.** Pauza i
+    wznowienie grupy konsumentów są wysyłane przed przekazaniem partycji
+    (nie czekają na tick koalescencji), a follower potwierdza w `Ack` pole
+    `groups_applied`, które zastosował (pole opcjonalne: starszy follower go nie
+    ma, wtedy liczy się wysłanie). Czekanie jest ograniczone do 2 s; ostatnie
+    wysłanie następuje tuż przed zatrzymaniem starego lidera. Zmiana wiersza
+    grupy po tym ostatnim wysłaniu, a przed zatrzymaniem, jest replikowana jak
+    każdy inny wiersz, bez gwarancji.
+  - **Ograniczenia, o których trzeba wiedzieć.** Ocalały węzeł, który po
+    (ponownym) połączeniu nie dostał żadnej ramki od lidera, nie staje do
+    elekcji sam: lider, który umrze w ciągu około jednego heartbeatu (500 ms)
+    od powrotu repliki, zostawia partycję bez lidera do jego powrotu. Podczas
+    aktualizacji partycja RF=2 może stać, gdy jeden węzeł ma starą wersję, a
+    drugi nową (pole `log_known`): aktualizować węzły po jednym i przed
+    kolejnym restartem sprawdzić, że oba są na nowej wersji.
+  - **Audyt przekazanych żądań wg listy.** Ograniczanie wpisów dotyczy tylko
+    żądań z jawnej listy tylko-do-odczytu (`READ_ONLY_VARIANTS`); wszystko
+    inne, w tym `ProjectStudioCasesBulkStatusRequest`, jest audytowane za
+    każdym razem po obu stronach. Zastępuje to heurystykę po nazwie.
+  - **Kroki lidera na jednym ticku.** Zrzeczenie się nieaktualnego przywództwa
+    (blokujące ogrodzenie i obcięcie logu) działa w osobnym zadaniu na
+    partycję, więc nie wstrzymuje elekcji ani sprawdzenia kworum.
+  - **`bus.leader.tail_discarded` także po stronie followera.** Follower, któremu
+    nowy lider obcina log (`Truncate`), zapisuje liczbę odrzuconych rekordów.
+  - **Polecenia mesh.** Limit czasu zależy od rodzaju polecenia: transfery
+    modeli i wdrożenia nie są ucinane po 10 minutach (modele: do 25 h, tyle
+    ile czeka wołający). Cofnięcie zaufania przerywa trwające polecenie, a
+    peer nie dostaje nowych uprawnień, dopóki jego stare polecenia trzymają sloty.
+  - **Odczyt tematu rozdzielonego między liderów.** Każdy lider dostaje swój
+    udział w odczycie (nie głodzą go partycje wcześniej na liście), a konsument
+    jest otwierany raz na wywołanie.
+  - **Audyt przekazanych żądań.** Rozpoznanie żądań tylko do odczytu jest
+    ścisłe: `...StatusSetRequest` i `...StatusUpdateRequest` zmieniają dane i
+    nie są już ograniczane. Klucz ograniczania zawiera organizację.
+  - **Zapomnienie partycji.** Wpis, którego nie ma w księdze, jest zapominany
+    dopiero po 10 s nieobecności, nie po dwóch odpytaniach.
+  - **Znacznik świeżej instalacji** nie jest ustawiany na węźle, który ma
+    zaufane węzły, a jeszcze nie zsynchronizował wierszy.
+  - **Uścisk dłoni strumienia replikacji ma limit czasu (10 s).** Lider czekał na
+    `HelloAck` bez limitu; strumień, na którym druga strona milczy, wisiał do
+    wygaśnięcia bezczynnego połączenia QUIC (40 s) plus 5 s ponownego łączenia,
+    czyli cykl co 45 s widoczny w logach po restarcie. Teraz kończy się po 10 s i
+    od razu łączy się ponownie. To usuwa wiszenie, ale nie wyjaśnia, dlaczego
+    strona przyjmująca milczała: przyczyny po stronie węzła po restarcie nie
+    ustalono.
+  - **Odczyt topiku rozdzielonego między nody.** `GET .../records` na topiku,
+    którego partycje prowadzą różne nody, nie kończy się już `503
+    bus_not_leader`: każdy lider jest pytany o swoje partycje (nowe pole
+    `only_partitions` w `ConsumeForward`), a odpowiedź zawiera rekordy
+    wszystkich. Gdy któryś lider zawiedzie po tym, jak inny zwrócił rekordy,
+    odpowiedź zawiera to, co już odczytano (ci liderzy zatwierdzili swój odczyt).
+    Partycja bez znanego lidera nadal daje `bus_not_leader`.
+  - **Zapis, który czekał na koniec przenosin lidera**, nie dostaje już 503: po
+    przenosinach jest ponawiany raz na nowego lidera. Gdy przenosiny trwają
+    dłużej niż 2 s, zapis nadal dostaje `bus_not_leader` bez nazwanego lidera
+    (producent ponawia).
+  - **Stan węzła w liście replik** (`reachable`) widzi węzeł, z którym łączy
+    strumień replikacji, jako niedostępny po 5 s ciszy na strumieniu, a nie po
+    15 s od ostatniego sygnału mesh (20-25 s od zabicia węzła).
+  - **Po świeżej instalacji** rozkład „po aktualizacji” jest oznaczany jako
+    wykonany od razu (przy pierwszym sprawdzeniu), a instalacja z topikami na
+    jednym węźle sprawdza co 30 s, czy dołączył drugi (było 10 min).
+  - **Audyt `app.route.execute`** dla żądań tylko do odczytu: jeden wiersz na
+    użytkownika, węzeł i wariant w oknie 10 min, jak wiersz węzła źródłowego.
+  - **Nazwy węzłów (D2):** nazwa z rejestru synchronizacji równa nazwie hosta
+    któregokolwiek węzła jest traktowana jak ta nazwa i nie rozróżnia węzłów.
+  - Każda elekcja działa we własnym zadaniu (najwyżej 16 naraz), a tyknięcie
+    pętli dzierżaw tylko je startuje i nie czeka na ich koniec: wolna elekcja
+    jednej partycji nie wstrzymuje startu elekcji innej, a partycja z trwającą
+    elekcją jest pomijana. Kontrole `check_stale_leadership` i
+    `check_quorum_leases` działają w tej samej pętli co start elekcji.
+    Zrzeczenie się prowadzenia z powodu braku kworum dotyczy tylko tego
+    prowadzenia, które utraciło kworum, nie późniejszego.
   - Wywołania dashboardu kierowane na inny węzeł (`targetNodeId`) kończyły się
     po 5 s błędem `no assertion key ... known for node`. Pętla zdarzeń mesh
     obsługiwała polecenie od peera w miejscu: `AppRouteOp` prosiło nadawcę o
     klucze asercji, a odpowiedź na to pytanie przychodzi tą samą pętlą, więc
     czekała, aż pytanie wygaśnie. Polecenia peerów działają teraz we własnych
-    zadaniach, ograniczonych do 32 na peera i 256 na węzeł (kolejne dostaje od
-    razu odpowiedź „busy”); kończą się z pętlą, z rozłączeniem peera i z
-    utratą zaufania do niego.
+    zadaniach, ograniczonych do 32 na peera i 256 na węzeł; zezwolenie jest
+    trzymane przez cały czas trwania polecenia. Kolejne polecenie dostaje od
+    razu odpowiedź „busy” z kodem błędu `busy` (nadawca odróżnia ją od błędu
+    polecenia i może ponowić później). Odpowiedź „busy” jest wysyłana z
+    osobnego zadania, najwyżej 8 naraz i do 2 s, więc nie blokuje pętli
+    zdarzeń, a nadmiarowe są pomijane bez odpowiedzi; odmowy loguje się
+    najwyżej raz na minutę na peera. Polecenie trwa do końca albo do 10 min
+    (wtedy odpowiedź z błędem „command timed out”); rozłączenie peera go nie
+    przerywa, a utrata zaufania pomija polecenia jeszcze nierozpoczęte i
+    odpowiedzi tych w toku.
   - Audyt `app.route.forward` powstaje tylko dla przekazania, na które węzeł
     docelowy odpowiedział, z nazwą wariantu i wynikiem. Zapytania tylko do
     odczytu (`*List`, `*Get` i podobne) są audytowane raz na 10 min dla

@@ -405,6 +405,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         promises: true,
                         bus_features: 0,
                         instance_unhosted: true,
+                        log_known: false,
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }

@@ -319,7 +319,9 @@ pub async fn start_mesh_pipeline(
                                 }
                                 break;
                             }
-                            Err(e) => debug!("baseline adopt: wznowienie post-commit odroczone: {}", e),
+                            Err(e) => {
+                                debug!("baseline adopt: wznowienie post-commit odroczone: {}", e)
+                            }
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
@@ -985,7 +987,6 @@ async fn handle_peer_disconnected(
     qm_events: Arc<IrohMeshManager>,
     mesh_security: Option<Arc<MeshSecurity>>,
     last_sync_sent: Arc<dashmap::DashMap<String, std::time::Instant>>,
-    command_tasks: Arc<crate::mesh::command_tasks::CommandTasks>,
 ) {
     // Po disconnect czyscimy cooldown — przy reconnecie od razu zsynchronizujemy klucze.
     last_sync_sent.remove(&node_id);
@@ -1001,8 +1002,6 @@ async fn handle_peer_disconnected(
     peer_store.set_quic_connected(&node_id, false);
     peer_store.set_status(&node_id, "disconnected");
     peer_store.clear_heartbeat(&node_id);
-    // What the peer asked is no longer wanted: nobody is there to answer.
-    command_tasks.cancel_peer(&node_id);
     info!(peer_id = %node_id, "QUIC peer rozlaczony");
 
     // F1b P3.B — disconnected peer's HMAC keys are no longer trustworthy
@@ -1226,7 +1225,14 @@ fn spawn_quic_event_handler(
                                 peer_store.set_hostname(&entry.node_id, hostname);
                             }
                         } else {
-                            peer_store.upsert_gossip_peer(&entry.node_id, hostname, "", "", addrs, 0);
+                            peer_store.upsert_gossip_peer(
+                                &entry.node_id,
+                                hostname,
+                                "",
+                                "",
+                                addrs,
+                                0,
+                            );
                         }
                         peer_store.set_status(&entry.node_id, "discovered");
                         if !target_trusted {
@@ -1695,7 +1701,6 @@ fn spawn_quic_event_handler(
                     let qm_events_c = qm_events.clone();
                     let mesh_security_c = mesh_security.clone();
                     let last_sync_sent_c = last_sync_sent.clone();
-                    let command_tasks_c = command_tasks.clone();
                     tokio::spawn(async move {
                         let _guard = peer_lock.lock().await;
                         handle_peer_disconnected(
@@ -1704,7 +1709,6 @@ fn spawn_quic_event_handler(
                             qm_events_c,
                             mesh_security_c,
                             last_sync_sent_c,
-                            command_tasks_c,
                         )
                         .await;
                     });
@@ -2353,7 +2357,9 @@ fn spawn_quic_event_handler(
                             // secret was set, so an adopting node passes it on.
                             // Adoption requires a strictly newer version, which
                             // ends the relay once the fleet has converged.
-                            qm_events.push_shared_secrets_to_trusted(Some(&node_id)).await;
+                            qm_events
+                                .push_shared_secrets_to_trusted(Some(&node_id))
+                                .await;
                         }
                         Err(e) => warn!(from = %node_id, "SharedSecretsSync rejected: {e}"),
                     }
@@ -2424,16 +2430,34 @@ fn spawn_quic_event_handler(
                     match command_tasks.try_start(&from_node_id) {
                         Some(slot) => {
                             let qm = qm_events.clone();
-                            tokio::spawn(async move {
-                                tokio::select! {
-                                    _ = slot.cancel.cancelled() => {}
-                                    _ = qm.handle_command_received(&from_node_id, &command) => {}
-                                }
+                            let cancel = slot.cancel.clone();
+                            // The slot moves into the task: its permits live
+                            // exactly as long as the command runs.
+                            crate::mesh::command_tasks::spawn_holding(slot, async move {
+                                qm.handle_command_received(&from_node_id, &command, &cancel)
+                                    .await;
                             });
                         }
                         None => {
-                            warn!(from = %from_node_id, "Odrzucono komende: za duzo polecen w toku");
-                            qm_events.respond_command_busy(&from_node_id, &command).await;
+                            if command_tasks.should_warn_busy(&from_node_id) {
+                                warn!(from = %from_node_id, "Odrzucono komende: za duzo polecen w toku");
+                            }
+                            // Not awaited here: opening the reply stream can
+                            // wait for QUIC credit, and this loop must keep
+                            // draining events. Dropped silently when the busy
+                            // replies themselves are at their limit. The event
+                            // only arrives from a trusted peer.
+                            if let Some(permit) = command_tasks.busy_reply_permit() {
+                                let qm = qm_events.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let _ = tokio::time::timeout(
+                                        crate::mesh::command_tasks::BUSY_REPLY_TIMEOUT,
+                                        qm.respond_command_busy(&from_node_id, &command),
+                                    )
+                                    .await;
+                                });
+                            }
                         }
                     }
                 }

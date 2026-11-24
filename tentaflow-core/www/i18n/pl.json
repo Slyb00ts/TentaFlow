@@ -12211,7 +12211,7 @@
         "leader_label": "Node prowadzący",
         "summary_leader": "dobierze instancja — node preferowany dla najmniejszej liczby partycji (teraz {node}: {count} {n|partycja|partycje|partycji})",
         "summary_leader_auto": "dobierze instancja — node preferowany dla najmniejszej liczby partycji",
-        "summary_leader_tie": "dobierze instancja — jeden z nodów: {nodes} albo {last} (każdy preferowany dla {count} {n|partycja|partycje|partycji})",
+        "summary_leader_tie": "dobierze instancja — jeden z nodów: {nodes} albo {last} (każdy preferowany dla {count} {n|partycji|partycji|partycji})",
         "summary_leader_old": "node, na którym powstaje topik — instancja dobierze go sama dopiero po aktualizacji wszystkich nodów"
       },
       "delete": {
@@ -12562,6 +12562,7 @@
       "changes_title": "Przejęcia prowadzenia",
       "changes_sub": "Gdy node prowadzący przestaje odpowiadać, inny node ze zgodną kopią przejmuje prowadzenie. Tu są też przeniesienia zrobione ręcznie.",
       "changes_none": "Nie było jeszcze przejęć prowadzenia.",
+      "changes_partial": "Lista może być niepełna: nie udało się odczytać historii z innego noda, więc pokazano ostatnio znane wpisy.",
       "change_name": "{topic} · partycja {partition}: prowadzenie przeszło z {from} na {to}",
       "change_took": "trwało {secs} s",
       "change_took_short": "trwało <1 s",

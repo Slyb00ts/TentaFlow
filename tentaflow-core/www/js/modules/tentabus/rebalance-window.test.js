@@ -340,12 +340,38 @@ test('a node without a label is named by its short id in the route, with the ful
   assert.match(plain(w.q('impact').innerHTML), /41291e27 będzie prowadził/);
 });
 
-test('the result of a split topic says how many partitions moved against all the topic has', async () => {
-  const splitMove = { ...moves[0], partitions: [0, 1, 3] };
-  const w = setup({ loadPlan: async () => ({ ...plan, moves: [splitMove] }), apply: async () => [{ ...splitMove, status: 'moved' }] });
+/** A topic whose partitions are led by `leaders` (one node id per partition) and its dead-letter partitions by `dlq`. */
+function withDlq(topic, leaders, dlq) {
+  const rows = (nodes) => nodes.map((leaderNodeId, partition) => ({ partition, leaderNodeId, replicas: ['a', 'b'], preferredLeaderNodeId: 'b', isr: ['a', 'b'], lagging: [] }));
+  return { topic, partitions: rows(leaders), dlqPartitions: rows(dlq) };
+}
+
+async function applyOne(move, leaders, dlq) {
+  const w = setup({ loadPlan: async () => ({ ...plan, moves: [move] }), apply: async () => [{ ...move, status: 'moved' }] });
+  w.view.replicaTopics = [withDlq(move.topic, leaders, dlq)];
+  w.view.topics = [{ name: move.topic }];
   await tick();
+  const preview = w.q('moves').rows[0];
   w.act('apply').click();
   await tick();
   await tick();
-  assert.deepEqual(w.q('moves').rows.map((r) => plain(r.detail)), ['przeniesiono 3 z 4']);
+  return { preview, result: w.q('moves').rows[0] };
+}
+
+test('a topic that moved whole with its dead-letter partitions counts both sides over the same set', async () => {
+  const move = { topic: 'przyjecia', partitions: [0, 1, 2, 3], fromNodeId: 'a', toNodeId: 'b', returnsToPreferred: true };
+  const { preview, result } = await applyOne(move, ['a', 'a', 'a', 'a'], ['a', 'a', 'a', 'a']);
+  assert.equal(preview.parts, '8', 'the preview counts the topic and its dead-letter partitions');
+  assert.equal(plain(result.detail), 'przeniesiono 8 z 8');
+});
+
+test('a split topic names the nodes its partitions really come from and counts only those that moved', async () => {
+  const move = { topic: 'przyjecia', partitions: [3], fromNodeId: 'b', toNodeId: 'b', returnsToPreferred: true };
+  const { preview, result } = await applyOne(move, ['b', 'b', 'b', 'a'], ['b', 'b', 'b', 'b']);
+  assert.equal(plain(preview.route), 'Serwer A → Serwer B', 'not "B → B"');
+  assert.equal(preview.parts, '1');
+  assert.equal(plain(result.detail), 'przeniesiono 1 z 8');
+  const several = await applyOne({ ...move, partitions: [1, 3] }, ['a', 'b', 'a', 'b'], ['a', 'a', 'a', 'a']);
+  assert.equal(plain(several.preview.route), 'Serwer A → Serwer B');
+  assert.equal(plain(several.result.detail), 'przeniesiono 6 z 8');
 });

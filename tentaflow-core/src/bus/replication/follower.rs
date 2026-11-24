@@ -152,6 +152,79 @@ pub struct ExpectedLeader {
     /// Where the stream leaves the leader's live in-sync set, as its
     /// heartbeats report it.
     pub leader_isr: LeaderIsr,
+    /// Set once this stream has brought the local log up to what the leader
+    /// reported as its high watermark. Shared across every stream of the
+    /// partition since the process started (`FollowerRunnerFactory::
+    /// caught_up_since_start`).
+    pub caught_up: CaughtUp,
+    /// Told when a leader's `Truncate` cuts records off this copy's log.
+    pub discarded: TailDiscard,
+}
+
+/// Where a follower reports the records a leader's `Truncate` cut off its
+/// log (`ReplAudit::tail_discarded`). Empty reports nowhere.
+#[derive(Clone, Default)]
+pub struct TailDiscard(Option<Arc<dyn Fn(u64, u64) + Send + Sync>>);
+
+impl TailDiscard {
+    pub fn new(report: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(report)))
+    }
+
+    fn report(&self, discarded: u64, new_leo: u64) {
+        if let Some(report) = &self.0 {
+            report(discarded, new_leo);
+        }
+    }
+}
+
+impl std::fmt::Debug for TailDiscard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TailDiscard")
+    }
+}
+
+/// Whether this node's copy of a partition has, since the process started,
+/// reached the leader's high watermark at least once. In memory only: a
+/// restart forgets it, which is the point — a node that was down while the
+/// leader went on acknowledging writes has not seen them, whatever the
+/// persisted placement still says about it.
+///
+/// Tied to a term: it holds the leader epoch it was earned under, and counts
+/// only while the partition's assignment is still at that epoch. A leader
+/// elected since has acknowledged writes this copy has not seen.
+#[derive(Debug, Clone, Default)]
+pub struct CaughtUp(Arc<std::sync::atomic::AtomicU32>);
+
+impl CaughtUp {
+    pub fn set(&self, epoch: u32) {
+        self.0.store(epoch, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the copy was caught up under `epoch` (never for epoch 0).
+    pub fn holds_for(&self, epoch: u32) -> bool {
+        epoch != 0 && self.0.load(std::sync::atomic::Ordering::SeqCst) == epoch
+    }
+
+    pub fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What a stream has to reach to count as caught up: the leader's position
+/// as of the first frame it sent, frozen. Compared with the leader's moving
+/// high watermark, a follower that is always a few records behind under
+/// steady writes would never be caught up.
+#[derive(Debug, Default)]
+struct CatchUpTarget(Option<u64>);
+
+impl CatchUpTarget {
+    fn note(&mut self, flag: &CaughtUp, epoch: u32, leo: u64, leader_position: u64) {
+        let target = *self.0.get_or_insert(leader_position);
+        if leo >= target {
+            flag.set(epoch);
+        }
+    }
 }
 
 /// The in-sync set the leader of a followed partition last reported
@@ -454,6 +527,10 @@ where
     // lease watchdog or the disconnect hint (see `FrameReader`'s doc).
     let mut frames = FrameReader::new(reader);
     let mut batches_since_ack: u32 = 0;
+    // The newest group rows applied, reported in every ack.
+    let mut groups_applied: u64 = 0;
+    let mut groups_ack_due = false;
+    let mut catch_up = CatchUpTarget::default();
     let mut last_ack_at = Instant::now();
     let ack_timer_armed = !follower.config.ack_interval.is_zero();
 
@@ -525,6 +602,12 @@ where
                         }
 
                         partition.set_high_watermark(header.hw);
+                        catch_up.note(
+                            &expected.caught_up,
+                            hello.leader_epoch,
+                            partition.log_end_offset(),
+                            header.hw,
+                        );
                         if let Some(committed) = header.committed {
                             partition.set_committed_offset(committed);
                         }
@@ -536,6 +619,12 @@ where
                             expected.leader_isr.set(isr);
                         }
                         partition.set_high_watermark(hb.hw);
+                        catch_up.note(
+                            &expected.caught_up,
+                            hello.leader_epoch,
+                            partition.log_end_offset(),
+                            hb.hw.max(hb.leader_leo),
+                        );
                         if let Some(committed) = hb.committed {
                             partition.set_committed_offset(committed);
                         }
@@ -571,8 +660,15 @@ where
                             );
                         } else {
                             let hw_before = partition.high_watermark();
+                            let leo_before = partition.log_end_offset();
                             match partition.truncate_to_offset_for_leader_authority(t.to_offset) {
                                 Ok(new_leo) => {
+                                    // Records this copy held that the new
+                                    // leader does not: some may have been
+                                    // acknowledged by a leader that is gone.
+                                    if new_leo < leo_before {
+                                        expected.discarded.report(leo_before - new_leo, new_leo);
+                                    }
                                     // The log is not the only thing that can be
                                     // ahead of the leader: a group's committed
                                     // offset outlives the records it points at,
@@ -653,6 +749,7 @@ where
                         }
                     }
                     ReplFrame::Offsets(offsets) => {
+                        let groups_gen = offsets.groups_gen;
                         // fjall writes with an fsync per frame: on the
                         // blocking pool, not on this stream's task.
                         let (stores, org_id, topic) =
@@ -666,6 +763,12 @@ where
                                 "applying an Offsets frame did not finish: {e}"
                             )))
                         })??;
+                        // Said at once, not at the next ack tick: a leader
+                        // handing the partition over waits for it.
+                        if groups_gen > groups_applied {
+                            groups_applied = groups_gen;
+                            groups_ack_due = true;
+                        }
                     }
                     ReplFrame::LeoQuery(_query) => {
                         let reply = ReplLeoReply {
@@ -684,6 +787,7 @@ where
                             promises: true,
                             bus_features: 0,
                             instance_unhosted: false,
+                            log_known: true,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }
@@ -697,16 +801,19 @@ where
                 // A confirmed term is acked at once: until a majority's acks
                 // say so, the leader keeps the earlier-term records it re-fed
                 // from consumers.
-                let ack_owed = cadence_frame
-                    && (term_confirmed
-                        || batches_since_ack >= follower.config.ack_every_n_batches
-                        || last_ack_at.elapsed() >= follower.config.ack_interval
-                        || (batches_since_ack > 0 && !frames.frame_ready()?));
+                let ack_owed = groups_ack_due
+                    || (cadence_frame
+                        && (term_confirmed
+                            || batches_since_ack >= follower.config.ack_every_n_batches
+                            || last_ack_at.elapsed() >= follower.config.ack_interval
+                            || (batches_since_ack > 0 && !frames.frame_ready()?)));
                 if ack_owed {
+                    groups_ack_due = false;
                     send_ack(
                         &mut writer,
                         &partition,
                         follower.leader_epoch(),
+                        groups_applied,
                         &mut batches_since_ack,
                         &mut last_ack_at,
                     )
@@ -718,6 +825,7 @@ where
                     &mut writer,
                     &partition,
                     follower.leader_epoch(),
+                    groups_applied,
                     &mut batches_since_ack,
                     &mut last_ack_at,
                 )
@@ -788,6 +896,7 @@ async fn send_ack<W: AsyncWrite + Unpin>(
     writer: &mut W,
     partition: &Partition,
     leader_epoch: u32,
+    groups_applied: u64,
     batches_since_ack: &mut u32,
     last_ack_at: &mut Instant,
 ) -> Result<(), FollowerError> {
@@ -796,6 +905,7 @@ async fn send_ack<W: AsyncWrite + Unpin>(
         follower_leo: partition.log_end_offset(),
         follower_hw: partition.high_watermark(),
         follower_log_epoch: Some(partition.log_epoch()),
+        groups_applied: Some(groups_applied),
     };
     write_frame(writer, &ReplFrame::Ack(ack)).await?;
     *batches_since_ack = 0;
@@ -917,6 +1027,8 @@ mod tests {
             partition: PART,
             local_node_id: LOCAL_NODE.to_string(),
             leader_isr: LeaderIsr::default(),
+            caught_up: CaughtUp::default(),
+            discarded: TailDiscard::default(),
         }
     }
 
@@ -1929,6 +2041,68 @@ mod tests {
     /// a follower stream, and under the `FollowLeo` default `hw == leo`
     /// always, so a truncate there could only ever be the below-hw refusal
     /// the test above covers.
+    /// A follower cut back by a new leader's `Truncate` reports what it lost,
+    /// as a stepped-down leader does: some of those records may have been
+    /// acknowledged by the leader that is gone.
+    #[tokio::test]
+    async fn a_follower_truncated_by_a_new_leader_reports_the_records_it_lost() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        partition.set_hw_tracking(HwTracking::Manual);
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let reported = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(u64, u64)>::new()));
+        let mut expect = expected();
+        let sink = reported.clone();
+        expect.discarded = TailDiscard::new(move |discarded, new_leo| {
+            sink.lock().push((discarded, new_leo));
+        });
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition.clone(),
+            stores,
+            NodeEnvironment::Prod,
+            expect,
+            fast_config(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(2, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        let _ = read_frame(&mut leader).await.unwrap();
+        for (payload, base) in [("a", 0u64), ("b", 1), ("c", 2), ("d", 3), ("e", 4)] {
+            write_frame(
+                &mut leader,
+                &batch_frame(base, (base + 1).min(3), 2, payload),
+            )
+            .await
+            .unwrap();
+            let _ = read_frame(&mut leader).await.unwrap();
+        }
+        write_frame(
+            &mut leader,
+            &ReplFrame::Truncate(ReplTruncate {
+                leader_epoch: 2,
+                to_offset: 3,
+            }),
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if !reported.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*reported.lock(), vec![(2, 3)]);
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn divergent_local_log_is_truncated_back_to_leader_authority_and_the_chain_resumes() {
         let part_dir = tempfile::tempdir().unwrap();
@@ -2030,6 +2204,61 @@ mod tests {
         let _ = handle.await.unwrap(); // transport error on EOF, not a hang
     }
 
+    /// Group rows are acknowledged as applied, at once, with the generation the
+    /// leader gave them: a leader handing the partition over waits for that.
+    #[tokio::test]
+    async fn applied_group_rows_are_acknowledged_with_their_generation() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition,
+            stores,
+            NodeEnvironment::Prod,
+            expected(),
+            // No periodic ack soon: only an ack owed for the rows can arrive.
+            FollowerConfig {
+                ack_every_n_batches: 1000,
+                ack_interval: Duration::from_secs(3600),
+                leader_lease: Duration::from_secs(60),
+            },
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(1, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        let _ = read_frame(&mut leader).await.unwrap();
+        write_frame(
+            &mut leader,
+            &ReplFrame::Offsets(ReplOffsets {
+                leader_epoch: 1,
+                commits: vec![],
+                discarded: vec![],
+                groups: vec![],
+                groups_gen: 7,
+            }),
+        )
+        .await
+        .unwrap();
+        let ack = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut leader))
+            .await
+            .expect("no ack for the group rows")
+            .unwrap()
+        {
+            ReplFrame::Ack(a) => a,
+            other => panic!("expected Ack, got {other:?}"),
+        };
+        assert_eq!(ack.groups_applied, Some(7));
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn offsets_frame_is_applied_and_visible_and_never_regresses() {
         let part_dir = tempfile::tempdir().unwrap();
@@ -2064,6 +2293,7 @@ mod tests {
                 commits: vec![("grp-a".to_string(), PART, 10, 0)],
                 discarded: vec![(PART, 3)],
                 groups: vec![],
+                groups_gen: 0,
             }),
         )
         .await
@@ -2078,6 +2308,7 @@ mod tests {
                 commits: vec![("grp-a".to_string(), PART, 4, 0)],
                 discarded: vec![],
                 groups: vec![],
+                groups_gen: 0,
             }),
         )
         .await
@@ -2157,6 +2388,7 @@ mod tests {
                 commits: vec![("grp-b".to_string(), PART, 20, 5)],
                 discarded: vec![],
                 groups: vec![],
+                groups_gen: 0,
             }),
         )
         .await
@@ -2368,5 +2600,35 @@ mod tests {
 
         drop(leader);
         let _ = handle.await.unwrap();
+    }
+
+    /// The flag is the term it was earned under, not a switch: a leader
+    /// elected since has acknowledged writes this copy has not seen.
+    #[test]
+    fn a_catch_up_counts_only_under_the_term_it_was_earned_in() {
+        let flag = CaughtUp::default();
+        assert!(!flag.holds_for(2));
+        flag.set(2);
+        assert!(flag.holds_for(2));
+        assert!(!flag.holds_for(3), "a newer term needs its own catch-up");
+        assert!(!flag.holds_for(0));
+        flag.clear();
+        assert!(!flag.holds_for(2));
+    }
+
+    /// Under steady writes the leader's position moves on every publish; the
+    /// target is the one at the stream's first frame, so a copy that is
+    /// always a few records behind still gets there.
+    #[test]
+    fn catching_up_under_sustained_writes_sets_the_flag() {
+        let flag = CaughtUp::default();
+        let mut target = CatchUpTarget::default();
+        target.note(&flag, 3, 0, 100);
+        assert!(!flag.holds_for(3));
+        // The leader keeps writing: 150, 200 ... while the copy gains.
+        target.note(&flag, 3, 60, 150);
+        assert!(!flag.holds_for(3));
+        target.note(&flag, 3, 100, 200);
+        assert!(flag.holds_for(3), "reached the position of the first frame");
     }
 }

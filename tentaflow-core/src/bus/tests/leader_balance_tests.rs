@@ -671,6 +671,40 @@ fn the_spread_after_an_upgrade_runs_once_and_is_audited_as_the_system() {
     assert_eq!(audit_details(&svc, "bus.leader.rebalance").len(), 1);
 }
 
+/// A fresh install has no topic from before the upgrade, so there is nothing
+/// for an "after upgrade" spread to do, and the first restart after a second
+/// node joined must not run one. An install with topics, all on this node,
+/// still waits for a second node.
+#[test]
+fn the_spread_is_marked_done_at_once_on_a_fresh_install() {
+    let (_dir, svc, coordinator) = service_with("n1", Vec::new());
+    assert_eq!(svc.run_post_upgrade_spread(), SpreadStatus::Done);
+    assert_eq!(spread_marker(&svc).as_deref(), Some("done"));
+    assert!(coordinator.transfers.lock().is_empty());
+
+    let rows = vec![row("a", 0, "n1", &["n1"])];
+    let (_dir, svc, _coordinator) = service_with("n1", rows);
+    assert_eq!(
+        svc.run_post_upgrade_spread(),
+        SpreadStatus::NotYet("single_node")
+    );
+    assert_eq!(spread_marker(&svc), None);
+}
+
+/// A node that has just joined a cluster sees no rows before its ledger has
+/// synced; it must not take that for a fresh install.
+#[test]
+fn a_node_with_trusted_peers_and_no_rows_yet_is_not_marked_done() {
+    let (_dir, svc, _coordinator) = service_with("n1", Vec::new());
+    crate::db::repository::add_trusted_node(&svc.db, "n2", "aa", "peer", "test", None)
+        .expect("trust a peer");
+    assert_eq!(
+        svc.run_post_upgrade_spread(),
+        SpreadStatus::NotYet("peers_not_synced")
+    );
+    assert_eq!(spread_marker(&svc), None);
+}
+
 #[test]
 fn the_spread_waits_while_a_peer_does_not_advertise_the_feature() {
     let (_dir, svc, coordinator) = service_with("n1", four_topics_on("n1", "n2"));

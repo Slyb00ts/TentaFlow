@@ -116,15 +116,230 @@ pub(crate) fn registry_name_in(state: &super::state::AppState, node_id: &str) ->
 // Origin side — the proxy
 // =============================================================================
 
-/// Whether a forwarded request only reads: `...ListRequest`, `...GetRequest`,
-/// and the like. A dashboard polls these every few seconds, so their origin
-/// audit rows are thinned (`audit_forward`).
+/// The forwarded requests that only read, by their `variant_name_of` name. A
+/// dashboard polls these every few seconds, so their audit rows are thinned
+/// (`audit_forward`, `execute_audit_due`). Listed by name, not guessed from
+/// it: a name that reads like a query can change data
+/// (`ProjectStudioCasesBulkStatusRequest` sets the status of many cases), and
+/// a request missing here is audited every time. Sorted, for the lookup.
+const READ_ONLY_VARIANTS: &[&str] = &[
+    "AgentRunDetailRequest",
+    "AgentRunsListRequest",
+    "AgentsDetailRequest",
+    "AgentsListRequest",
+    "AliasConsumerListRequest",
+    "ApiKeyListRequest",
+    "ApiKeyScopeListRequest",
+    "AppsListRequest",
+    "AuditLogListRequest",
+    "BaselineAdoptStatusRequest",
+    "BaselineDonorListRequest",
+    "BenchmarkGetRequest",
+    "BenchmarkListRequest",
+    "BusAclListRequest",
+    "BusDlqListRequest",
+    "BusFieldPolicyListRequest",
+    "BusFieldPolicyPreviewRequest",
+    "BusGroupDetailRequest",
+    "BusGroupListRequest",
+    "BusQuotaGetRequest",
+    "BusReplicaListRequest",
+    "BusSchemaDerivedGetRequest",
+    "BusSchemaFieldsGetRequest",
+    "BusSchemaForRecordGetRequest",
+    "BusSchemaGetRequest",
+    "BusSchemaSubjectListRequest",
+    "BusSchemaVersionListRequest",
+    "BusStatsSnapshotRequest",
+    "BusTopicDetailRequest",
+    "BusTopicListRequest",
+    "CatalogListRequest",
+    "ClusterDetailRequest",
+    "ClusterListRequest",
+    "CodeStudioApprovalsListRequest",
+    "CodeStudioCodeSearchRequest",
+    "CodeStudioGitStatusRequest",
+    "CodeStudioIndexStatusRequest",
+    "CodeStudioPatchBlobGetRequest",
+    "CodeStudioProjectLinkListRequest",
+    "CodeStudioSessionGrantsListRequest",
+    "CodeStudioSessionsListRequest",
+    "CodeStudioTerminalSnapshotRequest",
+    "CodeStudioTerminalsListRequest",
+    "CodeStudioWorkspaceGetRequest",
+    "CodeStudioWorkspacesListRequest",
+    "CodeStudioWorktreesListRequest",
+    "ContainerListRequest",
+    "DeploymentListRequest",
+    "DeploymentStatusRequest",
+    "FastPathListRequest",
+    "FlowDetailRequest",
+    "FlowExecutionsListRequest",
+    "FlowListRequest",
+    "FlowNodeTemplatesListRequest",
+    "FlowVersionGetRequest",
+    "FlowVersionListRequest",
+    "HubEngineListRequest",
+    "HubModelSearchRequest",
+    "LegalDocumentsListRequest",
+    "MapDeviceListRequest",
+    "MapSceneListRequest",
+    "MapSiteListRequest",
+    "MePreferencesGetRequest",
+    "MeetingSessionListRequest",
+    "MeshNodeDetailRequest",
+    "MeshNodeListRequest",
+    "MeshPeersListRequest",
+    "MeshPendingListRequest",
+    "MeshServicesListRequest",
+    "MeshTrustedListRequest",
+    "MlStudioSchemaGetRequest",
+    "ModelAliasListRequest",
+    "ModelConsumerListRequest",
+    "ModelDetailRequest",
+    "ModelListRequest",
+    "ModelVisibilityListRequest",
+    "MyOAuthAccountsListRequest",
+    "NetworkConfigGetRequest",
+    "NetworkInterfacesListRequest",
+    "NetworkRelayStatusRequest",
+    "NgcStatusRequest",
+    "NimCatalogListRequest",
+    "OrgStructureHandoverListRequest",
+    "OrgStructureHistoryListRequest",
+    "OrgStructureMemberListRequest",
+    "PiiRuleListRequest",
+    "ProcessDefinitionGetRequest",
+    "ProcessDefinitionListRequest",
+    "ProcessInstanceGetRequest",
+    "ProcessInstanceListRequest",
+    "ProcessInstanceModelGetRequest",
+    "ProcessInstanceTokensGetRequest",
+    "ProcessMessageGetRequest",
+    "ProcessMessageListRequest",
+    "ProcessScopeGetRequest",
+    "ProcessUserTaskGetRequest",
+    "ProcessVersionGetRequest",
+    "ProcessVersionListRequest",
+    "ProjectStudioActivityListRequest",
+    "ProjectStudioAttachmentGetRequest",
+    "ProjectStudioAttachmentPreviewRequest",
+    "ProjectStudioAttachmentUploadStatusRequest",
+    "ProjectStudioBuildProfileGetRequest",
+    "ProjectStudioCaseGetRequest",
+    "ProjectStudioCaseVersionGetRequest",
+    "ProjectStudioCasesListRequest",
+    "ProjectStudioCatalogueGetRequest",
+    "ProjectStudioChatsListRequest",
+    "ProjectStudioCreatorGrantsListRequest",
+    "ProjectStudioEnvApprovalsListRequest",
+    "ProjectStudioEnvironmentsListRequest",
+    "ProjectStudioGenerationGetRequest",
+    "ProjectStudioGenerationsListRequest",
+    "ProjectStudioIngestStatusRequest",
+    "ProjectStudioKbSearchRequest",
+    "ProjectStudioMembersListRequest",
+    "ProjectStudioMlLinksListRequest",
+    "ProjectStudioNotificationsListRequest",
+    "ProjectStudioProjectExportStatusRequest",
+    "ProjectStudioProjectGetRequest",
+    "ProjectStudioProjectImportStatusRequest",
+    "ProjectStudioProjectInheritancePreviewRequest",
+    "ProjectStudioProjectLifecyclePreviewRequest",
+    "ProjectStudioProjectScopePreviewRequest",
+    "ProjectStudioProjectsListRequest",
+    "ProjectStudioRunArtifactGetRequest",
+    "ProjectStudioRunAutoGetRequest",
+    "ProjectStudioRunGetRequest",
+    "ProjectStudioRunItemGetRequest",
+    "ProjectStudioRunnersListRequest",
+    "ProjectStudioRunsListRequest",
+    "ProjectStudioScheduleRunsListRequest",
+    "ProjectStudioSchedulesListRequest",
+    "ProjectStudioSourceFilePreviewRequest",
+    "ProjectStudioSourceFilesListRequest",
+    "ProjectStudioSourcesListRequest",
+    "ProjectStudioSuiteGetRequest",
+    "ProjectStudioSuitesListRequest",
+    "ProjectStudioTaskGetRequest",
+    "ProjectStudioTaskIndexStatusRequest",
+    "ProjectStudioTaskLinksListRequest",
+    "ProjectStudioTaskTransferPreviewRequest",
+    "ProjectStudioTaskTypesListRequest",
+    "ProjectStudioTasksListRequest",
+    "PromptDetailRequest",
+    "PromptListRequest",
+    "ProviderAccountAccountGetRequest",
+    "ProviderAccountAccountListRequest",
+    "ProviderAccountLoginStatusRequest",
+    "ProviderAccountMyAccountListRequest",
+    "ProviderAccountRuntimeListRequest",
+    "ProviderAccountSessionListRequest",
+    "RegistryListRequest",
+    "RobotGeoAnchorGetRequest",
+    "RobotsListRequest",
+    "RoleCatalogGetRequest",
+    "RoleCatalogListRequest",
+    "SchedulerJobsListRequest",
+    "SchedulerRunsListRequest",
+    "ServiceAccountListRequest",
+    "ServiceListRequest",
+    "SkillsDetailRequest",
+    "SkillsHubSearchRequest",
+    "SkillsListRequest",
+    "SlaBreachListRequest",
+    "SlaPolicyGetRequest",
+    "SlaPolicyListRequest",
+    "SlaStatusRequest",
+    "SsoProvidersListRequest",
+    "SyncConflictsListRequest",
+    "TentaNasAlertsListRequest",
+    "TentaNasApprovalsListRequest",
+    "TentaNasDatasetGetRequest",
+    "TentaNasDatasetsListRequest",
+    "TentaNasDiskGetRequest",
+    "TentaNasDisksListRequest",
+    "TentaNasElasticArrayGetRequest",
+    "TentaNasElasticArraysListRequest",
+    "TentaNasFleetMountsListRequest",
+    "TentaNasJobGetRequest",
+    "TentaNasJobsListRequest",
+    "TentaNasNodesListRequest",
+    "TentaNasPoolGetRequest",
+    "TentaNasPoolsListRequest",
+    "TentaNasSchedulesListRequest",
+    "TentaNasShareGetRequest",
+    "TentaNasShareUsersListRequest",
+    "TentaNasSharesListRequest",
+    "TentaNasSnapshotSchedulesListRequest",
+    "TentaNasSnapshotsListRequest",
+    "TentaNasTargetGetRequest",
+    "TentaNasTargetsListRequest",
+    "TentaQuantExampleGetRequest",
+    "TentaQuantExampleListRequest",
+    "TentaQuantFileListRequest",
+    "TentaQuantKataGetRequest",
+    "TentaQuantKataListRequest",
+    "TentaQuantLabListRequest",
+    "TentaQuantNotebookGetRequest",
+    "TentaQuantNotebookListRequest",
+    "TentaQuantProjectGetRequest",
+    "TentaQuantProjectListRequest",
+    "TentaQuantRunGetRequest",
+    "TentaQuantRunListRequest",
+    "TentaQuantTargetListRequest",
+    "TentaVmHostGetRequest",
+    "TentaVmHostGrantsListRequest",
+    "TentaVmHostsListRequest",
+    "TentaVmJobGetRequest",
+    "TentaVmJobsListRequest",
+    "TlsStatusRequest",
+    "TtsRuleListRequest",
+    "VoiceProfileListRequest",
+];
+
 fn is_read_only_variant(variant: &str) -> bool {
-    [
-        "List", "Get", "Detail", "Status", "Snapshot", "Search", "Preview",
-    ]
-    .iter()
-    .any(|verb| variant.contains(verb))
+    READ_ONLY_VARIANTS.binary_search(&variant).is_ok()
 }
 
 /// How long a read-only forward by one user to one node is audited once.
@@ -132,19 +347,45 @@ const READ_ONLY_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_se
 
 /// Whether a read-only forward `(user, node, variant)` was audited within
 /// `READ_ONLY_AUDIT_WINDOW`; records it when it was not.
-fn read_only_forward_is_new(user: &str, node: &str, variant: &str) -> bool {
+fn read_only_forward_is_new(
+    scope: &'static str,
+    org: &str,
+    user: &str,
+    node: &str,
+    variant: &str,
+) -> bool {
     static SEEN: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<(String, String, String), std::time::Instant>>,
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                (&'static str, String, String, String, String),
+                std::time::Instant,
+            >,
+        >,
     > = std::sync::OnceLock::new();
     let mut seen = SEEN.get_or_init(Default::default).lock();
     let now = std::time::Instant::now();
     seen.retain(|_, at| now.duration_since(*at) < READ_ONLY_AUDIT_WINDOW);
-    let key = (user.to_string(), node.to_string(), variant.to_string());
+    let key = (
+        scope,
+        org.to_string(),
+        user.to_string(),
+        node.to_string(),
+        variant.to_string(),
+    );
     if seen.contains_key(&key) {
         return false;
     }
     seen.insert(key, now);
     true
+}
+
+/// Whether the executing node writes its `app.route.execute` row for this
+/// request: always for one that changes something, once per window for a
+/// read-only one. Its own window, apart from the origin's, so the two rows of
+/// one request on a node that is both do not hide each other.
+fn execute_audit_due(org: &str, user: &str, from_node: &str, variant: &str) -> bool {
+    !is_read_only_variant(variant)
+        || read_only_forward_is_new("execute", org, user, from_node, variant)
 }
 
 /// Origin-side audit of a forward the executing node answered: WHERE the user
@@ -161,7 +402,9 @@ fn audit_forward(
     variant: &str,
     outcome: &str,
 ) {
-    if is_read_only_variant(variant) && !read_only_forward_is_new(&org.user_id, node_id, variant) {
+    if is_read_only_variant(variant)
+        && !read_only_forward_is_new("forward", &org.org_id, &org.user_id, node_id, variant)
+    {
         return;
     }
     let _ = crate::db::repository::log_audit_full(
@@ -382,22 +625,31 @@ async fn execute_remote_side_inner(
     // the wire supplied the user id and nothing that grants anything.
     let ctx = remote_proxy::handler_context(&state, &verified)?;
 
-    // Executor-side audit with the REAL user, not "mesh peer".
-    let _ = crate::db::repository::log_audit_full(
-        &state.db,
-        Some(&verified.user_id),
-        None,
-        "app.route.execute",
-        Some("mesh_node"),
-        Some(from_node_id),
-        Some(variant_name),
-        "info",
-        "B",
-        None,
-        Some(&verified.org_id),
-        None,
-        Some(&state.local_node_id),
-    );
+    // Executor-side audit with the REAL user, not "mesh peer". A read-only
+    // request is audited once per user, node and variant per window, like the
+    // origin's row: a dashboard polling another node would fill the table.
+    if execute_audit_due(
+        &verified.org_id,
+        &verified.user_id,
+        from_node_id,
+        variant_name,
+    ) {
+        let _ = crate::db::repository::log_audit_full(
+            &state.db,
+            Some(&verified.user_id),
+            None,
+            "app.route.execute",
+            Some("mesh_node"),
+            Some(from_node_id),
+            Some(variant_name),
+            "info",
+            "B",
+            None,
+            Some(&verified.org_id),
+            None,
+            Some(&state.local_node_id),
+        );
+    }
 
     let (response, _is_error) = remote_proxy::with_remote_origin(
         assertion::digest_hex(payload_cbor),
@@ -409,5 +661,128 @@ async fn execute_remote_side_inner(
         // code (PolicyDenied / AppUnavailable / NotFound...) unchanged.
         MessageBody::Error(error) => Err(error),
         other => encode_body(&other),
+    }
+}
+
+#[cfg(test)]
+mod audit_thinning_tests {
+    use super::*;
+
+    #[test]
+    fn a_read_only_request_is_audited_once_per_window_and_a_change_every_time() {
+        assert!(execute_audit_due(
+            "o",
+            "u-thin",
+            "n-thin",
+            "ProjectStudioCasesListRequest"
+        ));
+        assert!(!execute_audit_due(
+            "o",
+            "u-thin",
+            "n-thin",
+            "ProjectStudioCasesListRequest"
+        ));
+        assert!(!execute_audit_due(
+            "o",
+            "u-thin",
+            "n-thin",
+            "ProjectStudioCasesListRequest"
+        ));
+        assert!(execute_audit_due(
+            "o",
+            "u-thin2",
+            "n-thin",
+            "ProjectStudioCasesListRequest"
+        ));
+        assert!(execute_audit_due(
+            "o",
+            "u-thin",
+            "n-thin2",
+            "ProjectStudioCasesListRequest"
+        ));
+        assert!(
+            execute_audit_due("o2", "u-thin", "n-thin", "ProjectStudioCasesListRequest"),
+            "another org is audited on its own"
+        );
+        assert!(execute_audit_due(
+            "o",
+            "u-thin",
+            "n-thin",
+            "BusTopicDetailRequest"
+        ));
+        for _ in 0..3 {
+            assert!(execute_audit_due(
+                "o",
+                "u-thin",
+                "n-thin",
+                "ProjectStudioCaseDeleteRequest"
+            ));
+        }
+    }
+
+    #[test]
+    fn a_request_that_changes_a_status_is_never_thinned() {
+        for name in [
+            "ProjectStudioCaseStatusSetRequest",
+            "MeetingActionItemStatusUpdateRequest",
+            "ProjectStudioCasesBulkStatusRequest",
+        ] {
+            assert!(!is_read_only_variant(name), "{name}");
+            for _ in 0..3 {
+                assert!(execute_audit_due("o", "u-status", "n-status", name));
+            }
+        }
+        for name in [
+            "ProjectStudioCasesListRequest",
+            "BusTopicDetailRequest",
+            "TentaNasPoolGetRequest",
+            "SlaStatusRequest",
+        ] {
+            assert!(is_read_only_variant(name), "{name}");
+        }
+    }
+
+    /// The list is only worth anything if it is sorted (the lookup is a binary
+    /// search) and names variants that exist.
+    #[test]
+    fn the_read_only_list_is_sorted_and_names_real_variants() {
+        assert!(READ_ONLY_VARIANTS.windows(2).all(|w| w[0] < w[1]));
+        let source = include_str!("mod.rs");
+        for name in READ_ONLY_VARIANTS {
+            assert!(
+                source.contains(&format!("=> \"{name}\"")),
+                "{name} is not a variant of `variant_name_of`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_origin_and_the_executor_of_one_request_do_not_hide_each_other() {
+        assert!(read_only_forward_is_new(
+            "forward",
+            "o",
+            "u-both",
+            "n-both",
+            "FlowListRequest"
+        ));
+        assert!(execute_audit_due(
+            "o",
+            "u-both",
+            "n-both",
+            "FlowListRequest"
+        ));
+        assert!(!read_only_forward_is_new(
+            "forward",
+            "o",
+            "u-both",
+            "n-both",
+            "FlowListRequest"
+        ));
+        assert!(!execute_audit_due(
+            "o",
+            "u-both",
+            "n-both",
+            "FlowListRequest"
+        ));
     }
 }

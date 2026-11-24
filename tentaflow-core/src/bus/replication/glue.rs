@@ -51,7 +51,7 @@ use tentaflow_bus::{HwTracking, Partition};
 use crate::bus::replication::assignment::PartitionAssignment;
 use crate::bus::replication::election::LogPosition;
 use crate::bus::replication::follower::{
-    self, ExpectedLeader, FollowerConfig, FollowerExit, FollowerStores, LeaderIsr,
+    self, CaughtUp, ExpectedLeader, FollowerConfig, FollowerExit, FollowerStores, LeaderIsr,
 };
 use crate::bus::replication::frames::{ReplHello, ReplProducerMark, ReplReject};
 use crate::bus::replication::leader::{
@@ -799,6 +799,26 @@ impl LeaderHandle for GlueLeaderHandle {
             })
     }
 
+    fn flush_groups_to(&self, node: &str, within: Duration) {
+        let until = Instant::now() + within;
+        loop {
+            // Asked again each round: a change noted just before is read by
+            // the stream after the first request has been served.
+            self.0.leader.request_offsets_flush();
+            if self.0.leader.groups_flushed_to(node) {
+                return;
+            }
+            if Instant::now() >= until {
+                tracing::warn!(
+                    node,
+                    "replication: the consumer-group rows did not reach the transfer's target in time"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn open_writes(&self) {
         let mut writes = self.0.writes.lock();
         if !writes.stopped && !writes.open {
@@ -999,6 +1019,19 @@ pub struct GlueFollowerFactory {
     config: FollowerConfig,
     restart_stand_grace: Duration,
     lone_candidate_probe: Duration,
+    /// Per partition incarnation: whether this process has seen the local log
+    /// reach the leader's high watermark, or has led it
+    /// (`FollowerRunnerFactory::caught_up_since_start`).
+    caught_up: dashmap::DashMap<String, CaughtUp>,
+    /// Where the records a leader's `Truncate` cuts off a copy are reported.
+    audit: Option<Arc<dyn super::manager::ReplAudit>>,
+}
+
+fn caught_up_key(assignment: &PartitionAssignment) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        assignment.org_id, assignment.topic, assignment.partition, assignment.topic_generation
+    )
 }
 
 impl GlueFollowerFactory {
@@ -1015,7 +1048,37 @@ impl GlueFollowerFactory {
             config,
             restart_stand_grace: RESTART_STAND_GRACE,
             lone_candidate_probe: LONE_CANDIDATE_PROBE,
+            caught_up: dashmap::DashMap::new(),
+            audit: None,
         }
+    }
+
+    /// Reports through `audit` the records a leader's `Truncate` cuts off a
+    /// copy this factory runs (`ReplAudit::tail_discarded`).
+    pub fn with_audit(mut self, audit: Arc<dyn super::manager::ReplAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    fn discard_reporter(&self, assignment: &PartitionAssignment) -> super::follower::TailDiscard {
+        let Some(audit) = self.audit.clone() else {
+            return Default::default();
+        };
+        let (org, topic, partition) = (
+            assignment.org_id.clone(),
+            assignment.topic.clone(),
+            assignment.partition,
+        );
+        super::follower::TailDiscard::new(move |discarded, new_leo| {
+            audit.tail_discarded(&org, &topic, partition, discarded, new_leo)
+        })
+    }
+
+    fn caught_up_flag(&self, assignment: &PartitionAssignment) -> CaughtUp {
+        self.caught_up
+            .entry(caught_up_key(assignment))
+            .or_default()
+            .clone()
     }
 
     /// Replaces the delays before a replica no other replica answered stands
@@ -1057,6 +1120,19 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
 
     fn restart_stand_grace(&self) -> Duration {
         self.restart_stand_grace
+    }
+
+    fn caught_up_since_start(&self, assignment: &PartitionAssignment) -> bool {
+        self.caught_up_flag(assignment)
+            .holds_for(assignment.leader_epoch)
+    }
+
+    fn note_led(&self, assignment: &PartitionAssignment) {
+        self.caught_up_flag(assignment).set(assignment.leader_epoch);
+    }
+
+    fn forget_caught_up(&self, assignment: &PartitionAssignment) {
+        self.caught_up.remove(&caught_up_key(assignment));
     }
 
     fn lone_candidate_probe(&self) -> Duration {
@@ -1138,6 +1214,8 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
             partition: assignment.partition,
             local_node_id: self.local_node_id.clone(),
             leader_isr: leader_isr.clone(),
+            caught_up: self.caught_up_flag(assignment),
+            discarded: self.discard_reporter(assignment),
         };
 
         let disconnect_hint = Arc::new(Notify::new());
@@ -1447,6 +1525,28 @@ impl ReplAudit for AuditLogReplAudit {
     /// silently turn that into `2` the moment a real `ReplicationManager`
     /// (rather than a fake coordinator) is wired into that test's fixture.
     fn evicted(&self, _node_id: &str, _reason: &str, _count: u32) {}
+
+    fn tail_discarded(&self, org: &str, topic: &str, partition: u32, discarded: u64, new_leo: u64) {
+        let details = format!(
+            "instance_id={instance} org_id={org} partition={partition} discarded={discarded} \
+             new_leo={new_leo}",
+            instance = if self.instance_id.is_empty() {
+                "-"
+            } else {
+                self.instance_id.as_str()
+            },
+        );
+        let _ = crate::db::repository::log_audit(
+            &self.db,
+            None,
+            None,
+            "bus.leader.tail_discarded",
+            Some(topic),
+            Some(&details),
+            None,
+            Some(&self.local_node_id),
+        );
+    }
 }
 
 #[cfg(test)]

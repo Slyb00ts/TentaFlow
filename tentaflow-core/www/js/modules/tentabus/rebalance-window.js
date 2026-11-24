@@ -142,7 +142,7 @@ export function moveProgress(move, snapshot) {
  * Returns `{ win, refresh }`: call `refresh()` after every poll.
  */
 export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, describeError, onDone }) {
-  const state = { phase: 'loading', plan: null, results: null, notice: null, error: '', busy: false };
+  const state = { phase: 'loading', plan: null, before: new Map(), results: null, notice: null, error: '', busy: false };
   const nodeLabel = (id) => (id ? nodeNamer(observe().nodes)(id) : t('node_unknown'));
   const nodeTitle = (id) => nodeTitler(observe().nodes)(id);
   /** A node in the route cell: its name, as one unbreakable piece with the full id as a tooltip when it is shown shortened. */
@@ -205,27 +205,48 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
 
   const topAlert = (tone, title, message) => `<tf-alert tone="${escapeAttr(tone)}" title="${escapeAttr(title)}" message="${escapeAttr(message)}"></tf-alert>`;
 
+  const unitsOf = (view) => leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
+
+  /**
+   * What one move takes: the partitions of the topic and of its `__dlq.` topic that were not on the target when the
+   * plan was read (`moved`, of all `total`), and the nodes they were on (`from`). The plan lists only the topic's own
+   * partitions and names the node leading most of them, which for a split topic can be the target itself.
+   */
+  const extent = (m, units) => {
+    const before = state.before.get(m.topic);
+    const total = Math.max(before?.total || units.find((u) => u.name === m.topic)?.partitions || 0, m.partitions.length);
+    if (!before) return { moved: m.partitions.length, total, from: [m.fromNodeId], before: 0 };
+    const from = [...before.led.keys()].filter((id) => id !== m.toNodeId).sort();
+    const already = before.led.get(m.toNodeId) || 0;
+    return { moved: total - already, total, from: from.length ? from : [m.fromNodeId], before: already };
+  };
+
+  /** How far one move has got: partitions of the topic and its dead-letter topic now led by the target, beyond those that already were. */
+  const progressOf = (m, view, units = unitsOf(view)) => {
+    const { lagging, done: topicDone } = moveProgress(m, view);
+    const e = extent(m, units);
+    if (!state.before.has(m.topic)) return { done: topicDone, total: m.partitions.length, lagging };
+    const now = units.find((u) => u.name === m.topic)?.led.get(m.toNodeId) || 0;
+    return { done: Math.min(e.moved, Math.max(0, now - e.before)), total: e.moved, lagging };
+  };
+
   /** The cells of the moves table in the current phase. */
   const moveRows = () => {
     const view = snapshot();
-    const units = leadershipUnits({ topics: view.topics, perTopic: view.replicaTopics });
-    // What moved, of everything the topic has: a split topic moves only the partitions that were elsewhere.
-    const movedChip = (m) => chip('ok', t('state_moved_progress', {
-      done: fmtCount(m.partitions.length),
-      total: fmtCount(Math.max(units.find((u) => u.name === m.topic)?.partitions || 0, m.partitions.length)),
-    }));
+    const units = unitsOf(view);
+    const movedChip = (m) => { const e = extent(m, units); return chip('ok', t('state_moved_progress', { done: fmtCount(e.moved), total: fmtCount(e.total) })); };
     const base = (m) => ({
       topic: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(m.topic)}</span></span>`,
-      parts: String(m.partitions.length),
-      route: `<span class="tb-route">${routeNode(m.fromNodeId)} → ${routeNode(m.toNodeId)}</span>`,
+      parts: String(extent(m, units).moved),
+      route: `<span class="tb-route">${extent(m, units).from.map(routeNode).join(', ')} → ${routeNode(m.toNodeId)}</span>`,
       _key: m.topic,
     });
     const moves = state.plan.moves;
     if (state.phase === 'preview') {
-      return moves.map((m) => ({ ...base(m), detail: escapeHtml(whyText(m, moveProgress(m, view).lagging, nodeLabel)) }));
+      return moves.map((m) => ({ ...base(m), detail: escapeHtml(whyText(m, progressOf(m, view, units).lagging, nodeLabel)) }));
     }
     if (state.phase === 'progress') {
-      const progress = moves.map((m) => moveProgress(m, view));
+      const progress = moves.map((m) => progressOf(m, view, units));
       const current = progress.findIndex((p) => p.done < p.total);
       return moves.map((m, i) => {
         const p = progress[i];
@@ -243,7 +264,7 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
     if (state.phase === 'unknown' || state.phase === 'failed') {
       // No answer says how each move ended: only the polled replica lists do.
       return moves.map((m) => {
-        const p = moveProgress(m, view);
+        const p = progressOf(m, view, units);
         if (p.done >= p.total) return { ...base(m), detail: movedChip(m) };
         return { ...base(m), detail: state.phase === 'unknown' ? chip('neutral', t('state_checking')) : chip('neutral', t('state_failed')) };
       });
@@ -335,11 +356,11 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
         : `<div class="tb-explain-box">${escapeHtml(t('explain'))}</div>`;
     } else if (planned && phase === 'progress') {
       const view = snapshot();
-      const done = plan.moves.filter((m) => { const p = moveProgress(m, view); return p.done >= p.total; }).length;
+      const done = plan.moves.filter((m) => { const p = progressOf(m, view); return p.done >= p.total; }).length;
       top += topAlert('info', t('progress_title'), t('progress_text', { done: fmtCount(done), total: fmtCount(plan.moves.length), n: plan.moves.length }));
     } else if (planned && phase === 'unknown') {
       const view = snapshot();
-      const all = plan.moves.every((m) => { const p = moveProgress(m, view); return p.done >= p.total; });
+      const all = plan.moves.every((m) => { const p = progressOf(m, view); return p.done >= p.total; });
       top += all
         ? topAlert('success', t('result_ok_title'), t('result_ok_text', { count: fmtCount(plan.moves.length), n: plan.moves.length }))
         : topAlert('warning', t('result_unknown_title'), t('result_unknown_text'));
@@ -385,6 +406,8 @@ export function openRebalanceWindow({ instanceLabel, loadPlan, apply, observe, d
     try {
       const plan = await loadPlan();
       state.plan = { moves: plan?.moves || [], blockers: plan?.blockers || [] };
+      const view = snapshot();
+      state.before = new Map(unitsOf(view).map((u) => [u.name, { total: u.partitions, led: new Map(u.led) }]));
       state.phase = 'preview';
     } catch (err) {
       state.error = t('load_error', { error: describeError(err) });

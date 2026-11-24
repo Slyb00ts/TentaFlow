@@ -158,7 +158,7 @@ function mountBalance({ nodesList = pair, perTopic = evenTopics, canAdmin = true
   const state = { nodesList, perTopic, canAdmin, platformAdmin, leaderReturn, notice, reachableSince };
   const ctx = {
     view: () => ({
-      nodes: state.nodesList, replicaTopics: state.perTopic, failovers: [], topics: listOf(...state.perTopic), canAdmin: state.canAdmin,
+      nodes: state.nodesList, replicaTopics: state.perTopic, failovers: [], failoversIncomplete: Boolean(state.failoversIncomplete), topics: listOf(...state.perTopic), canAdmin: state.canAdmin,
       notice: state.notice, justMoved: new Set(), leaderReturn: state.leaderReturn, platformAdmin: state.platformAdmin, reachableSince: state.reachableSince, nowMs: Date.now(),
     }),
     go: (a) => calls.push(a),
@@ -455,7 +455,7 @@ test('asking every node for its changes: a node that does not answer breaks noth
   const asked = [];
   const own = [change('wyniki', 0, 4, 1000)];
   const nodes3 = [A, B, { nodeId: 'c', label: 'Serwer C', reachable: true }, { nodeId: 'd', label: 'Serwer D', reachable: false }];
-  const merged = await collectFailovers({
+  const { failovers: merged, incomplete } = await collectFailovers({
     own,
     nodes: nodes3,
     read: async (nodeId) => {
@@ -466,8 +466,9 @@ test('asking every node for its changes: a node that does not answer breaks noth
   });
   assert.deepEqual(asked.sort(), ['b', 'c'], 'this node and the node that is down are not asked');
   assert.deepEqual(merged.map((f) => f.topic).sort(), ['przyjecia', 'wyniki']);
+  assert.equal(incomplete, true, 'a node that did not answer, or is down, leaves the list possibly incomplete');
   // Nobody answers: the node\'s own history stands.
-  assert.deepEqual(await collectFailovers({ own, nodes: pair, read: async () => { throw new Error('no'); } }), own);
+  assert.deepEqual((await collectFailovers({ own, nodes: pair, read: async () => { throw new Error('no'); } })).failovers, own);
 });
 
 test('the leadership history costs one call per reachable remote node, whatever the number of topics', async () => {
@@ -518,4 +519,31 @@ test('without any node to name, the tab says why and does not draw empty cards',
   await tick();
   assert.equal(body.querySelector('[data-role="no-nodes"]'), null);
   assert.equal(body.querySelectorAll('.tb-node-card').length, 2);
+});
+
+test('when a node cannot be read the last merged history is kept and marked possibly incomplete', async () => {
+  const own = [change('wyniki', 0, 4, 1000)];
+  const remote = [change('przyjecia', 0, 7, 2000)];
+  const first = await collectFailovers({ own, nodes: pair, read: async () => ({ failovers: remote }) });
+  assert.equal(first.incomplete, false);
+  assert.equal(first.failovers.length, 2);
+  // The node was restarted and does not answer yet, or is not reachable: its entries stay.
+  const failing = await collectFailovers({ own, nodes: pair, previous: first.failovers, read: async () => { throw new Error('PolicyDenied'); } });
+  assert.deepEqual(failing.failovers.map((f) => f.topic).sort(), ['przyjecia', 'wyniki']);
+  assert.equal(failing.incomplete, true);
+  const away = await collectFailovers({ own, nodes: [A, { ...B, reachable: false }], previous: first.failovers, read: async () => { throw new Error('not asked'); } });
+  assert.equal(away.failovers.length, 2);
+  assert.equal(away.incomplete, true);
+  // Answering again clears the mark.
+  assert.equal((await collectFailovers({ own, nodes: pair, previous: first.failovers, read: async () => ({ failovers: remote }) })).incomplete, false);
+});
+
+test('the history says when it may be incomplete', async () => {
+  const { body, state, repaint } = mountBalance();
+  await tick();
+  assert.equal(body.querySelector('[data-role="changes-partial"]').hidden, true);
+  state.failoversIncomplete = true;
+  repaint();
+  assert.equal(body.querySelector('[data-role="changes-partial"]').hidden, false);
+  assert.match(text(body.querySelector('[data-role="changes-partial"]')), /Lista może być niepełna/);
 });

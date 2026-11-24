@@ -47,7 +47,7 @@ import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
 import { openLeaderTransfer, transferChoices, transferContext, LEADER_WAIT_MS, exclusive, askLeaders, overlayLeaderRows } from '/js/modules/tentabus/partitions.js';
 import { openRebalanceWindow, blockerText } from '/js/modules/tentabus/rebalance-window.js';
-import { leaderReturnEnabled, leaderReturnKey, leaderReturnValue, leastLoadedNode, isOlderNode } from '/js/modules/tentabus/leader-balance.js';
+import { leaderReturnEnabled, leaderReturnKey, leaderReturnValue, leastLoadedNode, isOlderNode, markSilent } from '/js/modules/tentabus/leader-balance.js';
 import { nodeLabel, nodeTitle, nodeNamer } from '/js/modules/tentabus/node-label.js';
 import { drawReplication, collectFailovers } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey, consumerRows } from '/js/modules/tentabus/consumers.js';
@@ -389,6 +389,8 @@ function freshShellState() {
     nodes: null,
     replicaTopics: null,
     failovers: [],
+    // Whether a node's entries are missing from `failovers` (it did not answer or was not reachable yet).
+    failoversIncomplete: false,
     // The leaders' own replica lists of the last poll (`Map` topic → leaderId → rows, see `askLeaders`).
     leaderAnswers: new Map(),
     replicaLags: [],
@@ -1116,11 +1118,11 @@ async function refreshReplicas() {
   const topicsChanged = await syncTopicList(instanceId);
   if (state.instanceId !== instanceId) return;
   const names = state.topics.map((t) => t.name);
-  const nodes = all?.nodes || [];
-  const localId = nodes.find((n) => n.isLocal)?.nodeId || null;
+  const listed = all?.nodes || [];
+  const localId = listed.find((n) => n.isLocal)?.nodeId || null;
   // A topic's `__dlq.` partitions move with it and weigh into what a node leads, so they are read too, but
   // only where the leadership card is shown (two nodes); a topic without unprocessed messages has none.
-  const withDlq = nodes.length >= 2;
+  const withDlq = listed.length >= 2;
   const partitionsOf = (topic) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic)).then((r) => r?.partitions || [], () => []);
   const perTopic = await Promise.all(names.map(async (topic) => ({
     topic,
@@ -1128,6 +1130,8 @@ async function refreshReplicas() {
     dlqPartitions: withDlq ? await partitionsOf(`__dlq.${topic}`) : [],
   })));
   if (state.instanceId !== instanceId) return;
+  // A node that stopped a moment ago is still "reachable" for the mesh; the partitions and heartbeats say otherwise.
+  const nodes = markSilent(listed, perTopic);
   const since = state.shell.reachableSince;
   const known = new Map((state.shell.nodes || []).map((n) => [n.nodeId, n.reachable !== false]));
   for (const n of nodes) {
@@ -1172,7 +1176,7 @@ async function refreshReplicas() {
   // (copies, leaders), a topic's "Partycje i kopie" (the moves); the leadership history is only on "Kopie i nody".
   const onTab = (tab) => !state.view && state.tab === tab;
   const watching = onTab('overview') || onTab('replication') || state.view?.kind === 'topic-detail';
-  const [answers, failovers] = await Promise.all([
+  const [answers, history] = await Promise.all([
     !watching ? previous : askLeaders({
       lists,
       localId,
@@ -1180,8 +1184,9 @@ async function refreshReplicas() {
       read: (key, leaderId) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, key), { targetNodeId: leaderId, timeoutMs: REMOTE_READ_MS }),
     }),
     // The audit log is kept per node: a move started from another node is in that node's history only.
-    !onTab('replication') ? state.shell.failovers : collectFailovers({
+    !onTab('replication') ? { failovers: state.shell.failovers, incomplete: state.shell.failoversIncomplete } : collectFailovers({
       own: all?.failovers || [],
+      previous: state.shell.failovers,
       nodes,
       read: (nodeId) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, ''), { targetNodeId: nodeId, timeoutMs: REMOTE_READ_MS }),
     }),
@@ -1189,7 +1194,8 @@ async function refreshReplicas() {
   if (state.instanceId !== instanceId) return;
   state.shell.leaderAnswers = answers;
   publish(overlaid(answers));
-  state.shell.failovers = failovers;
+  state.shell.failovers = history.failovers;
+  state.shell.failoversIncomplete = history.incomplete;
   if (state.tab === 'replication' && !state.view) await refreshLeaderReturn(instanceId);
   await refreshLagSeries(instanceId);
   if (state.instanceId !== instanceId) return;
@@ -2048,6 +2054,7 @@ const replicationContext = {
       nodes: shellNodes(),
       replicaTopics: sh.replicaTopics,
       failovers: sh.failovers,
+      failoversIncomplete: sh.failoversIncomplete,
       topics: state.topics,
       canAdmin: canAdmin(),
       notice: state.replicationNotice,

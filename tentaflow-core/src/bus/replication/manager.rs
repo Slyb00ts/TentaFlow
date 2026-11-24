@@ -132,6 +132,15 @@ const TRANSFER_MAJORITY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// through while the transfer is under way.
 const TRANSFER_CATCH_UP_MAX: Duration = Duration::from_millis(2_000);
 
+/// How often a leader whose writes are held back asks the other replicas again.
+const WRITE_GATE_RETRY: Duration = Duration::from_millis(250);
+
+/// Longest the last flush before a handed-over leader stops waits for the target.
+const TRANSFER_GROUPS_FINAL_FLUSH_MAX: Duration = Duration::from_millis(500);
+
+/// Longest a transfer waits for the consumer-group rows to reach its target.
+const TRANSFER_GROUPS_FLUSH_MAX: Duration = Duration::from_millis(2_000);
+
 /// How often the catch-up wait looks at the target's acknowledged offset.
 const TRANSFER_CATCH_UP_POLL: Duration = Duration::from_millis(5);
 
@@ -234,6 +243,14 @@ fn now_ms() -> i64 {
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError>;
+
+    /// A stream for one `LeoQuery`. Elections of many partitions ask the same
+    /// peer at once, and a dead peer's dial is slow: an implementor may let
+    /// the queries that overlap share one dial (`DialGate`); the default
+    /// opens a plain stream for each.
+    async fn open_query_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        self.open_stream(node_id).await
+    }
 
     /// A stream for one forwarded publish (`ProduceForward`). Such streams
     /// are short and frequent, so an implementor may reuse a connection to
@@ -395,6 +412,14 @@ pub trait LeaderHandle: Send + Sync {
     fn close_writes_for_transfer(&self) -> bool {
         false
     }
+    /// Sends the consumer-group rows this leader has changed to `node` now
+    /// and waits until its stream has (at most `within`). A transfer calls it
+    /// with the writes closed: the rows are replicated on a coalescing tick,
+    /// and a leader that stops before the tick takes a pause or a resume
+    /// with it. Blocking. The default has nothing to send.
+    fn flush_groups_to(&self, node: &str, within: Duration) {
+        let _ = (node, within);
+    }
     /// Opens the writes `close_writes_for_transfer` closed, for a transfer
     /// that was definitely not admitted.
     fn reopen_writes_after_transfer(&self) {}
@@ -547,6 +572,27 @@ pub trait FollowerRunnerFactory: Send + Sync {
     fn lone_candidate_probe(&self) -> Duration {
         Duration::ZERO
     }
+    /// Whether, since this process started, this node's copy of the partition
+    /// has reached the high watermark a leader reported to it, or this node
+    /// has led it. A node that has not may be missing records the leader
+    /// acknowledged while it was away — the persisted in-sync set still
+    /// names it, because only the leader knows the live one — so it must not
+    /// stand: its win would replace the log that holds them. The default
+    /// (`true`) is for factories that track nothing.
+    fn caught_up_since_start(&self, assignment: &PartitionAssignment) -> bool {
+        let _ = assignment;
+        true
+    }
+    /// This node leads `assignment`'s partition now: its log is the
+    /// authoritative one, whatever it has followed since the process started.
+    fn note_led(&self, assignment: &PartitionAssignment) {
+        let _ = assignment;
+    }
+    /// The partition left this node's registry: what it had earned for it
+    /// ends there.
+    fn forget_caught_up(&self, assignment: &PartitionAssignment) {
+        let _ = assignment;
+    }
     /// This node's own log for the assignment's partition, read from the
     /// local partition. An entry with no runner answers a `LeoQuery` and
     /// stands for election with it, never with zeros: a candidate that took
@@ -596,6 +642,9 @@ enum Promise {
     Made(u32),
     /// Refused: this node already promised that epoch to another candidate.
     Declined,
+    /// Not asked for: a leader's stream to this node is live, which makes a
+    /// candidacy of this node moot (`ReplicationManager::promise_term`).
+    LeaderLive,
     /// The partition could not record it.
     Failed,
 }
@@ -636,6 +685,12 @@ pub trait ReplAudit: Send + Sync {
         epoch: u32,
     );
     fn evicted(&self, node_id: &str, reason: &str, count: u32);
+    /// A stepped-down leader cut `discarded` records off its log: records it
+    /// held above the committed offset, which no majority had. Some were
+    /// acknowledged to producers (`acks=leader`). The default records nothing.
+    fn tail_discarded(&self, org: &str, topic: &str, partition: u32, discarded: u64, new_leo: u64) {
+        let _ = (org, topic, partition, discarded, new_leo);
+    }
 }
 
 // ===== Registry entry =======================================================
@@ -674,10 +729,9 @@ struct PartitionEntry {
     /// Without it a candidacy no other replica answered stays within
     /// `FollowerRunnerFactory::restart_stand_grace`.
     leader_heard: bool,
-    /// How many leader `Hello`s this entry accepted since the process started;
-    /// a candidacy that finds it moved since it began aborts
-    /// (`ReplicationManager::canvass`).
-    hellos: u64,
+    /// Whether `check_leases` already said that this node's election is held
+    /// back because it cannot show it holds what the leader acknowledged.
+    not_in_sync_logged: bool,
     /// Whether `run_election` already warned that the local log could not
     /// be read; cleared by the next successful read.
     log_read_warned: bool,
@@ -823,13 +877,44 @@ fn election_deferral(reply: &ReplLeoReply, own_epoch: u32) -> Option<&'static st
     }
 }
 
-/// How long a peer whose extended `LeoQuery` wait ran out is not waited for
-/// again by another partition's candidacy.
-const PROBE_DEAD_FOR: Duration = Duration::from_secs(5);
+/// Pause before a `LeoQuery` that failed at once (connection refused, stream
+/// reset) is asked again while the pre-vote's patience lasts.
+const LEO_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Elections running at once. The partitions of a dead leader all stand
+/// together; the rest wait for a slot instead of piling onto the peers.
+const MAX_CONCURRENT_ELECTIONS: usize = 16;
 
 /// How recent a sign of life from a leader must be to extend the restart
 /// grace.
 const LEADER_EVIDENCE_FRESH: Duration = Duration::from_secs(15);
+
+/// When the process came up, as far as replication can tell: the first
+/// manager built in it. Under test every manager is its own process.
+fn process_started_at() -> Instant {
+    #[cfg(test)]
+    {
+        Instant::now()
+    }
+    #[cfg(not(test))]
+    {
+        static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *STARTED.get_or_init(Instant::now)
+    }
+}
+
+/// Clears an election's mark in `ReplicationManager::elections` however its
+/// task ends.
+struct ElectionGuard {
+    elections: Arc<dashmap::DashSet<PartitionKey>>,
+    key: PartitionKey,
+}
+
+impl Drop for ElectionGuard {
+    fn drop(&mut self) {
+        self.elections.remove(&self.key);
+    }
+}
 
 /// The restart grace: closed once `grace` has run out, unless there is
 /// evidence the leader is alive, which keeps it open until `2 * grace`.
@@ -882,13 +967,16 @@ pub struct ReplicationManager {
     /// tells a row that is its own earlier attempt from one another op
     /// minted for the same term (a manual transfer).
     own_proposals: DashMap<PartitionKey, i64>,
-    /// When this manager was built, i.e. when the process came up
-    /// (`FollowerRunnerFactory::restart_stand_grace`).
+    /// When the first manager of this process was built, i.e. when the
+    /// process came up (`FollowerRunnerFactory::restart_stand_grace`); a
+    /// manager rebuilt on a reconfiguration does not restart the grace.
     started_at: Instant,
-    /// Peers whose extended `LeoQuery` wait ran out, and when: another
-    /// partition's candidacy within `PROBE_DEAD_FOR` does not wait for them
-    /// again.
-    probe_dead: DashMap<String, Instant>,
+    /// Partitions with an election running, started by `check_leases` and
+    /// cleared by `ElectionGuard`.
+    elections: Arc<dashmap::DashSet<PartitionKey>>,
+    /// Partitions whose step-down from a stale leadership is running in a task.
+    stepping_down: Arc<dashmap::DashSet<PartitionKey>>,
+    election_slots: Arc<tokio::sync::Semaphore>,
     transport: Arc<dyn Transport>,
     ledger: Arc<dyn LedgerAdmission>,
     assignments: Arc<dyn AssignmentStore>,
@@ -1159,8 +1247,10 @@ impl ReplicationManager {
             audit: config.audit,
             leo_query_timeout: config.leo_query_timeout,
             own_proposals: DashMap::new(),
-            started_at: Instant::now(),
-            probe_dead: DashMap::new(),
+            started_at: process_started_at(),
+            elections: Arc::new(dashmap::DashSet::new()),
+            stepping_down: Arc::new(dashmap::DashSet::new()),
+            election_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ELECTIONS)),
             majority_await_timeout: config.majority_await_timeout,
             shutdown: CancellationToken::new(),
             assignments_changed: watch::channel(()).0,
@@ -1522,6 +1612,7 @@ impl ReplicationManager {
                 promises: true,
                 bus_features: 0,
                 instance_unhosted: false,
+                log_known: false,
             };
             election_deferral(&seen, query.known_epoch)
                 .is_none()
@@ -1531,7 +1622,9 @@ impl ReplicationManager {
             Some((epoch, assignment)) => {
                 match self.promise_term(&key, &assignment, epoch, candidate).await {
                     Promise::Made(recognized) => Some(recognized),
-                    Promise::Declined => None,
+                    // (`LeaderLive` is only ever the answer to this node's own
+                    // candidacy.)
+                    Promise::Declined | Promise::LeaderLive => None,
                     // Asked for a promise it cannot make durable: no answer
                     // at all rather than one that looks like a vote.
                     Promise::Failed => return,
@@ -1553,6 +1646,7 @@ impl ReplicationManager {
             promises: true,
             bus_features: 0,
             instance_unhosted: false,
+            log_known: false,
         };
         // Read from the local log outside the registry guard: that opens
         // the partition, which may touch the disk.
@@ -1592,6 +1686,7 @@ impl ReplicationManager {
                                 log_epoch: Some(l.log_epoch()),
                                 committed: Some(l.committed_offset()),
                                 leading: l.holds_quorum_lease(),
+                                log_known: true,
                                 ..base
                             },
                             // Mid-rebuild, its handle not attached yet: the
@@ -1612,6 +1707,7 @@ impl ReplicationManager {
                                 log_epoch: Some(f.log_epoch()),
                                 committed: Some(f.committed()),
                                 leader_alive: !f.lease_expired(),
+                                log_known: true,
                                 ..base
                             },
                             None => {
@@ -1630,6 +1726,7 @@ impl ReplicationManager {
                 reply.hw = local.committed;
                 reply.committed = Some(local.committed);
                 reply.log_epoch = Some(local.epoch);
+                reply.log_known = true;
             }
         }
         // Asked for a promise, the answer carries exactly what was promised
@@ -1854,6 +1951,7 @@ impl ReplicationManager {
                     ..entry.assignment.clone()
                 };
                 entry.role = LocalRole::Follower;
+                entry.leader_heard = false;
                 entry.leadership = self.next_leadership();
                 entry.follower = None;
                 entry.unfollowed_since = Instant::now();
@@ -1955,7 +2053,6 @@ impl ReplicationManager {
                 }
                 entry.unfollowed_since = Instant::now();
                 entry.leader_heard = true;
-                entry.hellos += 1;
                 // Following a leader again: the next expiry draws its own delay.
                 entry.stand_after = None;
                 // A stepped-down tail is now this leader's to reconcile: its
@@ -2335,8 +2432,17 @@ impl ReplicationManager {
                 // glue spawns one supervisor per replica, each dialing in
                 // its own task. `spawn_deferred` keeps the engine's
                 // writer-thread epoch stamp off this call path too.
+                // A row that names this node leader and is the first this
+                // process sees of the partition may be the stale one the
+                // ledger replays at startup. A node that holds records of it
+                // does not take writes on its word: the replicas may have
+                // elected another leader since, and what this node
+                // acknowledged meanwhile would be cut away when that leader
+                // fences it (`open_gate`).
+                let gated = previous.is_none() && self.holds_records(&assignment).await;
                 match self.leader_factory.spawn_deferred(&assignment, Vec::new()) {
-                    Ok(handle) => match self.attach_leader(&key, &assignment, handle) {
+                    Ok(handle) => match self.attach_leader(&key, &assignment, handle, !gated) {
+                        Ok(serving) if gated => self.spawn_write_gate(key.clone(), serving),
                         Ok(serving) => serving.claim_term(),
                         // Either a handle another task attached while this
                         // one was blocked, or — when the entry has since
@@ -2397,7 +2503,7 @@ impl ReplicationManager {
                     unreconciled: false,
                     cutting: false,
                     leader_heard: false,
-                    hellos: 0,
+                    not_in_sync_logged: false,
                     log_read_warned: false,
                     quorum_lost_since: None,
                     abdicated_epoch: None,
@@ -2426,6 +2532,7 @@ impl ReplicationManager {
                     let follower = e.follower.take();
                     if e.role != LocalRole::Follower {
                         e.leadership = self.next_leadership();
+                        e.leader_heard = false;
                     }
                     e.assignment = assignment;
                     e.role = LocalRole::Follower;
@@ -2524,6 +2631,13 @@ impl ReplicationManager {
     /// its handles kept running against a dead incarnation, and a recreated
     /// topic's epoch-1 placement was refused as older than the dead
     /// incarnation's last term.
+    /// The partitions this node holds replication state for, whoever put
+    /// them there (the assignment poll, a `Hello` that found its row, a
+    /// promotion).
+    pub(crate) fn registered_partitions(&self) -> Vec<PartitionKey> {
+        self.registry.iter().map(|e| e.key().clone()).collect()
+    }
+
     pub(crate) fn forget_partition(&self, key: &PartitionKey) {
         if let Some((_, mut entry)) = self.registry.remove(key) {
             tracing::info!(
@@ -2538,6 +2652,7 @@ impl ReplicationManager {
             if let Some(follower) = entry.follower.take() {
                 follower.stop();
             }
+            self.follower_factory.forget_caught_up(&entry.assignment);
             self.notify_assignments_changed();
         }
     }
@@ -2576,6 +2691,7 @@ impl ReplicationManager {
         key: &PartitionKey,
         assignment: &PartitionAssignment,
         handle: Box<dyn LeaderHandle>,
+        open: bool,
     ) -> Result<Arc<dyn LeaderHandle>, Arc<dyn LeaderHandle>> {
         let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
         match self.registry.get_mut(key) {
@@ -2586,7 +2702,9 @@ impl ReplicationManager {
                     && e.assignment.replicas == assignment.replicas
                     && e.assignment.leader_epoch == assignment.leader_epoch
                 {
-                    handle.open_writes();
+                    if open {
+                        handle.open_writes();
+                    }
                     e.leader = Some(Arc::clone(&handle));
                     Ok(handle)
                 } else {
@@ -2604,7 +2722,9 @@ impl ReplicationManager {
                         assignment: assignment.clone(),
                         role: LocalRole::Leader,
                         leader: Some({
-                            handle.open_writes();
+                            if open {
+                                handle.open_writes();
+                            }
                             Arc::clone(&handle)
                         }),
                         follower: None,
@@ -2612,7 +2732,7 @@ impl ReplicationManager {
                         unreconciled: false,
                         cutting: false,
                         leader_heard: true,
-                        hellos: 0,
+                        not_in_sync_logged: false,
                         log_read_warned: false,
                         quorum_lost_since: None,
                         abdicated_epoch: None,
@@ -2626,6 +2746,110 @@ impl ReplicationManager {
                 Ok(handle)
             }
         }
+    }
+
+    /// Whether this node's copy of the partition holds any record. A copy that is empty has nothing a stale
+    /// leader could acknowledge over, and a partition just created is led from
+    /// its first row without waiting for anyone. An unreadable log counts as
+    /// held.
+    async fn holds_records(&self, assignment: &PartitionAssignment) -> bool {
+        let factory = Arc::clone(&self.follower_factory);
+        let assignment = assignment.clone();
+        match tokio::task::spawn_blocking(move || factory.local_log_position(&assignment)).await {
+            Ok(Ok(log)) => log.leo > 0,
+            _ => true,
+        }
+    }
+
+    /// Opens a leader's writes once it is known that nobody leads the
+    /// partition above the epoch of its row: a follower has accepted its
+    /// `Hello` at that epoch, or a majority of the replicas (this node
+    /// counted) answered with a log of their own and none of them has
+    /// promised or follows a higher epoch. Until then a publish is refused
+    /// with a retryable `NotLeader`. Stops asking when the entry is no longer
+    /// this handle's.
+    fn spawn_write_gate(&self, key: PartitionKey, handle: Arc<dyn LeaderHandle>) {
+        let Some(manager) = self.me.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        tokio::spawn(async move {
+            loop {
+                let assignment = match manager.registry.get(&key) {
+                    Some(entry)
+                        if entry.role == LocalRole::Leader
+                            && entry
+                                .leader
+                                .as_ref()
+                                .is_some_and(|serving| Arc::ptr_eq(serving, &handle)) =>
+                    {
+                        entry.assignment.clone()
+                    }
+                    _ => return,
+                };
+                if manager.shutdown.is_cancelled() {
+                    return;
+                }
+                let accepted = handle.isr().iter().any(|n| *n != manager.local_node_id);
+                if accepted || manager.nobody_leads_above(&key, &assignment).await {
+                    // Re-read under the guard: opened only for the handle that
+                    // is still serving.
+                    let serving = manager.registry.get(&key).is_some_and(|entry| {
+                        entry.role == LocalRole::Leader
+                            && entry
+                                .leader
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                    });
+                    if serving {
+                        handle.open_writes();
+                        handle.claim_term();
+                        tracing::info!(
+                            org_id = %key.0, topic = %key.1, partition = key.2,
+                            epoch = assignment.leader_epoch,
+                            after_ms = started.elapsed().as_millis() as u64,
+                            "replication: leader writes opened after the restart check"
+                        );
+                    }
+                    return;
+                }
+                tokio::time::sleep(WRITE_GATE_RETRY).await;
+            }
+        });
+    }
+
+    /// Whether a majority of the replicas, this node counted, answered with a
+    /// real log and none of them knows a leader or a promise above this
+    /// node's epoch.
+    async fn nobody_leads_above(
+        &self,
+        key: &PartitionKey,
+        assignment: &PartitionAssignment,
+    ) -> bool {
+        let others: Vec<String> = assignment
+            .replicas
+            .iter()
+            .filter(|n| **n != self.local_node_id)
+            .cloned()
+            .collect();
+        let deadline = Instant::now() + self.leo_query_timeout;
+        let replies = futures::future::join_all(
+            others
+                .iter()
+                .map(|peer| self.ask_leo(key, peer, None, deadline, Duration::ZERO)),
+        )
+        .await;
+        let epoch = assignment.leader_epoch;
+        let mut clean = 1usize;
+        for reply in replies.into_iter().flatten() {
+            if reply.leader_epoch > epoch || reply.promised_epoch.is_some_and(|p| p > epoch) {
+                return false;
+            }
+            if reply.log_known {
+                clean += 1;
+            }
+        }
+        clean >= assignment.replicas.len() / 2 + 1
     }
 
     /// Removes `key` only while it still holds the entry the calling
@@ -2770,9 +2994,20 @@ impl ReplicationManager {
         // peer gone: only a stream that keeps delivering overrules that. A
         // peer it holds a connection to still has to have been heard from.
         match mesh_up {
-            Some(true) => self
-                .peer_signal_age(node_id)
-                .is_some_and(|age| age <= MESH_SIGNAL_FRESH),
+            // A peer this node shares a replication stream with speaks at
+            // least every heartbeat on it, so its silence on the stream
+            // counts at the stream's own bound rather than the mesh's looser
+            // one: a killed peer is seen gone within the lease, not after the
+            // mesh has noticed (20-25 s).
+            Some(true) => {
+                let fresh = if self.stream_signal_age(node_id).is_some() {
+                    PEER_FRAME_FRESH
+                } else {
+                    MESH_SIGNAL_FRESH
+                };
+                self.peer_signal_age(node_id)
+                    .is_some_and(|age| age <= fresh)
+            }
             Some(false) => self
                 .stream_signal_age(node_id)
                 .is_some_and(|age| age <= PEER_FRAME_FRESH),
@@ -2810,7 +3045,7 @@ impl ReplicationManager {
     /// the replica set, adopts the proven epoch and becomes a `Follower`
     /// with no leader named yet, which is exactly the state `accept_hello`
     /// needs to accept the real leader's dial the moment it arrives.
-    pub async fn check_stale_leadership(&self) {
+    pub async fn check_stale_leadership(self: &Arc<Self>) {
         let due: Vec<(PartitionKey, u32)> = self
             .registry
             .iter()
@@ -2822,7 +3057,33 @@ impl ReplicationManager {
                 (have > entry.assignment.leader_epoch).then(|| (entry.key().clone(), have))
             })
             .collect();
+        // Each step-down in a task of its own: it awaits a blocking fence and
+        // the cut of the log, which must not hold back the elections and the
+        // quorum-lease check that share this tick. One at a time per
+        // partition.
         for (key, have) in due {
+            if !self.stepping_down.insert(key.clone()) {
+                continue;
+            }
+            let manager = Arc::clone(self);
+            tokio::spawn(async move {
+                manager.step_down_stale(&key, have).await;
+                manager.stepping_down.remove(&key);
+            });
+        }
+    }
+
+    /// Waits until no step-down started by `check_stale_leadership` is running.
+    #[cfg(test)]
+    async fn settle_step_downs(&self) {
+        while !self.stepping_down.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn step_down_stale(&self, key: &PartitionKey, have: u32) {
+        let key = key.clone();
+        {
             // Either way below, this node leaves a term that is over, and its
             // log may end in a tail no majority ever held. Until that tail is
             // cut (`cut_stepped_down_log`, right after the step-down) it
@@ -2831,7 +3092,7 @@ impl ReplicationManager {
                 entry.unreconciled = true;
                 entry.assignment.clone()
             }) else {
-                continue;
+                return;
             };
             // Before anything else: a publish this node admitted as leader
             // of the term now over may still be on its way to the partition
@@ -2862,14 +3123,14 @@ impl ReplicationManager {
                     );
                     self.apply_assignment(stored).await;
                     self.cut_stepped_down_log(&key).await;
-                    continue;
+                    return;
                 }
             }
             let Some(mut entry) = self.registry.get_mut(&key) else {
-                continue;
+                return;
             };
             if entry.role != LocalRole::Leader || have <= entry.assignment.leader_epoch {
-                continue; // Raced with a poll apply that already demoted us.
+                return; // Raced with a poll apply that already demoted us.
             }
             tracing::warn!(
                 org_id = %key.0, topic = %key.1, partition = key.2,
@@ -2887,6 +3148,7 @@ impl ReplicationManager {
             // role + epoch, never on this field.
             entry.assignment.leader_node_id = String::new();
             entry.role = LocalRole::Follower;
+            entry.leader_heard = false;
             entry.leadership = self.next_leadership();
             entry.follower = None;
             entry.unfollowed_since = Instant::now();
@@ -2920,18 +3182,36 @@ impl ReplicationManager {
             entry.assignment.clone()
         };
         let factory = Arc::clone(&self.follower_factory);
-        let cut = tokio::task::spawn_blocking(move || factory.cut_to_committed(&assignment))
-            .await
-            .map_err(|e| ReplError::Internal(format!("log cut task failed: {e}")))
-            .and_then(|r| r);
+        let cut = tokio::task::spawn_blocking(move || {
+            let before = factory.local_log_position(&assignment).ok();
+            factory
+                .cut_to_committed(&assignment)
+                .map(|after| (before, after))
+        })
+        .await
+        .map_err(|e| ReplError::Internal(format!("log cut task failed: {e}")))
+        .and_then(|r| r);
         if let Some(mut entry) = self.registry.get_mut(key) {
             entry.cutting = false;
         }
         match cut {
-            Ok(log) => {
+            Ok((before, log)) => {
                 if let Some(mut entry) = self.registry.get_mut(key) {
                     entry.unreconciled = false;
                     entry.log_read_warned = false;
+                }
+                let discarded = before.map_or(0, |b| b.leo.saturating_sub(log.leo));
+                if discarded > 0 {
+                    // Never silent: records this node held, and may have
+                    // acknowledged as the leader, are gone from its log.
+                    tracing::error!(
+                        org_id = %key.0, topic = %key.1, partition = key.2,
+                        discarded, new_leo = log.leo,
+                        "replication: a stepped-down leader discarded records above the \
+                         committed offset; those held by no other replica are lost"
+                    );
+                    self.audit
+                        .tail_discarded(&key.0, &key.1, key.2, discarded, log.leo);
                 }
                 tracing::info!(
                     org_id = %key.0, topic = %key.1, partition = key.2,
@@ -2973,7 +3253,7 @@ impl ReplicationManager {
     pub async fn check_quorum_leases(&self) {
         let lease = self.follower_factory.leader_lease();
         let now = Instant::now();
-        let mut due = Vec::new();
+        let mut due: Vec<(PartitionKey, u64)> = Vec::new();
         for mut entry in self.registry.iter_mut() {
             if entry.role != LocalRole::Leader {
                 entry.quorum_lost_since = None;
@@ -2988,14 +3268,16 @@ impl ReplicationManager {
             }
             let since = *entry.quorum_lost_since.get_or_insert(now);
             if now.saturating_duration_since(since) > lease {
-                due.push(entry.key().clone());
+                due.push((entry.key().clone(), entry.leadership));
             }
         }
-        for key in due {
+        for (key, leadership) in due {
             let Some(mut entry) = self.registry.get_mut(&key) else {
                 continue;
             };
-            if entry.role != LocalRole::Leader {
+            // The leadership that lost its quorum, not a later one this node
+            // won between the scan and now.
+            if entry.role != LocalRole::Leader || entry.leadership != leadership {
                 continue;
             }
             tracing::warn!(
@@ -3008,6 +3290,7 @@ impl ReplicationManager {
             entry.abdicated_epoch = Some(entry.assignment.leader_epoch);
             entry.quorum_lost_since = None;
             entry.role = LocalRole::Follower;
+            entry.leader_heard = false;
             entry.leadership = self.next_leadership();
             entry.follower = None;
             // Its own leadership is what just lapsed: no dial is coming to
@@ -3029,22 +3312,34 @@ impl ReplicationManager {
     /// still in the last known ISR (`election::should_start_election`).
     /// Meant to be called on a periodic tick by whatever owns this
     /// manager's lifecycle (wave 2, `tentaflow/src/main.rs`).
-    pub async fn check_leases(&self) {
+    ///
+    /// Only starts the elections: each runs in a task of its own, so one that
+    /// waits out a dead peer holds back neither the tick nor another
+    /// partition's election. A partition whose election still runs is left
+    /// alone by the next tick.
+    pub async fn check_leases(self: &Arc<Self>) {
         let uncut: Vec<PartitionKey> = self
             .registry
             .iter()
             .filter(|e| e.unreconciled && e.role == LocalRole::Follower)
             .map(|e| e.key().clone())
             .collect();
+        // Each cut in a task of its own (`cutting` keeps a second off the same
+        // partition): a slow disk must not hold back the tick's elections, nor
+        // the next tick's quorum-lease check.
         for key in uncut {
-            self.cut_stepped_down_log(&key).await;
+            let manager = Arc::clone(self);
+            tokio::spawn(async move { manager.cut_stepped_down_log(&key).await });
         }
         let now = Instant::now();
         let due: Vec<PartitionKey> = self
             .registry
             .iter_mut()
             .filter_map(|mut entry| {
-                if entry.role != LocalRole::Follower || entry.unreconciled {
+                if entry.role != LocalRole::Follower
+                    || entry.unreconciled
+                    || self.elections.contains(entry.key())
+                {
                     return None;
                 }
                 let lease_expired = match entry.follower.as_ref() {
@@ -3097,10 +3392,38 @@ impl ReplicationManager {
             })
             .collect();
         // Together, not one after another: each may wait out a dead peer's
-        // dial, and the partitions of one leader all fail at once. The entry
-        // is out of `Idle` while its election runs, so a tick that finds it
-        // again leaves it alone.
-        futures::future::join_all(due.into_iter().map(|key| self.run_election(key))).await;
+        // dial, and the partitions of one leader all fail at once. Not behind
+        // a barrier either: the tick returns at once, and a partition that
+        // falls due while another's election still waits starts at the next.
+        for key in due {
+            if !self.elections.insert(key.clone()) {
+                continue;
+            }
+            let guard = ElectionGuard {
+                elections: Arc::clone(&self.elections),
+                key: key.clone(),
+            };
+            let manager = Arc::clone(self);
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let _guard = guard;
+                let Ok(_slot) = manager.election_slots.clone().acquire_owned().await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = manager.run_election(key) => {}
+                }
+            });
+        }
+    }
+
+    /// Waits until no election started by `check_leases` is running.
+    #[cfg(test)]
+    async fn settle_elections(&self) {
+        while !self.elections.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Forces an election attempt for one partition regardless of lease
@@ -3114,15 +3437,14 @@ impl ReplicationManager {
     /// (`ReplLeoQuery::candidate_epoch`), and it proposes on what that second
     /// round reports: logs read after every replier promised its term.
     pub async fn run_election(&self, key: PartitionKey) {
-        let hellos_at_start = self.hello_count(&key);
-        if self.canvass(&key, false, hellos_at_start).await.is_none() {
+        if self.canvass(&key, false).await.is_none() {
             return;
         }
         // Not proposing yet: a vote round that stops before stepping (its
         // promise could not be made, its log could not be read) must leave
         // the entry free to stand on the next lease tick.
         self.set_promotion(&key, PromotionState::Idle);
-        let Some((state, proposed)) = self.canvass(&key, true, hellos_at_start).await else {
+        let Some((state, proposed)) = self.canvass(&key, true).await else {
             return;
         };
 
@@ -3135,9 +3457,9 @@ impl ReplicationManager {
             self.set_promotion(&key, PromotionState::Idle);
             return;
         }
-        // A leader's `Hello` accepted since the election began: the leader
-        // this candidacy replaces is back.
-        if self.leader_arrived_since(&key, hellos_at_start) {
+        // A leader whose stream is live now: the leader this candidacy
+        // replaces is back.
+        if self.leader_arrived_since(&key) {
             self.set_promotion(&key, PromotionState::Idle);
             return;
         }
@@ -3239,7 +3561,6 @@ impl ReplicationManager {
         &self,
         key: &PartitionKey,
         vote: bool,
-        hellos_at_start: u64,
     ) -> Option<(PromotionState, PartitionAssignment)> {
         let (assignment, promised) = self
             .registry
@@ -3254,6 +3575,14 @@ impl ReplicationManager {
             );
             return None;
         };
+        // Not provably in sync: this node may stand only when every other
+        // replica answered (below), which shows none of them leads or holds
+        // more. A restart of the whole replica set passes; a node that cannot
+        // reach a live leader does not.
+        let in_sync = self
+            .registry
+            .get(key)
+            .is_some_and(|entry| self.in_sync_since_start(&entry));
         let epoch = election::candidacy_epoch(assignment.leader_epoch, promised, slot);
         // Raft's vote for itself, before its own log is read: a leader of an
         // earlier term appending here after that read would leave this
@@ -3266,10 +3595,6 @@ impl ReplicationManager {
         // steps down on the refusal. Raft pays the same for a candidate that
         // raises its term. The pre-vote makes it rare: this round only runs
         // when the first one found nobody to defer to (logged below).
-        if vote && self.leader_arrived_since(key, hellos_at_start) {
-            self.set_promotion(key, PromotionState::Idle);
-            return None;
-        }
         let self_id = self.local_node_id.clone();
         if vote && assignment.isr.iter().any(|m| m == &self.local_node_id) {
             match self.promise_term(key, &assignment, epoch, &self_id).await {
@@ -3288,6 +3613,10 @@ impl ReplicationManager {
                     return None;
                 }
                 Promise::Made(_) => {}
+                Promise::LeaderLive => {
+                    self.set_promotion(key, PromotionState::Idle);
+                    return None;
+                }
                 Promise::Declined | Promise::Failed => return None,
             }
         }
@@ -3368,34 +3697,24 @@ impl ReplicationManager {
         // so a pre-vote that heard nobody deposes a leader that may be alive
         // behind a link merely slow to (re)connect: a QUIC connection that
         // died with a restart or a rebalance takes seconds to dial again over
-        // a poor path, far more than `leo_query_timeout`. The dial that is
-        // already running is therefore given `patience` more (not re-dialed),
-        // before silence counts as death. A crashed peer never answers
-        // either, so that wait is added to its failover — once, shared by
-        // every partition asking the same peer (`probe_dead`), and only in
-        // the pre-vote: a vote round has promised its term already.
+        // a poor path, far more than `leo_query_timeout`. The pre-vote
+        // therefore gives the peer `patience` more before silence counts as
+        // death, asking again when an attempt fails at once. A crashed peer
+        // never answers either, so that wait is added to its failover — in
+        // parallel for every partition asking, whose queries share one dial
+        // per peer (`Transport::open_query_stream`) — and only in the
+        // pre-vote: a vote round has promised its term already.
         let patience = self.follower_factory.lone_candidate_probe();
-        let extend = !vote && assignment.replicas.len() <= 2 && !patience.is_zero();
+        let patience = if !vote && assignment.replicas.len() <= 2 {
+            patience
+        } else {
+            Duration::ZERO
+        };
         let replies = futures::future::join_all(to.into_iter().map(|peer| async move {
-            let mut query = Box::pin(self.query_leo(key, &peer, candidacy));
-            let first = leo_deadline.saturating_duration_since(Instant::now());
-            let reply = match tokio::time::timeout(first, &mut query).await {
-                Ok(reply) => reply,
-                Err(_) if extend && !self.peer_probed_dead(&peer) => {
-                    let reply = tokio::time::timeout(patience, &mut query)
-                        .await
-                        .ok()
-                        .flatten();
-                    if reply.is_none() {
-                        self.probe_dead.insert(peer.clone(), Instant::now());
-                    }
-                    reply
-                }
-                Err(_) => None,
-            };
-            drop(query);
+            let reply = self
+                .ask_leo(key, &peer, candidacy, leo_deadline, patience)
+                .await;
             if let Some(reply) = &reply {
-                self.probe_dead.remove(&peer);
                 if reply.leading {
                     self.peers.entry(peer.clone()).or_default().leading_reply_at =
                         Some(Instant::now());
@@ -3405,9 +3724,45 @@ impl ReplicationManager {
         }))
         .await;
 
-        // A leader's `Hello` accepted while the queries were out is the
+        // A reply counts toward showing that no live leader holds more only
+        // when it carries a real log and, in a vote, is bound to this term:
+        // a peer whose bus is not up yet answers with zeros that look like an
+        // empty log (`ReplLeoReply::log_known`), and one that promised nothing
+        // may still follow a leader of an earlier term.
+        let counts = |reply: &ReplLeoReply| {
+            reply.log_known && (!vote || reply.promised_epoch.is_some_and(|p| p >= epoch))
+        };
+        // Only where one replica may win alone (`availability_quorum` of 1,
+        // RF <= 2). From RF 3 a candidate needs a majority of the logs bound to
+        // its term, which already keeps it from replacing one that holds
+        // acknowledged records, and demanding every replica would block a
+        // partition for good whenever one never returns.
+        let wins_alone = election::availability_quorum(assignment.replicas.len()) == 1;
+        if !in_sync
+            && wins_alone
+            && replies
+                .iter()
+                .any(|(_, reply)| !reply.as_ref().is_some_and(counts))
+        {
+            let first = self
+                .registry
+                .get_mut(key)
+                .map(|mut entry| !std::mem::replace(&mut entry.not_in_sync_logged, true))
+                .unwrap_or(false);
+            if first {
+                tracing::warn!(
+                    org_id = %key.0, topic = %key.1, partition = key.2,
+                    "replication: not standing — this node has not caught up with a leader \
+                     since it started and a replica did not answer, so a live leader may \
+                     hold records this log lacks; the partition waits for a caught-up replica"
+                );
+            }
+            self.set_promotion(key, PromotionState::Idle);
+            return None;
+        }
+        // A leader whose stream came up while the queries were out is the
         // answer this candidacy was waiting for: the leader is there.
-        if self.leader_arrived_since(key, hellos_at_start) {
+        if self.leader_arrived_since(key) {
             self.set_promotion(key, PromotionState::Idle);
             return None;
         }
@@ -3417,7 +3772,9 @@ impl ReplicationManager {
             let Some(reply) = reply else {
                 continue;
             };
-            answered += 1;
+            if reply.log_known {
+                answered += 1;
+            }
             if deferral.is_none() {
                 deferral = election_deferral(&reply, assignment.leader_epoch)
                     .map(|reason| (peer.clone(), reason));
@@ -3537,26 +3894,75 @@ impl ReplicationManager {
         Some((state, proposed))
     }
 
+    /// Whether this node can show that its copy of `entry`'s partition holds
+    /// what the leader acknowledged: it caught up with a leader since the
+    /// process started (or led itself), and the last in-sync set that leader
+    /// reported — when there was one — still named it. The persisted
+    /// placement cannot show it: a leader's ISR shrink is local, so the row
+    /// keeps naming a replica that was down for minutes. Without it a node
+    /// that restarted behind its leader would stand over a live one, win at
+    /// RF <= 2 without anyone's consent, and replace the log with its shorter
+    /// one — losing writes that were answered 200.
+    fn in_sync_since_start(&self, entry: &PartitionEntry) -> bool {
+        self.follower_factory
+            .caught_up_since_start(&entry.assignment)
+            && entry
+                .follower
+                .as_ref()
+                .and_then(|f| f.leader_isr())
+                .is_none_or(|isr| isr.iter().any(|n| n == &self.local_node_id))
+    }
+
     fn leader_heard(&self, key: &PartitionKey) -> bool {
         self.registry.get(key).is_some_and(|e| e.leader_heard)
     }
 
-    fn hello_count(&self, key: &PartitionKey) -> u64 {
-        self.registry.get(key).map_or(0, |e| e.hellos)
+    /// A leader's stream is bound to `key` and its lease is running. A
+    /// `Hello` that was accepted and whose stream ended again proves nothing:
+    /// a leader that restarts in a loop must not hold off a failover for good.
+    fn leader_arrived_since(&self, key: &PartitionKey) -> bool {
+        self.registry
+            .get(key)
+            .is_some_and(|e| e.follower.as_ref().is_some_and(|f| !f.lease_expired()))
     }
 
-    /// A leader's `Hello` was accepted on `key` since `hellos_at_start` was
-    /// read, or a live follower stream is bound to it now.
-    fn leader_arrived_since(&self, key: &PartitionKey, hellos_at_start: u64) -> bool {
-        self.registry.get(key).is_some_and(|e| {
-            e.hellos != hellos_at_start || e.follower.as_ref().is_some_and(|f| !f.lease_expired())
-        })
-    }
-
-    fn peer_probed_dead(&self, peer: &str) -> bool {
-        self.probe_dead
-            .get(peer)
-            .is_some_and(|at| at.elapsed() < PROBE_DEAD_FOR)
+    /// One `LeoQuery` to `peer` with the patience the pre-vote has for it.
+    ///
+    /// Without patience (`Duration::ZERO`) the answer must arrive by
+    /// `leo_deadline`. With it, the query is kept going until `leo_deadline +
+    /// patience`: the dial already running is waited for, and an attempt that
+    /// fails at once (connection refused, stream reset) is made again after
+    /// `LEO_RETRY_BACKOFF`, because a peer that is restarting refuses
+    /// connections for a moment and then answers.
+    async fn ask_leo(
+        &self,
+        key: &PartitionKey,
+        peer: &str,
+        candidacy: Option<u32>,
+        leo_deadline: Instant,
+        patience: Duration,
+    ) -> Option<ReplLeoReply> {
+        let give_up_at = if patience.is_zero() {
+            leo_deadline
+        } else {
+            leo_deadline + patience
+        };
+        let mut query = Box::pin(self.query_leo(key, peer, candidacy));
+        loop {
+            match tokio::time::timeout_at(give_up_at.into(), &mut query).await {
+                Ok(Some(reply)) => return Some(reply),
+                Err(_) => return None,
+                Ok(None) if patience.is_zero() => return None,
+                Ok(None) => {
+                    let retry_at = Instant::now() + LEO_RETRY_BACKOFF;
+                    if retry_at >= give_up_at {
+                        return None;
+                    }
+                    tokio::time::sleep_until(retry_at.into()).await;
+                    query = Box::pin(self.query_leo(key, peer, candidacy));
+                }
+            }
+        }
     }
 
     /// Whether the restart grace still holds this node back from standing
@@ -3574,13 +3980,16 @@ impl ReplicationManager {
     }
 
     fn leader_alive_evidence(&self, leader: &str) -> bool {
-        self.peers.get(leader).is_some_and(|p| {
-            p.mesh_up == Some(true)
-                || p.last_signal
+        // A mesh connection counts only with a signal behind it
+        // (`peer_reachable`): the bare flag outlives a peer that stopped
+        // answering.
+        self.peer_reachable(leader)
+            || self.peers.get(leader).is_some_and(|p| {
+                p.last_signal
                     .is_some_and(|at| at.elapsed() < LEADER_EVIDENCE_FRESH)
-                || p.leading_reply_at
-                    .is_some_and(|at| at.elapsed() < LEADER_EVIDENCE_FRESH)
-        })
+                    || p.leading_reply_at
+                        .is_some_and(|at| at.elapsed() < LEADER_EVIDENCE_FRESH)
+            })
     }
 
     /// Promises `epoch` to `candidate` on this node's partition of
@@ -3605,6 +4014,15 @@ impl ReplicationManager {
             };
             if entry.assignment.topic_generation != assignment.topic_generation {
                 return Promise::Failed;
+            }
+            // This node's own candidacy: a leader's stream accepted before this
+            // reservation (`accept_hello` refuses what comes after it) makes
+            // the candidacy moot. Judged under the same guard, so no `Hello`
+            // lands between the check and the promise.
+            if candidate == self.local_node_id
+                && entry.follower.as_ref().is_some_and(|f| !f.lease_expired())
+            {
+                return Promise::LeaderLive;
             }
             if entry.promised_epoch > epoch {
                 return Promise::Made(entry.promised_epoch);
@@ -3681,7 +4099,7 @@ impl ReplicationManager {
         peer: &str,
         candidate_epoch: Option<u32>,
     ) -> Option<ReplLeoReply> {
-        let (mut recv, mut send) = self.transport.open_stream(peer).await.ok()?;
+        let (mut recv, mut send) = self.transport.open_query_stream(peer).await.ok()?;
         let known_epoch = self
             .registry
             .get(key)
@@ -3955,6 +4373,7 @@ impl ReplicationManager {
         // removed. Every replica stream is the glue supervisor's job.
         match self.leader_factory.spawn_deferred(&assignment, Vec::new()) {
             Ok(handle) => {
+                self.follower_factory.note_led(&assignment);
                 let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
                 // Switched IN PLACE, never removed and re-inserted. The old
                 // follower runner's `stop()` blocks (it flushes partition
@@ -4952,6 +5371,8 @@ impl ReplicationManager {
             std::thread::sleep(TRANSFER_CATCH_UP_POLL);
         }
 
+        handle.flush_groups_to(target, TRANSFER_GROUPS_FLUSH_MAX);
+
         let mut proposed = assignment.clone();
         proposed.leader_node_id = target.to_string();
         proposed.epoch_slots = assignment.resolved_epoch_slots();
@@ -4985,6 +5406,11 @@ impl ReplicationManager {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        // Group rows changed since the first flush (a pause, a resume, a
+        // commit) are sent once more before this leader stops: the target is
+        // about to serve them. What changes after this last send travels no
+        // faster than any asynchronously replicated row.
+        handle.flush_groups_to(target, TRANSFER_GROUPS_FINAL_FLUSH_MAX);
         let fate_known = admitted || self.row_shows_move(key, target, proposed.leader_epoch);
         // Either way this leader stops leading: it was admitted, or it may
         // have been and nothing may land here until the ledger says.
@@ -5702,6 +6128,104 @@ impl ReplicationManager {
 pub struct IrohTransport {
     mesh: Arc<IrohMeshManager>,
     forward_connections: Arc<ConnectionPool<iroh::endpoint::Connection>>,
+    query_dials: DialGate<iroh::endpoint::Connection>,
+}
+
+/// What a dial one caller ran came to, for the callers waiting on it.
+#[derive(Clone)]
+enum DialOutcome<C> {
+    Done(Result<C, String>),
+    /// The caller running the dial went away before it finished.
+    Abandoned,
+}
+
+/// Lets the callers that dial one peer at the same time share one dial: the
+/// first runs it, the rest wait for its outcome — a failure included, which
+/// they take as their own instead of each sitting out a dead peer's dial. A
+/// caller that arrives after the dial ended dials again, so nothing outlives
+/// the attempt it was made for.
+struct DialGate<C: Clone> {
+    flights: DashMap<String, watch::Sender<Option<DialOutcome<C>>>>,
+}
+
+/// Ends a flight, with `Abandoned` unless `finish` ran first.
+struct Flight<'a, C: Clone> {
+    gate: &'a DialGate<C>,
+    node_id: &'a str,
+    outcome: watch::Sender<Option<DialOutcome<C>>>,
+    finished: bool,
+}
+
+impl<C: Clone> Flight<'_, C> {
+    fn finish(mut self, result: Result<C, String>) {
+        self.end(DialOutcome::Done(result));
+    }
+
+    fn end(&mut self, outcome: DialOutcome<C>) {
+        self.finished = true;
+        // Removed first: a caller arriving from now on starts its own dial.
+        self.gate.flights.remove(self.node_id);
+        self.outcome.send_replace(Some(outcome));
+    }
+}
+
+impl<C: Clone> Drop for Flight<'_, C> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.end(DialOutcome::Abandoned);
+        }
+    }
+}
+
+impl<C: Clone> DialGate<C> {
+    fn new() -> Self {
+        Self {
+            flights: DashMap::new(),
+        }
+    }
+
+    async fn dial<F, Fut>(&self, node_id: &str, dial: F) -> Result<C, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<C, String>>,
+    {
+        loop {
+            let waiting = match self.flights.entry(node_id.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => Err(e.get().subscribe()),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let outcome = watch::channel(None).0;
+                    e.insert(outcome.clone());
+                    Ok(outcome)
+                }
+            };
+            let mut waiting = match waiting {
+                Ok(outcome) => {
+                    let flight = Flight {
+                        gate: self,
+                        node_id,
+                        outcome,
+                        finished: false,
+                    };
+                    let result = dial().await;
+                    flight.finish(result.clone());
+                    return result;
+                }
+                Err(waiting) => waiting,
+            };
+            let outcome = loop {
+                if let Some(outcome) = waiting.borrow().clone() {
+                    break outcome;
+                }
+                if waiting.changed().await.is_err() {
+                    break DialOutcome::Abandoned;
+                }
+            };
+            match outcome {
+                DialOutcome::Done(result) => return result,
+                DialOutcome::Abandoned => continue,
+            }
+        }
+    }
 }
 
 /// How long a pooled connection stays open with no forwarded request on it.
@@ -5862,6 +6386,7 @@ impl IrohTransport {
         Self {
             mesh,
             forward_connections: Arc::new(ConnectionPool::new()),
+            query_dials: DialGate::new(),
         }
     }
 
@@ -5893,6 +6418,24 @@ impl Transport for IrohTransport {
             .connect_bus(node_id)
             .await
             .map_err(|e| ReplError::Internal(format!("connect_bus({node_id}): {e}")))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| ReplError::Internal(format!("open_bi({node_id}): {e}")))?;
+        Ok((Box::new(recv), Box::new(send)))
+    }
+
+    async fn open_query_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        let connection = self
+            .query_dials
+            .dial(node_id, || async {
+                self.mesh
+                    .connect_bus(node_id)
+                    .await
+                    .map_err(|e| format!("connect_bus({node_id}): {e}"))
+            })
+            .await
+            .map_err(ReplError::Internal)?;
         let (send, recv) = connection
             .open_bi()
             .await
@@ -6138,6 +6681,13 @@ mod tests {
         dial_count: DashMap<String, u32>,
         forward_peers: DashMap<String, ForwardPeer>,
         forward_dials: DashMap<String, u32>,
+        /// How long every dial takes before it succeeds or fails.
+        dial_delay: Mutex<Duration>,
+        query_dials: DialGate<()>,
+        /// Dials made for `LeoQuery` streams only.
+        query_dial_count: DashMap<String, u32>,
+        query_in_flight: AtomicU32,
+        query_max_in_flight: AtomicU32,
     }
 
     impl FakeTransport {
@@ -6147,7 +6697,53 @@ mod tests {
                 dial_count: DashMap::new(),
                 forward_peers: DashMap::new(),
                 forward_dials: DashMap::new(),
+                dial_delay: Mutex::new(Duration::ZERO),
+                query_dials: DialGate::new(),
+                query_dial_count: DashMap::new(),
+                query_in_flight: AtomicU32::new(0),
+                query_max_in_flight: AtomicU32::new(0),
             }
+        }
+
+        /// The most `LeoQuery` dials that were under way at once.
+        fn max_query_dials_at_once(&self) -> u32 {
+            self.query_max_in_flight.load(Ordering::SeqCst)
+        }
+
+        fn query_dials(&self, node_id: &str) -> u32 {
+            self.query_dial_count.get(node_id).map(|v| *v).unwrap_or(0)
+        }
+
+        fn set_dial_delay(&self, delay: Duration) {
+            *self.dial_delay.lock() = delay;
+        }
+
+        /// The dial: counted, as slow as `dial_delay` and the peer's script
+        /// make it, ending in a refusal for an unreachable peer.
+        async fn connect(&self, node_id: &str) -> Result<(), ReplError> {
+            *self.dial_count.entry(node_id.to_string()).or_insert(0) += 1;
+            let delay = *self.dial_delay.lock();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if !self.scripts.contains_key(node_id) && self.forward_peers.contains_key(node_id) {
+                return Ok(());
+            }
+            let script = self
+                .scripts
+                .get(node_id)
+                .map(|s| s.clone())
+                .unwrap_or(PeerScript::Unreachable);
+            if matches!(script, PeerScript::Unreachable) {
+                return Err(ReplError::Internal(format!("unreachable: {node_id}")));
+            }
+            if matches!(script, PeerScript::Hang) {
+                std::future::pending::<()>().await;
+            }
+            if let PeerScript::Slow(delay, _) = &script {
+                tokio::time::sleep(*delay).await;
+            }
+            Ok(())
         }
 
         fn set_forward_peer(&self, node_id: &str, peer: ForwardPeer) {
@@ -6186,6 +6782,7 @@ mod tests {
                         promised_epoch: None,
                         promises: true,
                         instance_unhosted: unhosted,
+                        log_known: !unhosted,
                         bus_features: if knows_forwarding {
                             frames::LOCAL_BUS_FEATURES
                         } else {
@@ -6237,15 +6834,47 @@ mod tests {
         }
 
         async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
-            *self.dial_count.entry(node_id.to_string()).or_insert(0) += 1;
+            self.connect(node_id).await?;
+            Ok(self.stream_to(node_id))
+        }
+
+        async fn open_query_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+            let dial = || async {
+                *self
+                    .query_dial_count
+                    .entry(node_id.to_string())
+                    .or_insert(0) += 1;
+                struct Under<'a>(&'a AtomicU32);
+                impl Drop for Under<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let now = self.query_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let _under = Under(&self.query_in_flight);
+                self.query_max_in_flight.fetch_max(now, Ordering::SeqCst);
+                let outcome = self.connect(node_id).await.map_err(|e| e.to_string());
+                outcome
+            };
+            self.query_dials
+                .dial(node_id, dial)
+                .await
+                .map_err(ReplError::Internal)?;
+            Ok(self.stream_to(node_id))
+        }
+    }
+
+    impl FakeTransport {
+        /// The far end of a stream to a peer already dialed.
+        fn stream_to(&self, node_id: &str) -> (BusRecv, BusSend) {
             // A peer set up only for forwarding answers the capability probe
             // the way a current build does, or, for `Predates`, without any.
             if !self.scripts.contains_key(node_id) {
                 if let Some(peer) = self.forward_peers.get(node_id).map(|p| p.clone()) {
-                    return Ok(Self::answer_probe(
+                    return Self::answer_probe(
                         !matches!(peer, ForwardPeer::Predates | ForwardPeer::NotHosted),
                         matches!(peer, ForwardPeer::NotHosted),
-                    ));
+                    );
                 }
             }
             let script = self
@@ -6253,15 +6882,6 @@ mod tests {
                 .get(node_id)
                 .map(|s| s.clone())
                 .unwrap_or(PeerScript::Unreachable);
-            if matches!(script, PeerScript::Unreachable) {
-                return Err(ReplError::Internal(format!("unreachable: {node_id}")));
-            }
-            if matches!(script, PeerScript::Hang) {
-                std::future::pending::<()>().await;
-            }
-            if let PeerScript::Slow(delay, _) = &script {
-                tokio::time::sleep(*delay).await;
-            }
             let (ours, theirs) = tokio::io::duplex(16 * 1024);
             tokio::spawn(async move {
                 let (mut peer_recv, mut peer_send) = split(theirs);
@@ -6280,6 +6900,7 @@ mod tests {
                             promised_epoch: query.candidate_epoch,
                             promises: true,
                             instance_unhosted: false,
+                            log_known: true,
                             bus_features: 0,
                         },
                         PeerScript::Reply(reply) => ReplLeoReply {
@@ -6293,7 +6914,7 @@ mod tests {
                 }
             });
             let (our_recv, our_send) = split(ours);
-            Ok((Box::new(our_recv), Box::new(our_send)))
+            (Box::new(our_recv), Box::new(our_send))
         }
     }
 
@@ -6847,6 +7468,8 @@ mod tests {
         stopped: AtomicBool,
         /// `last_frame_age` in milliseconds; `u64::MAX`: nothing received.
         frame_age_ms: AtomicU64,
+        /// The live in-sync set the leader last reported, if it did.
+        leader_isr: Mutex<Option<Vec<String>>>,
     }
 
     struct FakeFollowerRunner {
@@ -6871,6 +7494,9 @@ mod tests {
         }
         fn mark_leader_disconnected(&self) {
             self.shared.disconnected.store(true, Ordering::SeqCst);
+        }
+        fn leader_isr(&self) -> Option<Vec<String>> {
+            self.shared.leader_isr.lock().clone()
         }
         fn last_frame_age(&self) -> Option<Duration> {
             match self.shared.frame_age_ms.load(Ordering::SeqCst) {
@@ -6898,6 +7524,8 @@ mod tests {
         local_read_fails: AtomicBool,
         /// How many times `cut_to_committed` ran.
         cuts: Mutex<u32>,
+        /// How long `cut_to_committed` takes, as a slow disk would.
+        cut_delay: Mutex<Duration>,
         /// `fence:<epoch>` / `cut`, in call order.
         events: Mutex<Vec<String>>,
         /// The epoch the fake partition recognizes: raised by every fence,
@@ -6911,6 +7539,13 @@ mod tests {
         lone_probe: Mutex<Duration>,
         /// Every `fence_to_epoch` fails while set.
         fence_fails: AtomicBool,
+        /// How long `fence_to_epoch` takes, as a slow disk would.
+        fence_delay: Mutex<Duration>,
+        /// `caught_up_since_start`: true unless a test says the node restarted
+        /// behind its leader.
+        caught_up: AtomicBool,
+        /// How many times the manager said it led a partition.
+        led_calls: std::sync::atomic::AtomicU32,
     }
 
     impl FakeFollowerFactory {
@@ -6922,12 +7557,16 @@ mod tests {
                 local_epoch: Mutex::new(None),
                 local_read_fails: AtomicBool::new(false),
                 cuts: Mutex::new(0),
+                cut_delay: Mutex::new(Duration::ZERO),
                 events: Mutex::new(Vec::new()),
                 recognized: AtomicU32::new(0),
                 stagger: Mutex::new(Duration::ZERO),
                 restart_grace: Mutex::new(Duration::ZERO),
                 lone_probe: Mutex::new(Duration::ZERO),
                 fence_fails: AtomicBool::new(false),
+                fence_delay: Mutex::new(Duration::ZERO),
+                caught_up: AtomicBool::new(true),
+                led_calls: std::sync::atomic::AtomicU32::new(0),
             })
         }
     }
@@ -6981,6 +7620,7 @@ mod tests {
                 disconnected: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
                 frame_age_ms: AtomicU64::new(u64::MAX),
+                leader_isr: Mutex::new(None),
             });
             self.handles.lock().push(Arc::clone(&shared));
             Ok(Box::new(FakeFollowerRunner { shared }))
@@ -6998,6 +7638,15 @@ mod tests {
             *self.lone_probe.lock()
         }
 
+        fn caught_up_since_start(&self, _assignment: &PartitionAssignment) -> bool {
+            self.caught_up.load(Ordering::SeqCst)
+        }
+
+        fn note_led(&self, _assignment: &PartitionAssignment) {
+            self.led_calls.fetch_add(1, Ordering::SeqCst);
+            self.caught_up.store(true, Ordering::SeqCst);
+        }
+
         fn leader_lease(&self) -> Duration {
             FAKE_LEADER_LEASE
         }
@@ -7011,6 +7660,7 @@ mod tests {
             _assignment: &PartitionAssignment,
             epoch: u32,
         ) -> Result<u32, ReplError> {
+            std::thread::sleep(*self.fence_delay.lock());
             if self.fence_fails.load(Ordering::SeqCst) {
                 return Err(ReplError::Internal("forced fence failure".into()));
             }
@@ -7026,6 +7676,7 @@ mod tests {
             assignment: &PartitionAssignment,
         ) -> Result<LogPosition, ReplError> {
             self.events.lock().push("cut".to_string());
+            std::thread::sleep(*self.cut_delay.lock());
             let log = self.local_log_position(assignment)?;
             self.local_leo.store(log.committed, Ordering::SeqCst);
             *self.cuts.lock() += 1;
@@ -7692,6 +8343,7 @@ mod tests {
             disconnected: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             frame_age_ms: AtomicU64::new(200),
+            leader_isr: Mutex::new(None),
         });
         fx.manager.registry.get_mut(&key).unwrap().follower = Some(Box::new(FakeFollowerRunner {
             shared: Arc::clone(&runner),
@@ -7705,6 +8357,51 @@ mod tests {
         runner.frame_age_ms.store(60_000, Ordering::SeqCst);
         let snap = fx.manager.snapshot("org", Some("orders"));
         assert!(!node_info(&snap, "l").reachable);
+    }
+
+    /// The mesh still holds the connection of a peer that was killed, for
+    /// 20-25 s; a peer whose replication stream went silent is shown gone
+    /// within the stream's own bound.
+    #[tokio::test]
+    async fn a_connected_peer_whose_stream_went_silent_is_unreachable_before_the_mesh_notices() {
+        let fx = build("f1");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "l",
+                &["l", "f1"],
+                &["l", "f1"],
+                1,
+            ))
+            .await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let runner = Arc::new(FakeFollowerHandle {
+            leo: AtomicU64::new(0),
+            hw: AtomicU64::new(0),
+            lease_expired: AtomicBool::new(false),
+            log_epoch: AtomicU32::new(0),
+            committed: AtomicU64::new(0),
+            disconnected: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            frame_age_ms: AtomicU64::new(200),
+            leader_isr: Mutex::new(None),
+        });
+        fx.manager.registry.get_mut(&key).unwrap().follower = Some(Box::new(FakeFollowerRunner {
+            shared: Arc::clone(&runner),
+        }));
+        fx.manager.on_peer_connected("l");
+        assert!(node_info(&fx.manager.snapshot("org", Some("orders")), "l").reachable);
+
+        // The stream has been silent past its bound and so has the mesh's
+        // own signal, which the mesh still counts as connected.
+        runner.frame_age_ms.store(7_000, Ordering::SeqCst);
+        age_peer_signal(&fx.manager, "l", Duration::from_secs(7));
+        assert!(
+            !node_info(&fx.manager.snapshot("org", Some("orders")), "l").reachable,
+            "7 s of silence on a stream that speaks every 500 ms"
+        );
     }
 
     /// A peer never heard from (no mesh event, no frame) is not reachable,
@@ -8078,6 +8775,7 @@ mod tests {
             max_wait_ms: 10,
             topic_generation: 0,
             partitions: 0,
+            only_partitions: Vec::new(),
         }
     }
 
@@ -9564,6 +10262,8 @@ mod tests {
 
         fx.manager.check_stale_leadership().await;
 
+        fx.manager.settle_step_downs().await;
+
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Follower {
@@ -9579,6 +10279,30 @@ mod tests {
             "a stepped-down node must refuse publishes — the whole point is that writes \
              accepted here would never be replicated"
         );
+    }
+
+    /// A step-down waits for a blocking fence and the cut of the log: the tick
+    /// that starts it, and the elections and quorum-lease checks behind it,
+    /// do not wait with it.
+    #[tokio::test]
+    async fn a_slow_step_down_does_not_hold_the_lease_tick() {
+        let fx = build("a");
+        let stale = assignment("org", "orders", 0, "a", &["a", "b"], &["a", "b"], 2);
+        fx.manager.apply_assignment(stale).await;
+        fx.leader_factory.handles.lock()[0].note_stale_epoch(3);
+        *fx.follower_factory.fence_delay.lock() = Duration::from_millis(600);
+        let started = Instant::now();
+        fx.manager.check_stale_leadership().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "the tick waited for the step-down: {:?}",
+            started.elapsed()
+        );
+        fx.manager.settle_step_downs().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { .. }
+        ));
     }
 
     #[tokio::test]
@@ -9601,6 +10325,8 @@ mod tests {
         // on it, or the node keeps serving until sync happens to arrive.
 
         fx.manager.check_stale_leadership().await;
+
+        fx.manager.settle_step_downs().await;
 
         assert_eq!(
             fx.manager.role("org", "orders", 0),
@@ -9639,6 +10365,7 @@ mod tests {
         for have in [3u32, 2] {
             fx.leader_factory.handles.lock()[0].note_stale_epoch(have);
             fx.manager.check_stale_leadership().await;
+            fx.manager.settle_step_downs().await;
             assert_eq!(
                 fx.manager.role("org", "orders", 0),
                 PartitionRole::Leader { epoch: 3 },
@@ -10927,6 +11654,7 @@ mod tests {
                 .set_acked(OperationId::from_hash([raw; 32]), vec!["f2".to_string()]);
         }
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 },
@@ -10979,6 +11707,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: next_epoch },
@@ -11016,6 +11745,7 @@ mod tests {
 
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(matches!(
             fx.manager.registry.get(&key).map(|e| e.promotion.clone()),
             Some(PromotionState::Abandoned {
@@ -11068,6 +11798,7 @@ mod tests {
 
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(matches!(
             fx.manager.registry.get(&key).map(|e| e.promotion.clone()),
             Some(PromotionState::Abandoned {
@@ -11148,6 +11879,7 @@ mod tests {
             promised_epoch: None,
             promises: true,
             instance_unhosted: false,
+            log_known: true,
             bus_features: 0,
         })
     }
@@ -11177,6 +11909,7 @@ mod tests {
         *fx.follower_factory.local_epoch.lock() = Some(1);
         fx.leader_factory.handles.lock()[0].note_stale_epoch(2);
         fx.manager.check_stale_leadership().await;
+        fx.manager.settle_step_downs().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Follower {
@@ -11195,6 +11928,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
 
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert_eq!(
@@ -11256,6 +11990,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
 
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert!(
@@ -11305,6 +12040,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
 
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert_eq!(
@@ -11394,6 +12130,7 @@ mod tests {
                 promised_epoch: None,
                 promises: true,
                 instance_unhosted: false,
+                log_known: true,
                 bus_features: 0,
             }),
         );
@@ -11403,6 +12140,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert!(matches!(
             fx.manager.registry.get(&key).map(|e| e.promotion.clone()),
@@ -11474,6 +12212,7 @@ mod tests {
                 .set_acked(OperationId::from_hash([raw; 32]), vec!["f1".to_string()]);
         }
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 66 }
@@ -11515,6 +12254,7 @@ mod tests {
                 .set_acked(OperationId::from_hash([raw; 32]), vec!["z".to_string()]);
         }
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert!(matches!(
             fx.manager.registry.get(&key).map(|e| e.promotion.clone()),
@@ -11583,6 +12323,7 @@ mod tests {
                 promised_epoch: None,
                 promises: true,
                 instance_unhosted: false,
+                log_known: true,
                 bus_features: 0,
             }),
         );
@@ -11592,6 +12333,7 @@ mod tests {
         }
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert_eq!(fx.assignments.stored(&key).map(|r| r.leader_epoch), Some(3));
         assert!(matches!(
@@ -11624,6 +12366,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         fx.leader_factory.handles.lock()[0].note_stale_epoch(2);
         fx.manager.check_stale_leadership().await;
+        fx.manager.settle_step_downs().await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert!(fx.manager.registry.get(&key).unwrap().unreconciled);
 
@@ -11644,10 +12387,116 @@ mod tests {
             .local_read_fails
             .store(false, Ordering::SeqCst);
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             *fx.follower_factory.cuts.lock(),
             0,
             "no cut under a live stream"
+        );
+    }
+
+    fn peer_ahead_reply(epoch: u32) -> ReplLeoReply {
+        ReplLeoReply {
+            leader_epoch: epoch,
+            ineligible: false,
+            promises: true,
+            log_known: true,
+            ..zeroed_reply()
+        }
+    }
+
+    /// A node that restarts on the row it led under, holding records, does not
+    /// take writes while a replica already leads a later epoch: what it
+    /// acknowledged meanwhile would be cut away when that leader fenced it.
+    #[tokio::test]
+    async fn a_restarted_leader_with_records_takes_no_writes_while_a_replica_is_ahead() {
+        let fx = build("a");
+        fx.follower_factory.local_leo.store(5, Ordering::SeqCst);
+        fx.transport
+            .set_script("b", PeerScript::Reply(peer_ahead_reply(4)));
+        let row = assignment("org", "orders", 0, "a", &["a", "b"], &["a"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        assert!(
+            !handle.writes_opened.load(Ordering::SeqCst),
+            "writes were opened over a leader of a later epoch"
+        );
+    }
+
+    /// A full restart does not block: every replica answers with a log and
+    /// nobody is ahead.
+    #[tokio::test]
+    async fn a_restarted_leader_opens_writes_once_every_replica_answers_and_none_is_ahead() {
+        let fx = build("a");
+        fx.follower_factory.local_leo.store(5, Ordering::SeqCst);
+        fx.transport.set_script(
+            "b",
+            PeerScript::LeoReply {
+                leo: 5,
+                in_isr: true,
+            },
+        );
+        let row = assignment("org", "orders", 0, "a", &["a", "b"], &["a"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        for _ in 0..100 {
+            if handle.writes_opened.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(handle.writes_opened.load(Ordering::SeqCst));
+    }
+
+    /// A partition with nothing in it is led from its first row.
+    #[tokio::test]
+    async fn a_leader_of_an_empty_partition_opens_writes_at_once() {
+        let fx = build("a");
+        let row = assignment("org", "orders", 0, "a", &["a", "b"], &["a"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        assert!(handle.writes_opened.load(Ordering::SeqCst));
+    }
+
+    /// Two ticks (or a tick and the step-down) that reach one uncut partition
+    /// at once cut it once: the second sees the first's `cutting` flag.
+    #[tokio::test]
+    async fn two_concurrent_cuts_of_one_partition_run_once() {
+        let fx = build("x");
+        let a = assignment("org", "orders", 0, "y", &["x", "y"], &["x", "y"], 2);
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        fx.manager.registry.get_mut(&key).unwrap().unreconciled = true;
+        *fx.follower_factory.cut_delay.lock() = Duration::from_millis(300);
+        tokio::join!(
+            fx.manager.cut_stepped_down_log(&key),
+            fx.manager.cut_stepped_down_log(&key)
+        );
+        assert_eq!(*fx.follower_factory.cuts.lock(), 1);
+    }
+
+    /// A slow cut does not hold the lease tick: the quorum-lease check and the
+    /// elections behind it run on time.
+    #[tokio::test]
+    async fn a_slow_cut_does_not_hold_the_lease_tick() {
+        let fx = build("x");
+        let a = assignment("org", "orders", 0, "y", &["x", "y"], &["x", "y"], 2);
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        fx.manager.registry.get_mut(&key).unwrap().unreconciled = true;
+        *fx.follower_factory.cut_delay.lock() = Duration::from_millis(600);
+        let started = Instant::now();
+        fx.manager.check_leases().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "the tick waited for the cut: {:?}",
+            started.elapsed()
         );
     }
 
@@ -11763,6 +12612,7 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 }
@@ -11783,6 +12633,7 @@ mod tests {
             promised_epoch: None,
             promises: true,
             instance_unhosted: false,
+            log_known: true,
             bus_features: 0,
         }
     }
@@ -11803,6 +12654,7 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(
             matches!(
                 fx.manager.role("org", "orders", 0),
@@ -11824,6 +12676,7 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 }
@@ -11844,6 +12697,7 @@ mod tests {
         for _ in 0..3 {
             tokio::time::sleep(PAST_THE_LEASE).await;
             fx.manager.check_leases().await;
+            fx.manager.settle_elections().await;
         }
         assert!(
             matches!(
@@ -11873,12 +12727,14 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(matches!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Follower { .. }
         ));
         *fx.follower_factory.restart_grace.lock() = Duration::ZERO;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 }
@@ -11904,6 +12760,11 @@ mod tests {
         assert!(!fx.manager.leader_alive_evidence("l"));
         fx.manager.on_peer_connected("l");
         assert!(fx.manager.leader_alive_evidence("l"));
+        // A connected flag with nothing heard for longer than the mesh's own
+        // freshness window is a peer that stopped answering.
+        fx.manager.peers.get_mut("l").unwrap().last_signal =
+            Instant::now().checked_sub(Duration::from_secs(20));
+        assert!(!fx.manager.leader_alive_evidence("l"));
         fx.manager.on_peer_disconnected("l");
         fx.manager.peers.get_mut("l").unwrap().last_signal = None;
         assert!(!fx.manager.leader_alive_evidence("l"));
@@ -11927,32 +12788,32 @@ mod tests {
         fx.manager.apply_assignment(a.clone()).await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         assert!(!fx.manager.leader_heard(&key));
-        assert_eq!(fx.manager.hello_count(&key), 0);
         let ack = hello_roundtrip(Arc::clone(&fx.manager), hello_from(&a)).await;
         assert!(ack.accepted, "{:?}", ack.reject);
         assert!(fx.manager.leader_heard(&key));
-        assert_eq!(fx.manager.hello_count(&key), 1);
     }
 
-    /// The leader's `Hello` lands while the second wait for its answer is
-    /// still running: the candidacy ends there, however silent the dial was.
+    /// The leader's `Hello` is accepted through the real accept path while the
+    /// pre-vote's wait for its answer is still running: the candidacy ends
+    /// there, however silent the dial was.
     #[tokio::test]
-    async fn a_hello_accepted_during_the_wait_ends_the_candidacy() {
+    async fn a_hello_accepted_while_the_probe_runs_ends_the_candidacy() {
         let fx = build("f");
         *fx.follower_factory.lone_probe.lock() = Duration::from_secs(3);
         fx.transport.set_script("l", PeerScript::Hang);
         let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
         fx.assignments.seed(row.clone());
-        fx.manager.apply_assignment(row).await;
+        fx.manager.apply_assignment(row.clone()).await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         tokio::time::sleep(PAST_THE_LEASE).await;
         let manager = fx.manager.clone();
-        let landing = key.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(600)).await;
-            manager.registry.get_mut(&landing).unwrap().hellos += 1;
+            let ack = hello_roundtrip(manager, hello_from(&row)).await;
+            assert!(ack.accepted, "{:?}", ack.reject);
         });
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(
             matches!(
                 fx.manager.role("org", "orders", 0),
@@ -11967,6 +12828,286 @@ mod tests {
             .is_some_and(|a| a.leader_epoch == 3));
     }
 
+    /// A leader that restarts in a loop is heard and gone again within the
+    /// wait: a `Hello` whose stream is no longer live holds nothing off, or
+    /// the failover would wait on it for good.
+    #[tokio::test]
+    async fn a_leader_whose_stream_already_ended_does_not_hold_off_the_failover() {
+        let fx = build("f");
+        *fx.follower_factory.lone_probe.lock() = Duration::from_secs(1);
+        fx.transport.set_script("l", PeerScript::Hang);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        let manager = fx.manager.clone();
+        let factory = fx.follower_factory.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let ack = hello_roundtrip(manager, hello_from(&row)).await;
+            assert!(ack.accepted, "{:?}", ack.reject);
+            factory
+                .handles
+                .lock()
+                .last()
+                .unwrap()
+                .lease_expired
+                .store(true, Ordering::SeqCst);
+        });
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+    }
+
+    /// A leader whose stream is live when the vote begins stops it before
+    /// any promise is made: the reservation is judged with the live stream,
+    /// under the same guard.
+    #[tokio::test]
+    async fn a_live_leader_stream_stops_the_vote_before_it_promises() {
+        let fx = build("f");
+        fx.transport.set_script("l", PeerScript::Hang);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let ack = hello_roundtrip(fx.manager.clone(), hello_from(&row)).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        let promised = fx.manager.registry.get(&key).unwrap().promised_epoch;
+        assert!(fx.manager.canvass(&key, true).await.is_none());
+        assert_eq!(
+            fx.manager.registry.get(&key).unwrap().promised_epoch,
+            promised,
+            "the vote promised its term to itself over a live leader"
+        );
+    }
+
+    /// One partition's election waiting on a silent peer must not keep the
+    /// tick from starting another's: it falls due while the first still waits.
+    #[tokio::test]
+    async fn an_election_waiting_on_a_silent_peer_does_not_hold_back_another_partitions() {
+        let fx = build("f");
+        *fx.follower_factory.lone_probe.lock() = Duration::from_millis(1500);
+        *fx.follower_factory.stagger.lock() = Duration::from_millis(100);
+        fx.transport.set_script("l1", PeerScript::Hang);
+        fx.transport.set_script("l2", PeerScript::Hang);
+        let first = assignment("org", "orders", 0, "l1", &["l1", "f"], &["l1", "f"], 3);
+        fx.assignments.seed(first.clone());
+        fx.manager.apply_assignment(first).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        let started = Instant::now();
+        let mut second_applied = false;
+        while fx.transport.dials("l2") == 0 {
+            assert!(
+                started.elapsed() < Duration::from_millis(1200),
+                "the second partition's election never started behind the first"
+            );
+            if !second_applied && started.elapsed() >= Duration::from_millis(100) {
+                let second = assignment("org", "orders", 1, "l2", &["l2", "f"], &["l2", "f"], 3);
+                fx.assignments.seed(second.clone());
+                fx.manager.apply_assignment(second).await;
+                second_applied = true;
+            }
+            fx.manager.check_leases().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            matches!(
+                fx.manager.role("org", "orders", 0),
+                PartitionRole::Follower { .. }
+            ),
+            "the first election was meant to still be waiting"
+        );
+        while started.elapsed() < Duration::from_secs(8) {
+            fx.manager.check_leases().await;
+            if matches!(
+                (
+                    fx.manager.role("org", "orders", 0),
+                    fx.manager.role("org", "orders", 1)
+                ),
+                (PartitionRole::Leader { .. }, PartitionRole::Leader { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("both partitions were not taken over");
+    }
+
+    /// The partitions of one dead leader ask its node through one dial at a
+    /// time, not one dial each.
+    #[tokio::test]
+    async fn partitions_of_one_dead_leader_share_a_dial_to_it() {
+        let fx = build("f");
+        *fx.follower_factory.lone_probe.lock() = Duration::from_secs(1);
+        fx.transport.set_dial_delay(Duration::from_millis(100));
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        for p in 0..8u32 {
+            let row = assignment("org", "orders", p, "l", &["l", "f"], &["l", "f"], 3);
+            fx.assignments.seed(row.clone());
+            fx.manager.apply_assignment(row).await;
+        }
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        for p in 0..8u32 {
+            assert_eq!(
+                fx.manager.role("org", "orders", p),
+                PartitionRole::Leader { epoch: 64 },
+                "partition {p}"
+            );
+        }
+        // Eight partitions asking a dozen times each in the probe's second:
+        // one dial per round, the count depending on how fast the rounds run
+        // (11 to 19 measured), where one dial per query would be near a
+        // hundred.
+        assert_eq!(
+            fx.transport.max_query_dials_at_once(),
+            1,
+            "partitions dialed the dead peer at the same time"
+        );
+        assert!(
+            fx.transport.query_dials("l") <= 24,
+            "{} query dials to one dead peer",
+            fx.transport.query_dials("l")
+        );
+    }
+
+    /// More partitions fall due than elections may run at once: the surplus
+    /// waits for a slot, and every partition is still taken over.
+    #[tokio::test]
+    async fn elections_beyond_the_cap_wait_for_a_slot() {
+        let fx = build("f");
+        *fx.follower_factory.lone_probe.lock() = Duration::from_millis(400);
+        fx.transport.set_script("l", PeerScript::Hang);
+        let total = MAX_CONCURRENT_ELECTIONS as u32 + 4;
+        for p in 0..total {
+            let row = assignment("org", "orders", p, "l", &["l", "f"], &["l", "f"], 3);
+            fx.assignments.seed(row.clone());
+            fx.manager.apply_assignment(row).await;
+        }
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fx.manager.election_slots.available_permits(), 0);
+        assert_eq!(fx.manager.elections.len(), total as usize);
+        fx.manager.settle_elections().await;
+        for p in 0..total {
+            assert_eq!(
+                fx.manager.role("org", "orders", p),
+                PartitionRole::Leader { epoch: 64 },
+                "partition {p}"
+            );
+        }
+    }
+
+    /// A peer that refuses at first — it is restarting — and answers a moment
+    /// later is waited for: a refusal that comes at once is not silence.
+    #[tokio::test]
+    async fn a_peer_that_refuses_at_first_and_then_answers_is_not_deposed() {
+        let fx = build("f");
+        *fx.follower_factory.lone_probe.lock() = Duration::from_secs(3);
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        let transport = fx.transport.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            transport.set_script("l", PeerScript::Reply(a_live_leader_reply(3)));
+        });
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(
+            matches!(
+                fx.manager.role("org", "orders", 0),
+                PartitionRole::Follower { epoch: 3, .. }
+            ),
+            "{:?}",
+            fx.manager.role("org", "orders", 0)
+        );
+        assert!(fx
+            .assignments
+            .stored(&key)
+            .is_some_and(|a| a.leader_epoch == 3));
+    }
+
+    /// A node that led and stepped down has not heard the leader that now
+    /// holds the partition: the restart grace's proof starts over.
+    #[tokio::test]
+    async fn stepping_down_clears_what_the_node_heard_of_its_leader() {
+        let fx = build("x");
+        let a = assignment("org", "orders", 0, "x", &["x", "y"], &["x", "y"], 1);
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        fx.manager.registry.get_mut(&key).unwrap().leader_heard = true;
+        fx.leader_factory.handles.lock()[0].note_stale_epoch(2);
+        fx.manager.check_stale_leadership().await;
+        fx.manager.settle_step_downs().await;
+        assert!(!fx.manager.leader_heard(&key));
+    }
+
+    /// The dial gate: callers that overlap share one dial and its failure;
+    /// one that arrives after it ended dials again.
+    #[tokio::test]
+    async fn a_dial_gate_shares_one_dial_between_overlapping_callers() {
+        let gate = Arc::new(DialGate::<u32>::new());
+        let dials = Arc::new(AtomicU32::new(0));
+        let call = |fail: bool| {
+            let gate = Arc::clone(&gate);
+            let dials = Arc::clone(&dials);
+            async move {
+                gate.dial("p", || async {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if fail {
+                        Err("refused".to_string())
+                    } else {
+                        Ok(7)
+                    }
+                })
+                .await
+            }
+        };
+        let overlapping = futures::future::join_all((0..8).map(|_| call(true))).await;
+        assert!(overlapping.iter().all(|r| r == &Err("refused".to_string())));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        assert_eq!(call(false).await, Ok(7));
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "a later caller dials again"
+        );
+    }
+
+    /// The caller running the dial goes away: one of the others takes it over.
+    #[tokio::test]
+    async fn a_dial_gate_survives_the_caller_that_ran_the_dial() {
+        let gate = Arc::new(DialGate::<u32>::new());
+        let runner = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.dial("p", || async {
+                    std::future::pending::<Result<u32, String>>().await
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.dial("p", || async { Ok(9) }).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        runner.abort();
+        assert_eq!(waiter.await.unwrap(), Ok(9));
+    }
+
     /// The second wait is the pre-vote's alone: a vote round has promised its
     /// term already and does not sit out a dead dial.
     #[tokio::test]
@@ -11979,11 +13120,8 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         let key = ("org".to_string(), "orders".to_string(), 0u32);
         let started = Instant::now();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            fx.manager.canvass(&key, true, fx.manager.hello_count(&key)),
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), fx.manager.canvass(&key, true)).await;
         assert!(outcome.is_ok(), "the vote round waited on the silent dial");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -12003,6 +13141,7 @@ mod tests {
         tokio::time::sleep(PAST_THE_LEASE).await;
         let started = Instant::now();
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         for p in 0..8u32 {
             assert_eq!(
                 fx.manager.role("org", "orders", p),
@@ -12030,6 +13169,210 @@ mod tests {
         fx.manager.registry.get_mut(&key).unwrap().leader_heard = true;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+    }
+
+    /// A node that came up after the leader went on acknowledging writes has
+    /// not seen them, whatever the persisted placement says about it: it
+    /// stands only once it has caught up with a leader since it started.
+    #[tokio::test]
+    async fn a_node_that_has_not_caught_up_since_it_started_does_not_stand() {
+        let fx = build("f");
+        fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { epoch: 3, .. }
+        ));
+        assert!(fx
+            .assignments
+            .stored(&key)
+            .is_some_and(|a| a.leader_epoch == 3));
+        assert!(
+            fx.manager.registry.get(&key).unwrap().not_in_sync_logged,
+            "the hold-back is said once"
+        );
+        // Caught up with a leader: the same silence now means the leader is gone.
+        fx.follower_factory.caught_up.store(true, Ordering::SeqCst);
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+    }
+
+    /// Every replica restarting together has no leader to have caught up
+    /// with: when the others all answer and none leads, the node stands.
+    #[tokio::test]
+    async fn a_node_that_has_not_caught_up_stands_when_every_replica_answers() {
+        let fx = build("f");
+        fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+        fx.transport.set_script(
+            "l",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: true,
+            },
+        );
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+    }
+
+    /// What a peer whose bus is not up yet (or that predates the flag) says:
+    /// zeros that look like an empty log, flagged as no real log.
+    fn zeroed_reply() -> ReplLeoReply {
+        ReplLeoReply {
+            leo: 0,
+            hw: 0,
+            leader_epoch: 0,
+            in_isr: false,
+            log_epoch: None,
+            leading: false,
+            ineligible: true,
+            committed: None,
+            leader_alive: false,
+            promised_epoch: None,
+            promises: true,
+            bus_features: 0,
+            instance_unhosted: true,
+            log_known: false,
+        }
+    }
+
+    /// A rolling restart at RF=2: the peer's mesh is up and its bus is not,
+    /// so it answers with a zeroed reply. That is no evidence that no live
+    /// leader holds more, and the candidate that has not caught up must not
+    /// take it for an answer.
+    #[tokio::test]
+    async fn a_zeroed_reply_does_not_let_a_node_that_has_not_caught_up_stand() {
+        let fx = build("f");
+        fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+        fx.transport
+            .set_script("l", PeerScript::Reply(zeroed_reply()));
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { epoch: 3, .. }
+        ));
+    }
+
+    /// A zeroed reply is no answer for the restart grace either.
+    #[tokio::test]
+    async fn a_zeroed_reply_does_not_end_the_restart_grace() {
+        let fx = build("f");
+        *fx.follower_factory.restart_grace.lock() = Duration::from_secs(60);
+        fx.transport
+            .set_script("l", PeerScript::Reply(zeroed_reply()));
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { epoch: 3, .. }
+        ));
+    }
+
+    /// From RF 3 a majority of bound logs is what protects acknowledged
+    /// records, so one replica that never returns does not block the
+    /// partition for ever after a restart of the others.
+    #[tokio::test]
+    async fn at_rf3_a_node_that_has_not_caught_up_stands_with_a_majority_of_logs() {
+        let fx = build("f");
+        fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+        fx.transport.set_script(
+            "l",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: true,
+            },
+        );
+        fx.transport.set_script("g", PeerScript::Unreachable);
+        for raw in 1u8..=8 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["l".to_string()]);
+        }
+        let row = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f", "g"],
+            &["l", "f", "g"],
+            3,
+        );
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { .. }
+        ));
+    }
+
+    /// A leader row replayed at startup says nothing about what this node
+    /// holds: only a promotion it won does.
+    #[tokio::test]
+    async fn a_stale_leader_row_replayed_at_startup_does_not_mark_the_node_caught_up() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "f", &["f", "l"], &["f", "l"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        assert_eq!(fx.follower_factory.led_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The in-sync set the leader last reported is the live one: a leader
+    /// that dropped this node from it has acknowledged writes this node lacks.
+    #[tokio::test]
+    async fn a_node_the_leader_dropped_from_its_in_sync_set_does_not_stand() {
+        let fx = build("f");
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let ack = hello_roundtrip(fx.manager.clone(), hello_from(&row)).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        let handle = fx.follower_factory.handles.lock().last().unwrap().clone();
+        *handle.leader_isr.lock() = Some(vec!["l".to_string()]);
+        handle.lease_expired.store(true, Ordering::SeqCst);
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { epoch: 3, .. }
+        ));
+        *handle.leader_isr.lock() = Some(vec!["l".to_string(), "f".to_string()]);
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 }
@@ -12054,6 +13397,7 @@ mod tests {
         fx.manager.apply_assignment(row).await;
         tokio::time::sleep(PAST_THE_LEASE).await;
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert!(matches!(
             fx.manager.role("org", "orders", 0),
             PartitionRole::Follower { epoch: 3, .. }
@@ -12132,6 +13476,7 @@ mod tests {
             handle.note_stale_epoch(2);
         }
         fx.manager.check_stale_leadership().await;
+        fx.manager.settle_step_downs().await;
         assert!(fx.leader_factory.handles.lock()[0]
             .stopped
             .load(Ordering::SeqCst));
@@ -12295,6 +13640,7 @@ mod tests {
             disconnected: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             frame_age_ms: AtomicU64::new(u64::MAX),
+            leader_isr: Mutex::new(None),
         });
         fx.manager.registry.get_mut(&key).unwrap().follower = Some(Box::new(FakeFollowerRunner {
             shared: Arc::clone(&runner),
@@ -12445,6 +13791,7 @@ mod tests {
                 promised_epoch: Some(65),
                 promises: true,
                 instance_unhosted: false,
+                log_known: true,
                 bus_features: 0,
             }),
         );
@@ -12867,6 +14214,7 @@ mod tests {
                 promised_epoch: Some(65),
                 promises: true,
                 instance_unhosted: false,
+                log_known: true,
                 bus_features: 0,
             }),
         );
@@ -12882,6 +14230,7 @@ mod tests {
         assert!(stand_after >= Instant::now() + Duration::from_secs(9));
         let dials = fx.transport.dials("b");
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.transport.dials("b"),
             dials,
@@ -12984,6 +14333,7 @@ mod tests {
 
         fx.manager.registry.get_mut(&key).unwrap().stand_after = Some(long_ago);
         fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
         assert_eq!(
             fx.manager.registry.get(&key).unwrap().stand_after,
             None,

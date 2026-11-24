@@ -11488,6 +11488,7 @@
       "changes_title": "Changements de node principal",
       "changes_sub": "Quand le node principal cesse de répondre, un autre node avec une copie synchronisée prend le relais. Les changements faits à la main sont aussi listés ici.",
       "changes_none": "Il n’y a pas encore eu de changement de node principal.",
+      "changes_partial": "Cette liste peut être incomplète : l'historique d'un autre node n'a pas pu être lu, les dernières entrées connues sont donc affichées.",
       "change_name": "{topic} · partition {partition} : le node principal est passé de {from} à {to}",
       "change_took": "a pris {secs} s",
       "change_took_short": "a pris <1 s",

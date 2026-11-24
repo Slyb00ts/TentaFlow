@@ -3725,6 +3725,12 @@ fn partition_stored_bytes(part: &tentaflow_bus::Partition) -> u64 {
     sealed.saturating_add(part.active_segment_len())
 }
 
+thread_local! {
+    /// Set by a publish refused at `preflight` on this thread, read by
+    /// `BusService::publish` to tell that refusal from a refused forward.
+    static PREFLIGHT_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl BusService {
     pub fn new(cfg: BusInitConfig) -> Result<Self, BusServiceError> {
         // plan-app-platform §7 W4 finding 4: refuse to start an engine whose
@@ -6633,7 +6639,32 @@ impl BusService {
         topic: &str,
         batch: PublishBatch,
     ) -> Result<PublishResult, BusServiceError> {
-        self.publish_routed(ctx, topic, batch, None, false, PublishSource::Local, None)
+        // A write that waited out a leader transfer at `preflight` finds this
+        // node a follower when it is let through, and is refused naming the
+        // new leader before anything was appended: the one retry sends it
+        // there, instead of answering `NotLeader` for a transfer that has
+        // completed. Only a refusal made at `preflight` is retried (a refused
+        // forward has had its own second attempt), and not when the new leader
+        // is unreachable.
+        let coordinator = self.replication();
+        let retry = coordinator.as_ref().map(|_| batch.clone());
+        PREFLIGHT_REFUSED.with(|flag| flag.set(false));
+        let first = self.publish_routed(ctx, topic, batch, None, false, PublishSource::Local, None);
+        match (first, coordinator, retry) {
+            (
+                Err(BusServiceError::NotLeader {
+                    leader_node_id: Some(leader),
+                    ..
+                }),
+                Some(coordinator),
+                Some(batch),
+            ) if PREFLIGHT_REFUSED.with(|flag| flag.replace(false))
+                && coordinator.node_reachable(&leader) =>
+            {
+                self.publish_routed(ctx, topic, batch, None, false, PublishSource::Local, None)
+            }
+            (first, ..) => first,
+        }
     }
 
     /// `publish` for a write the BROKER makes into `__dlq.<topic>` (the
@@ -6824,9 +6855,8 @@ impl BusService {
                         std::collections::HashMap::new();
                     let mut kept_records = Vec::with_capacity(batch.records.len());
                     let mut kept_tags = Vec::with_capacity(batch.records.len());
-                    for (record, partition) in std::mem::take(&mut batch.records)
-                        .into_iter()
-                        .zip(assigned)
+                    for (record, partition) in
+                        std::mem::take(&mut batch.records).into_iter().zip(assigned)
                     {
                         let here = *led_here.entry(partition).or_insert_with(|| {
                             matches!(
@@ -7061,7 +7091,10 @@ impl BusService {
             for (partition, _) in &groups {
                 let epoch = coordinator
                     .preflight(&ctx.org_id, topic, *partition, cfg.acks)
-                    .map_err(|e| map_repl_error(coordinator, &ctx.org_id, topic, *partition, e))?;
+                    .map_err(|e| {
+                        PREFLIGHT_REFUSED.with(|flag| flag.set(true));
+                        map_repl_error(coordinator, &ctx.org_id, topic, *partition, e)
+                    })?;
                 admitted_epochs.push((*partition, epoch));
             }
         }
@@ -8244,6 +8277,21 @@ impl BusService {
         topics_in: &[String],
         cfg: ConsumerConfig,
     ) -> Result<ConsumerHandle, BusServiceError> {
+        self.open_consumer_scoped(ctx, group, topics_in, cfg, None)
+    }
+
+    /// `open_consumer` over only `only` partitions of every topic (`None`: all
+    /// of them). A stateless read of a topic whose partitions are led by
+    /// several nodes opens one scoped consumer per leader, each on the
+    /// partitions that node leads; leadership is required of those alone.
+    pub(crate) fn open_consumer_scoped(
+        &self,
+        ctx: &BusCallContext,
+        group: &str,
+        topics_in: &[String],
+        cfg: ConsumerConfig,
+        only: Option<&[u32]>,
+    ) -> Result<ConsumerHandle, BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         // an unvalidated group name is a free-form string that ends
@@ -8305,7 +8353,17 @@ impl BusService {
             // opened for any earlier one, same "validate everything, then
             // touch anything" guarantee this loop already gives
             // authorization/environment.
+            if let Some(only) = only {
+                if let Some(bad) = only.iter().find(|p| **p >= topic_cfg.partitions) {
+                    return Err(BusServiceError::InvalidArgument(format!(
+                        "partition {bad} is out of range for topic {topic}"
+                    )));
+                }
+            }
             for p in 0..topic_cfg.partitions {
+                if only.is_some_and(|only| !only.contains(&p)) {
+                    continue;
+                }
                 check_leader_role(&coordinator, &ctx.org_id, topic, p)?;
             }
             let existing_row =
@@ -8369,6 +8427,9 @@ impl BusService {
             }
             let env_byte = environment_to_u8(topic_cfg.environment);
             for p in 0..topic_cfg.partitions {
+                if only.is_some_and(|only| !only.contains(&p)) {
+                    continue;
+                }
                 let part = self.partition_handle(&ctx.org_id, topic, p, topic_cfg)?;
                 // Seq before the committed offset: a reset landing between
                 // the two reads then shows up as a moved seq and reloads the
@@ -11043,10 +11104,12 @@ impl ConsumerHandle {
                                         named,
                                     )?
                                     .map(|cfg| ReadTopicInfo::from(&cfg))
-                                    .unwrap_or(ReadTopicInfo {
-                                        content_type: String::new(),
-                                        schema_id: None,
-                                    }))
+                                    .unwrap_or(
+                                        ReadTopicInfo {
+                                            content_type: String::new(),
+                                            schema_id: None,
+                                        },
+                                    ))
                                 },
                             )?;
                             projections.insert(rec.topic.clone(), resolved);
@@ -11788,7 +11851,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         (dir, svc)
@@ -12443,7 +12508,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
 
@@ -12508,7 +12575,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .expect("bus service")
         };
@@ -12788,7 +12857,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
 
@@ -12852,7 +12923,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -12925,7 +12998,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13193,7 +13268,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13328,7 +13405,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13443,7 +13522,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13755,7 +13836,11 @@ mod tests {
             seen.extend(batch.records.iter().map(|r| r.offset));
         }
         assert_eq!(seen, (0..7).collect::<Vec<u64>>());
-        assert!(handle.fetch_up_to(1024 * 1024, 3, 20).unwrap().records.is_empty());
+        assert!(handle
+            .fetch_up_to(1024 * 1024, 3, 20)
+            .unwrap()
+            .records
+            .is_empty());
     }
 
     /// A backlog on partition 0 must not starve partition 1: each fetch call
@@ -14708,7 +14793,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .expect("bus service (first open)");
             svc.create_topic(
@@ -14773,7 +14860,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service (reopen)");
         assert!(
@@ -14839,7 +14928,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
 
@@ -15377,7 +15468,9 @@ mod tests {
                 dedup_expected_rate_per_sec: rate,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .expect("bus service")
         };
@@ -16075,7 +16168,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         let ctx = test_ctx("org-1");
@@ -16295,7 +16390,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -16335,7 +16432,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         svc.audit_windows
@@ -16395,7 +16494,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-audit-1");
@@ -16442,7 +16543,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -16511,7 +16614,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .unwrap();
             let ctx = test_ctx("org-1");
@@ -18554,7 +18659,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -18917,6 +19024,9 @@ mod tests {
     pub(in crate::bus) struct FakeCoordinator {
         role: parking_lot::Mutex<PartitionRole>,
         preflight_err: parking_lot::Mutex<Option<ReplError>>,
+        /// Once: the next `preflight` refuses and the role becomes this one,
+        /// as a leader does that hands the partition over while a write waits.
+        preflight_hand_over: parking_lot::Mutex<Option<(ReplError, PartitionRole)>>,
         await_outcome: parking_lot::Mutex<AckOutcome>,
         #[allow(clippy::type_complexity)]
         note_offset_commit_calls: parking_lot::Mutex<Vec<(String, String, String, u32, u64, u32)>>,
@@ -18973,6 +19083,7 @@ mod tests {
                 topic_partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
+                preflight_hand_over: parking_lot::Mutex::new(None),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
                     acked_nodes: 1,
                     required: 1,
@@ -19078,6 +19189,10 @@ mod tests {
         ) -> Result<u32, ReplError> {
             if let Some(e) = self.preflight_err.lock().clone() {
                 return Err(e);
+            }
+            if let Some((err, role)) = self.preflight_hand_over.lock().take() {
+                *self.role.lock() = role;
+                return Err(err);
             }
             if let Some(role) = self
                 .topic_partition_roles
@@ -19204,7 +19319,12 @@ mod tests {
         fn can_forward_publish(&self) -> bool {
             self.forwarding.load(std::sync::atomic::Ordering::SeqCst)
         }
-        fn assigned_leader(&self, _org: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
+        fn assigned_leader(
+            &self,
+            _org: &str,
+            topic: &str,
+            partition: u32,
+        ) -> Option<(String, u32)> {
             self.assigned_leaders
                 .lock()
                 .get(&(topic.to_string(), partition))
@@ -19633,7 +19753,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
 
@@ -19698,7 +19820,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         let coord = FakeCoordinator::leader(1);
@@ -19764,7 +19888,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         let coord = FakeCoordinator::leader(1);
@@ -19912,7 +20038,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
 
@@ -20943,9 +21071,13 @@ mod tests {
             row.leader_node_id = "node-c".to_string();
             row.leader_epoch = 2;
             row.updated_at_ms += 1;
-            store.propose(&row).expect("the dead-letter partitions fail over");
+            store
+                .propose(&row)
+                .expect("the dead-letter partitions fail over");
         }
-        let mut dlq_cfg = svc.topic_config(&ctx.org_id, &dlq_name).expect("dlq config");
+        let mut dlq_cfg = svc
+            .topic_config(&ctx.org_id, &dlq_name)
+            .expect("dlq config");
         dlq_cfg.partitions = 3;
         svc.place_unplaced_partitions(&ctx.org_id, &dlq_cfg, NodeEnvironment::Prod);
 
@@ -21699,7 +21831,11 @@ mod tests {
 
         // The identity of the forwarding node, and the broker's own, are not
         // the caller: the leader's rule names alice only.
-        for impostor in ["node-b", crate::services::bus_authorizer::SYSTEM_ACTOR, "bob"] {
+        for impostor in [
+            "node-b",
+            crate::services::bus_authorizer::SYSTEM_ACTOR,
+            "bob",
+        ] {
             let reply = svc.publish_forwarded("node-b", forward_request_for(&svc, topic, impostor));
             let error = reply.error.expect("refused");
             assert!(
@@ -21755,7 +21891,10 @@ mod tests {
         let started = Instant::now();
         let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
         assert_eq!(result.accepted, 1);
-        assert!(started.elapsed() < Duration::from_secs(1), "no wait for a leader");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no wait for a leader"
+        );
         assert_eq!(coord.forward_calls.lock()[0].0, "node-b");
     }
 
@@ -21840,7 +21979,11 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert_eq!(coord.forward_calls.lock().len(), 1, "never sent a second time");
+        assert_eq!(
+            coord.forward_calls.lock().len(),
+            1,
+            "never sent a second time"
+        );
     }
 
     #[test]
@@ -21972,7 +22115,11 @@ mod tests {
             }
             other => panic!("expected PartialPublish, got {other:?}"),
         }
-        assert_eq!(coord.forward_calls.lock().len(), 1, "one request for one leader");
+        assert_eq!(
+            coord.forward_calls.lock().len(),
+            1,
+            "one request for one leader"
+        );
     }
 
     fn big_record(key: &str) -> PublishRecord {
@@ -21983,6 +22130,34 @@ mod tests {
             timestamp_ms: now_ms(),
             schema_id: 0,
         }
+    }
+
+    /// A write that waited out a transfer at `preflight` is refused as the
+    /// partition leaves: the retry sends it to the new leader, so the caller
+    /// is not answered `bus_not_leader` for a transfer that completed.
+    #[test]
+    fn a_write_that_waited_out_a_transfer_is_forwarded_to_the_new_leader() {
+        let topic = "orders.fwd-handover";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.script_forwarding(vec![landed(0, 0, 1)]);
+        *coord.preflight_hand_over.lock() = Some((
+            ReplError::NotPartitionLeader {
+                topic: topic.to_string(),
+                partition: 0,
+                leader: "node-b".to_string(),
+                leader_epoch: 2,
+            },
+            follower_of("node-b", 2),
+        ));
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record_with_key("v", "k")])
+            .expect("the write reaches the new leader");
+        assert_eq!(result.accepted, 1);
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "node-b");
     }
 
     #[test]
@@ -21996,7 +22171,10 @@ mod tests {
 
         let records = (0..20).map(|i| big_record(&format!("k{i}"))).collect();
         let err = fwd_publish(&svc, topic, Some(0), records).unwrap_err();
-        assert!(matches!(err, BusServiceError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
         assert!(coord.forward_calls.lock().is_empty());
     }
 
@@ -22019,7 +22197,9 @@ mod tests {
         assert_eq!(result.accepted, 20);
         let calls = coord.forward_calls.lock();
         assert_eq!(calls.len(), 2, "9 MB + 9 MB do not fit one 16 MiB frame");
-        assert!(calls.iter().all(|(t, r)| t == "node-b" && r.groups.len() == 1));
+        assert!(calls
+            .iter()
+            .all(|(t, r)| t == "node-b" && r.groups.len() == 1));
     }
 
     /// Quota is charged, and the checks before partitioning are made, once
@@ -22259,7 +22439,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: Some(1),
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         let ctx = test_ctx("org-1");
@@ -22336,7 +22518,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: Some(1),
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         let ctx = test_ctx("org-1");
@@ -23202,8 +23386,7 @@ mod tests {
         assert_eq!(peeked, expected);
 
         let batch = handle.fetch(4096, 50).unwrap();
-        let fetched: serde_json::Value =
-            serde_json::from_slice(&batch.records[0].payload).unwrap();
+        let fetched: serde_json::Value = serde_json::from_slice(&batch.records[0].payload).unwrap();
         assert_eq!(fetched, expected);
     }
 
@@ -23314,13 +23497,20 @@ mod tests {
         create_typed_topic(&svc, &ctx, "p.json", "application/json");
         publish_one(&svc, &ctx, "p.json", r#"{"name":"Jan Kowalski"}"#);
         set_read_rule(&svc, "org-1", "p.json", &["name"], &["name"], &[]);
-        assert_eq!(peek_text(&svc, &ctx, "p.json"), r#"{"name":"*********ski"}"#);
+        assert_eq!(
+            peek_text(&svc, &ctx, "p.json"),
+            r#"{"name":"*********ski"}"#
+        );
         assert!(svc.field_hash_keys().info("org-1").unwrap().is_none());
 
         set_read_rule(&svc, "org-1", "p.json", &["name"], &[], &["name"]);
         peek_text(&svc, &ctx, "p.json");
         assert_eq!(
-            svc.field_hash_keys().info("org-1").unwrap().unwrap().key_version,
+            svc.field_hash_keys()
+                .info("org-1")
+                .unwrap()
+                .unwrap()
+                .key_version,
             1
         );
     }
@@ -23345,16 +23535,27 @@ mod tests {
                 },
             )
             .unwrap();
-        publish_one(&svc, &ctx, "p.json", r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#);
-        set_read_rule_without_key(&svc, "org-1", "p.json", &["id", "name", "card"], &["card"], &["name"]);
+        publish_one(
+            &svc,
+            &ctx,
+            "p.json",
+            r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#,
+        );
+        set_read_rule_without_key(
+            &svc,
+            "org-1",
+            "p.json",
+            &["id", "name", "card"],
+            &["card"],
+            &["name"],
+        );
 
         let hidden = serde_json::json!({"id": "7", "card": "*************111"});
         let peeked: serde_json::Value =
             serde_json::from_str(&peek_text(&svc, &ctx, "p.json")).unwrap();
         assert_eq!(peeked, hidden);
         let batch = handle.fetch(4096, 50).unwrap();
-        let fetched: serde_json::Value =
-            serde_json::from_slice(&batch.records[0].payload).unwrap();
+        let fetched: serde_json::Value = serde_json::from_slice(&batch.records[0].payload).unwrap();
         assert_eq!(fetched, hidden);
         let runs = svc.peek_runs(&ctx, "p.json", 0, &[0..1], 4096).unwrap();
         let listed: serde_json::Value = serde_json::from_slice(&runs.records[0].payload).unwrap();
@@ -23406,8 +23607,20 @@ mod tests {
         .expect("the bus starts without a cipher");
         let ctx = test_ctx("org-1");
         create_typed_topic(&bare, &ctx, "p.json", "application/json");
-        publish_one(&bare, &ctx, "p.json", r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#);
-        set_read_rule_without_key(&bare, "org-1", "p.json", &["id", "name", "card"], &["card"], &["name"]);
+        publish_one(
+            &bare,
+            &ctx,
+            "p.json",
+            r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#,
+        );
+        set_read_rule_without_key(
+            &bare,
+            "org-1",
+            "p.json",
+            &["id", "name", "card"],
+            &["card"],
+            &["name"],
+        );
         // A key made by a node that has a cipher is in the table, and this bus
         // cannot open it: the hashed field is not shown, nothing fails.
         field_hash_key::FieldHashKeys::new(
@@ -23416,8 +23629,12 @@ mod tests {
         )
         .get_or_create("org-1")
         .unwrap();
-        let seen: serde_json::Value = serde_json::from_str(&peek_text(&bare, &ctx, "p.json")).unwrap();
-        assert_eq!(seen, serde_json::json!({"id": "7", "card": "*************111"}));
+        let seen: serde_json::Value =
+            serde_json::from_str(&peek_text(&bare, &ctx, "p.json")).unwrap();
+        assert_eq!(
+            seen,
+            serde_json::json!({"id": "7", "card": "*************111"})
+        );
         // Nothing can be made without a cipher either.
         assert!(bare.field_hash_keys().get_or_create("org-9").is_err());
         assert!(bare.field_hash_keys().for_read("org-1").is_none());
@@ -23443,10 +23660,25 @@ mod tests {
         .unwrap();
         let raw = r#"{"id":"7","card":"4111111111111111","name":"Jan"}"#;
         publish_one(&svc, &ctx, "cards.json", raw);
-        set_read_rule(&svc, "org-1", "cards.json", &["id", "card", "name"], &["card"], &["name"]);
+        set_read_rule(
+            &svc,
+            "org-1",
+            "cards.json",
+            &["id", "card", "name"],
+            &["card"],
+            &["name"],
+        );
 
-        let seen = svc.peek(&ctx, "cards.json", 0, 0, 1, 4096).unwrap().records.remove(0);
-        assert_ne!(seen.payload.as_ref(), raw.as_bytes(), "the reader's view is narrowed");
+        let seen = svc
+            .peek(&ctx, "cards.json", 0, 0, 1, 4096)
+            .unwrap()
+            .records
+            .remove(0);
+        assert_ne!(
+            seen.payload.as_ref(),
+            raw.as_bytes(),
+            "the reader's view is narrowed"
+        );
         assert!(matches!(
             svc.note_delivery_failure(
                 &ctx,
@@ -23483,7 +23715,9 @@ mod tests {
     #[test]
     fn peek_runs_that_keeps_no_payload_projects_none_but_still_hides_the_error_text() {
         let (_tmp, svc, ctx, _expected) = xml_dlq_fixture();
-        let read = svc.peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 0).unwrap();
+        let read = svc
+            .peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 0)
+            .unwrap();
         assert_eq!(read.records.len(), 1);
         assert!(read.records[0].payload.is_empty());
         let header = |name: &str| {
@@ -23500,7 +23734,9 @@ mod tests {
             "the error text is hidden from a restricted reader"
         );
         // The same call that keeps the payload still returns it projected.
-        let kept = svc.peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 4096).unwrap();
+        let kept = svc
+            .peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 4096)
+            .unwrap();
         assert!(!kept.records[0].payload.is_empty());
     }
 
@@ -23519,7 +23755,8 @@ mod tests {
             },
         )
         .unwrap();
-        let payload = "<L><id>7</id><ssn>123</ssn><card>4111111111111111</card><name>Jan</name></L>";
+        let payload =
+            "<L><id>7</id><ssn>123</ssn><card>4111111111111111</card><name>Jan</name></L>";
         publish_one(&svc, &ctx, "labs.xml", payload);
         set_read_rule(
             &svc,
@@ -23946,7 +24183,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service");
         (tmp, svc, checker)
@@ -24242,10 +24481,10 @@ mod tests {
         let dlq_for_thread = dlq_topic.clone();
         let placer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            placed.topic_roles.lock().insert(
-                dlq_for_thread,
-                PartitionRole::Leader { epoch: 1 },
-            );
+            placed
+                .topic_roles
+                .lock()
+                .insert(dlq_for_thread, PartitionRole::Leader { epoch: 1 });
         });
         let result = svc
             .publish(
@@ -24272,7 +24511,8 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_record_whose_dlq_never_gets_a_leader_fails_the_publish_instead_of_being_dropped() {
+    fn an_invalid_record_whose_dlq_never_gets_a_leader_fails_the_publish_instead_of_being_dropped()
+    {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         let (_coord, dlq_topic) = fresh_dlq_topic_with_unplaced_dlq(&svc, &ctx);
@@ -24292,7 +24532,10 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(10), "the wait is bounded");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait is bounded"
+        );
         assert_eq!(svc.schema_dlq_write_failures_total(), 1);
         assert_eq!(
             svc.partition_stats(&ctx, &dlq_topic, 0)
@@ -26670,7 +26913,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         }
     }
 
@@ -26824,7 +27069,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         });
         // `BusService` does not implement `Debug` (it owns a live fjall
         // handle, background timers, ...), so `Result::expect_err` (which
@@ -26880,7 +27127,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service A");
 
@@ -26899,7 +27148,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         })
         .expect("bus service B");
 
@@ -27465,7 +27716,9 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                &[7u8; 32],
+            ))),
         };
         let no_dlq = BusService::new(config(
             Arc::new(DenyConsumePrefixAuthorizer { prefix: "__dlq." }),
@@ -27604,7 +27857,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .unwrap(),
         );
@@ -27826,7 +28081,10 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
-        assert_eq!(register_schema(&svc, "org-1", "orders", WITH_NOTE).version, 2);
+        assert_eq!(
+            register_schema(&svc, "org-1", "orders", WITH_NOTE).version,
+            2
+        );
         svc.create_topic(
             &ctx,
             "orders.events",
@@ -27851,14 +28109,36 @@ mod tests {
         };
         assert_eq!(publish_note().accepted, 1, "v2 is in force");
 
-        schema_registry::registry::delete(&svc.db, svc.instance_id(), "org-1", "orders", Some(2), true)
-            .unwrap();
+        schema_registry::registry::delete(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "orders",
+            Some(2),
+            true,
+        )
+        .unwrap();
         let withdrawn = publish_note();
-        assert_eq!((withdrawn.accepted, withdrawn.schema_rejected), (0, 1), "v1 is in force");
+        assert_eq!(
+            (withdrawn.accepted, withdrawn.schema_rejected),
+            (0, 1),
+            "v1 is in force"
+        );
 
-        schema_registry::registry::delete(&svc.db, svc.instance_id(), "org-1", "orders", Some(1), true)
-            .unwrap();
-        assert_eq!(publish_note().accepted, 1, "every version withdrawn: the latest validates");
+        schema_registry::registry::delete(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "orders",
+            Some(1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            publish_note().accepted,
+            1,
+            "every version withdrawn: the latest validates"
+        );
     }
 
     // ---- F4 B6: field policies on topics of Avro / Protobuf / Thrift messages ----
@@ -27905,7 +28185,9 @@ mod tests {
                 "a" => [vec![0x08], varint(5)].concat(),
                 "b" => [vec![0x12, 3], b"bee".to_vec()].concat(),
                 "c" => [vec![0x1a, 3], b"sea".to_vec()].concat(),
-                "d" => d.map(|d| [vec![0x20], varint(d as u64)].concat()).unwrap_or_default(),
+                "d" => d
+                    .map(|d| [vec![0x20], varint(d as u64)].concat())
+                    .unwrap_or_default(),
                 _ => unreachable!(),
             }
         }
@@ -27965,7 +28247,11 @@ mod tests {
             },
         ];
 
-        fn setup(svc: &BusService, case: &Case, validation: topics::ValidationMode) -> BusCallContext {
+        fn setup(
+            svc: &BusService,
+            case: &Case,
+            validation: topics::ValidationMode,
+        ) -> BusCallContext {
             let ctx = test_ctx("org-1");
             registry::register(
                 &svc.db,
@@ -27994,7 +28280,11 @@ mod tests {
             ctx
         }
 
-        fn publish_bytes(svc: &BusService, ctx: &BusCallContext, payload: Vec<u8>) -> Result<PublishResult, BusServiceError> {
+        fn publish_bytes(
+            svc: &BusService,
+            ctx: &BusCallContext,
+            payload: Vec<u8>,
+        ) -> Result<PublishResult, BusServiceError> {
             svc.publish(
                 ctx,
                 "bytes.topic",
@@ -28012,7 +28302,12 @@ mod tests {
             )
         }
 
-        fn rule(svc: &BusService, direction: field_policies::Direction, fields: &[&str], required: &[&str]) {
+        fn rule(
+            svc: &BusService,
+            direction: field_policies::Direction,
+            fields: &[&str],
+            required: &[&str],
+        ) {
             field_policies::set_policy(
                 &svc.db,
                 svc.instance_id(),
@@ -28044,7 +28339,12 @@ mod tests {
             .unwrap();
         }
 
-        fn peek_one(svc: &BusService, ctx: &BusCallContext, topic: &str, offset: u64) -> FetchedRecordMeta {
+        fn peek_one(
+            svc: &BusService,
+            ctx: &BusCallContext,
+            topic: &str,
+            offset: u64,
+        ) -> FetchedRecordMeta {
             svc.peek(ctx, topic, 0, offset, 1, 4096)
                 .unwrap()
                 .records
@@ -28067,30 +28367,47 @@ mod tests {
                     let full = (case.write)(None, &["a", "b", "c"]);
                     publish_bytes(&svc, &ctx, full.clone()).unwrap();
                     let stamp = svc
-                        .raw_record("org-1", "bytes.topic", 0, 0, &svc.topic_config("org-1", "bytes.topic").unwrap())
+                        .raw_record(
+                            "org-1",
+                            "bytes.topic",
+                            0,
+                            0,
+                            &svc.topic_config("org-1", "bytes.topic").unwrap(),
+                        )
                         .unwrap()
                         .unwrap()
                         .schema_id;
-                    assert_ne!(stamp, 0, "a record that passed the check carries the version");
+                    assert_ne!(
+                        stamp, 0,
+                        "a record that passed the check carries the version"
+                    );
                     let handle = svc
                         .open_consumer(
                             &ctx,
                             "g1",
                             &["bytes.topic".to_string()],
-                            ConsumerConfig { commit_mode: groups::CommitMode::Explicit },
+                            ConsumerConfig {
+                                commit_mode: groups::CommitMode::Explicit,
+                            },
                         )
                         .unwrap();
 
                     // No rule: the record as published, under the version's own id.
                     let open = peek_one(&svc, &ctx, "bytes.topic", 0);
-                    assert_eq!((open.payload.to_vec(), open.schema_id), (full.clone(), stamp));
+                    assert_eq!(
+                        (open.payload.to_vec(), open.schema_id),
+                        (full.clone(), stamp)
+                    );
 
                     rule(&svc, field_policies::Direction::Read, &["a", "c"], &[]);
                     let expected = (case.write)(None, &["a", "c"]);
                     let peeked = peek_one(&svc, &ctx, "bytes.topic", 0);
                     assert_eq!(peeked.payload.to_vec(), expected, "{:?}", case.kind);
                     assert_ne!(peeked.schema_id, 0);
-                    assert_ne!(peeked.schema_id, stamp, "the sub-schema has an id of its own");
+                    assert_ne!(
+                        peeked.schema_id, stamp,
+                        "the sub-schema has an id of its own"
+                    );
                     let fetched = handle.fetch(4096, 50).unwrap().records.remove(0);
                     assert_eq!(
                         (fetched.payload.to_vec(), fetched.schema_id),
@@ -28167,17 +28484,29 @@ mod tests {
 
                 let old = peek_one(&svc, &ctx, "bytes.topic", 0);
                 let new = peek_one(&svc, &ctx, "bytes.topic", 1);
-                assert_eq!(old.payload.to_vec(), (case.write)(None, &["a"]), "{:?}", case.kind);
+                assert_eq!(
+                    old.payload.to_vec(),
+                    (case.write)(None, &["a"]),
+                    "{:?}",
+                    case.kind
+                );
                 assert_eq!(new.payload.to_vec(), (case.write)(Some(9), &["a", "d"]));
                 assert_ne!(old.schema_id, new.schema_id);
-                let old_schema = svc.schema_for_reader(&ctx, "bytes.topic", old.schema_id).unwrap();
-                let new_schema = svc.schema_for_reader(&ctx, "bytes.topic", new.schema_id).unwrap();
+                let old_schema = svc
+                    .schema_for_reader(&ctx, "bytes.topic", old.schema_id)
+                    .unwrap();
+                let new_schema = svc
+                    .schema_for_reader(&ctx, "bytes.topic", new.schema_id)
+                    .unwrap();
                 assert_eq!((old_schema.version, new_schema.version), (1, 2));
                 valid_under(case.kind, &old_schema.schema_text, &old.payload);
                 valid_under(case.kind, &new_schema.schema_text, &new.payload);
                 // A record of an older version is not decoded with the newer one.
-                assert!(!old_schema.schema_text.contains('d') || case.kind == SchemaType::Thrift
-                    || !old_schema.schema_text.contains("\"d\""));
+                assert!(
+                    !old_schema.schema_text.contains('d')
+                        || case.kind == SchemaType::Thrift
+                        || !old_schema.schema_text.contains("\"d\"")
+                );
             }
         }
 
@@ -28209,8 +28538,14 @@ mod tests {
                 let seen = peek_one(&svc, &ctx, "bytes.topic", 0);
                 assert!(matches!(
                     svc.note_delivery_failure(
-                        &ctx, "g", "bytes.topic", 0, 0, &seen,
-                        dlq::DlqReason::ConsumerError, "boom",
+                        &ctx,
+                        "g",
+                        "bytes.topic",
+                        0,
+                        0,
+                        &seen,
+                        dlq::DlqReason::ConsumerError,
+                        "boom",
                     )
                     .unwrap(),
                     dlq::DlqOutcome::SentToDlq { .. }
@@ -28224,14 +28559,22 @@ mod tests {
                     .iter()
                     .find(|r| !r.payload.is_empty())
                     .expect("the valid record's projection");
-                assert_eq!(projected.payload.to_vec(), (case.write)(None, &["a", "c"]), "{:?}", case.kind);
+                assert_eq!(
+                    projected.payload.to_vec(),
+                    (case.write)(None, &["a", "c"]),
+                    "{:?}",
+                    case.kind
+                );
                 assert_ne!(projected.schema_id, 0);
                 let served = svc
                     .schema_for_reader(&ctx, "__dlq.bytes.topic", projected.schema_id)
                     .unwrap();
                 assert!(served.derived);
                 // The quarantined garbage is not valid under any version: withheld.
-                let garbage = by_error.iter().find(|r| r.payload.is_empty()).expect("withheld");
+                let garbage = by_error
+                    .iter()
+                    .find(|r| r.payload.is_empty())
+                    .expect("withheld");
                 assert_eq!(garbage.schema_id, 0);
                 // The DLQ error text stays hidden, like on any restricted read.
                 let hidden = |r: &FetchedRecordMeta| {
@@ -28274,7 +28617,9 @@ mod tests {
                     BusServiceError::FieldPolicyPayloadMalformed { .. }
                 ));
                 assert_eq!(
-                    publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b"])).unwrap().accepted,
+                    publish_bytes(&svc, &ctx, (case.write)(None, &["a", "b"]))
+                        .unwrap()
+                        .accepted,
                     1
                 );
             }
@@ -28289,8 +28634,14 @@ mod tests {
                 {"name":"ssn","type":["null","string"],"default":null},
                 {"name":"note","type":"string","default":"-"}]}"#;
             registry::register(
-                &svc.db, svc.instance_id(), "org-1", "x.avro", SchemaType::Avro, schema,
-                Some(Compatibility::None), None,
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "x.avro",
+                SchemaType::Avro,
+                schema,
+                Some(Compatibility::None),
+                None,
             )
             .unwrap();
             svc.create_topic(
@@ -28305,7 +28656,12 @@ mod tests {
             )
             .unwrap();
             // `a` has no default and is not nullable: always set, so it must be allowed.
-            rule(&svc, field_policies::Direction::Write, &["a", "note"], &["a"]);
+            rule(
+                &svc,
+                field_policies::Direction::Write,
+                &["a", "note"],
+                &["a"],
+            );
             let record = |ssn: Option<&str>, note: &str| {
                 [
                     zz(5),
@@ -28317,8 +28673,18 @@ mod tests {
                 ]
                 .concat()
             };
-            assert_eq!(publish_bytes(&svc, &ctx, record(None, "-")).unwrap().accepted, 1);
-            assert_eq!(publish_bytes(&svc, &ctx, record(None, "changed")).unwrap().accepted, 1);
+            assert_eq!(
+                publish_bytes(&svc, &ctx, record(None, "-"))
+                    .unwrap()
+                    .accepted,
+                1
+            );
+            assert_eq!(
+                publish_bytes(&svc, &ctx, record(None, "changed"))
+                    .unwrap()
+                    .accepted,
+                1
+            );
             match publish_bytes(&svc, &ctx, record(Some("90010112345"), "-")).unwrap_err() {
                 BusServiceError::FieldNotAllowed { fields, .. } => {
                     assert_eq!(fields, vec!["ssn".to_string()])
@@ -28338,7 +28704,12 @@ mod tests {
                 let preview = svc
                     .preview_binary_record(&ctx, "bytes.topic", 0, 0, Some(&subject), Some(&caller))
                     .unwrap();
-                assert_eq!(preview.payload.to_vec(), (case.write)(None, &["a"]), "{:?}", case.kind);
+                assert_eq!(
+                    preview.payload.to_vec(),
+                    (case.write)(None, &["a"]),
+                    "{:?}",
+                    case.kind
+                );
                 assert_ne!(preview.schema_id, 0);
                 // `b` is shown by the subject's rule but not to the caller: the
                 // caller is not told the record sets it.

@@ -29,8 +29,8 @@ use crate::net::iroh::{
         endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
         merge_contact_hints, PairingContactHints, PairingHandler,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS,
-    ALPN_MESH, ALPN_PAIRING,
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS, ALPN_MESH,
+    ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -130,8 +130,19 @@ pub struct CommandWaitResponse {
     pub ok: bool,
     pub payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
     pub error: Option<String>,
+    /// Machine-readable kind of the failure, when the peer gave one (see
+    /// `command_tasks::BUSY_ERROR_CODE`).
+    pub error_code: Option<String>,
     /// See `CommandResponse::restarted`.
     pub restarted: Option<bool>,
+}
+
+impl CommandWaitResponse {
+    /// The peer had no slot for the command: it was not run, and may be sent
+    /// again later.
+    pub fn is_busy(&self) -> bool {
+        self.error_code.as_deref() == Some(crate::mesh::command_tasks::BUSY_ERROR_CODE)
+    }
 }
 
 const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
@@ -1093,7 +1104,10 @@ impl IrohMeshManager {
     /// Remembers a bus connection so it can be closed if the peer moves, and
     /// forgets the handles that have already died.
     fn track_bus_connection(&self, remote_hex: &str, connection: &Connection) {
-        let mut entry = self.bus_connections.entry(remote_hex.to_string()).or_default();
+        let mut entry = self
+            .bus_connections
+            .entry(remote_hex.to_string())
+            .or_default();
         entry.retain(|handle| handle.upgrade().is_some());
         entry.push(connection.weak_handle());
     }
@@ -1478,16 +1492,18 @@ impl IrohMeshManager {
         // Bounded for the same reason the bus dial is, and one more: this runs
         // under the per-peer dial lock, so a dial that never returns wedges
         // every later attempt to reach the peer, not just this one.
-        let connection =
-            tokio::time::timeout(Self::MESH_DIAL_TIMEOUT, self.endpoint.connect(addr, ALPN_MESH))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "iroh connect direct: dial to {direct_addr} timed out after {:?}",
-                        Self::MESH_DIAL_TIMEOUT
-                    )
-                })?
-                .map_err(|e| anyhow::anyhow!("iroh connect direct: {}", error_chain(&e)))?;
+        let connection = tokio::time::timeout(
+            Self::MESH_DIAL_TIMEOUT,
+            self.endpoint.connect(addr, ALPN_MESH),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "iroh connect direct: dial to {direct_addr} timed out after {:?}",
+                Self::MESH_DIAL_TIMEOUT
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("iroh connect direct: {}", error_chain(&e)))?;
         match self
             .register_connection(
                 peer_id_str.clone(),
@@ -1684,9 +1700,11 @@ impl IrohMeshManager {
         // at an address this dial cannot reach is never retried at the address
         // it can.
         let dialed = addr.clone();
-        let outcome =
-            tokio::time::timeout(Self::BUS_DIAL_TIMEOUT, self.endpoint.connect(addr, ALPN_BUS))
-                .await;
+        let outcome = tokio::time::timeout(
+            Self::BUS_DIAL_TIMEOUT,
+            self.endpoint.connect(addr, ALPN_BUS),
+        )
+        .await;
         let err = match outcome {
             Ok(Ok(connection)) => {
                 self.track_bus_connection(node_id, &connection);
@@ -2783,6 +2801,7 @@ impl IrohMeshManager {
         ok: bool,
         payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
         error: Option<String>,
+        error_code: Option<String>,
         restarted: Option<bool>,
     ) -> bool {
         if let Some((_, tx)) = self.command_waiters.remove(command_id) {
@@ -2791,6 +2810,7 @@ impl IrohMeshManager {
                 ok,
                 payload,
                 error,
+                error_code,
                 restarted,
             });
             true
@@ -2817,6 +2837,12 @@ impl IrohMeshManager {
             ok: bool,
             payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
             error: &'a str,
+            error_code: &'a str,
+        }
+        // The event comes from a trusted peer, but trust may have been
+        // withdrawn since: nothing is written to a peer that lost it.
+        if !self.security.is_trusted(from_node_id) {
+            return;
         }
         let Ok(CommandId { command_id }) = crate::mesh::cbor::decode(data) else {
             return;
@@ -2826,6 +2852,7 @@ impl IrohMeshManager {
             ok: false,
             payload: tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
             error: "busy: too many commands in flight",
+            error_code: crate::mesh::command_tasks::BUSY_ERROR_CODE,
         };
         if let Ok(bytes) = crate::mesh::cbor::encode(&reply) {
             let _ = self
@@ -2838,7 +2865,16 @@ impl IrohMeshManager {
         }
     }
 
-    pub async fn handle_command_received(&self, from_node_id: &str, data: &[u8]) {
+    /// `cancel` fires when the sender loses trust: a command not yet started
+    /// is dropped, and the reply of a running one is withheld. The execution
+    /// itself is bounded by `command_tasks::COMMAND_TIMEOUT`; the reply write
+    /// is never cut short, so no stream is left half written.
+    pub async fn handle_command_received(
+        &self,
+        from_node_id: &str,
+        data: &[u8],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) {
         #[derive(serde::Deserialize)]
         struct RequestEnvelope {
             command_id: String,
@@ -2899,7 +2935,49 @@ impl IrohMeshManager {
             }
         };
 
-        let response = executor.execute(from_node_id, envelope.command).await;
+        if cancel.is_cancelled() {
+            return;
+        }
+        let limit = crate::mesh::command_tasks::command_timeout(&envelope.command);
+        // Stopped, not just unanswered, when the sender loses trust: the
+        // command may be a model transfer that would otherwise run on for
+        // hours for a peer that is no longer allowed.
+        let Ok(bounded) = crate::mesh::command_tasks::run_bounded_unless_cancelled(
+            limit,
+            cancel,
+            executor.execute(from_node_id, envelope.command),
+        )
+        .await
+        else {
+            return;
+        };
+        let Some(response) = bounded else {
+            warn!(
+                from = %from_node_id,
+                cmd = %envelope.command_id,
+                "MeshCommand przekroczyla limit czasu — odsylam blad"
+            );
+            let resp = ResponseEnvelope {
+                command_id: &envelope.command_id,
+                ok: false,
+                payload: &tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
+                error: Some("command timed out"),
+                restarted: None,
+            };
+            if let Ok(bytes) = crate::mesh::cbor::encode(&resp) {
+                let _ = self
+                    .send_ufp2_to_peer(
+                        from_node_id,
+                        tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
+                        &bytes,
+                    )
+                    .await;
+            }
+            return;
+        };
+        if cancel.is_cancelled() {
+            return;
+        }
         let resp_envelope = ResponseEnvelope {
             command_id: &envelope.command_id,
             ok: response.ok,
@@ -2945,6 +3023,8 @@ impl IrohMeshManager {
             #[serde(default)]
             error: Option<String>,
             #[serde(default)]
+            error_code: Option<String>,
+            #[serde(default)]
             restarted: Option<bool>,
         }
         if let Ok(env) = crate::mesh::cbor::decode::<ResponseEnvelope>(data) {
@@ -2954,6 +3034,7 @@ impl IrohMeshManager {
                     env.ok,
                     env.payload,
                     env.error,
+                    env.error_code,
                     env.restarted,
                 )
                 .await;
@@ -3451,10 +3532,9 @@ impl IrohMeshManagerRef {
                 }
             }
             x if x == MESH_MSG_SHARED_SECRETS_SYNC => {
-                match crate::mesh::cbor::decode::<
-                    tentaflow_protocol::mesh::SharedSecretsSyncPayload,
-                >(&payload)
-                {
+                match crate::mesh::cbor::decode::<tentaflow_protocol::mesh::SharedSecretsSyncPayload>(
+                    &payload,
+                ) {
                     Ok(p) => IrohMeshEvent::SharedSecretsSyncReceived {
                         node_id: remote_hex,
                         payload: p,
