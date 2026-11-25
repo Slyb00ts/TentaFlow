@@ -567,7 +567,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
       zawężenia lidera (`shrink_seq`, pole dopisane, domyślnie 0) i liczy się
       tylko taki, którego numer nie jest niższy niż numer zawężenia zdejmującego
       flagę, więc heartbeat wysłany przed zawężeniem, a przetworzony po
-      komunikacie, flagi nie przywraca. Flagę zdejmuje i przyznaje się pod jednym
+      komunikacie, flagi nie przywraca. Numery zawężeń startują od wartości z zegara
+      (`czas ms << 16`) przy każdym uruchomieniu lidera, więc po restarcie
+      lidera w tej samej epoce wszystkie numery są wyższe niż wcześniejsze:
+      komunikat z nowego uruchomienia zastępuje zdjęcie flagi z celem od zera, a
+      heartbeat z wyższym numerem liczy się z własnym celem. Komunikat z
+      wcześniejszej epoki nie zastępuje nowszego zdjęcia. Węzeł, który przestał
+      być repliką partycji, zapomina też flagę. Seria odmów kończy się także
+      ramką strumienia od węzła (również gdy strumienia już nie ma), a sondy
+      idą tylko po partycjach, w których decyzja czeka na ten węzeł. Lider
+      sprzed tej zmiany (716671606) nie wysyła `IsrShrink`, więc nic nie
+      zdejmuje flagi follower. Flagę zdejmuje i przyznaje się pod jednym
       zamkiem, a `note_led` po przeniesieniu nie unieważnia zdjęcia z tej samej
       epoki. Follower nie potwierdza zawężenia,
       gdy sam prowadzi elekcję albo obiecał nowszą kadencję. Węzeł bez wpisu o
@@ -650,7 +660,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     a przy przekroczeniu limitu 8 odpada pepper wycofany najdawniej, ale nigdy
     wycofany w ostatniej godzinie (na każdym węźle, według jego zegara, więc
     zegar węzła wycofującego spóźniony o mniej niż godzinę nikogo nie
-    zawodzi); ten sam pepper wycofany w różnych momentach
+    zawodzi; ochrona obowiązuje w całej flocie, dopóki rozjazd zegarów jest
+    mniejszy niż godzina); ten sam pepper wycofany w różnych momentach
     zachowuje wcześniejszy czas, więc węzły zbiegają do tej samej listy.
     Nowy klucz ma postać `sk-<id peppera>-<losowe hex>` (id to 8 bajtów SHA-256
     z tagiem domeny, nie ujawnia peppera), a weryfikator w bazie to nadal goły
@@ -675,6 +686,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     restart nie jest zaimplementowana) to łamie: follower z ogonem dawnej
     inkarnacji, który następnie uzgadnia z innym liderem niż zrestartowany,
     zachowuje ten ogon bez śladu w audycie. Dotyczy to także RF=3.
+  - **Restart węzła w tym samym adresie nie zostawia martwych połączeń szyny
+    (D1).** Gdy węzeł wraca na ten sam adres po `kill -9`, mesh podmienia
+    zamilkłą sesję, ale połączenia szyny do dawnego procesu (przekazywanie
+    zapisów, replikacja) zostawały otwarte do limitu bezczynności QUIC
+    (47–55 s: 504 `bus_forward_outcome_unknown`, wiszące zapisy, późny powrót do
+    ISR). Podmiana zamilkłej sesji zamyka teraz też połączenia szyny do tego
+    węzła, więc pula przekazywania i pętle replikacji dzwonią od nowa.
+  - **Zatrzymanie followera zwalnia lidera od razu (D2).** Zatrzymujący się
+    węzeł najpierw przestaje obsługiwać i stawać do elekcji, potem mówi
+    liderom RF=2, których śledzi (`ReplLeoQuery::leaving_epoch`, pole
+    dopisane), że odchodzi; lider wyjmuje go z ISR i zatwierdza sam bez
+    czekania `T_alone` (do 5–6 s odmów `acks=all` przy każdym restarcie).
+    Reguła bezpieczeństwa bez zmian: lider działa dopiero po tym, jak węzeł
+    przestał obsługiwać.
+  - **Pierwszy klucz API na świeżej parze działa na obu węzłach (D3).**
+    Wydanie albo rotacja klucza, które tworzy pepper, wypychają od razu
+    sekrety floty do zaufanych węzłów; wcześniej drugi węzeł tworzył własny
+    pepper przy pierwszym sprawdzeniu klucza i klucz działał tylko na
+    wydającym do następnego połączenia.
+  - **Odczyt wstrzymanej grupy konsumentów to 409 `bus_group_paused`, nie 500
+    (D4).**
+  - **Zapis w trakcie przenoszenia nie czeka całych 3 s (D5).** Nadawca
+    czekający na zmianę lidera co 100 ms sprawdza, gdzie partycja jest
+    prowadzona (wiersz w ledgerze wyprzedza poll, który stosuje go na tym
+    węźle i podbija generację), zamiast czekać na ogłoszenie zmiany do
+    `LEADER_WAIT`.
+  - **Czas przejęcia (`duration_ms` rekordu failover) liczy się od ostatniego
+    sygnału życia poprzedniego lidera (D6),** nie od zliczenia głosów, gdy ten
+    moment jest znany; nazwa pola i format bez zmian.
   - **Zamknięcie węzła przekazuje partycje.** Przed zatrzymaniem replikacji
     węzeł oddaje partycje, które prowadzi, replice z zgodnym logiem
     (najwyżej 5 s łącznie, każde oczekiwanie przeniesienia jest przycięte do

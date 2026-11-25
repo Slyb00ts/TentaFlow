@@ -242,11 +242,15 @@ impl CaughtUp {
 
     /// A leader at `epoch` shrank its in-sync set to itself (its `shrink`th
     /// shrink): drops the claim and keeps it dropped until it is earned again.
-    /// A repeat of the same notice changes nothing; a newer one starts the
-    /// catch-up over.
+    /// A repeat of the same notice changes nothing; a newer one (a higher
+    /// number: numbers are unique per epoch across leader restarts, see
+    /// `PartitionLeader::shrink_seq`) starts the catch-up over and never keeps
+    /// the target of the one before; a notice of an earlier epoch than the
+    /// stored revocation is ignored.
     pub fn revoke(&self, epoch: u32, shrink: u64) {
         let mut state = self.0.lock();
         match state.revoked.as_mut() {
+            Some(r) if r.epoch > epoch => return,
             Some(r) if r.epoch == epoch && r.shrink >= shrink => {}
             _ => {
                 state.revoked = Some(Revoked {
@@ -270,7 +274,10 @@ impl CaughtUp {
     /// Whether the claim of a revoked `epoch` is re-earned by a heartbeat that
     /// carries the leader's `shrink` count and `position` (log end) and says
     /// whether it lists this node (`listed`); `leo` is this copy's. A heartbeat
-    /// sent before the revoking shrink says nothing about it and is ignored.
+    /// sent before the revoking shrink says nothing about it and is ignored. One
+    /// numbered higher than the revocation (a newer shrink, or a restarted
+    /// leader whose numbers all exceed the earlier one's) counts, with a
+    /// target of its own: its position covers what the earlier one committed.
     fn re_earn(&self, epoch: u32, leo: u64, position: u64, listed: bool, shrink: u64) -> bool {
         let mut state = self.0.lock();
         let Some(r) = state
@@ -280,6 +287,10 @@ impl CaughtUp {
         else {
             return false;
         };
+        if shrink > r.shrink {
+            r.shrink = shrink;
+            r.target = None;
+        }
         if !listed {
             r.target = None;
             return false;
@@ -2026,6 +2037,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await
@@ -2115,6 +2127,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await
@@ -2286,6 +2299,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await
@@ -2586,6 +2600,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await
@@ -2880,6 +2895,47 @@ mod tests {
         assert!(!flag.holds_for(2));
         target.note(&flag, 3, 5, 5);
         assert!(flag.holds_for(3));
+    }
+
+    /// A leader that restarts at the same epoch numbers its shrinks above every
+    /// number of the incarnation before. Its notice replaces the revocation
+    /// with a target of its own, and its heartbeat counts with a fresh one: the
+    /// target an earlier incarnation's heartbeat set does not carry over.
+    #[test]
+    fn a_restarted_leaders_shrinks_do_not_inherit_the_earlier_incarnations_target() {
+        let flag = CaughtUp::default();
+        let mut target = CatchUpTarget::default();
+        let (first, second) = (1u64 << 16, 2u64 << 16);
+        flag.set(4);
+        flag.revoke(4, first + 1);
+        // Listed again at 100 by the first incarnation; the copy is at 50.
+        target.note_heartbeat(&flag, 4, 50, 100, true, first + 1);
+        assert!(!flag.holds_for(4));
+        // The leader restarts and shrinks again; the copy has passed 100 but
+        // the second incarnation committed up to 200 alone.
+        flag.revoke(4, second + 1);
+        target.note_heartbeat(&flag, 4, 150, 200, true, second + 1);
+        assert!(!flag.holds_for(4), "the old target of 100 was not reused");
+        target.note_heartbeat(&flag, 4, 200, 200, true, second + 1);
+        assert!(flag.holds_for(4));
+
+        // A heartbeat of a newer incarnation arriving before its notice counts
+        // with a fresh target too.
+        flag.revoke(4, second + 2);
+        target.note_heartbeat(&flag, 4, 10, 300, true, second + 2);
+        flag.revoke(4, (3u64 << 16) + 1);
+        target.note_heartbeat(&flag, 4, 310, 400, true, 4u64 << 16);
+        assert!(!flag.holds_for(4), "listed at 400, the copy is at 310");
+    }
+
+    /// A delayed notice of an earlier epoch does not replace a newer one.
+    #[test]
+    fn a_notice_of_an_earlier_epoch_does_not_replace_a_newer_revocation() {
+        let flag = CaughtUp::default();
+        flag.revoke(5, 3);
+        flag.revoke(4, 9);
+        flag.set(5);
+        assert!(!flag.holds_for(5), "the revocation at epoch 5 stands");
     }
 
     /// Under steady writes the leader's position moves on every publish; the

@@ -44,6 +44,10 @@ use crate::services::ports::PortAllocator;
 /// to a caught-up replica (`ReplicationManager::hand_over_leaders`).
 const SHUTDOWN_HANDOVER_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a graceful stop spends telling the leaders it follows that it is
+/// leaving (`ReplicationManager::announce_leaving`).
+const SHUTDOWN_LEAVING_BUDGET: Duration = Duration::from_secs(2);
+
 /// Node identity and the cipher every encrypted setting goes through.
 pub struct CoreIdentity {
     pub settings_cipher: Arc<SettingsCipher>,
@@ -958,6 +962,14 @@ impl CoreNode {
                 info!(
                     moved,
                     "handed the bus partitions this node led to a replica before stopping"
+                );
+            }
+            // The leaders this node follows stop waiting for it.
+            let released = manager.announce_leaving(SHUTDOWN_LEAVING_BUDGET).await;
+            if released > 0 {
+                info!(
+                    released,
+                    "told the bus leaders this node followed that it is stopping"
                 );
             }
             crate::bus::replication::init::stop(&manager);

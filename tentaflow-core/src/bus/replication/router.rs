@@ -841,6 +841,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await
@@ -890,6 +891,7 @@ mod tests {
                 isr_shrink_epoch: Some(5),
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 1,
+                leaving_epoch: None,
             }),
         )
         .await

@@ -304,6 +304,11 @@ pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         BusServiceError::TopicAlreadyExists { .. } | BusServiceError::OffsetRegression { .. } => {
             error_response(StatusCode::CONFLICT, "conflict_error", e.to_string())
         }
+        // The group exists and is held by an operator: the read is refused
+        // until it is resumed, which is neither a server fault nor a retry.
+        BusServiceError::GroupPaused { .. } => {
+            error_response(StatusCode::CONFLICT, "bus_group_paused", e.to_string())
+        }
         BusServiceError::InvalidTopicName { .. }
         | BusServiceError::InvalidTopicConfig { .. }
         | BusServiceError::InvalidArgument(_)
@@ -4150,6 +4155,19 @@ mod tests {
         assert!(resp.headers().get("Retry-After").is_none());
         let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
         assert_eq!(body["error"]["code"], "bus_leader_failure");
+    }
+
+    /// A read of a paused group is refused with a 409 and its own code, not
+    /// reported as a server fault.
+    #[test]
+    fn a_read_of_a_paused_group_is_a_409_with_its_own_code() {
+        let resp = map_bus_error(&BusServiceError::GroupPaused {
+            group: "g".to_string(),
+            topic: "t".to_string(),
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp)).unwrap();
+        assert_eq!(body["error"]["code"], "bus_group_paused");
     }
 
     /// What the leader's own read says about a group that fell behind

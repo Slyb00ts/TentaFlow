@@ -373,6 +373,13 @@ pub trait LeaderHandle: Send + Sync {
     fn shrink_seq(&self) -> u64 {
         0
     }
+    /// The follower `node_id` says it is stopping (`ReplLeoQuery::leaving_epoch`):
+    /// takes it out of the in-sync set and grants the permission to commit
+    /// alone. `false` for a handle that does not track it.
+    fn follower_leaving(&self, node_id: &str) -> bool {
+        let _ = node_id;
+        false
+    }
     /// Grants the permission only if the in-sync set has not shrunk again
     /// since it counted `seq` shrinks: an acknowledgement belongs to the
     /// shrink it answered. `true` when granted.
@@ -1877,7 +1884,117 @@ impl ReplicationManager {
                     query.isr_shrink_seq,
                 );
         }
+        if let Some(leaving_at) = query.leaving_epoch {
+            reply.isr_shrink_acked = serving
+                && self.accept_leaving(&key, candidate, leaving_at, query.isr_shrink_generation);
+        }
         let _ = frames::write_frame(&mut send, &ReplFrame::LeoReply(reply)).await;
+    }
+
+    /// The leader's side of `announce_leaving`: `sender`, the follower of the
+    /// partition this node leads at `epoch`, is stopping. It stopped serving and
+    /// standing before it said so, so nothing is left for the leader to wait
+    /// for: the follower leaves the in-sync set and the leader commits alone.
+    fn accept_leaving(
+        &self,
+        key: &PartitionKey,
+        sender: &str,
+        epoch: u32,
+        generation: u64,
+    ) -> bool {
+        let Some(entry) = self.registry.get(key) else {
+            return false;
+        };
+        if entry.role != LocalRole::Leader
+            || entry.assignment.leader_epoch != epoch
+            || entry.assignment.topic_generation != generation
+            || entry.assignment.replicas.len() != 2
+            || !entry.assignment.replicas.iter().any(|r| r == sender)
+        {
+            return false;
+        }
+        let Some(handle) = entry.leader.clone() else {
+            return false;
+        };
+        drop(entry);
+        let granted = handle.follower_leaving(sender);
+        if granted {
+            self.alone.remove(key);
+            tracing::info!(
+                org_id = %key.0, topic = %key.1, partition = key.2, peer = %sender, epoch,
+                "replication: committing alone — the follower is stopping"
+            );
+        }
+        granted
+    }
+
+    /// Tells the leaders this node follows at RF 2 that it is stopping, so
+    /// they take it out of the in-sync set and commit alone at once instead of
+    /// waiting out `T_alone` for a node that is gone. This node stops serving
+    /// and standing first (the shutdown token), which is what makes the leader
+    /// safe to act on it: nothing here can lead the partition afterwards.
+    /// Returns how many leaders acknowledged.
+    pub async fn announce_leaving(self: &Arc<Self>, budget: Duration) -> usize {
+        self.shutdown.cancel();
+        let leaders: Vec<(PartitionKey, String, u32, u64)> = self
+            .registry
+            .iter()
+            .filter(|e| {
+                e.role == LocalRole::Follower
+                    && e.assignment.replicas.len() == 2
+                    && e.assignment.leader_node_id != self.local_node_id
+            })
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.assignment.leader_node_id.clone(),
+                    e.assignment.leader_epoch,
+                    e.assignment.topic_generation,
+                )
+            })
+            .collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for (key, leader, epoch, generation) in leaders {
+            let manager = Arc::clone(self);
+            tasks.spawn(async move {
+                let query = ReplFrame::LeoQuery(ReplLeoQuery {
+                    instance_id: manager.instance_id.clone(),
+                    org_id: key.0.clone(),
+                    topic: key.1.clone(),
+                    partition: key.2,
+                    known_epoch: epoch,
+                    candidate_epoch: None,
+                    isr_shrink_epoch: None,
+                    isr_shrink_generation: generation,
+                    isr_shrink_seq: 0,
+                    leaving_epoch: Some(epoch),
+                });
+                let exchange = async {
+                    let (mut recv, mut send) =
+                        manager.transport.open_query_stream(&leader).await.ok()?;
+                    frames::write_frame(&mut send, &query).await.ok()?;
+                    match frames::read_frame(&mut recv).await.ok()? {
+                        ReplFrame::LeoReply(reply) => Some(reply.isr_shrink_acked),
+                        _ => None,
+                    }
+                };
+                tokio::time::timeout(manager.leo_query_timeout, exchange)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false)
+            });
+        }
+        let mut acked = 0;
+        let collect = async {
+            while let Some(done) = tasks.join_next().await {
+                if done.unwrap_or(false) {
+                    acked += 1;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(budget, collect).await;
+        acked
     }
 
     /// This node's own log of `assignment`'s partition, read from the local
@@ -1970,6 +2087,8 @@ impl ReplicationManager {
         }
         self.peer_features
             .insert(remote_node_id.to_string(), hello.bus_features);
+        // A stream from the peer is its bus serving: refusals before it are over.
+        self.forget_refusals(remote_node_id);
         let key: PartitionKey = (hello.org_id.clone(), hello.topic.clone(), hello.partition);
 
         // A registry miss is not yet an answer: resolve it against the
@@ -2563,7 +2682,11 @@ impl ReplicationManager {
             // no longer a replica, so answering a `LeoQuery` with zeros is the
             // truthful answer rather than a self-denial.
             LocalRole::NotReplica => {
-                self.registry.remove(&key);
+                // What it had earned for the partition ends with its place in
+                // it: a replica added back at the same epoch starts unproven.
+                if let Some((_, gone)) = self.registry.remove(&key) {
+                    self.follower_factory.forget_caught_up(&gone.assignment);
+                }
             }
             LocalRole::Leader => {
                 // No dials here (see the NON-NEGOTIABLE note above): the
@@ -3725,6 +3848,12 @@ impl ReplicationManager {
     /// partition the peer leads the answer must show it leads it
     /// (`leader_may_still_be_there`).
     fn probe_silent_peers(self: &Arc<Self>) {
+        // A frame on a stream with the peer since a run began ends the run, even
+        // when that stream is gone by the time the run is next consulted.
+        self.refusals.retain(|_, r| {
+            self.stream_signal_age(&r.peer)
+                .is_none_or(|age| age >= r.since.elapsed())
+        });
         let mut targets: Vec<(String, PartitionKey, Option<u32>)> = Vec::new();
         for entry in self.registry.iter() {
             if entry.assignment.replicas.len() > 2
@@ -3740,6 +3869,23 @@ impl ReplicationManager {
             else {
                 continue;
             };
+            // Only a partition with a decision waiting on the peer is asked
+            // about: a leader that may not commit alone, a follower whose
+            // leader has gone quiet. The rest add probes and decide nothing.
+            let pending = match entry.role {
+                LocalRole::Leader => entry
+                    .leader
+                    .as_ref()
+                    .is_some_and(|l| l.isr().len() <= 1 && !l.alone_cleared()),
+                LocalRole::Follower => entry.follower.as_ref().is_none_or(|f| {
+                    f.last_frame_age()
+                        .is_none_or(|age| age >= HEARTBEAT_STALE / 2)
+                }),
+                _ => false,
+            };
+            if !pending {
+                continue;
+            }
             let led_epoch =
                 (entry.assignment.leader_node_id == *peer).then_some(entry.assignment.leader_epoch);
             targets.push((peer.clone(), entry.key().clone(), led_epoch));
@@ -3837,6 +3983,7 @@ impl ReplicationManager {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         let exchange = async {
             let (mut recv, mut send) = self.transport.open_query_stream(peer).await.ok()?;
@@ -3873,6 +4020,7 @@ impl ReplicationManager {
             isr_shrink_epoch: Some(epoch),
             isr_shrink_generation: generation,
             isr_shrink_seq: seq,
+            leaving_epoch: None,
         });
         let exchange = async {
             let (mut recv, mut send) = self.transport.open_query_stream(peer).await.ok()?;
@@ -4809,6 +4957,7 @@ impl ReplicationManager {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         frames::write_frame(&mut send, &query).await.ok()?;
         match frames::read_frame(&mut recv).await.ok()? {
@@ -5061,6 +5210,9 @@ impl ReplicationManager {
         }) else {
             return;
         };
+        // The takeover began when the old leader was last heard, not when the
+        // vote was counted: the lease and `T_alone` ran down before that.
+        let silent_for = self.peer_signal_age(&from_node).unwrap_or_default();
         let started_at = Instant::now();
 
         // No dials here either (mirrors `apply_assignment`'s NON-NEGOTIABLE
@@ -5170,7 +5322,7 @@ impl ReplicationManager {
                     &self.local_node_id,
                     from_epoch,
                     epoch,
-                    started_at.elapsed().as_millis() as u64,
+                    (silent_for + started_at.elapsed()).as_millis() as u64,
                     "lease_expired",
                 );
             }
@@ -6674,6 +6826,7 @@ async fn probe_features(
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         frames::write_frame(&mut send, &query)
             .await
@@ -8522,6 +8675,10 @@ mod tests {
             *self.alone_after.lock()
         }
 
+        fn forget_caught_up(&self, _assignment: &PartitionAssignment) {
+            self.events.lock().push("forget".to_string());
+        }
+
         fn revoke_caught_up(&self, _assignment: &PartitionAssignment, _epoch: u32, _shrink: u64) {
             self.revoked.fetch_add(1, Ordering::SeqCst);
             self.caught_up.store(false, Ordering::SeqCst);
@@ -8591,6 +8748,8 @@ mod tests {
     #[derive(Default)]
     struct FakeAudit {
         failovers: Mutex<u32>,
+        /// `duration_ms` of every failover, in order.
+        failover_durations: Mutex<Vec<u64>>,
         transfers: Mutex<u32>,
         evictions: Mutex<u32>,
     }
@@ -8605,10 +8764,11 @@ mod tests {
             _to_node: &str,
             _from_epoch: u32,
             _to_epoch: u32,
-            _duration_ms: u64,
+            duration_ms: u64,
             _reason: &str,
         ) {
             *self.failovers.lock() += 1;
+            self.failover_durations.lock().push(duration_ms);
         }
         fn transfer(
             &self,
@@ -8787,6 +8947,14 @@ mod tests {
                 .set_acked(OperationId::from_hash([raw; 32]), vec!["f2".to_string()]);
         }
         fx.manager.apply_assignment(stored.clone()).await;
+        // This fixture re-applies the node's own row, so the leader the
+        // takeover starts from is the row's: heard last seven seconds ago.
+        fx.manager.on_peer_connected(&stored.leader_node_id);
+        fx.manager
+            .peers
+            .get_mut(stored.leader_node_id.as_str())
+            .unwrap()
+            .last_signal = Some(Instant::now() - Duration::from_secs(7));
         fx.manager.run_election(key.clone()).await;
 
         assert_eq!(
@@ -8795,6 +8963,11 @@ mod tests {
             "standing again from 64: the next epoch in its own slot"
         );
         assert_eq!(*fx.audit.failovers.lock(), 1);
+        let took = fx.audit.failover_durations.lock()[0];
+        assert!(
+            took >= 7000,
+            "the takeover is timed from the old leader's last sign of life, not from the vote: {took} ms"
+        );
     }
 
     // ---- promotion dispatches the truncate it derived -------------------
@@ -11756,6 +11929,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await;
@@ -11796,6 +11970,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await;
@@ -11822,6 +11997,7 @@ mod tests {
                 isr_shrink_epoch: None,
                 isr_shrink_generation: 0,
                 isr_shrink_seq: 0,
+                leaving_epoch: None,
             }),
         )
         .await;
@@ -13074,6 +13250,7 @@ mod tests {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         let leading = |reply: ReplFrame| match reply {
             ReplFrame::LeoReply(r) => r.leading,
@@ -13288,6 +13465,7 @@ mod tests {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         let alive = |reply: ReplFrame| match reply {
             ReplFrame::LeoReply(r) => r.leader_alive,
@@ -13864,6 +14042,7 @@ mod tests {
             isr_shrink_epoch: Some(epoch),
             isr_shrink_generation: generation,
             isr_shrink_seq: 1,
+            leaving_epoch: None,
         };
         // Not from a replica of the partition, or for another epoch or
         // incarnation of the topic: no acknowledgement, the claim stands.
@@ -13923,6 +14102,7 @@ mod tests {
             isr_shrink_epoch: Some(epoch),
             isr_shrink_generation: row.topic_generation,
             isr_shrink_seq: seq,
+            leaving_epoch: None,
         }
     }
 
@@ -14108,6 +14288,24 @@ mod tests {
                 assert!(at >= Duration::from_millis(700), "cleared after {at:?}");
             }
         }
+    }
+
+    /// A node that stops being a replica forgets what it had earned for the
+    /// partition, so a replica added back at the same epoch starts unproven.
+    #[tokio::test]
+    async fn a_node_removed_from_the_replica_set_forgets_its_caught_up_flag() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let removed = assignment("org", "orders", 0, "l", &["l", "x"], &["l", "x"], 3);
+        fx.manager.apply_assignment(removed).await;
+        assert!(fx
+            .follower_factory
+            .events
+            .lock()
+            .iter()
+            .any(|e| e == "forget"));
     }
 
     /// Refusals are evidence only while they are an unbroken, renewed run on
@@ -15326,6 +15524,7 @@ mod tests {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         })
     }
 

@@ -5040,6 +5040,33 @@ async fn a_leader_does_not_commit_alone_on_refusals_from_before_its_follower_rej
     );
 }
 
+/// A follower that stops gracefully tells its leader, which then commits alone
+/// at once: the follower is gone before `T_alone` could run out, and the mesh
+/// (which still vouches for it) would otherwise keep the leader waiting for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_stops_gracefully_releases_its_leader_at_once() {
+    let (nodes, registry, _mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let released = b.manager.announce_leaving(Duration::from_secs(2)).await;
+    b.manager.shutdown();
+    // The process is gone: nothing answers the leader's own notice.
+    registry.peers.lock().remove("B");
+    let started = tokio::time::Instant::now();
+    let accepted = publish_until_accepted(a, "after-stop", Duration::from_secs(10)).await;
+    let waited = started.elapsed();
+    let a_payloads = text_payloads(a);
+    shutdown_all(&nodes);
+    assert_eq!(released, 1, "the leader never acknowledged the departure");
+    assert!(accepted, "the leader never resumed after the follower left");
+    assert!(
+        waited < TEST_ALONE_AFTER,
+        "the leader waited {waited:?}, as long as it would for a node that is not leaving"
+    );
+    let lost: Vec<&String> = acked.iter().filter(|p| !a_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
 /// The old give-up: a follower whose leader stays reachable on the mesh used
 /// to stand after 60 s of silence on the stream, over writes the leader had
 /// acknowledged. It does not any more, however long, and the leader reports

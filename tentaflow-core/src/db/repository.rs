@@ -564,6 +564,12 @@ pub fn retired_api_key_peppers(
         .collect())
 }
 
+/// Whether this node already holds an API key pepper (`get_or_create_api_key_pepper`
+/// would not mint one).
+pub fn api_key_pepper_exists(pool: &DbPool) -> bool {
+    matches!(get_setting(pool, API_KEY_PEPPER_KEY), Ok(Some(raw)) if !raw.is_empty())
+}
+
 /// Returns the org-wide API key pepper, decrypting the stored value, and only
 /// generating + persisting 32 CSPRNG bytes when none exists yet.
 ///
@@ -29454,6 +29460,17 @@ mod api_key_access_v2_tests {
             ),
             format!("{}:40", hex(1))
         );
+    }
+
+    /// Issuing the first key mints the pepper; callers push it to the fleet
+    /// only when it was not there before.
+    #[test]
+    fn the_pepper_is_reported_missing_until_it_is_minted() {
+        let db = fresh_db();
+        let cipher = test_cipher();
+        assert!(!api_key_pepper_exists(&db));
+        get_or_create_api_key_pepper(&db, &cipher).unwrap();
+        assert!(api_key_pepper_exists(&db));
     }
 
     /// Replacing the pepper retires the old one at the time of the change.

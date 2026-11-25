@@ -1289,6 +1289,14 @@ impl IrohMeshManager {
                     let prev = occ.insert(ActiveConnection::new(new_id, conn, direction));
                     drop(occ);
                     prev.connection.close(0u32.into(), b"stale-superseded");
+                    // The peer redialed over a session that went silent: it
+                    // restarted, on the same address (a moved one is handled
+                    // above). Its bus connections are sessions with the
+                    // process that died; left open they take forwarded writes
+                    // and replication frames into the void until QUIC's idle
+                    // timeout, and the pooled forward connection keeps
+                    // opening streams on them.
+                    self.close_bus_connections(&remote_hex);
                     Some(new_id)
                 } else if existing_dir == direction {
                     // Duplikat tego samego kierunku — iroh retry/migration.
@@ -4413,6 +4421,8 @@ mod tie_break_tests {
         let (out_a, _inc_b) = single_link(&manager, &peer).await;
         let (_out_b, inc_a) = single_link(&peer, &manager).await;
         let (_out_b2, inc_a2) = single_link(&peer, &manager).await;
+        let (_out_b3, bus_conn) = single_link(&peer, &manager).await;
+        manager.track_bus_connection(&peer_hex, &bus_conn);
 
         let first = manager
             .register_connection(
@@ -4462,6 +4472,12 @@ mod tie_break_tests {
             )
             .await;
         assert!(stale.is_some(), "an old entry is superseded by the redial");
+        // The bus connections of the process that went silent go with it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            bus_conn.close_reason().is_some(),
+            "a bus connection to the restarted peer was left open"
+        );
         assert_eq!(
             manager.connections.get(&peer_hex).expect("entry").id,
             stale.unwrap()

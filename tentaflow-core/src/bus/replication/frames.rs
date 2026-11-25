@@ -519,6 +519,13 @@ pub struct ReplLeoQuery {
     /// revocation. Appended: `0` from a leader that predates it.
     #[serde(default)]
     pub isr_shrink_seq: u64,
+    /// The sender is a follower of this partition, led at this epoch by the
+    /// node it asks, and is stopping: it no longer serves or stands, so the
+    /// leader may take it out of the in-sync set and commit alone at once
+    /// instead of waiting out `T_alone`. Answered by
+    /// `ReplLeoReply::isr_shrink_acked`. Appended.
+    #[serde(default)]
+    pub leaving_epoch: Option<u32>,
 }
 
 /// Everything after `in_isr` is appended. A peer on an older build omits it
@@ -1792,6 +1799,7 @@ mod tests {
             isr_shrink_epoch: None,
             isr_shrink_generation: 0,
             isr_shrink_seq: 0,
+            leaving_epoch: None,
         });
         assert_eq!(roundtrip(lq.clone()).await, lq);
 

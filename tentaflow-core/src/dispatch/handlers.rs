@@ -1616,8 +1616,12 @@ pub fn api_key_create(
         use std::fmt::Write as _;
         let _ = write!(token_hex, "{:02x}", b);
     }
+    let pepper_is_new = !repository::api_key_pepper_exists(db);
     let pepper =
         repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    if pepper_is_new {
+        push_new_pepper(ctx);
+    }
     let raw_key = auth::issue_api_key_token(&token_hex, &pepper);
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
@@ -1963,8 +1967,12 @@ pub fn api_key_rotate(
         use std::fmt::Write as _;
         let _ = write!(token_hex, "{:02x}", b);
     }
+    let pepper_is_new = !repository::api_key_pepper_exists(db);
     let pepper =
         repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    if pepper_is_new {
+        push_new_pepper(ctx);
+    }
     let raw_key = auth::issue_api_key_token(&token_hex, &pepper);
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
@@ -3758,6 +3766,16 @@ pub fn settings_list(
         })
         .collect();
     Ok(MessageBody::SettingsListResponse { entries })
+}
+
+/// A pepper minted by issuing the first API key of a fleet is pushed to the
+/// trusted peers at once. Left to the next reconnect, a peer checking the key
+/// before then mints a pepper of its own (and one of the two wins by node id,
+/// breaking the keys of the other).
+fn push_new_pepper(ctx: &HandlerContext) {
+    if let Some(mesh) = ctx.state.quic_mesh.clone() {
+        tokio::spawn(async move { mesh.push_shared_secrets_to_trusted(None).await });
+    }
 }
 
 /// A settings write may not name a setting the system keeps itself

@@ -58,6 +58,12 @@ use crate::bus::{
 /// before giving up with `NotLeader`.
 const LEADER_WAIT: Duration = Duration::from_secs(3);
 
+/// How often a publish waiting for the leader to change asks again where the
+/// partition is led, whether or not this node has applied a new assignment:
+/// the route reads the ledger row itself, which a move reaches before the
+/// poll that applies it here does.
+const LEADER_RECHECK: Duration = Duration::from_millis(100);
+
 /// How long a publish first pauses before asking again a leader that knows no
 /// leader for the partition yet (it has not materialized the assignment that
 /// names it), and how far the pause doubles up to. A leader that waits for
@@ -1088,16 +1094,15 @@ impl BusService {
                 unaware_pause = (unaware_pause * 2).min(UNAWARE_LEADER_RETRY_MAX);
                 pause
             } else {
-                remaining
+                remaining.min(LEADER_RECHECK)
             };
-            if remaining.is_zero()
-                || (!coordinator.wait_for_assignment_change(generation, pause) && !unaware)
-            {
+            if remaining.is_zero() {
                 return Err(last_refusal.unwrap_or(BusServiceError::NotLeader {
                     leader_node_id: None,
                     leader_epoch: 0,
                 }));
             }
+            coordinator.wait_for_assignment_change(generation, pause);
         }
         Ok(totals)
     }

@@ -522,7 +522,7 @@ impl PartitionLeader {
             // transfer's old leader, a restart's follower) that a standing
             // would turn on the writes committed here.
             alone_cleared: AtomicBool::new(replicas_len != 2),
-            shrink_seq: parking_lot::Mutex::new(0),
+            shrink_seq: parking_lot::Mutex::new(shrink_seq_base()),
             start_leo,
             fed: dashmap::DashSet::new(),
             config,
@@ -751,7 +751,10 @@ impl PartitionLeader {
         }
     }
 
-    /// The number of shrinks counted so far; what an `IsrShrink` notice names.
+    /// The shrink counter: what an `IsrShrink` notice and the heartbeats name.
+    /// It starts at a base derived from the clock, so the numbers of a leader
+    /// that restarts at the same epoch all exceed those of the incarnation
+    /// before (a follower's revocation outlives the restart).
     pub fn shrink_seq(&self) -> u64 {
         *self.shrink_seq.lock()
     }
@@ -770,6 +773,17 @@ impl PartitionLeader {
             self.recompute_hw();
         }
         true
+    }
+
+    /// The follower `node_id` is stopping and no longer serves or stands: at
+    /// RF 2 it leaves the in-sync set and, nothing it could stand on being
+    /// left, this leader may commit alone at once. `true` when granted.
+    pub fn follower_leaving(&self, node_id: &str) -> bool {
+        if self.replicas.len() != 2 || !self.replicas.iter().any(|r| r == node_id) {
+            return false;
+        }
+        self.remove_follower(node_id, "follower stopping");
+        self.grant_alone_if_unshrunk(self.shrink_seq())
     }
 
     pub fn follower_state(&self, node_id: &str) -> Option<FollowerState> {
@@ -1422,6 +1436,16 @@ async fn feed<W: AsyncWrite + Unpin>(
 /// Sends a bare `Heartbeat` and returns the `hw` it carried. It carries the
 /// leader's live in-sync set too, which `isr_sent` records: the follower has
 /// no other way to know it.
+/// Where a leader handle's shrink numbering starts: the wall clock in
+/// milliseconds shifted left 16 bits, which leaves 65k shrinks per incarnation
+/// before one could reach the next millisecond's base.
+fn shrink_seq_base() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    ms << 16
+}
+
 async fn send_heartbeat<W: AsyncWrite + Unpin>(
     writer: &mut W,
     leader: &PartitionLeader,
@@ -4083,7 +4107,7 @@ mod tests {
         part.append_batch_async(one_record_batch(1)).await.unwrap();
         assert!(!leader.alone_cleared());
         assert_eq!(leader.high_watermark(), 0, "nothing is committed alone yet");
-        assert!(leader.grant_alone_if_unshrunk(0));
+        assert!(leader.grant_alone_if_unshrunk(leader.shrink_seq()));
         assert_eq!(leader.high_watermark(), 1);
 
         let rf3 = make_leader(

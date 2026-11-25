@@ -794,6 +794,10 @@ impl LeaderHandle for GlueLeaderHandle {
         self.0.leader.shrink_seq()
     }
 
+    fn follower_leaving(&self, node_id: &str) -> bool {
+        self.0.leader.follower_leaving(node_id)
+    }
+
     fn grant_alone_if_unshrunk(&self, seq: u64) -> bool {
         self.0.leader.grant_alone_if_unshrunk(seq)
     }

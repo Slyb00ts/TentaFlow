@@ -22020,6 +22020,46 @@ mod tests {
         }
     }
 
+    /// The move reaches the ledger row before this node applies it (the poll
+    /// that bumps the assignment generation runs once a second): the publish
+    /// that was refused asks again where the partition is led and does not
+    /// sit out its whole wait for a change it was never told about.
+    #[test]
+    fn a_refused_publish_notices_a_move_the_generation_does_not_announce() {
+        let topic = "orders.fwd-moved-quietly";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-b".to_string()),
+                leader_epoch: 2,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+        let mover = {
+            let coord = coord.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                coord.set_role(follower_of("node-c", 3));
+            })
+        };
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        mover.join().unwrap();
+        assert_eq!(result.accepted, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a change nobody announced",
+            started.elapsed()
+        );
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "node-c");
+    }
+
     #[test]
     fn a_leader_that_moved_before_anything_was_sent_is_retried_at_the_new_leader() {
         let topic = "orders.fwd-moved-unsent";
