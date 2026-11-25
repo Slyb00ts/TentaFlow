@@ -406,6 +406,10 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         bus_features: 0,
                         instance_unhosted: true,
                         log_known: false,
+                        // A node that hosts no such instance holds no claim to
+                        // drop and cannot stand: nothing keeps the leader from
+                        // committing alone.
+                        isr_shrink_acked: query.isr_shrink_epoch.is_some(),
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }
@@ -834,6 +838,9 @@ mod tests {
                 partition: 0,
                 known_epoch: 5,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await
@@ -850,6 +857,50 @@ mod tests {
                     "the answer must say the instance is not hosted here, so a capability \
                      probe does not take the node for an old build"
                 );
+            }
+            other => panic!("expected LeoReply, got {other:?}"),
+        }
+    }
+
+    /// A node that hosts no such instance holds no claim a shrink could drop:
+    /// it acknowledges the notice, so the leader is not left waiting on it.
+    #[tokio::test]
+    async fn route_stream_acknowledges_a_shrink_notice_for_an_unknown_instance() {
+        let _decoy = with_decoy_manager("tentabus-decade04");
+        let id = BusInstanceId::parse("tentabus-0badc0df").expect("shape-valid, never registered");
+        unregister(&id);
+
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_recv, mut client_send) = split(client);
+        let (server_recv, server_send) = split(server);
+        tokio::spawn(route_stream(
+            "peer".to_string(),
+            Box::new(server_recv),
+            Box::new(server_send),
+        ));
+        frames::write_frame(
+            &mut client_send,
+            &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-0badc0df".to_string(),
+                org_id: "org".to_string(),
+                topic: "orders".to_string(),
+                partition: 0,
+                known_epoch: 5,
+                candidate_epoch: None,
+                isr_shrink_epoch: Some(5),
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 1,
+            }),
+        )
+        .await
+        .expect("write LeoQuery");
+        match frames::read_frame(&mut client_recv)
+            .await
+            .expect("read LeoReply")
+        {
+            ReplFrame::LeoReply(r) => {
+                assert!(r.instance_unhosted);
+                assert!(r.isr_shrink_acked);
             }
             other => panic!("expected LeoReply, got {other:?}"),
         }

@@ -195,8 +195,23 @@ impl LogPosition {
     /// any reply committed past the winner's `leo`) and what a replica
     /// enforces (`BusError::TruncateBelowCommitted`).
     pub fn kept_end(&self, leader: &LogPosition) -> u64 {
+        self.kept_end_in(leader, None)
+    }
+
+    /// `kept_end`, given where the leader's chain holds the records of this
+    /// log's last epoch (`Partition::epoch_span`): `[start, end)`. Records of
+    /// one epoch are one leader's, written once each, so a log that has any
+    /// record of that epoch agrees with the leader's chain up to where the
+    /// leader's records of it end, and only what lies past that diverges. A
+    /// follower that was a few records ahead of its committed offset when its
+    /// leader went, and whose records the new leader holds as well, keeps
+    /// them. `None` (or a log with no record in that span) judges as
+    /// `kept_end` always did.
+    pub fn kept_end_in(&self, leader: &LogPosition, leader_span: Option<(u64, u64)>) -> u64 {
         if self.epoch == leader.epoch {
             self.leo.min(leader.leo)
+        } else if let Some((_, end)) = leader_span.filter(|&(start, _)| self.leo > start) {
+            self.leo.min(end).min(leader.leo)
         } else {
             self.committed.min(self.leo).min(leader.leo)
         }

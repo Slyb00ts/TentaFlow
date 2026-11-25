@@ -462,6 +462,7 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
                     // that no quorum has acknowledged for a whole lease.
                     manager.check_stale_leadership().await;
                     manager.check_quorum_leases().await;
+                    manager.check_alone_rules().await;
                     // A follower whose leader stopped refreshing the lease
                     // elects. Each election runs in a task of its own
                     // (`check_leases` only starts them), so one that waits

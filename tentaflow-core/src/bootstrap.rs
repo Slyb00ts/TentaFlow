@@ -40,6 +40,10 @@ use crate::routing::Router;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
 
+/// How long a graceful stop spends handing the bus partitions this node leads
+/// to a caught-up replica (`ReplicationManager::hand_over_leaders`).
+const SHUTDOWN_HANDOVER_BUDGET: Duration = Duration::from_secs(5);
+
 /// Node identity and the cipher every encrypted setting goes through.
 pub struct CoreIdentity {
     pub settings_cipher: Arc<SettingsCipher>,
@@ -949,6 +953,13 @@ impl CoreNode {
         // own manager. Stopping an instance flushes its pending windowed audit
         // occurrences now, not at the sweeper's next tick.
         for manager in crate::bus::replication::router::running_managers() {
+            let moved = manager.hand_over_leaders(SHUTDOWN_HANDOVER_BUDGET).await;
+            if moved > 0 {
+                info!(
+                    moved,
+                    "handed the bus partitions this node led to a replica before stopping"
+                );
+            }
             crate::bus::replication::init::stop(&manager);
         }
         for bus_service in crate::bus::running_instances() {

@@ -423,7 +423,40 @@ struct ActiveConnection {
     id: u64,
     connection: Connection,
     direction: ConnectionDirection,
+    established: Instant,
+    /// When the peer last opened a stream on this connection. A live peer
+    /// does so at least every heartbeat.
+    last_rx: Arc<parking_lot::Mutex<Instant>>,
 }
+
+impl ActiveConnection {
+    fn new(id: u64, connection: Connection, direction: ConnectionDirection) -> Self {
+        let now = Instant::now();
+        Self {
+            id,
+            connection,
+            direction,
+            established: now,
+            last_rx: Arc::new(parking_lot::Mutex::new(now)),
+        }
+    }
+
+    /// The session is dead as far as the peer is concerned: it has opened
+    /// nothing for `ZOMBIE_SILENCE` although it has had that long to (a peer
+    /// that restarted holds no session, and QUIC notices only after
+    /// `max_idle_timeout`).
+    fn silent(&self) -> bool {
+        self.established.elapsed() >= ZOMBIE_SILENCE
+            && self.last_rx.lock().elapsed() >= ZOMBIE_SILENCE
+    }
+}
+
+/// A peer that dials us while the connection we hold to it has been silent
+/// this long, which is several heartbeats, no longer holds it. Tie-breaking
+/// such a dial keeps the dead session and closes the live one, every time the
+/// peer redials. A connection that still carries traffic is never replaced
+/// this way, however old it is, so a slow dial over a healthy entry loses.
+const ZOMBIE_SILENCE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct ConnectionPathSnapshot {
@@ -1252,7 +1285,12 @@ impl IrohMeshManager {
                     // no longer has.
                     return None;
                 }
-                if existing_dir == direction {
+                if occ.get().silent() {
+                    let prev = occ.insert(ActiveConnection::new(new_id, conn, direction));
+                    drop(occ);
+                    prev.connection.close(0u32.into(), b"stale-superseded");
+                    Some(new_id)
+                } else if existing_dir == direction {
                     // Duplikat tego samego kierunku — iroh retry/migration.
                     drop(occ);
                     conn.close(0u32.into(), b"duplicate");
@@ -1262,22 +1300,14 @@ impl IrohMeshManager {
                     conn.close(0u32.into(), b"tie-break-loser");
                     None
                 } else {
-                    let prev = occ.insert(ActiveConnection {
-                        id: new_id,
-                        connection: conn,
-                        direction,
-                    });
+                    let prev = occ.insert(ActiveConnection::new(new_id, conn, direction));
                     drop(occ);
                     prev.connection.close(0u32.into(), b"tie-break-loser");
                     Some(new_id)
                 }
             }
             Entry::Vacant(vac) => {
-                vac.insert(ActiveConnection {
-                    id: new_id,
-                    connection: conn,
-                    direction,
-                });
+                vac.insert(ActiveConnection::new(new_id, conn, direction));
                 Some(new_id)
             }
         }
@@ -3188,6 +3218,15 @@ impl IrohMeshManagerRef {
         Ok(())
     }
 
+    /// Records that the peer opened a stream on connection `connection_id`.
+    fn note_rx(&self, remote_hex: &str, connection_id: u64) {
+        if let Some(active) = self.connections.get(remote_hex) {
+            if active.id == connection_id {
+                *active.last_rx.lock() = Instant::now();
+            }
+        }
+    }
+
     async fn handle_mesh_connection(
         &self,
         remote_hex: String,
@@ -3205,6 +3244,7 @@ impl IrohMeshManagerRef {
                             break;
                         }
                     };
+                    self.note_rx(&remote_hex, connection_id);
                     let me = self.clone();
                     let rhex = remote_hex.clone();
                     tokio::spawn(async move {
@@ -3221,6 +3261,7 @@ impl IrohMeshManagerRef {
                             break;
                         }
                     };
+                    self.note_rx(&remote_hex, connection_id);
                     let me = self.clone();
                     let rhex = remote_hex.clone();
                     tokio::spawn(async move {
@@ -4357,6 +4398,80 @@ mod tie_break_tests {
             inc_a.close_reason().is_some(),
             "przegrane incoming powinno byc zamkniete po podmianie"
         );
+    }
+
+    /// After a peer restart the stored session is a zombie and the peer redials
+    /// from a clean slate. The redial must replace an old entry, whichever way
+    /// the tie-break would have gone, or it is closed again every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redial_replaces_a_stale_entry_instead_of_losing_the_tie_break() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true); // self < peer: outgoing wins
+
+        let (out_a, _inc_b) = single_link(&manager, &peer).await;
+        let (_out_b, inc_a) = single_link(&peer, &manager).await;
+        let (_out_b2, inc_a2) = single_link(&peer, &manager).await;
+
+        let first = manager
+            .register_connection(
+                peer_hex.clone(),
+                out_a.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await;
+        assert!(first.is_some());
+
+        // Young entry: the losing incoming dial is the simultaneous-dial case.
+        let young = manager
+            .register_connection(
+                peer_hex.clone(),
+                inc_a.clone(),
+                ConnectionDirection::Incoming,
+            )
+            .await;
+        assert!(young.is_none(), "a young winner keeps the tie-break");
+
+        let old = Instant::now() - ZOMBIE_SILENCE - Duration::from_secs(1);
+        {
+            let mut entry = manager.connections.get_mut(&peer_hex).expect("entry");
+            entry.established = old;
+            // Old but still carrying traffic: a slow dial must not replace it.
+            *entry.last_rx.lock() = Instant::now();
+        }
+        let slow = manager
+            .register_connection(
+                peer_hex.clone(),
+                inc_a.clone(),
+                ConnectionDirection::Incoming,
+            )
+            .await;
+        assert!(slow.is_none(), "a healthy entry is never replaced by age");
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = old;
+        let stale = manager
+            .register_connection(
+                peer_hex.clone(),
+                inc_a2.clone(),
+                ConnectionDirection::Incoming,
+            )
+            .await;
+        assert!(stale.is_some(), "an old entry is superseded by the redial");
+        assert_eq!(
+            manager.connections.get(&peer_hex).expect("entry").id,
+            stale.unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            out_a.close_reason().is_some(),
+            "the stale session is closed"
+        );
+        assert!(inc_a2.close_reason().is_none(), "the redial stays open");
     }
 
     /// Gdy w mapie jest zwyciezca (outgoing) i przychodzi przegrywajacy

@@ -297,6 +297,29 @@ Gdy node prowadzący przestaje odpowiadać, node ze zgodną kopią przejmuje pro
 
 Fałszywe przejęcie `lease_expired` tuż po ręcznym przeniesieniu zaobserwowano jednokrotnie (po przeniesieniu jedna partycja i jej DLQ dostały wpis „przestał odpowiadać”, choć node działał, a ich node preferowany został inny niż reszty topiku). Topik, którego partycje nie zgadzają się co do noda preferowanego, jest pomijany przez automatyczny powrót, więc po ręcznym przeniesieniu sprawdź pinezki w „Partycje i kopie”.
 
+### Strumień replikacji zerwany, mesh żywy (RF=2)
+
+Przy RF=2 węzeł działa sam tylko wtedy, gdy drugi jest poza grą: potwierdził, że nie stanie na tej epoce, albo jest nieosiągalny bez przerwy przez `T_alone` (5 s): bez połączenia mesh, albo z połączeniem, które od 2 s nie niesie heartbeatu i nie odpowiada na sondę kanałem zapytań. Liczenie biegnie od ostatniego znaku życia, a ponowne połączenie, heartbeat lub odpowiedź na sondę je zeruje. Krótkie migotanie łącza nie rusza żadnej ze stron. Gdy strumień replikacji milczy, a drugi węzeł jest w mesh:
+
+- **follower nie staje do elekcji**, na jak długo lider jest osiągalny. Stanie dopiero, gdy ma ważną flagę „doścignięty” (nie cofniętą komunikatem `IsrShrink`) i lider jest nieosiągalny przez `T_alone`. Odpowiedź lidera `leading: true` z bieżącej epoki też go wstrzymuje. Nie ma limitu czasu typu „po 60 s staje mimo wszystko”;
+- **lider nie potwierdza zapisów sam.** Zawężony do siebie, wysyła followerowi komunikat `IsrShrink` (kanałem zapytań, który działa przy martwym strumieniu). Do potwierdzenia przez followera albo `T_alone` nieosiągalności: zapisy `acks=all` dostają 503 `bus_not_enough_replicas` (ponawialny; także zapis przyjęty tuż przed zawężeniem), a `hw` nie rusza. Zapisy `acks=leader` są nadal przyjmowane i potwierdzane przy dopisaniu, lecz nie są zatwierdzane (nie przesuwają `hw`, więc konsumenci ich nie widzą). To świadoma decyzja: `acks=leader` działa jak `acks=1` w Kafce, czyli potwierdzenie oznacza dopisanie u lidera, a niezatwierdzony ogon może zostać obcięty przy zmianie lidera (każde obcięcie zapisuje `bus.leader.tail_discarded`). Trwałość daje `acks=all`.
+- **nowy lider RF=2 startuje zablokowany** (po elekcji, przeniesieniu, odbudowie, restarcie): zgodę na zatwierdzanie samemu daje potwierdzenie `IsrShrink`, `T_alone` nieosiągalności albo rejestracja followera. Follower, który potwierdził zawężenie, odzyskuje flagę dopiero po heartbeacie lidera z nim w ISR i po dojściu do pozycji z tego heartbeatu. Węzeł bez wpisu o partycji, bez tej instancji albo z zamkniętym menedżerem potwierdza zawężenie od razu;
+- **odpowiedź na sondę „nie obsługuję tej partycji”** (a dla lidera: „nie prowadzę jej w tej epoce”) nie liczy się jako znak życia: heartbeat mesh przestaje wtedy ręczyć za węzeł, gdy takie odpowiedzi o danej partycji trwają nieprzerwanie przez `T_alone` i są odnawiane (seria zaczęta po ostatniej ramce strumienia od węzła; odpowiedź „obsługuję”, połączenie lub rozłączenie mesh albo ramka strumienia ją kończą), więc follower nie czeka bez końca na lidera z martwą szyną, a lider nie czeka na followera z martwą szyną. Brak odpowiedzi w ogóle niczego nie przesądza (łącze może być przyczyną), dlatego węzeł osiągalny w mesh, którego strumień i zapytania nie działają, nadal wstrzymuje drugi.
+
+Gdy odmowa trwa dłużej niż 30 s, a drugi węzeł jest w mesh, lider zapisuje błąd w logu i wiersz audytu `bus.leader.alone_refused` (szczegóły: instancja, partycja, peer, `refused_s`). Wstrzymanie dotyczy RF≤2; od RF=3 decyduje większość.
+
+Ubity proces zostawia połączenie mesh stojące do limitu bezczynności transportu (30–40 s), więc o jego śmierci mówi cisza heartbeatu i sondy. Przejęcie trwa `T_alone` plus elekcja: w teście `process_three_node_bus_failover` (osiem partycji) zmierzono 8,8–9,2 s od ubicia lidera do przejęcia wszystkich partycji. W logu follower pisze na poziomie debug „not standing — the leader has not been out of reach of the mesh for the alone interval”. Ostrzeżenie „not standing — this node has not caught up” powtarza się co 60 s na partycję, dopóki wstrzymanie trwa.
+
+**Ograniczenie RF=2: prawdziwa symetryczna awaria sieci między dwoma węzłami, trwająca dłużej niż `T_alone`, może zgubić potwierdzone zapisy.** Obie strony widzą wtedy drugą jako martwą, każda może prowadzić i po zrośnięciu zostaje łańcuch jednej z nich (`bus.leader.tail_discarded` pokazuje, ile rekordów odrzucono). Zerowa utrata wymaga RF=3, bo o liderze decyduje większość (albo świadka, poza zakresem). To świadomy wybór: przy RF=2 dostępność (lider pisze dalej po `T_alone`) ma pierwszeństwo przed zerową utratą. Dwie instancje na jednym serwerze rozłączają się praktycznie tylko przez zatrzymanie procesu, nie przez sieć.
+
+### Przeniesienie a przejęcie
+
+Lider, który oddał partycję w przeniesieniu (ręcznym, powrocie do noda preferowanego albo rozkładzie), ma po nim ten sam log co cel i może przejąć partycję, gdy nowy lider padnie od razu.
+
+### Zamknięcie węzła
+
+Węzeł zamykany łagodnie (SIGTERM) oddaje najpierw partycje, które prowadzi, zgodnej replice (do 5 s łącznie, po jednej partycji; każde oczekiwanie jest przycięte do pozostałego budżetu, po jego wyczerpaniu nie zaczyna się kolejne przeniesienie), więc druga strona nie czeka na wygaśnięcie dzierżawy. W logu: „handed the bus partitions this node led to a replica before stopping”. Partycja bez zgodnej repliki zostaje i przejęcie trwa jak po awarii.
+
 ## Audyt
 
 | Akcja | Kiedy | Szczegóły |
@@ -306,6 +329,7 @@ Fałszywe przejęcie `lease_expired` tuż po ręcznym przeniesieniu zaobserwowan
 | `bus.leader.rebalance` | jeden wpis na organizację na przebieg (Apply, rozkład po aktualizacji, każdy powrót lub zebranie) | `instance_id`, `org_id`, `actor` (id użytkownika albo `system`), `reason`, `moves`, `moved`, `result`; przy błędzie `failed_topic`, `error` |
 | `bus.leader.rebalance_skipped` | topik zostawiony na miejscu przez rozkład po aktualizacji | `instance_id`, `org_id`, `reason` (powód blokady albo kod błędu), `node_id`, `source=post_upgrade_spread` |
 | `bus.leader.failover` | zwykłe przejęcie po awarii (istniejące, bez zmian w TB-04) | źródło historii przejęć prowadzenia |
+| `bus.leader.alone_refused` | lider RF=2 odmawia zatwierdzania sam od ponad 30 s, choć drugi węzeł jest w mesh, a strumień replikacji nie wraca (powtarzane co 30 s) | `instance_id`, `org_id`, `partition`, `peer`, `refused_s` |
 
 Dziennik audytu jest **per node**: wpis leży na nodzie, na którym wykonano akcję (przeniesienie kliknięte na B jest tylko w audycie B). Lista „Przejęcia prowadzenia” w „Kopie i nody” pyta o historię **każdy osiągalny node**, łączy odpowiedzi i usuwa powtórzenia (ten sam topik, partycja, epoka i chwila), więc **gdy nody łączą się bezpośrednio**, pokazuje to samo niezależnie od tego, na którym nodzie jest otwarta; node, który nie odpowie, jest pomijany. W przekliku zapytania do drugiego noda kończyły się błędem `PolicyDenied: no assertion key … known for node …`, więc każdy node pokazywał tylko własne wpisy (znane ograniczenie). Filtr „Akcja” w dzienniku audytu wymaga pełnej nazwy (`bus.leader.transfer`; samo `bus.leader` daje „Brak wpisów”).
 

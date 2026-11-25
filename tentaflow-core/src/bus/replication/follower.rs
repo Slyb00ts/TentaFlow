@@ -194,20 +194,103 @@ impl std::fmt::Debug for TailDiscard {
 /// only while the partition's assignment is still at that epoch. A leader
 /// elected since has acknowledged writes this copy has not seen.
 #[derive(Debug, Clone, Default)]
-pub struct CaughtUp(Arc<std::sync::atomic::AtomicU32>);
+pub struct CaughtUp(Arc<parking_lot::Mutex<CaughtUpState>>);
+
+/// One lock for the claim and its revocation: a notice that lands while
+/// batches are being applied must not be undone by the batch that checked
+/// just before it.
+#[derive(Debug, Default)]
+struct CaughtUpState {
+    epoch: u32,
+    revoked: Option<Revoked>,
+}
+
+/// A claim a leader's `IsrShrink` notice took away: it is not given back by the
+/// stream's ordinary catch-up, which the leader's moving position makes
+/// meaningless once it commits alone. It is earned again only from a
+/// heartbeat sent after that shrink that lists this node, by reaching the
+/// position that heartbeat carries.
+#[derive(Debug)]
+struct Revoked {
+    epoch: u32,
+    shrink: u64,
+    /// The leader position of the first such heartbeat.
+    target: Option<u64>,
+}
 
 impl CaughtUp {
+    /// Grants the claim for `epoch` unless a shrink notice took it away for
+    /// that epoch: nothing but a heartbeat sent after the shrink
+    /// (`CatchUpTarget::note_heartbeat`) gives it back. Used by every other
+    /// path that marks the copy caught up, `note_led` included.
     pub fn set(&self, epoch: u32) {
-        self.0.store(epoch, std::sync::atomic::Ordering::SeqCst);
+        let mut state = self.0.lock();
+        if state.revoked.as_ref().is_some_and(|r| r.epoch == epoch) {
+            return;
+        }
+        state.epoch = epoch;
     }
 
     /// Whether the copy was caught up under `epoch` (never for epoch 0).
     pub fn holds_for(&self, epoch: u32) -> bool {
-        epoch != 0 && self.0.load(std::sync::atomic::Ordering::SeqCst) == epoch
+        epoch != 0 && self.0.lock().epoch == epoch
     }
 
     pub fn clear(&self) {
-        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.0.lock().epoch = 0;
+    }
+
+    /// A leader at `epoch` shrank its in-sync set to itself (its `shrink`th
+    /// shrink): drops the claim and keeps it dropped until it is earned again.
+    /// A repeat of the same notice changes nothing; a newer one starts the
+    /// catch-up over.
+    pub fn revoke(&self, epoch: u32, shrink: u64) {
+        let mut state = self.0.lock();
+        match state.revoked.as_mut() {
+            Some(r) if r.epoch == epoch && r.shrink >= shrink => {}
+            _ => {
+                state.revoked = Some(Revoked {
+                    epoch,
+                    shrink,
+                    target: None,
+                })
+            }
+        }
+        state.epoch = 0;
+    }
+
+    fn revoked_at(&self, epoch: u32) -> bool {
+        self.0
+            .lock()
+            .revoked
+            .as_ref()
+            .is_some_and(|r| r.epoch == epoch)
+    }
+
+    /// Whether the claim of a revoked `epoch` is re-earned by a heartbeat that
+    /// carries the leader's `shrink` count and `position` (log end) and says
+    /// whether it lists this node (`listed`); `leo` is this copy's. A heartbeat
+    /// sent before the revoking shrink says nothing about it and is ignored.
+    fn re_earn(&self, epoch: u32, leo: u64, position: u64, listed: bool, shrink: u64) -> bool {
+        let mut state = self.0.lock();
+        let Some(r) = state
+            .revoked
+            .as_mut()
+            .filter(|r| r.epoch == epoch && shrink >= r.shrink)
+        else {
+            return false;
+        };
+        if !listed {
+            r.target = None;
+            return false;
+        }
+        let target = *r.target.get_or_insert(position);
+        if leo < target {
+            return false;
+        }
+        state.revoked = None;
+        state.epoch = epoch;
+        true
     }
 }
 
@@ -219,10 +302,30 @@ impl CaughtUp {
 struct CatchUpTarget(Option<u64>);
 
 impl CatchUpTarget {
+    /// A batch: it carries no in-sync set, so it cannot re-earn a claim a
+    /// shrink notice took away (`CaughtUp::set` refuses it).
     fn note(&mut self, flag: &CaughtUp, epoch: u32, leo: u64, leader_position: u64) {
         let target = *self.0.get_or_insert(leader_position);
         if leo >= target {
             flag.set(epoch);
+        }
+    }
+
+    /// A heartbeat, which names the leader's in-sync set and how many times it
+    /// has shrunk (`shrink`).
+    fn note_heartbeat(
+        &mut self,
+        flag: &CaughtUp,
+        epoch: u32,
+        leo: u64,
+        leader_position: u64,
+        listed: bool,
+        shrink: u64,
+    ) {
+        if flag.revoked_at(epoch) {
+            flag.re_earn(epoch, leo, leader_position, listed, shrink);
+        } else {
+            self.note(flag, epoch, leo, leader_position);
         }
     }
 }
@@ -615,15 +718,19 @@ where
                         batches_since_ack += 1;
                     }
                     ReplFrame::Heartbeat(hb) => {
-                        if let Some(isr) = hb.isr {
-                            expected.leader_isr.set(isr);
+                        if let Some(isr) = &hb.isr {
+                            expected.leader_isr.set(isr.clone());
                         }
                         partition.set_high_watermark(hb.hw);
-                        catch_up.note(
+                        catch_up.note_heartbeat(
                             &expected.caught_up,
                             hello.leader_epoch,
                             partition.log_end_offset(),
                             hb.hw.max(hb.leader_leo),
+                            hb.isr.as_ref().is_some_and(|isr| {
+                                isr.iter().any(|n| n == &expected.local_node_id)
+                            }),
+                            hb.shrink_seq,
                         );
                         if let Some(committed) = hb.committed {
                             partition.set_committed_offset(committed);
@@ -788,6 +895,7 @@ where
                             bus_features: 0,
                             instance_unhosted: false,
                             log_known: true,
+                            isr_shrink_acked: false,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }
@@ -1468,6 +1576,7 @@ mod tests {
             committed: None,
             epoch_start: Some(epoch_start),
             isr: None,
+            shrink_seq: 0,
         })
     }
 
@@ -1789,6 +1898,7 @@ mod tests {
                     committed: None,
                     epoch_start: None,
                     isr: None,
+                    shrink_seq: 0,
                 }),
             )
             .await
@@ -1913,6 +2023,9 @@ mod tests {
                 partition: PART,
                 known_epoch: 1,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await
@@ -1999,6 +2112,9 @@ mod tests {
                 partition: PART,
                 known_epoch: 5,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await
@@ -2167,6 +2283,9 @@ mod tests {
                 partition: PART,
                 known_epoch: 2,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await
@@ -2326,6 +2445,7 @@ mod tests {
                 committed: None,
                 epoch_start: None,
                 isr: None,
+                shrink_seq: 0,
             }),
         )
         .await
@@ -2406,6 +2526,7 @@ mod tests {
                 committed: None,
                 epoch_start: None,
                 isr: None,
+                shrink_seq: 0,
             }),
         )
         .await
@@ -2462,6 +2583,9 @@ mod tests {
                 partition: PART,
                 known_epoch: 1,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await
@@ -2614,6 +2738,148 @@ mod tests {
         assert!(!flag.holds_for(0));
         flag.clear();
         assert!(!flag.holds_for(2));
+    }
+
+    /// A claim a shrink notice took away stays away across the stream's next
+    /// frames, whatever the position frozen at its first frame: only a
+    /// heartbeat that lists this node in the leader's in-sync set, and the copy
+    /// reaching the position that heartbeat carries, give it back.
+    #[tokio::test]
+    async fn a_claim_a_shrink_notice_took_away_is_not_given_back_by_the_next_frames() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let exp = expected();
+        let flag = exp.caught_up.clone();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition.clone(),
+            stores,
+            NodeEnvironment::Prod,
+            exp,
+            fast_config(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(1, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut leader).await.unwrap(),
+            ReplFrame::HelloAck(a) if a.accepted
+        ));
+        let heartbeat = |leader_leo: u64, isr: Vec<&str>, shrink_seq: u64| {
+            ReplFrame::Heartbeat(ReplHeartbeat {
+                leader_epoch: 1,
+                hw: leader_leo,
+                leader_leo,
+                committed: None,
+                epoch_start: None,
+                isr: Some(isr.into_iter().map(String::from).collect()),
+                shrink_seq,
+            })
+        };
+        async fn next_ack(leader: &mut tokio::io::DuplexStream) {
+            assert!(matches!(
+                read_frame(leader).await.unwrap(),
+                ReplFrame::Ack(_)
+            ));
+        }
+
+        write_frame(&mut leader, &batch_frame(0, 1, 1, "one"))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(flag.holds_for(1), "caught up with the first frame");
+
+        // The leader shrank its set to itself and the notice was acknowledged.
+        flag.revoke(1, 1);
+        write_frame(&mut leader, &batch_frame(1, 2, 1, "two"))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(
+            !flag.holds_for(1),
+            "a batch past the old target is no proof"
+        );
+        write_frame(&mut leader, &heartbeat(2, vec![LEADER_NODE], 1))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(
+            !flag.holds_for(1),
+            "the leader's set does not list this node"
+        );
+
+        // A heartbeat sent before the shrink, still queued behind the notice,
+        // lists this node and says nothing about the shrink.
+        write_frame(&mut leader, &heartbeat(2, vec![LEADER_NODE, LOCAL_NODE], 0))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(
+            !flag.holds_for(1),
+            "a heartbeat from before the shrink is no proof"
+        );
+
+        // Listed again after it, but the leader is ahead of this copy.
+        write_frame(&mut leader, &heartbeat(4, vec![LEADER_NODE, LOCAL_NODE], 1))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(
+            !flag.holds_for(1),
+            "listed, not yet at the leader's position"
+        );
+        for (base, payload) in [(2u64, "three"), (3, "four")] {
+            write_frame(&mut leader, &batch_frame(base, base + 1, 1, payload))
+                .await
+                .unwrap();
+            next_ack(&mut leader).await;
+        }
+        assert!(!flag.holds_for(1), "batches never give the claim back");
+        write_frame(&mut leader, &heartbeat(4, vec![LEADER_NODE, LOCAL_NODE], 1))
+            .await
+            .unwrap();
+        next_ack(&mut leader).await;
+        assert!(flag.holds_for(1), "listed and at the position it reported");
+
+        drop(leader);
+        let _ = handle.await.unwrap();
+    }
+
+    /// A newer shrink starts the catch-up over; a repeat of the same one does not.
+    #[test]
+    fn a_repeated_notice_keeps_the_catch_up_and_a_newer_one_restarts_it() {
+        let flag = CaughtUp::default();
+        let mut target = CatchUpTarget::default();
+        flag.set(2);
+        flag.revoke(2, 5);
+        target.note_heartbeat(&flag, 2, 10, 10, true, 5);
+        assert!(flag.holds_for(2));
+
+        flag.revoke(2, 6);
+        target.note_heartbeat(&flag, 2, 10, 20, true, 6);
+        assert!(!flag.holds_for(2), "listed at 20, the copy is at 10");
+        flag.revoke(2, 6);
+        target.note_heartbeat(&flag, 2, 20, 30, true, 6);
+        assert!(
+            flag.holds_for(2),
+            "the same notice again kept the target of 20"
+        );
+        flag.revoke(2, 7);
+        assert!(!flag.holds_for(2));
+        // Marking the copy caught up by any other path (`note_led`) does not
+        // lift it either; a claim of another term is not bound by it.
+        flag.set(2);
+        assert!(!flag.holds_for(2));
+        target.note(&flag, 3, 5, 5);
+        assert!(flag.holds_for(3));
     }
 
     /// Under steady writes the leader's position moves on every publish; the

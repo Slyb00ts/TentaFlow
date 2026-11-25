@@ -438,6 +438,24 @@ pub struct PartitionLeader {
     /// Wakes every feeder task whenever `recompute_hw` actually moves the
     /// engine-visible `high_watermark` — see `subscribe_hw`'s doc.
     hw_tx: watch::Sender<u64>,
+    /// At RF 2, whether this leader may commit alone since its in-sync set
+    /// shrank to itself: the follower acknowledged the shrink, or has been
+    /// out of reach of the whole mesh long enough that it cannot be standing
+    /// over this leader (`ReplicationManager::check_alone_rules`). Cleared by
+    /// every shrink; `true` otherwise and at any other RF.
+    alone_cleared: AtomicBool,
+    /// How many times the in-sync set has shrunk under this leader at RF 2.
+    /// Guards the grant of `alone_cleared`: an acknowledgement is for the shrink
+    /// it answered. Held while `alone_cleared` is withdrawn or granted on it.
+    shrink_seq: parking_lot::Mutex<u64>,
+    /// The log end when this leader started: what an earlier incarnation of
+    /// the same term durably left. Records of this term above it, on a
+    /// follower that this incarnation has not fed yet, were written by that
+    /// earlier incarnation and lost from this log in the crash
+    /// (`previous_incarnation_cut`).
+    start_leo: u64,
+    /// Followers this incarnation has completed a handshake with.
+    fed: dashmap::DashSet<String>,
     config: LeaderConfig,
     metrics: Arc<LeaderMetrics>,
 }
@@ -467,11 +485,13 @@ impl PartitionLeader {
         config: LeaderConfig,
         metrics: Arc<LeaderMetrics>,
     ) -> Self {
+        let replicas_len = replicas.len();
         let min_isr = compute_min_isr(replicas.len().max(1));
         // Seeded with the current `hw` so a subscription created later only
         // fires on a FUTURE advance — the same contract
         // `Partition::subscribe_leo` gives its own receivers.
         let hw_tx = watch::channel(partition.high_watermark()).0;
+        let start_leo = partition.log_end_offset();
         metrics.record_leader_epoch(epoch);
         let leader = Self {
             instance_id: instance_id.into(),
@@ -497,6 +517,14 @@ impl PartitionLeader {
             groups_legacy: dashmap::DashSet::new(),
             flush_tx: watch::channel(0).0,
             hw_tx,
+            // A leader that starts alone commits alone only once its follower
+            // is out of the way: it may hold a claim on this very term (a
+            // transfer's old leader, a restart's follower) that a standing
+            // would turn on the writes committed here.
+            alone_cleared: AtomicBool::new(replicas_len != 2),
+            shrink_seq: parking_lot::Mutex::new(0),
+            start_leo,
+            fed: dashmap::DashSet::new(),
             config,
             metrics,
         };
@@ -578,6 +606,12 @@ impl PartitionLeader {
         self.partition.record_epoch()
     }
 
+    /// Where this leader's log holds the records of `epoch`
+    /// (`Partition::epoch_span`).
+    pub fn epoch_span(&self, epoch: u32) -> Option<(u64, u64)> {
+        self.partition.epoch_span(epoch)
+    }
+
     /// Where this leader's own term begins in its log: its first record in
     /// that term, or the claim it stamped on starting to serve
     /// (`GlueLeaderHandle::open_writes`). `None` before either.
@@ -651,6 +685,93 @@ impl PartitionLeader {
         1 + fresh >= availability_quorum(self.replicas.len())
     }
 
+    /// Where to cut a follower whose log holds records an earlier
+    /// incarnation of this leader wrote under the same term, `None` when this
+    /// is not such a follower. A leader that restarts keeps its epoch and
+    /// writes new records at the offsets its unflushed tail had; a follower
+    /// that holds that tail has records at the same `(epoch, offset)` with
+    /// other contents, which no comparison of epochs and offsets can tell
+    /// from this chain's. This incarnation has written nothing to a follower
+    /// it has not fed, so every record of the follower above `start_leo` and
+    /// of this term predates it. A follower whose committed offset is above
+    /// that holds acknowledged records this log lacks and is left to refuse
+    /// the cut.
+    ///
+    /// A follower counts as fed only once nothing is left to cut: at once
+    /// when no cut applies, otherwise when it acknowledged a position that
+    /// shows the `Truncate` applied (`note_cut_applied`). A stream that drops
+    /// in between leaves it unfed, and the next handshake cuts it again.
+    fn previous_incarnation_cut(&self, node: &str, log: &LogPosition) -> Option<u64> {
+        if self.fed.contains(node) {
+            return None;
+        }
+        let cut = log.epoch == self.epoch()
+            && log.leo > self.start_leo
+            && log.committed <= self.start_leo;
+        if !cut {
+            self.fed.insert(node.to_string());
+            return None;
+        }
+        Some(self.start_leo)
+    }
+
+    /// The follower acknowledged a position that shows this incarnation's
+    /// `Truncate` was applied: it holds nothing of an earlier one any more.
+    fn note_cut_applied(&self, node: &str) {
+        self.fed.insert(node.to_string());
+    }
+
+    /// See `alone_cleared`.
+    pub fn alone_cleared(&self) -> bool {
+        self.alone_cleared.load(Ordering::SeqCst)
+    }
+
+    /// Clearing (`false`) is what a shrink does; granting (`true`) is the
+    /// manager's verdict that the follower is out of the way. Granting wakes
+    /// the writes that waited for it.
+    pub fn set_alone_cleared(&self, cleared: bool) {
+        if self.alone_cleared.swap(cleared, Ordering::SeqCst) != cleared {
+            self.recompute_hw();
+        }
+    }
+
+    /// At RF 2 with the follower out of the in-sync set and not yet cleared
+    /// to commit alone: nothing is acknowledged by this leader's log alone
+    /// (`acks=all`) and `hw` stays where it is.
+    fn alone_blocked(&self) -> bool {
+        self.replicas.len() == 2 && !self.alone_cleared() && self.isr_size() <= 1
+    }
+
+    /// A shrink at RF 2 revokes the permission to commit alone.
+    fn note_shrunk(&self) {
+        if self.replicas.len() == 2 {
+            let mut seq = self.shrink_seq.lock();
+            *seq += 1;
+            self.alone_cleared.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The number of shrinks counted so far; what an `IsrShrink` notice names.
+    pub fn shrink_seq(&self) -> u64 {
+        *self.shrink_seq.lock()
+    }
+
+    /// Grants the permission to commit alone only if no shrink was counted
+    /// since `seq` was read. `true` when granted.
+    pub fn grant_alone_if_unshrunk(&self, seq: u64) -> bool {
+        let changed = {
+            let current = self.shrink_seq.lock();
+            if *current != seq {
+                return false;
+            }
+            !self.alone_cleared.swap(true, Ordering::SeqCst)
+        };
+        if changed {
+            self.recompute_hw();
+        }
+        true
+    }
+
     pub fn follower_state(&self, node_id: &str) -> Option<FollowerState> {
         self.followers.get(node_id).map(|e| e.clone())
     }
@@ -690,6 +811,7 @@ impl PartitionLeader {
     /// ended; `reason` is that end cause, carried on `IsrEvent::Detached`.
     pub fn remove_follower(&self, node_id: &str, reason: &str) {
         if self.followers.remove(node_id).is_some() {
+            self.note_shrunk();
             let isr_size = self.isr_size();
             self.metrics.record_isr_size(isr_size);
             self.emit(IsrEvent::Detached {
@@ -778,6 +900,7 @@ impl PartitionLeader {
             if let Some(mut fs) = self.followers.get_mut(node_id) {
                 fs.in_isr = false;
             }
+            self.note_shrunk();
             let reason = if lag_too_high {
                 IsrShrinkReason::LagBytes {
                     lag_bytes: snapshot.lag_bytes,
@@ -910,6 +1033,7 @@ impl PartitionLeader {
         match acks {
             Acks::Leader => 1,
             Acks::Quorum => self.min_isr,
+            Acks::All if self.alone_blocked() => 2,
             Acks::All => (isr_len as u32).max(availability_quorum(self.replicas.len()) as u32),
         }
     }
@@ -999,6 +1123,11 @@ impl PartitionLeader {
             candidate = candidate.min(self.partition.committed_offset());
         }
         let before = self.partition.high_watermark();
+        // Alone at RF 2 without leave: what this leader appends is not
+        // committed until the follower is known to be out of the way.
+        if self.alone_blocked() {
+            candidate = before;
+        }
         let after = self.partition.set_high_watermark(candidate);
         // Only a real advance wakes anyone: `set_high_watermark` is a monotonic
         // `fetch_max`, so `after > before` can only mean this call moved it. Two
@@ -1298,6 +1427,9 @@ async fn send_heartbeat<W: AsyncWrite + Unpin>(
     leader: &PartitionLeader,
     isr_sent: &mut Vec<String>,
 ) -> Result<u64, FollowerStreamError> {
+    // Read before the set and the log end it describes: a heartbeat that
+    // carries a shrink's number shows the leader after that shrink.
+    let shrink_seq = leader.shrink_seq();
     let hw = leader.high_watermark();
     let isr = leader.isr_members();
     write_frame(
@@ -1309,6 +1441,7 @@ async fn send_heartbeat<W: AsyncWrite + Unpin>(
             committed: Some(leader.committed_offset()),
             epoch_start: leader.term_start(),
             isr: Some(isr.clone()),
+            shrink_seq,
         }),
     )
     .await?;
@@ -1415,6 +1548,11 @@ where
     //   wrote its own records to), which no offset comparison can see, so it
     //   goes back to its own committed offset — every record below that is
     //   on a majority, this chain included — and is fed again from there.
+    //   Unless this chain holds records of the follower's last epoch: those
+    //   are one leader's, so it agrees with this chain up to where they end
+    //   (`LogPosition::kept_end_in`), and only what lies past that goes. A
+    //   replica that was ahead of its committed offset by records this leader
+    //   holds too is not cut back to be fed what it had.
     //
     // Epochs here are RECORD epochs (`Partition::record_epoch`) on both
     // sides, the epoch the last record was written under — not the term a
@@ -1438,7 +1576,16 @@ where
         leo: ack.follower_leo,
         committed: ack.follower_committed.unwrap_or(ack.follower_hw),
     };
-    let kept = follower_log.kept_end(&authority);
+    let mut kept = follower_log.kept_end_in(&authority, leader.epoch_span(follower_log.epoch));
+    // While the follower still holds its old tail, its acknowledgements repeat
+    // its handshake position: a different one means the cut was applied.
+    let mut cut_unapplied = None;
+    if let Some(to) = leader.previous_incarnation_cut(&follower_node_id, &follower_log) {
+        kept = kept.min(to);
+        if kept < ack.follower_leo {
+            cut_unapplied = Some(ack.follower_leo);
+        }
+    }
     let follower_leo = if kept < ack.follower_leo {
         write_frame(
             &mut writer,
@@ -1571,6 +1718,10 @@ where
             frame = frames.next_frame() => {
                 match frame? {
                     ReplFrame::Ack(a) => {
+                        if cut_unapplied.is_some_and(|held| a.follower_leo != held) {
+                            leader.note_cut_applied(&follower_node_id);
+                            cut_unapplied = None;
+                        }
                         let lag = inflight.ack(a.follower_leo);
                         leader.record_ack(&follower_node_id, &a, lag);
                         match a.groups_applied {
@@ -2060,6 +2211,186 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// A replica whose last epoch is one this leader's chain holds keeps what
+    /// it has of it: those records are the same ones, written by the same
+    /// leader, and cutting them back to its committed offset only to feed them
+    /// again reads as a loss that did not happen.
+    #[tokio::test]
+    async fn a_follower_ahead_of_its_hw_by_records_the_leader_holds_too_is_not_cut() {
+        let kept = handshake_with_older_epoch_follower(2, 0).await;
+        assert_eq!(kept, None, "records 0..2 are this chain's: nothing to cut");
+    }
+
+    #[tokio::test]
+    async fn a_follower_with_records_past_its_epochs_end_in_the_leader_is_cut_to_that_end() {
+        let kept = handshake_with_older_epoch_follower(3, 0).await;
+        assert_eq!(kept, Some(2), "record 2 was another chain's");
+    }
+
+    /// The leader holds epochs `TEST_EPOCH - 2` at offsets 0..2 and
+    /// `TEST_EPOCH` at 2..4. A follower whose last epoch is the first one
+    /// reports `follower_leo` and `follower_committed`; the offset the leader
+    /// cut it to, `None` when it sent no `Truncate`.
+    async fn handshake_with_older_epoch_follower(
+        follower_leo: u64,
+        follower_committed: u64,
+    ) -> Option<u64> {
+        let part = temp_partition("rejoin-epoch-span");
+        part.set_leader_epoch(TEST_EPOCH - 2).unwrap();
+        for _ in 0..2 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        for _ in 0..2 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        assert_eq!(part.log_end_offset(), 4);
+
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo,
+                follower_hw: follower_committed,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: Some(TEST_EPOCH - 2),
+                follower_committed: Some(follower_committed),
+                bus_features: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        // Registered at what the handshake kept, before any feeding.
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(fs) = leader.follower_state("f1") {
+                    return fs.leo;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the follower was never registered");
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+        (registered < follower_leo).then_some(registered)
+    }
+
+    /// A leader that restarts at the same epoch lost its unflushed tail and
+    /// wrote new records at those offsets; a follower that holds the old tail
+    /// has other contents at the same `(epoch, offset)`. It is cut to what the
+    /// restarted leader started with — at its first handshake with this
+    /// incarnation only: after that its records are this leader's own.
+    #[tokio::test]
+    async fn a_follower_holding_the_tail_a_restarted_leader_lost_is_cut_to_where_it_restarted() {
+        let part = temp_partition("restart-same-epoch");
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        for _ in 0..2 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        // The restart: offsets 0..2 survived, the old tail at 2..4 did not.
+        let leader = make_leader(part.clone(), &["leader", "f1"], Acks::Quorum, fast_config());
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        assert_eq!(part.log_end_offset(), 5);
+
+        // The stream drops before the follower says it applied the cut: it
+        // may still hold the old tail, so the next handshake cuts it again.
+        let first = same_epoch_handshake(&leader, 4, None).await;
+        assert_eq!(first, Some(2), "records 2..4 were the old incarnation's");
+        let unproven = same_epoch_handshake(&leader, 4, None).await;
+        assert_eq!(unproven, Some(2), "nothing showed the cut was applied");
+        // An acknowledgement of a position below where the tail began shows it.
+        let applied = same_epoch_handshake(&leader, 4, Some(2)).await;
+        assert_eq!(applied, Some(2));
+        let again = same_epoch_handshake(&leader, 4, None).await;
+        assert_eq!(
+            again, None,
+            "on a reconnect the follower's records are this incarnation's"
+        );
+    }
+
+    /// One handshake of `f1`, which reports `follower_leo` records all
+    /// written under the leader's term; the offset the leader cut it to.
+    /// `acked`: the position the follower acknowledges once it has the cut.
+    async fn same_epoch_handshake(
+        leader: &Arc<PartitionLeader>,
+        follower_leo: u64,
+        acked: Option<u64>,
+    ) -> Option<u64> {
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: Some(TEST_EPOCH),
+                follower_committed: Some(0),
+                bus_features: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(fs) = leader.follower_state("f1") {
+                    return fs.leo;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the follower was never registered");
+        if let Some(position) = acked {
+            write_frame(
+                &mut foll_w,
+                &ReplFrame::Ack(ReplAck {
+                    leader_epoch: TEST_EPOCH,
+                    follower_leo: position,
+                    follower_hw: 0,
+                    follower_log_epoch: Some(TEST_EPOCH),
+                    groups_applied: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !leader.fed.contains("f1") {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the acknowledgement never reached the leader");
+        }
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+        leader.remove_follower("f1", "test");
+        (registered < follower_leo).then_some(registered)
+    }
+
     /// A re-elected leader's claim on its term holds no record: a follower
     /// whose last record shares the leader's last record's epoch is its
     /// chain as far as it goes and keeps every record. Reconciled against
@@ -2383,6 +2714,7 @@ mod tests {
         );
         leader.register_follower("f1", 0, 0);
         leader.remove_follower("f1", "stream ended");
+        assert!(leader.grant_alone_if_unshrunk(leader.shrink_seq()));
         assert_eq!(leader.high_watermark(), 3, "the lone RF=2 survivor serves");
     }
 
@@ -2702,7 +3034,9 @@ mod tests {
     }
 
     /// A lone RF=2 leader that starts over a log whose tail no replica ever
-    /// acknowledged makes it readable at once, with no publish and no ack.
+    /// acknowledged keeps it hidden until the manager clears it (its follower
+    /// out of the way, or having dropped its claim); the grant makes it
+    /// readable at once, with no publish and no ack.
     #[test]
     fn a_lone_leader_starting_over_an_unreplicated_tail_exposes_it() {
         let part = temp_partition("lone-start");
@@ -2712,6 +3046,14 @@ mod tests {
         let before = part.high_watermark();
         assert!(before < part.log_end_offset(), "the tail starts hidden");
         let leader = make_leader(part, &["leader", "f1"], Acks::Leader, fast_config());
+        // Alone from the start, but not yet known to be: the manager clears it
+        // once the follower is out of the way.
+        assert!(!leader.alone_cleared());
+        assert!(
+            leader.high_watermark() < leader.log_end_offset(),
+            "the tail stays hidden before the grant"
+        );
+        assert!(leader.grant_alone_if_unshrunk(leader.shrink_seq()));
         assert_eq!(
             leader.high_watermark(),
             leader.log_end_offset(),
@@ -3719,6 +4061,56 @@ mod tests {
         leader.register_follower("f1", 0, 0);
         leader.remove_follower("f1", "stream ended");
         assert!(leader.has_quorum_lease());
+        // Alone, but not yet known to be alone: the follower may be standing
+        // over this leader, so nothing is committed until the manager says
+        // it is out of the way (`ReplicationManager::check_alone_rules`).
+        assert!(!leader.alone_cleared());
+        assert_eq!(leader.high_watermark(), 0);
+        assert_eq!(leader.required_for(Acks::All, 1), 2);
+        leader.set_alone_cleared(true);
         assert_eq!(leader.high_watermark(), 3);
+        assert_eq!(leader.required_for(Acks::All, 1), 1);
+    }
+    /// A leader starts out alone, which is not yet known to be alone: its
+    /// follower may hold a claim on this very term (a transfer's old leader, a
+    /// restart's follower). At RF 3 nothing changes.
+    #[tokio::test]
+    async fn a_new_rf2_leader_commits_alone_only_once_it_is_cleared() {
+        let part = temp_partition("rf2-new");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(part.clone(), &["leader", "f1"], Acks::All, fast_config());
+        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        assert!(!leader.alone_cleared());
+        assert_eq!(leader.high_watermark(), 0, "nothing is committed alone yet");
+        assert!(leader.grant_alone_if_unshrunk(0));
+        assert_eq!(leader.high_watermark(), 1);
+
+        let rf3 = make_leader(
+            temp_partition("rf3-new"),
+            &["leader", "f1", "f2"],
+            Acks::All,
+            fast_config(),
+        );
+        assert!(rf3.alone_cleared());
+    }
+
+    /// An acknowledgement is for the shrink it answered: after another shrink
+    /// it grants nothing.
+    #[tokio::test]
+    async fn a_grant_for_an_earlier_shrink_is_refused_after_a_later_one() {
+        let part = temp_partition("rf2-seq");
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(part, &["leader", "f1"], Acks::All, fast_config());
+        leader.register_follower("f1", 0, 0);
+        leader.remove_follower("f1", "stream ended");
+        let first = leader.shrink_seq();
+        leader.register_follower("f1", 0, 0);
+        leader.remove_follower("f1", "stream ended again");
+        assert!(leader.shrink_seq() > first);
+        assert!(!leader.grant_alone_if_unshrunk(first));
+        assert!(!leader.alone_cleared());
+        assert!(leader.grant_alone_if_unshrunk(leader.shrink_seq()));
+        assert!(leader.alone_cleared());
     }
 }

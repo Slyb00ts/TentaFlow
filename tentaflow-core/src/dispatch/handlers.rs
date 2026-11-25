@@ -1607,8 +1607,8 @@ pub fn api_key_create(
         ));
     }
 
-    // Token = "sk-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC verifier is
-    // persisted; the raw token is returned once and never stored.
+    // Token = "sk-<pepper id>-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC
+    // verifier is persisted; the raw token is returned once and never stored.
     let mut token_bytes = [0u8; 32];
     getrandom::fill(&mut token_bytes).expect("OS RNG fill_bytes");
     let mut token_hex = String::with_capacity(token_bytes.len() * 2);
@@ -1616,9 +1616,9 @@ pub fn api_key_create(
         use std::fmt::Write as _;
         let _ = write!(token_hex, "{:02x}", b);
     }
-    let raw_key = format!("sk-{}", token_hex);
     let pepper =
         repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    let raw_key = auth::issue_api_key_token(&token_hex, &pepper);
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
 
@@ -1963,9 +1963,9 @@ pub fn api_key_rotate(
         use std::fmt::Write as _;
         let _ = write!(token_hex, "{:02x}", b);
     }
-    let raw_key = format!("sk-{}", token_hex);
     let pepper =
         repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    let raw_key = auth::issue_api_key_token(&token_hex, &pepper);
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
 
@@ -3760,6 +3760,21 @@ pub fn settings_list(
     Ok(MessageBody::SettingsListResponse { entries })
 }
 
+/// A settings write may not name a setting the system keeps itself
+/// (`repository::is_system_managed_setting_key`).
+fn refuse_system_managed_settings(entries: &[SettingEntry]) -> Result<(), ProtocolError> {
+    match entries
+        .iter()
+        .find(|entry| repository::is_system_managed_setting_key(&entry.key))
+    {
+        Some(entry) => Err(ProtocolError::bad_request(format!(
+            "setting '{}' is maintained by the system and cannot be written",
+            entry.key
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[handler(variant = "SettingsUpdateRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
@@ -3817,6 +3832,8 @@ pub fn settings_update(
             return Err(ProtocolError::bad_request(problem));
         }
     }
+
+    refuse_system_managed_settings(&payload.entries)?;
 
     // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
     // odrzucamy caly request, zeby nie zapisac nieuzywalnej lokalizacji.
@@ -15652,5 +15669,30 @@ mod bus_consumer_status_wire_tests {
     fn a_wait_without_a_known_leader_names_none() {
         let wire = consumer_status_wire(waiting(None), "node-a", None, true);
         assert_eq!((wire.leader_node_id, wire.leader_node_name), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod system_managed_settings_tests {
+    use super::*;
+
+    fn entry(key: &str) -> SettingEntry {
+        SettingEntry {
+            key: key.to_string(),
+            value: "ab".repeat(32),
+            is_secret: true,
+        }
+    }
+
+    /// The retired peppers are collected by the system when a pepper is
+    /// replaced; an operator's value would replace the list the keys issued
+    /// under earlier peppers depend on, so the whole request is refused.
+    #[test]
+    fn a_write_naming_the_retired_peppers_is_refused() {
+        let refused =
+            refuse_system_managed_settings(&[entry("theme"), entry("api_key_pepper_retired")])
+                .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest);
+        assert!(refuse_system_managed_settings(&[entry("theme")]).is_ok());
     }
 }

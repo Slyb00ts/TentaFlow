@@ -2408,6 +2408,14 @@ impl Partition {
         self.inner.state.epochs.read().epoch_at(offset)
     }
 
+    /// Where the records of `epoch` lie in this log, as `[start, end)`, if it
+    /// has an entry for it (`EpochTable::span_of`). What a leader answers a
+    /// follower asking where the last epoch of its own log ends.
+    pub fn epoch_span(&self, epoch: u32) -> Option<(u64, u64)> {
+        let log_end = self.log_end_offset();
+        self.inner.state.epochs.read().span_of(epoch, log_end)
+    }
+
     /// The offset of the first record written in `epoch`, if this log has
     /// one.
     pub fn epoch_start(&self, epoch: u32) -> Option<u64> {

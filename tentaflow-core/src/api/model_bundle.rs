@@ -156,8 +156,7 @@ pub fn resolve_bearer_api_key(
         Ok(p) => p,
         Err(_) => return BearerAuthResult::Unavailable,
     };
-    let verifier = crate::api::dashboard::auth::api_key_verifier(token, &pepper);
-    match crate::db::repository::verify_api_key(pool, &verifier) {
+    match crate::api::dashboard::auth::verify_api_key_any_pepper(pool, cipher, token, &pepper) {
         Ok(Some(row)) => BearerAuthResult::Ok(row),
         Ok(None) => BearerAuthResult::Invalid,
         Err(_) => BearerAuthResult::Invalid,

@@ -104,6 +104,18 @@ impl EpochTable {
             .map(|&(_, start)| start)
     }
 
+    /// Where the records of `epoch` lie in a log ending at `log_end`: from
+    /// the offset of its entry to the entry of the next epoch, or to `log_end`
+    /// for the last one. `None` when the log has no entry for `epoch`.
+    pub fn span_of(&self, epoch: u32, log_end: u64) -> Option<(u64, u64)> {
+        let idx = self.entries.iter().position(|&(e, _)| e == epoch)?;
+        let end = self
+            .entries
+            .get(idx + 1)
+            .map_or(log_end, |&(_, start)| start);
+        Some((self.entries[idx].1, end))
+    }
+
     /// The table after a record of `epoch` lands at `offset` (the log
     /// end), or `None` when the table does not change (same epoch as the
     /// last entry). An epoch below the last record's is refused: records of

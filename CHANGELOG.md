@@ -527,6 +527,161 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     partycję, więc nie wstrzymuje elekcji ani sprawdzenia kworum.
   - **`bus.leader.tail_discarded` także po stronie followera.** Follower, któremu
     nowy lider obcina log (`Truncate`), zapisuje liczbę odrzuconych rekordów.
+  - **Utrata potwierdzonych zapisów przy RF=2, gdy padł tylko strumień
+    replikacji (krytyczne).** Przyczyna z przebiegu e2e (restart 7): połączenie
+    mesh i przekazywanie zapisów działały, a strumień replikacji był zerwany.
+    Follower uznawał lidera za martwego (dzierżawa strumienia wygasła) i stawał
+    do elekcji, a lider, wyrzuciwszy follower z ISR, dalej potwierdzał zapisy
+    sam. Po zwycięstwie followera te zapisy znikały (66 i 9 rekordów).
+    Zasada przy RF=2: węzeł działa sam tylko wtedy, gdy drugi jest
+    potwierdzony poza grą, albo nieosiągalny przez `T_alone` (5 s) bez
+    przerwy: bez połączenia mesh albo z połączeniem, które od 2 s nie niesie
+    heartbeatu i nie odpowiada na sondę (zapytanie kanałem zapytań, nie tym
+    połączeniem). Licznik biegnie od ostatniego znaku życia, a każde
+    ponowne połączenie, heartbeat lub odpowiedź na sondę go zeruje. Krótkie
+    migotanie nie rusza żadnej ze stron, a zgubiony sam heartbeat przy
+    odpowiadającym węźle też nie.
+    - **Lider** zawężony do siebie przestaje potwierdzać `acks=all` (503
+      `bus_not_enough_replicas`, ponawialny) i nie przesuwa `hw`, dopóki
+      (a) follower nie potwierdzi komunikatu `IsrShrink` (lider wysyła go
+      kanałem zapytań `LeoQuery`, osobnym od strumienia; follower zdejmuje
+      wtedy swoją flagę „doścignięty” dla tej epoki i nie może na niej stanąć),
+      albo (b) follower nie będzie nieosiągalny przez `T_alone`. Zapis przyjęty
+      przed zawężeniem i czekający na ack follower nie zostaje potwierdzony
+      przez samo zawężenie: kończy się `bus_not_enough_replicas`. Przy
+      `acks=leader` obowiązuje dotychczasowa umowa (potwierdzenie przy
+      dopisaniu do logu lidera), ale `hw` stoi, aż zajdzie (a) lub (b); takie
+      niereplikowane zapisy mogą zginąć przy prawdziwym przejęciu. To jest
+      świadoma decyzja: `acks=leader` działa jak `acks=1` w Kafce
+      (potwierdzenie przy dopisaniu u lidera, niezatwierdzony ogon może zostać
+      obcięty przy zmianie lidera); trwałość daje `acks=all`. Każde takie
+      obcięcie zapisuje `bus.leader.tail_discarded`.
+    - Nowy lider RF=2 (po elekcji, przeniesieniu, odbudowie i restarcie) startuje
+      bez zgody na zatwierdzanie samemu: zgodę daje potwierdzenie `IsrShrink`,
+      `T_alone` nieosiągalności albo rejestracja followera. Potwierdzenie jest
+      przypisane do zawężenia, na które odpowiada (numer zawężenia w
+      komunikacie): odpowiedź na wcześniejsze zawężenie nie zdejmuje
+      blokady po późniejszym. Follower, który potwierdził zawężenie, odzyskuje
+      flagę „doścignięty” dopiero po heartbeacie lidera wymieniającym go w ISR i
+      po dojściu do pozycji lidera z tego heartbeatu. Heartbeat niesie numer
+      zawężenia lidera (`shrink_seq`, pole dopisane, domyślnie 0) i liczy się
+      tylko taki, którego numer nie jest niższy niż numer zawężenia zdejmującego
+      flagę, więc heartbeat wysłany przed zawężeniem, a przetworzony po
+      komunikacie, flagi nie przywraca. Flagę zdejmuje i przyznaje się pod jednym
+      zamkiem, a `note_led` po przeniesieniu nie unieważnia zdjęcia z tej samej
+      epoki. Follower nie potwierdza zawężenia,
+      gdy sam prowadzi elekcję albo obiecał nowszą kadencję. Węzeł bez wpisu o
+      partycji, bez tej instancji albo po zamknięciu menedżera potwierdza
+      zawężenie od razu (nie ma flagi do zdjęcia). Odpowiedź na sondę „partycja
+      nie jest tu obsługiwana” (albo, dla lidera, „nie prowadzę jej w tej
+      epoce”) nie jest znakiem życia: heartbeat mesh przestaje wtedy
+      ręczyć za węzeł, gdy takie odpowiedzi o tej partycji trwają
+      nieprzerwanie przez `T_alone`, są odnawiane (ostatnia nie starsza niż
+      4 s) i zaczęły się po ostatniej ramce strumienia od tego węzła.
+      Odpowiedź „obsługuję”, połączenie albo rozłączenie mesh z węzłem oraz
+      ramka strumienia kończą serię. Każda partycja RF=2 jest sondowana osobno.
+      Brak jakiejkolwiek odpowiedzi niczego nie przesądza (seria wygasa).
+    - **Follower** staje do elekcji sam tylko z ważną flagą „doścignięty”, nie
+      cofniętą przez `IsrShrink`, i gdy lider jest nieosiągalny przez `T_alone`.
+      Odpowiedź `leading: true` z bieżącej epoki też blokuje. Dawne 60 s
+      „poddania się” nie ma: lider osiągalny w mesh zatrzymuje partycję na
+      tak długo, jak jest osiągalny. Wstrzymanie dotyczy tylko RF≤2; od RF=3
+      decyduje większość jak dotąd.
+    - Lider, który odmawia dłużej niż 30 s, choć drugi węzeł jest w mesh, a strumień
+      nie wraca, zapisuje błąd w logu i wiersz audytu
+      `bus.leader.alone_refused`; zasada bezpieczeństwa się nie łamie.
+    - Ubity proces zostawia połączenie mesh stojące do limitu bezczynności
+      transportu (30–40 s), więc o jego śmierci mówi cisza heartbeatu i
+      sondy; przejęcie trwa `T_alone` plus elekcja. Zmierzone w
+      `process_three_node_bus_failover` (osiem partycji, bez RUST_LOG):
+      8,8 s, 8,9 s i 9,2 s od ubicia lidera do przejęcia wszystkich partycji.
+    Znane ograniczenie (decyzja: dostępność ponad spójność): **prawdziwa
+    symetryczna awaria sieci między dwoma węzłami RF=2, trwająca dłużej niż
+    `T_alone`, może zgubić potwierdzone zapisy `acks=all`** (obie strony widzą
+    drugą jako martwą, lider dalej pisze sam, follower staje). Przy RF=2 bez
+    świadka zerowa utrata w tym przypadku wymaga RF=3.
+  - **Migotanie połączenia mesh po restarcie węzła (przyczyna pośrednia
+    powyższego).** Węzeł, który wstał, dialował drugi, a ten trzymał martwe
+    (zombie) połączenie sprzed restartu i zamykał świeże jako
+    `tie-break-loser` (14 razy co ok. 13 s po restarcie A) albo `duplicate`
+    (22–40 razy na minutę po restarcie B). Każde takie zamknięcie wysyłało
+    `PeerDisconnected`, które kończy strumień replikacji followera
+    (`mark_leader_disconnected`), więc follower tracił dzierżawę. Zapisane
+    połączenie jest teraz zastępowane przez nowe połączenie tego samego peera
+    tylko wtedy, gdy jest martwe, czyli peer nie otworzył na nim żadnego
+    strumienia od 3 s (kilka heartbeatów); połączenie, które niesie ruch, nie
+    jest zastępowane, jak stare by nie było. Dwa równoczesne dialowania nadal
+    rozstrzyga tie-break. Strumienie replikacji jadą na osobnym połączeniu
+    (`ALPN_BUS`), które tie-break mesh nie zamyka; psuło je wspomniane
+    `PeerDisconnected`.
+  - **Repliki nieobecne w wierszu ISR nie stawały po śmierci lidera.** Wiersz
+    umieszczenia zapisuje ISR tylko przy zmianie lidera; replika, której nie
+    było przy wyborze lidera, zostawała poza nim, choć od dawna była
+    doścignięta, więc po śmierci lidera nie stawała (trzeci restart e2e:
+    partycje czekały na powrót lidera, w logu nic). Elekcja liczy teraz
+    ISR z wiersza razem z ISR, który lider ostatnio zgłosił w heartbeacie.
+  - **Restart lidera w tej samej epoce a nieutrwalony ogon.** Lider, który po
+    awarii wstaje w tej samej epoce, pisze nowe rekordy pod offsetami zgubionego
+    ogona; follower, który ten ogon ma, miał rekordy o tym samym `(epoka,
+    offset)` i innej treści, czego porównanie epok i offsetów nie widzi. Przy
+    pierwszym uścisku dłoni z danym followerem w tym wcieleniu lider obcina go
+    do końca swojego logu z chwili startu (o ile follower nie ma tam
+    zatwierdzonych rekordów).
+  - **Brak przejęcia po wcześniejszym przeniesieniu (krytyczne dla dostępności).**
+    Lider, który oddał partycję w przenosinach (ręcznych, powrocie do noda
+    preferowanego), zostawał followerem bez dowodu, że ma pełny log, więc gdy
+    nowy lider padł zaraz po przenosinach (przed pierwszą ramką nowej epoki),
+    partycja czekała na jego powrót (7–154 s, w logu nic, bo ostrzeżenie
+    „not standing” pojawiało się raz na proces). Teraz przeniesienie, po którym
+    cel był dogoniony (lider zamyka zapisy i czeka, aż cel ma cały log),
+    oznacza dawnego lidera jako zgodnego w nowej epoce. Ostrzeżenie „not
+    standing — has not caught up” powtarza się co 60 s na partycję, dopóki
+    wstrzymanie trwa.
+  - **Klucze API przestawały działać po restarcie węzła.** Dwa węzły
+    parowane po osobnej instalacji mają każdy swój pepper kluczy API;
+    synchronizacja sekretów (`SharedSecretsSync`) przyjmowała pepper
+    nowszego i nadpisywała własny, więc klucze wydane na węźle, który
+    przegrał, przestawały przechodzić weryfikację (401) na obu węzłach.
+    Pepper zastąpiony przy przyjęciu trafia teraz na listę wycofanych
+    (`api_key_pepper_retired`, szyfrowana, replikowana jako sekret z
+    sumą mnogościową zamiast wersji; lista jest posortowana, więc węzły
+    scalają ją do tej samej wartości w dowolnej kolejności, a ustawień API
+    nie można jej zapisać). Wpisy listy mają postać `<hex>:<czas wycofania w ms>`,
+    a przy przekroczeniu limitu 8 odpada pepper wycofany najdawniej, ale nigdy
+    wycofany w ostatniej godzinie (na każdym węźle, według jego zegara, więc
+    zegar węzła wycofującego spóźniony o mniej niż godzinę nikogo nie
+    zawodzi); ten sam pepper wycofany w różnych momentach
+    zachowuje wcześniejszy czas, więc węzły zbiegają do tej samej listy.
+    Nowy klucz ma postać `sk-<id peppera>-<losowe hex>` (id to 8 bajtów SHA-256
+    z tagiem domeny, nie ujawnia peppera), a weryfikator w bazie to nadal goły
+    HMAC całego tokenu, więc klucz wydany na nowym węźle działa też na węźle
+    sprzed tej zmiany z tym samym pepperem. Token z id jest sprawdzany jednym
+    HMAC-iem i jednym zapytaniem pod nazwanym pepperem; klucz sprzed
+    identyfikatorów (`sk-<hex>`) jest próbowany pod pepperem bieżącym, potem
+    wycofanymi. Węzeł wycofuje pepper, który sam
+    zastępuje przy przyjęciu, więc klucz działa tam, gdzie go wydano; na węzeł,
+    który nigdy nie miał starego peppera, lista dociera przy najbliższej
+    synchronizacji sekretów (przy połączeniu i po przyjęciu), niezależnie od
+    replikacji samych kluczy. Do tego czasu taki klucz jest odrzucany (401), nie
+    przyjmowany błędnie. Wartości peppera nie trafiają do logów.
+  - **`bus.leader.tail_discarded` nie liczy rekordów, które wracają.** Lider
+    przy uścisku dłoni obcina follower do końca jego ostatniej epoki w logu
+    lidera (jak `OffsetForLeaderEpoch` w Kafce), a nie do jego znacznika
+    zatwierdzenia. Rekordy, które lider też ma, zostają, a liczą się tylko te,
+    które naprawdę rozeszły się z łańcuchem lidera. Obejmuje to uścisk
+    dłoni; elekcja, która sama obcina follower, nadal tnie do zatwierdzonego.
+    Zastrzeżenie: reguła zakłada, że rekordy epoki zapisał jeden lider
+    jednorazowo. Restart lidera w tej samej epoce (świeża epoka na każdy
+    restart nie jest zaimplementowana) to łamie: follower z ogonem dawnej
+    inkarnacji, który następnie uzgadnia z innym liderem niż zrestartowany,
+    zachowuje ten ogon bez śladu w audycie. Dotyczy to także RF=3.
+  - **Zamknięcie węzła przekazuje partycje.** Przed zatrzymaniem replikacji
+    węzeł oddaje partycje, które prowadzi, replice z zgodnym logiem
+    (najwyżej 5 s łącznie, każde oczekiwanie przeniesienia jest przycięte do
+    pozostałego budżetu, po jego wyczerpaniu nie zaczyna się kolejne, a
+    liczba przeniesionych jest raportowana także wtedy, gdy budżet się skończył),
+    więc druga strona nie czeka na wygaśnięcie dzierżawy. Partycja bez zgodnej
+    repliki zostaje, jak dotąd.
   - **Polecenia mesh.** Limit czasu zależy od rodzaju polecenia: transfery
     modeli i wdrożenia nie są ucinane po 10 minutach (modele: do 25 h, tyle
     ile czeka wołający). Cofnięcie zaufania przerywa trwające polecenie, a

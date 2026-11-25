@@ -475,6 +475,95 @@ fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
 /// the same pepper.
 const API_KEY_PEPPER_KEY: &str = "api_key_pepper";
 
+/// Settings key holding the peppers this fleet used before the current one
+/// (comma-separated `<hex>:<retired at, ms>`, newest first, stored encrypted).
+/// A pepper the fleet converged away from still verifies the keys that were
+/// issued under it, so it is kept for verification and travels as a shared
+/// secret that merges by union instead of by version.
+const API_KEY_PEPPER_RETIRED_KEY: &str = "api_key_pepper_retired";
+
+/// Whether a setting is kept by the system itself and refused when written
+/// through the settings API: the retired peppers are collected when a pepper is
+/// replaced, and an operator's value would replace the list the keys issued
+/// under earlier peppers depend on.
+pub fn is_system_managed_setting_key(key: &str) -> bool {
+    key == API_KEY_PEPPER_RETIRED_KEY
+}
+
+/// A fleet that rotates peppers more often than this has bigger problems; past
+/// it the list keeps the most recently retired ones (the same on every node).
+const MAX_RETIRED_PEPPERS: usize = 8;
+
+/// A pepper retired this recently is never evicted for the cap.
+const RECENT_RETIREMENT_MS: u64 = 60 * 60 * 1000;
+
+/// One retired pepper: its hex and when it was retired, in unix milliseconds
+/// (`0` for an entry that carries no time).
+fn parse_retired_peppers(list: &str) -> Vec<(String, u64)> {
+    list.split(',')
+        .filter_map(|entry| {
+            let (hex, at) = entry.trim().split_once(':').unwrap_or((entry.trim(), "0"));
+            let hex = hex.to_ascii_lowercase();
+            (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| (hex, at.parse().unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Union of two retired lists, `held` first. Entries that are not 32-byte hex
+/// are dropped. A pepper listed twice keeps the earlier retirement time, the
+/// closest to when the fleet really stopped issuing under it. Past the cap the
+/// oldest retirements go, ties by hex, so the union is the same list whichever
+/// node merges first and whichever order the lists arrive in. `keep`, the
+/// pepper that was retired just now, is never the one dropped, and neither is
+/// any pepper retired within `RECENT_RETIREMENT_MS` of `now_ms` on whichever
+/// node merges: a node whose clock runs behind stamps its retirement with an
+/// old time, and the fleet must not evict it before the keys under it have had
+/// time to be re-issued.
+fn merge_retired_peppers(held: &str, incoming: &str, keep: Option<&str>, now_ms: u64) -> String {
+    let mut merged: Vec<(String, u64)> = Vec::new();
+    for (hex, at) in parse_retired_peppers(held)
+        .into_iter()
+        .chain(parse_retired_peppers(incoming))
+    {
+        match merged.iter_mut().find(|(known, _)| *known == hex) {
+            Some((_, known_at)) => *known_at = (*known_at).min(at),
+            None => merged.push((hex, at)),
+        }
+    }
+    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if merged.len() > MAX_RETIRED_PEPPERS {
+        let protected: Vec<(String, u64)> = merged
+            .split_off(MAX_RETIRED_PEPPERS)
+            .into_iter()
+            .filter(|(hex, at)| {
+                keep == Some(hex.as_str()) || at.saturating_add(RECENT_RETIREMENT_MS) > now_ms
+            })
+            .collect();
+        merged.extend(protected);
+    }
+    merged
+        .iter()
+        .map(|(hex, at)| format!("{hex}:{at}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Peppers the fleet no longer issues keys under but whose keys still exist.
+pub fn retired_api_key_peppers(
+    pool: &DbPool,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<Vec<Vec<u8>>> {
+    let Some(list) = get_setting_secure(pool, API_KEY_PEPPER_RETIRED_KEY, cipher)? else {
+        return Ok(Vec::new());
+    };
+    Ok(parse_retired_peppers(&list)
+        .into_iter()
+        .filter_map(|(hex, _)| decode_hex(&hex).ok())
+        .filter(|bytes| bytes.len() == 32)
+        .collect())
+}
+
 /// Returns the org-wide API key pepper, decrypting the stored value, and only
 /// generating + persisting 32 CSPRNG bytes when none exists yet.
 ///
@@ -1030,7 +1119,12 @@ pub fn set_setting_secure(
 /// Allowlist of `settings` keys that replicate as `core.shared_setting_secret`
 /// (re-encrypted per node). Single source of truth for the secret capture path,
 /// the upgrade-time enqueue, and the baseline-reset reseed.
-pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &["hf_token", "ngc_api_key", "api_key_pepper"];
+pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &[
+    "hf_token",
+    "ngc_api_key",
+    "api_key_pepper",
+    API_KEY_PEPPER_RETIRED_KEY,
+];
 
 pub fn is_shared_secret_setting_key(key: &str) -> bool {
     SHARED_SECRET_SETTING_KEYS.contains(&key)
@@ -1237,7 +1331,32 @@ pub fn adopt_shared_secret_version(
             |row| row.get(0),
         )
         .optional()?;
-    let holds_value = held.is_some_and(|raw| !raw.is_empty());
+    if secret.key == API_KEY_PEPPER_RETIRED_KEY {
+        let held_list = match held.as_deref().filter(|raw| !raw.is_empty()) {
+            Some(raw) => cipher.decrypt(raw).map_err(|e| anyhow::anyhow!("{}", e))?,
+            None => String::new(),
+        };
+        let merged = merge_retired_peppers(
+            &held_list,
+            &secret.value,
+            None,
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        );
+        if merged == held_list {
+            return Ok(false);
+        }
+        let encrypted = cipher
+            .encrypt(&merged)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+            rusqlite::params![secret.key, encrypted],
+        )?;
+        tx.commit()?;
+        return Ok(true);
+    }
+    let holds_value = held.as_ref().is_some_and(|raw| !raw.is_empty());
     let local_version = shared_secret_version_tx(&tx, &secret.key)?;
     // A version row without a value is left over from a ledger-era write that was
     // since purged; it must not shadow the value a peer still holds.
@@ -1253,8 +1372,56 @@ pub fn adopt_shared_secret_version(
         rusqlite::params![secret.key, encrypted],
     )?;
     stamp_shared_secret_version_tx(&tx, &secret.key, &secret.hlc)?;
+    if secret.key == API_KEY_PEPPER_KEY {
+        retire_replaced_pepper_tx(&tx, cipher, held.as_deref(), &secret.value)?;
+    }
     tx.commit()?;
     Ok(true)
+}
+
+/// Keeps the pepper that an adoption replaces, so keys issued under it keep
+/// verifying. A replaced value equal to the new one retires nothing.
+fn retire_replaced_pepper_tx(
+    tx: &rusqlite::Transaction<'_>,
+    cipher: &crate::crypto::SettingsCipher,
+    replaced_raw: Option<&str>,
+    adopted_hex: &str,
+) -> Result<()> {
+    let Some(raw) = replaced_raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(());
+    };
+    let replaced = cipher.decrypt(raw).map_err(|e| anyhow::anyhow!("{}", e))?;
+    if replaced == adopted_hex {
+        return Ok(());
+    }
+    let held_raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![API_KEY_PEPPER_RETIRED_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let held_list = match held_raw.as_deref().filter(|raw| !raw.is_empty()) {
+        Some(raw) => cipher.decrypt(raw).map_err(|e| anyhow::anyhow!("{}", e))?,
+        None => String::new(),
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let replaced_entry = format!("{replaced}:{now_ms}");
+    let merged = merge_retired_peppers(
+        &held_list,
+        &replaced_entry,
+        Some(&replaced.to_ascii_lowercase()),
+        now_ms,
+    );
+    let encrypted = cipher
+        .encrypt(&merged)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        rusqlite::params![API_KEY_PEPPER_RETIRED_KEY, encrypted],
+    )?;
+    Ok(())
 }
 
 /// Usuwa ustawienie po kluczu (CR-016: jednorazowe tokeny SSO state)
@@ -29165,6 +29332,253 @@ mod api_key_access_v2_tests {
             .expect("new verifier");
         assert_eq!(found.uid, uid);
         assert_eq!(found.key_prefix, "sk-...new");
+    }
+
+    /// A key carries the id of the pepper it was issued under and is checked
+    /// against that pepper alone; a key issued before ids existed is tried
+    /// under the current pepper, then the retired ones.
+    #[test]
+    fn a_key_is_checked_against_the_pepper_it_names() {
+        use crate::api::dashboard::auth::{issue_api_key_token, pepper_id};
+        let db = fresh_db();
+        let cipher = test_cipher();
+        let current = get_or_create_api_key_pepper(&db, &cipher).unwrap();
+        let retired_a = vec![0xa1u8; 32];
+        let retired_b = vec![0xb2u8; 32];
+        let list = format!(
+            "{}:2000,{}:1000",
+            hex::encode(&retired_a),
+            hex::encode(&retired_b)
+        );
+        set_setting_secure(&db, API_KEY_PEPPER_RETIRED_KEY, &list, &cipher).unwrap();
+        let store = |token: &str, pepper: &[u8], uid: &str| {
+            create_api_key(
+                &db,
+                &api_key_verifier(token, pepper),
+                "sk-...x",
+                "k",
+                "user",
+                Some(uid),
+                60,
+            )
+            .unwrap()
+            .1
+        };
+        let verify = |token: &str| {
+            crate::api::dashboard::auth::verify_api_key_any_pepper(&db, &cipher, token, &current)
+                .unwrap()
+        };
+
+        let under_a = issue_api_key_token(&"ab".repeat(32), &retired_a);
+        assert!(under_a.starts_with(&format!("sk-{}-", pepper_id(&retired_a))));
+        let uid_a = store(&under_a, &retired_a, "user-uid-a");
+        assert_eq!(verify(&under_a).map(|k| k.uid), Some(uid_a));
+
+        // The stored verifier is the bare MAC a node that predates pepper ids
+        // computes for the same token, so it verifies there too.
+        let mut mac =
+            <hmac::Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&retired_a).unwrap();
+        hmac::Mac::update(&mut mac, under_a.as_bytes());
+        assert_eq!(
+            api_key_verifier(&under_a, &retired_a),
+            hex::encode(hmac::Mac::finalize(mac).into_bytes())
+        );
+
+        // A token that names pepper A is not satisfied by a row keyed under B,
+        // and one naming a pepper this node does not hold finds nothing.
+        let names_a_keyed_b = issue_api_key_token(&"cd".repeat(32), &retired_a);
+        store(&names_a_keyed_b, &retired_b, "user-uid-m");
+        assert!(verify(&names_a_keyed_b).is_none());
+        let unknown = issue_api_key_token(&"ef".repeat(32), &[0x77u8; 32]);
+        store(&unknown, &[0x77u8; 32], "user-uid-u");
+        assert!(verify(&unknown).is_none());
+
+        // Issued before ids existed: a bare token, under a retired pepper.
+        let legacy = format!("sk-{}", "12".repeat(32));
+        let uid_legacy = store(&legacy, &retired_b, "user-uid-l");
+        assert_eq!(verify(&legacy).map(|k| k.uid), Some(uid_legacy));
+        assert!(verify("sk-unknown").is_none());
+    }
+
+    /// Past the cap the pepper retired longest ago goes, whichever order the
+    /// lists meet in; the one retired just now stays even when it would sort
+    /// among the oldest.
+    #[test]
+    fn the_retired_peppers_merge_drops_the_oldest_retirement_and_converges() {
+        let hex = |n: u8| format!("{:02x}", n).repeat(32);
+        let list = |range: std::ops::RangeInclusive<u8>| {
+            range
+                .map(|n| format!("{}:{}", hex(n), 1000 + n as u64))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        // Far later than every retirement below: none counts as recent.
+        const LATER: u64 = 100 * RECENT_RETIREMENT_MS;
+        let (a, b) = (list(1..=6), list(4..=12));
+        let ab = merge_retired_peppers(&a, &b, None, LATER);
+        assert_eq!(ab, merge_retired_peppers(&b, &a, None, LATER));
+        let kept: Vec<String> = ab
+            .split(',')
+            .map(|entry| entry.split_once(':').unwrap().0.to_string())
+            .collect();
+        assert_eq!(kept.len(), MAX_RETIRED_PEPPERS);
+        assert_eq!(
+            kept,
+            (5u8..=12).rev().map(hex).collect::<Vec<_>>(),
+            "the eight most recent retirements, newest first"
+        );
+        // Merging what is already merged changes nothing.
+        assert_eq!(merge_retired_peppers(&ab, &a, None, LATER), ab);
+        assert_eq!(merge_retired_peppers("", "not-hex,", None, LATER), "");
+
+        // The pepper just retired is kept even when its time is the oldest
+        // (a clock behind the fleet's), at the cost of the next oldest.
+        let late = format!("{}:1", hex(99));
+        let with_late = merge_retired_peppers(&ab, &late, Some(&hex(99)), LATER);
+        assert!(with_late.contains(&hex(99)));
+        assert_eq!(with_late.split(',').count(), MAX_RETIRED_PEPPERS + 1);
+        // Another node, without `keep`, still holds on to a pepper retired
+        // within the last hour by a clock that runs behind its own.
+        let behind = format!("{}:{}", hex(98), 1000);
+        let elsewhere = merge_retired_peppers(&ab, &behind, None, 1000 + RECENT_RETIREMENT_MS - 1);
+        assert!(elsewhere.contains(&hex(98)));
+        let aged = merge_retired_peppers(&ab, &behind, None, 1000 + RECENT_RETIREMENT_MS);
+        assert!(!aged.contains(&hex(98)));
+        // A pepper two nodes retired at different times keeps the earlier time.
+        assert_eq!(
+            merge_retired_peppers(
+                &format!("{}:50", hex(1)),
+                &format!("{}:40", hex(1)),
+                None,
+                LATER
+            ),
+            format!("{}:40", hex(1))
+        );
+    }
+
+    /// Replacing the pepper retires the old one at the time of the change.
+    #[test]
+    fn the_pepper_an_adoption_replaces_is_retired_with_a_time() {
+        let db = fresh_db();
+        let cipher = test_cipher();
+        let own = get_or_create_api_key_pepper(&db, &cipher).unwrap();
+        let before = chrono::Utc::now().timestamp_millis() as u64;
+        adopt_shared_secret_version(
+            &db,
+            &cipher,
+            &SharedSecretVersion {
+                key: API_KEY_PEPPER_KEY.to_string(),
+                value: "ab".repeat(32),
+                hlc: crate::sync::ledger::HybridLogicalTimestamp {
+                    wall_time_ms: 1,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        let stored = get_setting_secure(&db, API_KEY_PEPPER_RETIRED_KEY, &cipher)
+            .unwrap()
+            .unwrap();
+        let (hex_part, at) = stored.split_once(':').unwrap();
+        assert_eq!(hex_part, hex::encode(&own));
+        assert!(at.parse::<u64>().unwrap() >= before);
+    }
+
+    #[test]
+    fn a_key_survives_the_fleet_adopting_another_pepper() {
+        let db = fresh_db();
+        let cipher = test_cipher();
+        let own = get_or_create_api_key_pepper(&db, &cipher).unwrap();
+        let verifier = api_key_verifier("sk-issued-here", &own);
+        create_api_key(
+            &db,
+            &verifier,
+            "sk-...h",
+            "mine",
+            "user",
+            Some("user-uid-pepper"),
+            60,
+        )
+        .unwrap();
+
+        let fleet = "ab".repeat(32);
+        let adopted = adopt_shared_secret_version(
+            &db,
+            &cipher,
+            &SharedSecretVersion {
+                key: API_KEY_PEPPER_KEY.to_string(),
+                value: fleet.clone(),
+                hlc: crate::sync::ledger::HybridLogicalTimestamp {
+                    wall_time_ms: 1,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(adopted);
+        let current = get_or_create_api_key_pepper(&db, &cipher).unwrap();
+        assert_eq!(current, decode_hex(&fleet).unwrap());
+        assert!(
+            verify_api_key(&db, &api_key_verifier("sk-issued-here", &current))
+                .unwrap()
+                .is_none(),
+            "the key no longer verifies under the new pepper alone"
+        );
+
+        let found = crate::api::dashboard::auth::verify_api_key_any_pepper(
+            &db,
+            &cipher,
+            "sk-issued-here",
+            &current,
+        )
+        .unwrap();
+        assert!(
+            found.is_some(),
+            "the replaced pepper still verifies its keys"
+        );
+        assert!(crate::api::dashboard::auth::verify_api_key_any_pepper(
+            &db,
+            &cipher,
+            "sk-forged",
+            &current,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn retired_peppers_replicate_by_union_and_reach_the_issuing_peer() {
+        let own = "cd".repeat(32);
+        let other = "ef".repeat(32);
+        let db = fresh_db();
+        let cipher = test_cipher();
+        for incoming in [&own, &other, &own] {
+            adopt_shared_secret_version(
+                &db,
+                &cipher,
+                &SharedSecretVersion {
+                    key: API_KEY_PEPPER_RETIRED_KEY.to_string(),
+                    value: incoming.clone(),
+                    hlc: crate::sync::ledger::HybridLogicalTimestamp {
+                        wall_time_ms: 0,
+                        logical: 0,
+                        node_id: String::new(),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let retired = retired_api_key_peppers(&db, &cipher).unwrap();
+        assert_eq!(
+            retired,
+            vec![decode_hex(&own).unwrap(), decode_hex(&other).unwrap()]
+        );
+        let sent = list_shared_secret_versions(&db, &cipher).unwrap();
+        assert!(sent
+            .iter()
+            .any(|secret| secret.key == API_KEY_PEPPER_RETIRED_KEY));
     }
 
     #[test]

@@ -118,6 +118,10 @@ pub type PartitionKey = (String, String, u32);
 pub type BusRecv = Box<dyn AsyncRead + Unpin + Send>;
 pub type BusSend = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// How often a partition's "not standing: not caught up" warning repeats while
+/// the hold-back lasts.
+const NOT_IN_SYNC_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// How long a `transfer_leader` admin call waits for majority admission
 /// before giving up. Not pinned by PLAN-M2; chosen generous (an admin
 /// action, not the hot path) so a merely-slow outbox drain still succeeds
@@ -216,10 +220,15 @@ const ACKS_ALL_ISR_RECHECK: Duration = Duration::from_millis(50);
 /// (`live_isr`), never fewer than `election::availability_quorum`: a
 /// follower dropped from the ISR is not waited for, and at RF ≤ 2 the
 /// surviving replica alone completes the write.
-fn required_acks(acks: Acks, rf: usize, live_isr: usize) -> u32 {
+///
+/// `alone_cleared` is the leader's permission to commit alone at RF 2
+/// (`LeaderHandle::alone_cleared`): without it an ISR of one replica does not
+/// complete an `acks=all` write.
+fn required_acks(acks: Acks, rf: usize, live_isr: usize, alone_cleared: bool) -> u32 {
     match acks {
         Acks::Leader => 1,
         Acks::Quorum => election::min_isr_required(rf) as u32,
+        Acks::All if rf == 2 && live_isr <= 1 && !alone_cleared => 2,
         Acks::All => live_isr.max(election::availability_quorum(rf)) as u32,
     }
 }
@@ -349,6 +358,31 @@ pub trait LeaderHandle: Send + Sync {
     /// so a follower dropping out of (or rejoining) the ISR is visible
     /// immediately rather than only after the next ledger round trip.
     fn isr(&self) -> Vec<String>;
+    /// At RF 2, whether this leader may commit alone while its follower is
+    /// out of the in-sync set (`PartitionLeader::alone_cleared`). `true` for a
+    /// handle that does not track it.
+    fn alone_cleared(&self) -> bool {
+        true
+    }
+    /// Grants (`true`) or withdraws (`false`) the permission above.
+    fn set_alone_cleared(&self, cleared: bool) {
+        let _ = cleared;
+    }
+    /// How many times the in-sync set has shrunk under this leader
+    /// (`PartitionLeader::shrink_seq`).
+    fn shrink_seq(&self) -> u64 {
+        0
+    }
+    /// Grants the permission only if the in-sync set has not shrunk again
+    /// since it counted `seq` shrinks: an acknowledgement belongs to the
+    /// shrink it answered. `true` when granted.
+    fn grant_alone_if_unshrunk(&self, seq: u64) -> bool {
+        if self.shrink_seq() != seq {
+            return false;
+        }
+        self.set_alone_cleared(true);
+        true
+    }
     /// Replicas of this partition currently OUTSIDE the live ISR, each
     /// with a human-readable reason (K-M2-2/PLAN-M2 §1f's
     /// `BusReplicaLagWire` UI surface). `Vec::new()` (the default here) is
@@ -572,6 +606,18 @@ pub trait FollowerRunnerFactory: Send + Sync {
     fn lone_candidate_probe(&self) -> Duration {
         Duration::ZERO
     }
+    /// `T_alone`: how long a replica's peer must be out of reach of the whole
+    /// mesh before this node acts without it at RF 2 (`check_alone_rules`,
+    /// `canvass`).
+    fn alone_after(&self) -> Duration {
+        ALONE_AFTER
+    }
+    /// The leader told this node its in-sync set shrank to itself
+    /// (`ReplLeoQuery::isr_shrink_epoch`): the claim that this copy is caught
+    /// up with that leader's term ends, so it cannot stand on it.
+    fn revoke_caught_up(&self, assignment: &PartitionAssignment, epoch: u32, shrink: u64) {
+        let _ = (assignment, epoch, shrink);
+    }
     /// Whether, since this process started, this node's copy of the partition
     /// has reached the high watermark a leader reported to it, or this node
     /// has led it. A node that has not may be missing records the leader
@@ -583,8 +629,9 @@ pub trait FollowerRunnerFactory: Send + Sync {
         let _ = assignment;
         true
     }
-    /// This node leads `assignment`'s partition now: its log is the
-    /// authoritative one, whatever it has followed since the process started.
+    /// This node leads `assignment`'s partition now, or handed it to a replica
+    /// that held the same log: its log is the authoritative one, whatever it
+    /// has followed since the process started.
     fn note_led(&self, assignment: &PartitionAssignment) {
         let _ = assignment;
     }
@@ -691,6 +738,12 @@ pub trait ReplAudit: Send + Sync {
     fn tail_discarded(&self, org: &str, topic: &str, partition: u32, discarded: u64, new_leo: u64) {
         let _ = (org, topic, partition, discarded, new_leo);
     }
+    /// A leader at RF 2 has refused to commit alone for `refused_s` seconds
+    /// although its follower is reachable on the mesh: the stream between
+    /// them is down and stays down. The default records nothing.
+    fn alone_refused(&self, org: &str, topic: &str, partition: u32, peer: &str, refused_s: u64) {
+        let _ = (org, topic, partition, peer, refused_s);
+    }
 }
 
 // ===== Registry entry =======================================================
@@ -729,9 +782,10 @@ struct PartitionEntry {
     /// Without it a candidacy no other replica answered stays within
     /// `FollowerRunnerFactory::restart_stand_grace`.
     leader_heard: bool,
-    /// Whether `check_leases` already said that this node's election is held
-    /// back because it cannot show it holds what the leader acknowledged.
-    not_in_sync_logged: bool,
+    /// When `check_leases` last said that this node's election is held back
+    /// because it cannot show it holds what the leader acknowledged; it says
+    /// it again after `NOT_IN_SYNC_LOG_EVERY` while the hold-back lasts.
+    not_in_sync_logged_at: Option<Instant>,
     /// Whether `run_election` already warned that the local log could not
     /// be read; cleared by the next successful read.
     log_read_warned: bool,
@@ -1033,6 +1087,16 @@ pub struct ReplicationManager {
     forward_handler: parking_lot::RwLock<Option<Weak<dyn ForwardedPublishHandler>>>,
     /// What this node knows about each peer's liveness (`PeerLiveness`).
     peers: DashMap<String, PeerLiveness>,
+    /// Per RF 2 partition this node leads whose follower left the in-sync set:
+    /// how long it has refused to commit alone, and its `IsrShrink` notice.
+    alone: DashMap<PartitionKey, AloneState>,
+    /// Partitions (with the peer asked) a liveness probe is on its way for
+    /// (`probe_silent_peers`).
+    probing: dashmap::DashSet<String>,
+    /// Per RF 2 partition: the unbroken run of probe refusals, if any.
+    /// Dropped by any sign the peer's bus serves, and by any mesh connect or
+    /// disconnect of the peer (`forget_refusals`).
+    refusals: DashMap<PartitionKey, Refusal>,
     /// The `BUS_FEATURE_*` bits of the peers: from the `Hello` of a leader
     /// that dialed this node, or from a probe (`probe_features`).
     peer_features: Arc<DashMap<String, u32>>,
@@ -1133,6 +1197,20 @@ impl Drop for ReopenWritesUnlessProposed<'_> {
     }
 }
 
+/// What a leader at RF 2 keeps while its follower is out of the in-sync set
+/// and it may not yet commit alone (`ReplicationManager::check_alone_rules`).
+#[derive(Default)]
+struct AloneState {
+    /// Since when the leader has been refusing.
+    refusing_since: Option<Instant>,
+    /// The last `IsrShrink` notice sent.
+    notice_at: Option<Instant>,
+    /// A notice is on its way.
+    notice_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// The last time the refusal was reported as an error.
+    reported_at: Option<Instant>,
+}
+
 /// What the mesh and the replication streams have told this node about one
 /// peer.
 #[derive(Default)]
@@ -1145,7 +1223,27 @@ struct PeerLiveness {
     last_signal: Option<Instant>,
     /// When the peer last answered a `LeoQuery` as the live leader.
     leading_reply_at: Option<Instant>,
+    /// When the mesh last reported the connection lost. With `last_signal` it
+    /// dates the stretch the peer has been out of reach (`peer_unreachable_for`).
+    down_since: Option<Instant>,
 }
+
+/// What probes of one RF 2 partition have shown about the peer's bus
+/// (`ReplicationManager::note_probe_answer`): it does not serve the partition
+/// (this node leads it), or does not lead it (the peer is its leader).
+struct Refusal {
+    peer: String,
+    peer_leads: bool,
+    /// The first of an unbroken run of refusals.
+    since: Instant,
+    /// The latest refusal.
+    confirmed: Instant,
+}
+
+/// How recent the latest refusal must be for the run to count: probes go out
+/// every tick while a peer is silent, so a run that is not being renewed is
+/// over (the peer's bus came back, or the path is down and proves nothing).
+const REFUSAL_FRESH: Duration = Duration::from_secs(4);
 
 /// How recent a frame from a peer must be for the peer to count as reachable
 /// when the mesh does not vouch for it (it reported the peer gone, or said
@@ -1158,6 +1256,29 @@ const PEER_FRAME_FRESH: Duration = Duration::from_secs(5);
 /// the node's mesh heartbeat runs every 500 ms, so this much silence is a
 /// peer that is not answering whatever the connection table says.
 const MESH_SIGNAL_FRESH: Duration = Duration::from_secs(15);
+
+/// How long the mesh heartbeat of a peer may be missing before the peer is
+/// probed over the query channel (four heartbeat periods).
+const HEARTBEAT_STALE: Duration = Duration::from_secs(2);
+
+/// `T_alone`: at RF 2, how long the peer must have been out of reach of the
+/// whole mesh before a replica acts without it: a leader commits alone, a
+/// follower stands. Out of reach means no connection, or a connection that
+/// carries no heartbeat and answers no probe; the clock runs from the last
+/// sign of life and restarts at any reconnect, heartbeat or answered probe.
+/// A killed process leaves its connection standing for the transport's idle
+/// timeout, so the silence of its heartbeat is what dates it, and a failover
+/// costs this on top of the election; a flap shorter than it moves nobody.
+pub(crate) const ALONE_AFTER: Duration = Duration::from_secs(5);
+
+/// How often a leader that cannot yet commit alone repeats its `IsrShrink`
+/// notice to the follower.
+const SHRINK_NOTICE_EVERY: Duration = Duration::from_secs(1);
+
+/// How long a leader refuses to commit alone while its peer stays reachable
+/// on the mesh before that is reported as an error and audited: the stream
+/// between them is down and does not come back.
+const ALONE_REFUSED_REPORT_AFTER: Duration = Duration::from_secs(30);
 
 /// How long dialing and opening a stream for a forwarded publish may take:
 /// beyond it nothing was sent and the leader is as good as unreachable.
@@ -1260,6 +1381,9 @@ impl ReplicationManager {
             runtime: tokio::runtime::Handle::try_current().ok(),
             forward_handler: parking_lot::RwLock::new(None),
             peers: DashMap::new(),
+            alone: DashMap::new(),
+            probing: dashmap::DashSet::new(),
+            refusals: DashMap::new(),
             peer_features: Arc::new(DashMap::new()),
             probe_misses: DashMap::new(),
             assignment_changes: AssignmentChanges::new(),
@@ -1613,6 +1737,7 @@ impl ReplicationManager {
                 bus_features: 0,
                 instance_unhosted: false,
                 log_known: false,
+                isr_shrink_acked: false,
             };
             election_deferral(&seen, query.known_epoch)
                 .is_none()
@@ -1647,6 +1772,7 @@ impl ReplicationManager {
             bus_features: 0,
             instance_unhosted: false,
             log_known: false,
+            isr_shrink_acked: false,
         };
         // Read from the local log outside the registry guard: that opens
         // the partition, which may touch the disk.
@@ -1687,6 +1813,7 @@ impl ReplicationManager {
                                 committed: Some(l.committed_offset()),
                                 leading: l.holds_quorum_lease(),
                                 log_known: true,
+                                isr_shrink_acked: false,
                                 ..base
                             },
                             // Mid-rebuild, its handle not attached yet: the
@@ -1708,6 +1835,7 @@ impl ReplicationManager {
                                 committed: Some(f.committed()),
                                 leader_alive: !f.lease_expired(),
                                 log_known: true,
+                                isr_shrink_acked: false,
                                 ..base
                             },
                             None => {
@@ -1739,6 +1867,16 @@ impl ReplicationManager {
             reply.promised_epoch = promised.or(reply.promised_epoch.filter(|p| *p > asked));
         }
         reply.bus_features = frames::LOCAL_BUS_FEATURES;
+        if let Some(shrunk_at) = query.isr_shrink_epoch {
+            reply.isr_shrink_acked = !serving
+                || self.accept_isr_shrink(
+                    &key,
+                    candidate,
+                    shrunk_at,
+                    query.isr_shrink_generation,
+                    query.isr_shrink_seq,
+                );
+        }
         let _ = frames::write_frame(&mut send, &ReplFrame::LeoReply(reply)).await;
     }
 
@@ -2503,7 +2641,7 @@ impl ReplicationManager {
                     unreconciled: false,
                     cutting: false,
                     leader_heard: false,
-                    not_in_sync_logged: false,
+                    not_in_sync_logged_at: None,
                     log_read_warned: false,
                     quorum_lost_since: None,
                     abdicated_epoch: None,
@@ -2732,7 +2870,7 @@ impl ReplicationManager {
                         unreconciled: false,
                         cutting: false,
                         leader_heard: true,
-                        not_in_sync_logged: false,
+                        not_in_sync_logged_at: None,
                         log_read_warned: false,
                         quorum_lost_since: None,
                         abdicated_epoch: None,
@@ -2888,7 +3026,12 @@ impl ReplicationManager {
     /// `node_reachable` and `snapshot` report from then on (unless the peer
     /// keeps sending replication frames).
     pub fn on_peer_disconnected(&self, node_id: &str) {
-        self.peers.entry(node_id.to_string()).or_default().mesh_up = Some(false);
+        {
+            let mut peer = self.peers.entry(node_id.to_string()).or_default();
+            peer.mesh_up = Some(false);
+            peer.down_since = Some(Instant::now());
+        }
+        self.forget_refusals(node_id);
         for entry in self.registry.iter() {
             if entry.assignment.leader_node_id == node_id {
                 if let Some(follower) = entry.follower.as_ref() {
@@ -2904,6 +3047,14 @@ impl ReplicationManager {
         let mut peer = self.peers.entry(node_id.to_string()).or_default();
         peer.mesh_up = Some(true);
         peer.last_signal = Some(Instant::now());
+        drop(peer);
+        self.forget_refusals(node_id);
+    }
+
+    /// A peer's refusals are only evidence of the connection they were seen
+    /// on: a connect or a disconnect starts them over.
+    fn forget_refusals(&self, node_id: &str) {
+        self.refusals.retain(|_, r| r.peer != node_id);
     }
 
     /// Records the peers the mesh is connected to at startup. Only peers the
@@ -2915,6 +3066,8 @@ impl ReplicationManager {
             if peer.mesh_up.is_none() {
                 peer.mesh_up = Some(true);
                 peer.last_signal = Some(Instant::now());
+                drop(peer);
+                self.forget_refusals(node_id);
             }
         }
     }
@@ -2928,12 +3081,20 @@ impl ReplicationManager {
             if peer.mesh_up != Some(true) {
                 peer.mesh_up = Some(true);
                 peer.last_signal = Some(Instant::now());
+                drop(peer);
+                self.forget_refusals(node_id);
             }
         }
+        let mut gone: Vec<String> = Vec::new();
         for mut peer in self.peers.iter_mut() {
             if peer.mesh_up == Some(true) && !connected.iter().any(|c| c == peer.key()) {
                 peer.mesh_up = Some(false);
+                peer.down_since = Some(Instant::now());
+                gone.push(peer.key().clone());
             }
+        }
+        for node_id in gone {
+            self.forget_refusals(&node_id);
         }
     }
 
@@ -2979,6 +3140,92 @@ impl ReplicationManager {
                 }
             })
             .min()
+    }
+
+    /// How long `node_id` has been out of reach of the whole mesh: nothing
+    /// heard from it since the later of its last signal and the moment the
+    /// mesh reported it gone (never heard from, since this process started).
+    /// `None` while the mesh holds a connection to it that still carries a
+    /// heartbeat (or an answer to a probe) from the last `HEARTBEAT_STALE`.
+    /// A reconnect, a heartbeat or an answer therefore restarts the count,
+    /// and a flap never adds up.
+    ///
+    /// The mesh heartbeat says the process is up, not that its bus is. While
+    /// the heartbeat vouches, the peer counts as out of reach only on positive
+    /// proof that it does not serve the partition: it answered every probe
+    /// "not served here" (no such instance, no log of the partition, a manager
+    /// that shut down), or — asked as a leader (`leading_epoch`) — that it does
+    /// not lead it at that epoch, and no replication frame from it is arriving.
+    /// `refusal` names the partition asked about and whether the peer leads it.
+    /// The count runs from the first answer of an unbroken run of refusals
+    /// that is still being renewed (`REFUSAL_FRESH`) and began after the last
+    /// frame the peer's streams carried; an answer that says the bus serves
+    /// ends the run. A probe that gets no answer at all proves nothing, since
+    /// the path may be what is down: the run lapses, the heartbeat keeps
+    /// vouching, and the refusal to commit is reported.
+    fn peer_unreachable_for(
+        &self,
+        node_id: &str,
+        refusal: Option<(&PartitionKey, bool)>,
+    ) -> Option<Duration> {
+        let Some(peer) = self.peers.get(node_id) else {
+            return Some(self.started_at.elapsed());
+        };
+        if peer.mesh_up == Some(true)
+            && peer
+                .last_signal
+                .is_some_and(|at| at.elapsed() < HEARTBEAT_STALE)
+        {
+            drop(peer);
+            let run = refusal.and_then(|(key, peer_leads)| {
+                self.refusals
+                    .get(key)
+                    .filter(|r| {
+                        r.peer == node_id
+                            && r.peer_leads == peer_leads
+                            && r.confirmed.elapsed() < REFUSAL_FRESH
+                    })
+                    .map(|r| r.since.elapsed())
+            });
+            // The run must have begun after the stream's last frame: a bus
+            // that was deaf while it loaded and has spoken since is not deaf.
+            return run.filter(|age| {
+                self.stream_signal_age(node_id)
+                    .is_none_or(|frame_age| frame_age > *age)
+            });
+        }
+        let since = [peer.last_signal, peer.down_since]
+            .into_iter()
+            .flatten()
+            .max();
+        Some(since.map_or_else(|| self.started_at.elapsed(), |at| at.elapsed()))
+    }
+
+    /// Whether this node may act without `node_id`: it has been out of reach
+    /// of the whole mesh for `T_alone`.
+    fn peer_out_of_the_way(&self, node_id: &str, refusal: Option<(&PartitionKey, bool)>) -> bool {
+        self.peer_unreachable_for(node_id, refusal)
+            .is_some_and(|age| age >= self.follower_factory.alone_after())
+    }
+
+    /// Whether this follower must not stand because its leader may still be
+    /// there: at RF 2 it stands alone only once the leader has been out of
+    /// reach of the whole mesh for `T_alone`. The replication stream being
+    /// down says the stream is down, not the leader; a leader the mesh still
+    /// reaches keeps its partition for as long as it does, and refuses (or
+    /// does not commit) what it cannot replicate meanwhile. From RF 3 the
+    /// majority rule applies unchanged.
+    fn leader_may_still_be_there(&self, assignment: &PartitionAssignment) -> bool {
+        let leader = &assignment.leader_node_id;
+        if leader == &self.local_node_id || assignment.replicas.len() > 2 {
+            return false;
+        }
+        let key: PartitionKey = (
+            assignment.org_id.clone(),
+            assignment.topic.clone(),
+            assignment.partition,
+        );
+        !self.peer_out_of_the_way(leader, Some((&key, true)))
     }
 
     /// Whether `node_id` answers: this node itself, a peer the mesh holds a
@@ -3307,6 +3554,385 @@ impl ReplicationManager {
         }
     }
 
+    /// The RF 2 rule for a leader whose follower left its in-sync set: it
+    /// commits alone only when the follower is out of the way, which is when
+    /// (a) the follower acknowledged an `IsrShrink` notice (sent over a
+    /// channel of its own, so it gets through while the stream is down), or
+    /// (b) the follower has been out of reach of the whole mesh for `T_alone`.
+    /// Until then `acks=all` writes wait and fail (`NotEnoughReplicas`) and
+    /// `hw` stays put. A peer the mesh still reaches whose stream does not
+    /// return is reported, not overruled. Meant for the same periodic tick as
+    /// `check_leases`.
+    pub async fn check_alone_rules(self: &Arc<Self>) {
+        self.probe_silent_peers();
+        let now = Instant::now();
+        struct Blocked {
+            key: PartitionKey,
+            peer: String,
+            epoch: u32,
+            generation: u64,
+            shrink_seq: u64,
+            handle: Arc<dyn LeaderHandle>,
+        }
+        let mut blocked: Vec<Blocked> = Vec::new();
+        let mut seen: Vec<PartitionKey> = Vec::new();
+        for entry in self.registry.iter() {
+            if entry.role != LocalRole::Leader || entry.assignment.replicas.len() != 2 {
+                continue;
+            }
+            let Some(handle) = entry.leader.clone() else {
+                continue;
+            };
+            if handle.isr().len() > 1 || handle.alone_cleared() {
+                continue;
+            }
+            let Some(peer) = entry
+                .assignment
+                .replicas
+                .iter()
+                .find(|n| **n != self.local_node_id)
+            else {
+                continue;
+            };
+            seen.push(entry.key().clone());
+            blocked.push(Blocked {
+                key: entry.key().clone(),
+                peer: peer.clone(),
+                epoch: entry.assignment.leader_epoch,
+                generation: entry.assignment.topic_generation,
+                shrink_seq: handle.shrink_seq(),
+                handle,
+            });
+        }
+        self.alone.retain(|key, _| seen.contains(key));
+        for item in blocked {
+            if self.peer_out_of_the_way(&item.peer, Some((&item.key, false))) {
+                tracing::warn!(
+                    org_id = %item.key.0, topic = %item.key.1, partition = item.key.2,
+                    peer = %item.peer, epoch = item.epoch,
+                    "replication: committing alone — the follower has been out of reach of the \
+                     whole mesh for the alone interval"
+                );
+                item.handle.set_alone_cleared(true);
+                self.alone.remove(&item.key);
+                continue;
+            }
+            let (send_notice, in_flight, report) = {
+                let mut state = self.alone.entry(item.key.clone()).or_default();
+                let since = *state.refusing_since.get_or_insert(now);
+                let due = state
+                    .notice_at
+                    .is_none_or(|at| at.elapsed() >= SHRINK_NOTICE_EVERY)
+                    && !state
+                        .notice_in_flight
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                if due {
+                    state.notice_at = Some(now);
+                    state
+                        .notice_in_flight
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let report = self
+                    .peer_unreachable_for(&item.peer, Some((&item.key, false)))
+                    .is_none()
+                    && now.saturating_duration_since(since) >= ALONE_REFUSED_REPORT_AFTER
+                    && state
+                        .reported_at
+                        .is_none_or(|at| at.elapsed() >= ALONE_REFUSED_REPORT_AFTER);
+                if report {
+                    state.reported_at = Some(now);
+                }
+                (
+                    due,
+                    Arc::clone(&state.notice_in_flight),
+                    report.then(|| now.saturating_duration_since(since)),
+                )
+            };
+            if let Some(refused_for) = report {
+                tracing::error!(
+                    org_id = %item.key.0, topic = %item.key.1, partition = item.key.2,
+                    peer = %item.peer, refused_for_s = refused_for.as_secs(),
+                    "replication: this leader cannot commit alone and its follower is still \
+                     reachable on the mesh but not replicating — writes with acks=all are \
+                     refused until the stream returns"
+                );
+                self.audit.alone_refused(
+                    &item.key.0,
+                    &item.key.1,
+                    item.key.2,
+                    &item.peer,
+                    refused_for.as_secs(),
+                );
+            }
+            if send_notice {
+                let manager = Arc::clone(self);
+                tokio::spawn(async move {
+                    let acked = manager
+                        .send_isr_shrink(
+                            &item.key,
+                            &item.peer,
+                            item.epoch,
+                            item.generation,
+                            item.shrink_seq,
+                        )
+                        .await;
+                    in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if !acked {
+                        return;
+                    }
+                    // Only for the handle that was refusing, at the epoch
+                    // the follower acknowledged.
+                    let current = manager.registry.get(&item.key).is_some_and(|entry| {
+                        entry.role == LocalRole::Leader
+                            && entry.assignment.leader_epoch == item.epoch
+                            && entry
+                                .leader
+                                .as_ref()
+                                .is_some_and(|serving| Arc::ptr_eq(serving, &item.handle))
+                    });
+                    // The acknowledgement answers the shrink the notice named: a
+                    // follower that came back and a shrink after it make this
+                    // one stale, and the follower holds a claim again.
+                    if current
+                        && item.handle.isr().len() <= 1
+                        && item.handle.grant_alone_if_unshrunk(item.shrink_seq)
+                    {
+                        tracing::warn!(
+                            org_id = %item.key.0, topic = %item.key.1, partition = item.key.2,
+                            peer = %item.peer, epoch = item.epoch,
+                            "replication: committing alone — the follower acknowledged the \
+                             in-sync shrink and stands on no claim of this epoch"
+                        );
+                        manager.alone.remove(&item.key);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Asks every RF 2 peer over the query channel, which is not the
+    /// connection the heartbeat rides, when it shows no life: its mesh
+    /// heartbeat has gone quiet, or its bus has (no replication frame, no
+    /// answer to an earlier probe). An answer that says the partition is
+    /// served there is a sign of life (it restarts the unreachable clock); one
+    /// that does not (the instance is not hosted, no log of the partition),
+    /// or none at all, leaves the clock running. A peer whose heartbeat alone
+    /// is lost stays reachable, and a killed one, whose connection outlives
+    /// it, does not.
+    ///
+    /// Every RF 2 partition shared with a silent peer is asked about, one
+    /// probe each: one partition's answer never speaks for another. For a
+    /// partition the peer leads the answer must show it leads it
+    /// (`leader_may_still_be_there`).
+    fn probe_silent_peers(self: &Arc<Self>) {
+        let mut targets: Vec<(String, PartitionKey, Option<u32>)> = Vec::new();
+        for entry in self.registry.iter() {
+            if entry.assignment.replicas.len() > 2
+                || !entry.assignment.replicas.contains(&self.local_node_id)
+            {
+                continue;
+            }
+            let Some(peer) = entry
+                .assignment
+                .replicas
+                .iter()
+                .find(|n| **n != self.local_node_id)
+            else {
+                continue;
+            };
+            let led_epoch =
+                (entry.assignment.leader_node_id == *peer).then_some(entry.assignment.leader_epoch);
+            targets.push((peer.clone(), entry.key().clone(), led_epoch));
+        }
+        // Judged after the registry walk: the streams' silence reads the registry.
+        targets.retain(|(peer, ..)| {
+            let (mesh_up, heartbeat_quiet) =
+                self.peers.get(peer.as_str()).map_or((false, false), |p| {
+                    (
+                        p.mesh_up == Some(true),
+                        p.last_signal
+                            .is_some_and(|at| at.elapsed() >= HEARTBEAT_STALE / 2),
+                    )
+                });
+            mesh_up
+                && (heartbeat_quiet
+                    || self
+                        .stream_signal_age(peer)
+                        .is_none_or(|age| age >= HEARTBEAT_STALE / 2))
+        });
+        for (peer, key, led_epoch) in targets {
+            let probing = format!("{peer}/{}/{}/{}", key.0, key.1, key.2);
+            if !self.probing.insert(probing.clone()) {
+                continue;
+            }
+            let manager = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Some(reply) = manager.send_probe(&key, &peer).await {
+                    manager.note_probe_answer(&peer, &key, &reply, led_epoch);
+                }
+                manager.probing.remove(&probing);
+            });
+        }
+    }
+
+    /// Records what a probe answer shows about `peer` and the partition `key`.
+    /// An answer that carries a real log of the partition is a sign of life (it
+    /// restarts the unreachable clock) and ends any run of refusals. One that
+    /// does not — the instance is not hosted, the manager shut down — shows
+    /// the node is up and does not serve the partition: it extends the run of
+    /// refusals the mesh heartbeat stops vouching on (`peer_unreachable_for`).
+    /// Asked about a partition the peer leads (`leader_epoch`), an answer must
+    /// also say it leads it at that epoch or later.
+    fn note_probe_answer(
+        &self,
+        peer: &str,
+        key: &PartitionKey,
+        reply: &ReplLeoReply,
+        leader_epoch: Option<u32>,
+    ) {
+        let served = reply.log_known && !reply.instance_unhosted;
+        let leads = leader_epoch.map(|epoch| reply.leading && reply.leader_epoch >= epoch);
+        let now = Instant::now();
+        if served && leads != Some(false) {
+            self.peers.entry(peer.to_string()).or_default().last_signal = Some(now);
+        }
+        if leads == Some(true) {
+            self.peers
+                .entry(peer.to_string())
+                .or_default()
+                .leading_reply_at = Some(now);
+        }
+        let refused = leads.map_or(!served, |leading| !leading);
+        if !refused {
+            self.refusals.remove(key);
+            return;
+        }
+        let peer_leads = leader_epoch.is_some();
+        let mut run = self.refusals.entry(key.clone()).or_insert_with(|| Refusal {
+            peer: peer.to_string(),
+            peer_leads,
+            since: now,
+            confirmed: now,
+        });
+        if run.peer != peer
+            || run.peer_leads != peer_leads
+            || run.confirmed.elapsed() >= REFUSAL_FRESH
+        {
+            run.peer = peer.to_string();
+            run.peer_leads = peer_leads;
+            run.since = now;
+        }
+        run.confirmed = now;
+    }
+
+    /// A `LeoQuery` that changes nothing on the other side, for `probe_silent_peers`.
+    async fn send_probe(&self, key: &PartitionKey, peer: &str) -> Option<ReplLeoReply> {
+        let query = ReplFrame::LeoQuery(ReplLeoQuery {
+            instance_id: self.instance_id.clone(),
+            org_id: key.0.clone(),
+            topic: key.1.clone(),
+            partition: key.2,
+            known_epoch: 0,
+            candidate_epoch: None,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
+        });
+        let exchange = async {
+            let (mut recv, mut send) = self.transport.open_query_stream(peer).await.ok()?;
+            frames::write_frame(&mut send, &query).await.ok()?;
+            match frames::read_frame(&mut recv).await.ok()? {
+                ReplFrame::LeoReply(reply) => Some(reply),
+                _ => None,
+            }
+        };
+        tokio::time::timeout(self.leo_query_timeout, exchange)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Tells `peer`, a follower of the partition this node leads at `epoch`,
+    /// that the in-sync set shrank to this leader. `true` when it answered
+    /// that it dropped its claim of being caught up with that term.
+    async fn send_isr_shrink(
+        &self,
+        key: &PartitionKey,
+        peer: &str,
+        epoch: u32,
+        generation: u64,
+        seq: u64,
+    ) -> bool {
+        let query = ReplFrame::LeoQuery(ReplLeoQuery {
+            instance_id: self.instance_id.clone(),
+            org_id: key.0.clone(),
+            topic: key.1.clone(),
+            partition: key.2,
+            known_epoch: epoch,
+            candidate_epoch: None,
+            isr_shrink_epoch: Some(epoch),
+            isr_shrink_generation: generation,
+            isr_shrink_seq: seq,
+        });
+        let exchange = async {
+            let (mut recv, mut send) = self.transport.open_query_stream(peer).await.ok()?;
+            frames::write_frame(&mut send, &query).await.ok()?;
+            match frames::read_frame(&mut recv).await.ok()? {
+                ReplFrame::LeoReply(reply) => Some(reply.isr_shrink_acked),
+                _ => None,
+            }
+        };
+        tokio::time::timeout(self.leo_query_timeout, exchange)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
+    /// The follower's side of `send_isr_shrink`: `sender`, the leader of the
+    /// partition at `epoch`, says its in-sync set is itself (shrink number
+    /// `seq`). This node drops the claim of being caught up with that term, and
+    /// keeps it dropped until a heartbeat lists it again and it has reached
+    /// the leader's position (`CaughtUp::revoke`), so it cannot stand on it
+    /// (`in_sync_since_start`).
+    ///
+    /// Acknowledged when the claim is gone, or never could be: this node
+    /// follows that leader, or holds no entry for the partition at all (it
+    /// cannot stand). Not while it is running an election for it or has
+    /// promised a newer term than the leader's: an election that read its claim
+    /// before this notice must not be outrun by the leader committing alone.
+    fn accept_isr_shrink(
+        &self,
+        key: &PartitionKey,
+        sender: &str,
+        epoch: u32,
+        generation: u64,
+        seq: u64,
+    ) -> bool {
+        let Some(entry) = self.registry.get(key) else {
+            return true;
+        };
+        let promoting = matches!(
+            entry.promotion,
+            PromotionState::Querying { .. }
+                | PromotionState::Proposing { .. }
+                | PromotionState::AwaitingMajority { .. }
+        );
+        if entry.role == LocalRole::Leader
+            || entry.assignment.topic_generation != generation
+            || entry.assignment.leader_epoch > epoch
+            || !entry.assignment.replicas.iter().any(|n| n == sender)
+            || promoting
+            || self.elections.contains(key)
+            || entry.promised_epoch > epoch
+        {
+            return false;
+        }
+        self.follower_factory
+            .revoke_caught_up(&entry.assignment, epoch, seq);
+        true
+    }
+
     /// Scans every `Follower` entry and starts an election for any whose
     /// lease has expired (per `FollowerRunner::lease_expired`) and who is
     /// still in the last known ISR (`election::should_start_election`).
@@ -3358,11 +3984,7 @@ impl ReplicationManager {
                 if !lease_expired {
                     entry.stand_after = None;
                 }
-                let in_isr = entry
-                    .assignment
-                    .isr
-                    .iter()
-                    .any(|n| n == &self.local_node_id);
+                let in_isr = self.in_isr_for_election(&entry);
                 // `Abandoned` is a finished attempt, not a running one: an
                 // election that lost, found no majority or could not propose
                 // must stand again on the next expired lease, or a partition
@@ -3562,10 +4184,13 @@ impl ReplicationManager {
         key: &PartitionKey,
         vote: bool,
     ) -> Option<(PromotionState, PartitionAssignment)> {
-        let (assignment, promised) = self
-            .registry
-            .get(key)
-            .map(|e| (e.assignment.clone(), e.promised_epoch))?;
+        let (assignment, promised, election_isr) = self.registry.get(key).map(|e| {
+            (
+                e.assignment.clone(),
+                e.promised_epoch,
+                self.isr_for_election(&e),
+            )
+        })?;
         let Some(slot) = assignment.epoch_slot(&self.local_node_id) else {
             // Only a set adopted from a leader's Hello, ahead of its ledger
             // row, can name this node without a slot; the row brings one.
@@ -3575,6 +4200,16 @@ impl ReplicationManager {
             );
             return None;
         };
+        if self.leader_may_still_be_there(&assignment) {
+            tracing::debug!(
+                org_id = %key.0, topic = %key.1, partition = key.2,
+                leader = %assignment.leader_node_id,
+                "replication: not standing — the leader has not been out of reach of the \
+                 mesh for the alone interval; only its replication stream may be down"
+            );
+            self.set_promotion(key, PromotionState::Idle);
+            return None;
+        }
         // Not provably in sync: this node may stand only when every other
         // replica answered (below), which shows none of them leads or holds
         // more. A restart of the whole replica set passes; a node that cannot
@@ -3596,7 +4231,7 @@ impl ReplicationManager {
         // raises its term. The pre-vote makes it rare: this round only runs
         // when the first one found nobody to defer to (logged below).
         let self_id = self.local_node_id.clone();
-        if vote && assignment.isr.iter().any(|m| m == &self.local_node_id) {
+        if vote && election_isr.iter().any(|m| m == &self.local_node_id) {
             match self.promise_term(key, &assignment, epoch, &self_id).await {
                 Promise::Made(recognized) if recognized > epoch => {
                     tracing::debug!(
@@ -3676,7 +4311,7 @@ impl ReplicationManager {
             epoch,
             vote,
             own,
-            isr: assignment.isr.clone(),
+            isr: election_isr,
             replicas: assignment.replicas.clone(),
             leo_query_deadline: leo_deadline,
         };
@@ -3747,7 +4382,15 @@ impl ReplicationManager {
             let first = self
                 .registry
                 .get_mut(key)
-                .map(|mut entry| !std::mem::replace(&mut entry.not_in_sync_logged, true))
+                .map(|mut entry| {
+                    let due = entry
+                        .not_in_sync_logged_at
+                        .is_none_or(|at| at.elapsed() >= NOT_IN_SYNC_LOG_EVERY);
+                    if due {
+                        entry.not_in_sync_logged_at = Some(Instant::now());
+                    }
+                    due
+                })
                 .unwrap_or(false);
             if first {
                 tracing::warn!(
@@ -3766,6 +4409,9 @@ impl ReplicationManager {
             self.set_promotion(key, PromotionState::Idle);
             return None;
         }
+        let all_counted = replies
+            .iter()
+            .all(|(_, reply)| reply.as_ref().is_some_and(counts));
         let mut deferral = None;
         let mut answered = 0usize;
         for (peer, reply) in replies {
@@ -3853,6 +4499,20 @@ impl ReplicationManager {
             return None;
         }
 
+        // The claim is read again: a leader's shrink notice that was
+        // acknowledged while the queries were out (before this round's
+        // promise could hold it off) took it away.
+        if wins_alone
+            && !all_counted
+            && !self
+                .registry
+                .get(key)
+                .is_some_and(|entry| self.in_sync_since_start(&entry))
+        {
+            self.set_promotion(key, PromotionState::Idle);
+            return None;
+        }
+
         // Nobody answered, and this node has not heard the leader since it
         // started: silence on a link that may merely be slow to come up is no
         // proof the leader is gone. Ask again on the next tick.
@@ -3911,6 +4571,40 @@ impl ReplicationManager {
                 .as_ref()
                 .and_then(|f| f.leader_isr())
                 .is_none_or(|isr| isr.iter().any(|n| n == &self.local_node_id))
+    }
+
+    /// Whether this node is in the in-sync set an election of `entry` goes by:
+    /// the persisted row's, or the one the leader last reported on its stream.
+    /// The row is written only when a leader is placed, so a replica that was
+    /// away at that moment stays missing from it for as long as that leader
+    /// lives, however long it has been caught up since; the leader's own
+    /// heartbeat names it. Without this such a replica never stands when that
+    /// leader dies.
+    fn in_isr_for_election(&self, entry: &PartitionEntry) -> bool {
+        entry
+            .assignment
+            .isr
+            .iter()
+            .any(|n| n == &self.local_node_id)
+            || entry
+                .follower
+                .as_ref()
+                .and_then(|f| f.leader_isr())
+                .is_some_and(|isr| isr.iter().any(|n| n == &self.local_node_id))
+    }
+
+    /// The in-sync set an election of `entry` is judged against: the row's,
+    /// with the members the leader last reported added.
+    fn isr_for_election(&self, entry: &PartitionEntry) -> Vec<String> {
+        let mut isr = entry.assignment.isr.clone();
+        if let Some(reported) = entry.follower.as_ref().and_then(|f| f.leader_isr()) {
+            for node in reported {
+                if !isr.contains(&node) && entry.assignment.replicas.contains(&node) {
+                    isr.push(node);
+                }
+            }
+        }
+        isr
     }
 
     fn leader_heard(&self, key: &PartitionKey) -> bool {
@@ -4112,6 +4806,9 @@ impl ReplicationManager {
             partition: key.2,
             known_epoch,
             candidate_epoch,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         });
         frames::write_frame(&mut send, &query).await.ok()?;
         match frames::read_frame(&mut recv).await.ok()? {
@@ -4588,6 +5285,27 @@ impl ReplicationCoordinator for ReplicationManager {
                 required,
             });
         }
+        // At RF 2 an ISR of this node alone is no licence to commit alone
+        // until the follower is known to be out of the way
+        // (`check_alone_rules`): one whose stream is merely down may be about
+        // to stand over this leader, and what is acknowledged here meanwhile
+        // would be taken back. `acks=leader` keeps its contract (acknowledged
+        // on append); its `hw` waits instead (`PartitionLeader::alone_blocked`).
+        if rf == 2
+            && isr_len == 1
+            && acks == Acks::All
+            && !entry
+                .leader
+                .as_ref()
+                .is_none_or(|handle| handle.alone_cleared())
+        {
+            return Err(ReplError::NotEnoughReplicas {
+                topic: topic.to_string(),
+                partition,
+                isr: isr_len,
+                required: 2,
+            });
+        }
         Ok(entry.assignment.leader_epoch)
     }
 
@@ -4632,13 +5350,36 @@ impl ReplicationCoordinator for ReplicationManager {
         loop {
             let started = Instant::now();
             let remaining = deadline.saturating_duration_since(started);
-            let required = required_acks(acks, wait.replicas, wait.handle.isr().len());
+            let required = required_acks(
+                acks,
+                wait.replicas,
+                wait.handle.isr().len(),
+                wait.handle.alone_cleared(),
+            );
             let slice = match acks {
                 Acks::All => remaining.min(ACKS_ALL_ISR_RECHECK),
                 Acks::Leader | Acks::Quorum => remaining,
             };
             let outcome = wait.handle.await_acks(next_offset, required, slice);
-            if outcome.acked_nodes >= outcome.required || Instant::now() >= deadline {
+            if outcome.acked_nodes >= outcome.required {
+                return Ok(outcome);
+            }
+            if Instant::now() >= deadline {
+                // Refused for want of the follower, not for a slow one: the
+                // write is on this leader's log only, and nothing may call it
+                // acknowledged. The caller may send it again.
+                if acks == Acks::All
+                    && wait.replicas == 2
+                    && wait.handle.isr().len() <= 1
+                    && !wait.handle.alone_cleared()
+                {
+                    return Err(ReplError::NotEnoughReplicas {
+                        topic: topic.to_string(),
+                        partition,
+                        isr: wait.handle.isr().len() as u32,
+                        required: 2,
+                    });
+                }
                 return Ok(outcome);
             }
             // The slice ran out, not the handle: re-read the live ISR.
@@ -5167,6 +5908,7 @@ impl ReplicationManager {
                 dry_run,
                 restore,
                 expected.map(|e| (e.node_id.as_str(), e.epoch)),
+                None,
             );
         }
         let leader = row.leader_node_id;
@@ -5265,8 +6007,19 @@ impl ReplicationManager {
         dry_run: bool,
         restore: &[String],
         expected: Option<(&str, u32)>,
+        deadline: Option<Instant>,
     ) -> Result<u32, ReplError> {
         let (org, topic, partition) = (key.0.as_str(), key.1.as_str(), key.2);
+        // Every wait below ends by `deadline` when there is one: a graceful
+        // stop hands over within a budget, and a transfer that outlasted it
+        // would hold the stop (and the writes it closed) for as long as its
+        // own, much longer, limits.
+        let cap = |until: Instant| deadline.map_or(until, |d| until.min(d));
+        let within = |limit: Duration| {
+            deadline.map_or(limit, |d| {
+                limit.min(d.saturating_duration_since(Instant::now()))
+            })
+        };
         let blocker = self
             .forward_handler
             .read()
@@ -5281,7 +6034,17 @@ impl ReplicationManager {
         }
         // A dry run changes nothing, so it does not queue behind a
         // reconfiguration that is waiting for the ledger.
-        let _serial = (!dry_run).then(|| self.reconfiguring.lock());
+        let _serial = match (dry_run, deadline) {
+            (true, _) => None,
+            (false, None) => Some(self.reconfiguring.lock()),
+            (false, Some(d)) => Some(self.reconfiguring.try_lock_until(d).ok_or_else(|| {
+                ReplError::TransferTargetBehind {
+                    topic: topic.to_string(),
+                    partition,
+                    node_id: target.to_string(),
+                }
+            })?),
+        };
         let assignment = self
             .current_row(key)
             .ok_or_else(|| ReplError::NoAssignment {
@@ -5363,7 +6126,7 @@ impl ReplicationManager {
             armed: closed,
         };
         // The writes are closed, so the log end read from here on is final.
-        let catch_up_until = Instant::now() + TRANSFER_CATCH_UP_MAX;
+        let catch_up_until = cap(Instant::now() + TRANSFER_CATCH_UP_MAX);
         while !caught_up() {
             if !handle.isr().iter().any(|n| n == target) || Instant::now() >= catch_up_until {
                 return Err(behind());
@@ -5371,7 +6134,7 @@ impl ReplicationManager {
             std::thread::sleep(TRANSFER_CATCH_UP_POLL);
         }
 
-        handle.flush_groups_to(target, TRANSFER_GROUPS_FLUSH_MAX);
+        handle.flush_groups_to(target, within(TRANSFER_GROUPS_FLUSH_MAX));
 
         let mut proposed = assignment.clone();
         proposed.leader_node_id = target.to_string();
@@ -5401,7 +6164,7 @@ impl ReplicationManager {
             if election::admitted_by_quorum(&acked, &proposed.replicas, &self.local_node_id) {
                 break true;
             }
-            if start.elapsed() >= TRANSFER_MAJORITY_TIMEOUT {
+            if Instant::now() >= cap(start + TRANSFER_MAJORITY_TIMEOUT) {
                 break false;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -5410,8 +6173,17 @@ impl ReplicationManager {
         // commit) are sent once more before this leader stops: the target is
         // about to serve them. What changes after this last send travels no
         // faster than any asynchronously replicated row.
-        handle.flush_groups_to(target, TRANSFER_GROUPS_FINAL_FLUSH_MAX);
-        let fate_known = admitted || self.row_shows_move(key, target, proposed.leader_epoch);
+        handle.flush_groups_to(target, within(TRANSFER_GROUPS_FINAL_FLUSH_MAX));
+        let fate_known =
+            admitted || self.row_shows_move(key, target, proposed.leader_epoch, deadline);
+        if fate_known {
+            // The target held every record this log does when the move was
+            // proposed (`caught_up` above, with the writes closed), so this
+            // node stays in sync under the new term. Without the mark it would
+            // be a follower that cannot show it, and the partition could not
+            // fail over to it when the new leader goes within moments.
+            self.follower_factory.note_led(&proposed);
+        }
         // Either way this leader stops leading: it was admitted, or it may
         // have been and nothing may land here until the ledger says.
         //
@@ -5479,11 +6251,78 @@ impl ReplicationManager {
         Ok(proposed.leader_epoch)
     }
 
+    /// Hands every partition this node leads to a replica of its in-sync set,
+    /// one after the other, for at most `budget`: a graceful stop that moves
+    /// the leaders first leaves the replicas a leader that is not a lease away
+    /// from being replaced, and nothing in flight to fail over. A partition
+    /// with no other replica in sync stays (a stop then costs the failover it
+    /// always did); one that fails to move is logged and left. Returns how
+    /// many moved.
+    pub async fn hand_over_leaders(self: &Arc<Self>, budget: Duration) -> usize {
+        let mut candidates: Vec<(PartitionKey, String)> = self
+            .registry
+            .iter()
+            .filter_map(|entry| {
+                if entry.role != LocalRole::Leader {
+                    return None;
+                }
+                let isr = entry.leader.as_ref()?.isr();
+                let target = entry
+                    .assignment
+                    .replicas
+                    .iter()
+                    .find(|n| **n != self.local_node_id && isr.contains(*n))?
+                    .clone();
+                Some((entry.key().clone(), target))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return 0;
+        }
+        // A fixed order: with a budget that may not reach every partition, which
+        // ones moved should not depend on the registry's iteration order.
+        candidates.sort();
+        let me = Arc::clone(self);
+        let deadline = Instant::now() + budget;
+        // Counted as they happen: a transfer still running when the budget
+        // ends is not waited for, and the ones that finished count.
+        let moved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&moved);
+        let moves = tokio::task::spawn_blocking(move || {
+            for (key, target) in candidates {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                match me.transfer_leader_here(&key, &target, false, &[], None, Some(deadline)) {
+                    Ok(_) => {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(e) => tracing::warn!(
+                        org_id = %key.0, topic = %key.1, partition = key.2, target = %target,
+                        error = %e,
+                        "replication: a leader could not be handed over before the stop"
+                    ),
+                }
+            }
+        });
+        let _ = tokio::time::timeout(budget, moves).await;
+        moved.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Whether the row, read again, shows `target` leading at `epoch` or
     /// later: the proposal was admitted although its acknowledgements were
     /// not seen in time. Looks for at most `TRANSFER_RESOLVE_MAX`.
-    fn row_shows_move(&self, key: &PartitionKey, target: &str, epoch: u32) -> bool {
-        let until = Instant::now() + TRANSFER_RESOLVE_MAX;
+    fn row_shows_move(
+        &self,
+        key: &PartitionKey,
+        target: &str,
+        epoch: u32,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let mut until = Instant::now() + TRANSFER_RESOLVE_MAX;
+        if let Some(d) = deadline {
+            until = until.min(d);
+        }
         loop {
             if self
                 .current_row(key)
@@ -5575,6 +6414,7 @@ impl ReplicationManager {
                 expected
                     .as_ref()
                     .map(|(node, epoch)| (node.as_str(), *epoch)),
+                None,
             )
         })
         .await;
@@ -5831,6 +6671,9 @@ async fn probe_features(
             partition: 0,
             known_epoch: 0,
             candidate_epoch: None,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         });
         frames::write_frame(&mut send, &query)
             .await
@@ -6783,6 +7626,7 @@ mod tests {
                         promises: true,
                         instance_unhosted: unhosted,
                         log_known: !unhosted,
+                        isr_shrink_acked: false,
                         bus_features: if knows_forwarding {
                             frames::LOCAL_BUS_FEATURES
                         } else {
@@ -6901,6 +7745,8 @@ mod tests {
                             promises: true,
                             instance_unhosted: false,
                             log_known: true,
+                            // A current build acknowledges a shrink notice.
+                            isr_shrink_acked: query.isr_shrink_epoch.is_some(),
                             bus_features: 0,
                         },
                         PeerScript::Reply(reply) => ReplLeoReply {
@@ -7174,6 +8020,10 @@ mod tests {
         /// Called with the number of `progress` looks so far; its answer, if
         /// any, replaces what `progress` holds for the replica.
         progress_script: Mutex<Option<Box<dyn Fn(usize) -> Option<ReplicaProgress> + Send>>>,
+        /// `alone_cleared`: a lone RF 2 leader may commit alone.
+        alone_cleared: AtomicBool,
+        /// How many times `set_alone_cleared(false)` stood for a shrink.
+        shrinks: AtomicU64,
     }
 
     impl FakeLeaderHandle {
@@ -7202,6 +8052,8 @@ mod tests {
                 events: Mutex::new(Vec::new()),
                 on_close: Mutex::new(None),
                 progress_script: Mutex::new(None),
+                alone_cleared: AtomicBool::new(true),
+                shrinks: AtomicU64::new(0),
             }
         }
 
@@ -7232,6 +8084,18 @@ mod tests {
     impl LeaderHandle for FakeLeaderHandle {
         fn isr(&self) -> Vec<String> {
             self.isr.lock().clone()
+        }
+        fn alone_cleared(&self) -> bool {
+            self.alone_cleared.load(Ordering::SeqCst)
+        }
+        fn set_alone_cleared(&self, cleared: bool) {
+            if !cleared {
+                self.shrinks.fetch_add(1, Ordering::SeqCst);
+            }
+            self.alone_cleared.store(cleared, Ordering::SeqCst);
+        }
+        fn shrink_seq(&self) -> u64 {
+            self.shrinks.load(Ordering::SeqCst)
         }
         fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
             let looks = {
@@ -7376,6 +8240,15 @@ mod tests {
     impl LeaderHandle for SharedFakeLeaderHandle {
         fn isr(&self) -> Vec<String> {
             self.0.isr()
+        }
+        fn alone_cleared(&self) -> bool {
+            self.0.alone_cleared()
+        }
+        fn set_alone_cleared(&self, cleared: bool) {
+            self.0.set_alone_cleared(cleared);
+        }
+        fn shrink_seq(&self) -> u64 {
+            self.0.shrink_seq()
         }
         fn replica_progress(&self, node_id: &str) -> Option<ReplicaProgress> {
             self.0.replica_progress(node_id)
@@ -7537,6 +8410,11 @@ mod tests {
         restart_grace: Mutex<Duration>,
         /// `lone_candidate_probe`; zero unless a test sets it.
         lone_probe: Mutex<Duration>,
+        /// `alone_after`: zero unless a test sets it.
+        alone_after: Mutex<Duration>,
+        /// How many times the leader's shrink notice made this node drop its
+        /// caught-up claim.
+        revoked: std::sync::atomic::AtomicU32,
         /// Every `fence_to_epoch` fails while set.
         fence_fails: AtomicBool,
         /// How long `fence_to_epoch` takes, as a slow disk would.
@@ -7563,6 +8441,8 @@ mod tests {
                 stagger: Mutex::new(Duration::ZERO),
                 restart_grace: Mutex::new(Duration::ZERO),
                 lone_probe: Mutex::new(Duration::ZERO),
+                alone_after: Mutex::new(Duration::ZERO),
+                revoked: std::sync::atomic::AtomicU32::new(0),
                 fence_fails: AtomicBool::new(false),
                 fence_delay: Mutex::new(Duration::ZERO),
                 caught_up: AtomicBool::new(true),
@@ -7636,6 +8516,15 @@ mod tests {
 
         fn lone_candidate_probe(&self) -> Duration {
             *self.lone_probe.lock()
+        }
+
+        fn alone_after(&self) -> Duration {
+            *self.alone_after.lock()
+        }
+
+        fn revoke_caught_up(&self, _assignment: &PartitionAssignment, _epoch: u32, _shrink: u64) {
+            self.revoked.fetch_add(1, Ordering::SeqCst);
+            self.caught_up.store(false, Ordering::SeqCst);
         }
 
         fn caught_up_since_start(&self, _assignment: &PartitionAssignment) -> bool {
@@ -9557,6 +10446,40 @@ mod tests {
         );
     }
 
+    /// The old leader of a moved partition holds what the new one holds, so
+    /// when the new one goes within moments (no frame of the new term reached
+    /// it) the partition must fail back to it, not wait for a node that may
+    /// never return.
+    #[tokio::test]
+    async fn the_old_leader_of_a_transfer_stands_when_the_new_leader_goes_at_once() {
+        let fx = build("l");
+        let a = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 4);
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        for raw in 1u8..=4 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f1".to_string()]);
+        }
+        fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+        let epoch = fx
+            .manager
+            .transfer_leader("org", "orders", 0, "f1")
+            .expect("transfer succeeds");
+        assert_eq!(fx.follower_factory.led_calls.load(Ordering::SeqCst), 1);
+
+        fx.transport.set_script("f1", PeerScript::Unreachable);
+        let moved = assignment("org", "orders", 0, "f1", &["f1", "l"], &["f1", "l"], epoch);
+        fx.assignments.seed(moved.clone());
+        fx.manager.apply_assignment(moved).await;
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { .. }
+        ));
+    }
+
     /// A transfer planned from a read of the row that has gone stale (the
     /// partition was moved since, or re-elected at another epoch) is refused
     /// by the leader and changes nothing; one that names the epoch the leader
@@ -9643,6 +10566,64 @@ mod tests {
         let handle = fx.leader_factory.handles.lock()[0].clone();
         handle.leo.store(100, Ordering::SeqCst);
         (fx, handle)
+    }
+
+    /// The hand-over before a stop is bounded by its budget in every wait, not
+    /// only in what the caller waits for: a transfer whose target never
+    /// catches up gives the writes back when the budget runs out, instead of
+    /// holding them closed for its own 2 s limit while the node is stopping.
+    #[tokio::test]
+    async fn a_handover_ends_its_waits_with_its_budget() {
+        let (fx, handle) = transfer_fixture().await;
+        handle.set_progress("f1", 40, 10 * 1024 * 1024);
+        let started = Instant::now();
+        let moved = fx
+            .manager
+            .hand_over_leaders(Duration::from_millis(400))
+            .await;
+        assert_eq!(moved, 0);
+        assert!(started.elapsed() < Duration::from_millis(900));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            handle.events.lock().contains(&"reopen"),
+            "the transfer must have given up with the budget, not at its own limit"
+        );
+        assert!(!handle.writes_closed.load(Ordering::SeqCst));
+    }
+
+    /// What moved before the budget ran out is reported as moved, and no
+    /// transfer starts once the budget is spent.
+    #[tokio::test]
+    async fn a_handover_counts_the_partitions_it_moved_before_its_budget_ran_out() {
+        let (fx, _first) = transfer_fixture().await;
+        let second = assignment(
+            "org",
+            "orders",
+            1,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            4,
+        );
+        fx.assignments.seed(second.clone());
+        fx.manager.apply_assignment(second).await;
+        let handles = fx.leader_factory.handles.lock().clone();
+        assert_eq!(handles.len(), 2);
+        for h in &handles {
+            h.leo.store(100, Ordering::SeqCst);
+        }
+        // Whichever partition is taken first moves; the other's target is far
+        // behind and holds the transfer until the budget ends.
+        handles[1].set_progress("f1", 40, 10 * 1024 * 1024);
+        handles[0].set_progress("f1", 100, 0);
+        let moved = fx
+            .manager
+            .hand_over_leaders(Duration::from_millis(700))
+            .await;
+        assert_eq!(moved, 1, "the one that moved is counted");
+        // The budget is spent: no third transfer, and no wait left running.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!handles[1].writes_closed.load(Ordering::SeqCst));
     }
 
     fn stored_orders(fx: &Fixture) -> PartitionAssignment {
@@ -10772,6 +11753,9 @@ mod tests {
                 partition: 0,
                 known_epoch: 3,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await;
@@ -10809,6 +11793,9 @@ mod tests {
                 partition: 0,
                 known_epoch: 4,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await;
@@ -10832,6 +11819,9 @@ mod tests {
                 partition: 9,
                 known_epoch: 0,
                 candidate_epoch: None,
+                isr_shrink_epoch: None,
+                isr_shrink_generation: 0,
+                isr_shrink_seq: 0,
             }),
         )
         .await;
@@ -11880,6 +12870,7 @@ mod tests {
             promises: true,
             instance_unhosted: false,
             log_known: true,
+            isr_shrink_acked: false,
             bus_features: 0,
         })
     }
@@ -12080,6 +13071,9 @@ mod tests {
             partition: 0,
             known_epoch: 4,
             candidate_epoch: None,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         });
         let leading = |reply: ReplFrame| match reply {
             ReplFrame::LeoReply(r) => r.leading,
@@ -12131,6 +13125,7 @@ mod tests {
                 promises: true,
                 instance_unhosted: false,
                 log_known: true,
+                isr_shrink_acked: false,
                 bus_features: 0,
             }),
         );
@@ -12290,6 +13285,9 @@ mod tests {
             partition: 0,
             known_epoch: 3,
             candidate_epoch: None,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         });
         let alive = |reply: ReplFrame| match reply {
             ReplFrame::LeoReply(r) => r.leader_alive,
@@ -12324,6 +13322,7 @@ mod tests {
                 promises: true,
                 instance_unhosted: false,
                 log_known: true,
+                isr_shrink_acked: false,
                 bus_features: 0,
             }),
         );
@@ -12401,6 +13400,7 @@ mod tests {
             ineligible: false,
             promises: true,
             log_known: true,
+            isr_shrink_acked: false,
             ..zeroed_reply()
         }
     }
@@ -12619,6 +13619,625 @@ mod tests {
         );
     }
 
+    // ---- RF 2: when a node may act alone ---------------------------------
+
+    /// One `LeoQuery` to `manager` as `remote`, answered through the real
+    /// accept path.
+    async fn leo_roundtrip_from(
+        manager: Arc<ReplicationManager>,
+        remote: &str,
+        query: ReplLeoQuery,
+    ) -> ReplLeoReply {
+        let remote = remote.to_string();
+        let (asker_side, answerer_side) = tokio::io::duplex(16 * 1024);
+        let (mut asker_recv, mut asker_send) = split(asker_side);
+        let (answerer_recv, answerer_send) = split(answerer_side);
+        tokio::spawn(async move {
+            manager
+                .accept_stream(remote, Box::new(answerer_recv), Box::new(answerer_send))
+                .await;
+        });
+        frames::write_frame(&mut asker_send, &ReplFrame::LeoQuery(query))
+            .await
+            .expect("write LeoQuery");
+        match frames::read_frame(&mut asker_recv)
+            .await
+            .expect("read LeoReply")
+        {
+            ReplFrame::LeoReply(reply) => reply,
+            other => panic!("expected LeoReply, got {other:?}"),
+        }
+    }
+
+    /// A leader at RF 2 whose follower left the in-sync set, the follower
+    /// reachable on the mesh.
+    async fn lone_rf2_leader(fx: &Fixture) -> Arc<FakeLeaderHandle> {
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.manager.apply_assignment(row).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        handle.set_isr(vec!["l".to_string()]);
+        handle.set_alone_cleared(false);
+        fx.manager.on_peer_connected("f");
+        handle
+    }
+
+    /// The leader does not commit alone because its stream is down: the
+    /// follower must acknowledge the shrink, or stay out of reach of the whole
+    /// mesh for `T_alone`. A notice nobody answers, to a peer the mesh still
+    /// reaches, moves nothing; the acknowledgement does.
+    #[tokio::test]
+    async fn a_lone_rf2_leader_commits_alone_once_the_follower_acknowledges_the_shrink() {
+        let fx = build("l");
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script("f", PeerScript::Unreachable);
+        for _ in 0..8 {
+            fx.manager.check_alone_rules().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            !handle.alone_cleared(),
+            "an unanswered notice to a reachable peer clears nothing"
+        );
+        fx.transport.set_script(
+            "f",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: false,
+            },
+        );
+        let cleared = async {
+            while !handle.alone_cleared() {
+                fx.manager.check_alone_rules().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), cleared)
+            .await
+            .expect("the acknowledged shrink clears the leader to commit alone");
+    }
+
+    /// `T_alone` is continuous unreachability: a peer that keeps reconnecting
+    /// restarts the count each time, however long the flapping goes on, and
+    /// one that stays gone is acted on once it has been gone that long.
+    #[tokio::test]
+    async fn a_lone_rf2_leader_commits_alone_only_after_a_continuous_stretch_out_of_reach() {
+        let fx = build("l");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(900);
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script("f", PeerScript::Unreachable);
+        // Gone for 500 ms, back for a moment, again and again: 3 s in all.
+        for _ in 0..6 {
+            fx.manager.on_peer_disconnected("f");
+            for _ in 0..5 {
+                fx.manager.check_alone_rules().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            fx.manager.on_peer_connected("f");
+        }
+        assert!(
+            !handle.alone_cleared(),
+            "a flap shorter than T_alone moves nobody"
+        );
+        fx.manager.on_peer_disconnected("f");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        fx.manager.check_alone_rules().await;
+        assert!(
+            handle.alone_cleared(),
+            "out of reach for longer than T_alone, the leader commits alone"
+        );
+    }
+
+    /// A heartbeat alone is enough to keep the clock at zero: the connection
+    /// reported down but the peer heard from is reachable.
+    #[tokio::test]
+    async fn a_heartbeat_resets_the_unreachable_clock_like_a_reconnect() {
+        let fx = build("l");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script("f", PeerScript::Unreachable);
+        fx.manager.on_peer_disconnected("f");
+        for _ in 0..15 {
+            fx.manager.note_peer_signal("f");
+            fx.manager.check_alone_rules().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!handle.alone_cleared(), "heartbeats keep the peer in reach");
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        fx.manager.check_alone_rules().await;
+        assert!(handle.alone_cleared(), "silence for T_alone clears it");
+    }
+
+    /// A killed peer leaves its connection standing and its heartbeat quiet:
+    /// unprobed and unanswering for `T_alone` past the stale window, it is out
+    /// of the way.
+    #[tokio::test]
+    async fn a_peer_whose_connection_stands_but_is_silent_and_deaf_is_out_of_the_way() {
+        let fx = build("l");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script("f", PeerScript::Unreachable);
+        let started = Instant::now();
+        let mut cleared_at = None;
+        while started.elapsed() < Duration::from_secs(5) {
+            fx.manager.check_alone_rules().await;
+            if handle.alone_cleared() {
+                cleared_at = Some(started.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cleared_at = cleared_at.expect("a silent, deaf peer is out of the way");
+        assert!(
+            cleared_at >= HEARTBEAT_STALE,
+            "cleared after {cleared_at:?}, before its heartbeat was even stale"
+        );
+    }
+
+    /// A heartbeat lost on a live connection is not a dead peer: the probe over
+    /// the query channel is answered, which keeps the peer in reach for as
+    /// long as it answers.
+    #[tokio::test]
+    async fn a_peer_with_a_lost_heartbeat_that_answers_its_probe_stays_in_reach() {
+        let fx = build("l");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script("f", leo_reply(0, 0, 3, 3, false));
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            fx.manager.check_alone_rules().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !handle.alone_cleared(),
+            "a peer that answers its probes is not out of the way"
+        );
+    }
+
+    /// A write admitted while the follower was in the in-sync set waits on
+    /// both replicas; when the follower drops out under it, the shrink does
+    /// not complete it: it is refused as `NotEnoughReplicas`, and was never
+    /// acknowledged.
+    #[tokio::test]
+    async fn an_acks_all_write_in_flight_across_the_shrink_is_refused_not_acknowledged() {
+        let fx = build("l");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.manager.apply_assignment(row).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        fx.manager.on_peer_connected("f");
+        assert_eq!(
+            fx.manager
+                .preflight("org", "orders", 0, Acks::All)
+                .expect("admitted with both replicas in sync"),
+            3
+        );
+        *handle.acked_override.lock() = Some(1);
+        *handle.ack_hold.lock() = Duration::from_secs(5);
+        let shrinker = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                handle.set_isr(vec!["l".to_string()]);
+                handle.set_alone_cleared(false);
+            })
+        };
+        let manager = Arc::clone(&fx.manager);
+        let outcome = tokio::task::spawn_blocking(move || {
+            manager.await_acks("org", "orders", 0, 1, Acks::All, Duration::from_secs(2))
+        })
+        .await
+        .expect("join");
+        shrinker.await.expect("shrinker");
+        assert!(
+            matches!(
+                outcome,
+                Err(ReplError::NotEnoughReplicas { required: 2, .. })
+            ),
+            "the shrink must not acknowledge the write, got {outcome:?}"
+        );
+        // And what comes after the shrink is refused up front.
+        assert!(matches!(
+            fx.manager.preflight("org", "orders", 0, Acks::All),
+            Err(ReplError::NotEnoughReplicas { required: 2, .. })
+        ));
+        // acks=leader keeps its contract: acknowledged on append.
+        assert!(fx
+            .manager
+            .preflight("org", "orders", 0, Acks::Leader)
+            .is_ok());
+    }
+
+    /// The follower's side of the notice: it drops its claim of being caught
+    /// up with the leader's term and says so, so it cannot stand on it.
+    #[tokio::test]
+    async fn an_isr_shrink_notice_makes_the_follower_drop_its_caught_up_claim() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let notice = |epoch: u32, generation: u64| ReplLeoQuery {
+            instance_id: row.instance_id.clone(),
+            org_id: row.org_id.clone(),
+            topic: row.topic.clone(),
+            partition: row.partition,
+            known_epoch: epoch,
+            candidate_epoch: None,
+            isr_shrink_epoch: Some(epoch),
+            isr_shrink_generation: generation,
+            isr_shrink_seq: 1,
+        };
+        // Not from a replica of the partition, or for another epoch or
+        // incarnation of the topic: no acknowledgement, the claim stands.
+        let stranger = leo_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "z",
+            notice(3, row.topic_generation),
+        )
+        .await;
+        assert!(!stranger.isr_shrink_acked);
+        let wrong_generation = leo_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "l",
+            notice(3, row.topic_generation + 1),
+        )
+        .await;
+        assert!(!wrong_generation.isr_shrink_acked);
+        let stale = leo_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "l",
+            notice(2, row.topic_generation),
+        )
+        .await;
+        assert!(!stale.isr_shrink_acked);
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 0);
+        assert!(fx.follower_factory.caught_up.load(Ordering::SeqCst));
+
+        let reply = leo_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "l",
+            notice(3, row.topic_generation),
+        )
+        .await;
+        assert!(reply.isr_shrink_acked);
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 1);
+        // Without the claim the follower stands only when every replica
+        // answers, and the leader does not: it does not stand alone.
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_ne!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 },
+            "a follower that dropped its claim must not stand alone"
+        );
+    }
+
+    fn shrink_notice(row: &PartitionAssignment, epoch: u32, seq: u64) -> ReplLeoQuery {
+        ReplLeoQuery {
+            instance_id: row.instance_id.clone(),
+            org_id: row.org_id.clone(),
+            topic: row.topic.clone(),
+            partition: row.partition,
+            known_epoch: epoch,
+            candidate_epoch: None,
+            isr_shrink_epoch: Some(epoch),
+            isr_shrink_generation: row.topic_generation,
+            isr_shrink_seq: seq,
+        }
+    }
+
+    /// A node that cannot stand on the partition at all — it holds no entry for
+    /// it, or its manager no longer serves — acknowledges the notice: there is
+    /// no claim to drop, and without the answer the leader would wait on a peer
+    /// that never can.
+    #[tokio::test]
+    async fn a_shrink_notice_is_acknowledged_by_a_node_that_holds_no_claim_to_drop() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        let unknown =
+            leo_roundtrip_from(Arc::clone(&fx.manager), "l", shrink_notice(&row, 3, 1)).await;
+        assert!(unknown.isr_shrink_acked, "no entry for the partition");
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 0);
+
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        fx.manager.shutdown();
+        let shut_down =
+            leo_roundtrip_from(Arc::clone(&fx.manager), "l", shrink_notice(&row, 3, 1)).await;
+        assert!(shut_down.isr_shrink_acked, "a manager that serves nothing");
+        assert!(!shut_down.log_known);
+    }
+
+    /// A node running an election for the partition, or that promised a newer
+    /// term than the leader's, does not acknowledge: its candidacy may have
+    /// read its claim already, and the leader committing alone on the answer
+    /// would be outrun by it.
+    #[tokio::test]
+    async fn a_shrink_notice_is_refused_while_the_node_stands_or_has_promised_a_newer_term() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        let ask = || async {
+            leo_roundtrip_from(Arc::clone(&fx.manager), "l", shrink_notice(&row, 3, 1))
+                .await
+                .isr_shrink_acked
+        };
+
+        fx.manager.elections.insert(key.clone());
+        assert!(!ask().await, "an election is running");
+        fx.manager.elections.remove(&key);
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 0);
+
+        fx.manager.registry.get_mut(&key).unwrap().promised_epoch = 9;
+        assert!(!ask().await, "a newer term was promised");
+        fx.manager.registry.get_mut(&key).unwrap().promised_epoch = 0;
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 0);
+
+        assert!(ask().await);
+        assert_eq!(fx.follower_factory.revoked.load(Ordering::SeqCst), 1);
+    }
+
+    /// The claim is read at the start of a round and again before the node
+    /// proposes: a shrink acknowledged while the queries were out takes it
+    /// away, and the leader may commit alone from then on.
+    #[tokio::test]
+    async fn a_claim_taken_away_while_the_queries_are_out_keeps_the_node_from_standing() {
+        for revoked_meanwhile in [false, true] {
+            let fx = build("f");
+            *fx.follower_factory.alone_after.lock() = Duration::from_millis(10);
+            let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+            fx.assignments.seed(row.clone());
+            fx.manager.apply_assignment(row.clone()).await;
+            fx.transport.set_script("l", PeerScript::Hang);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let election = {
+                let manager = Arc::clone(&fx.manager);
+                tokio::spawn(async move {
+                    manager
+                        .run_election(("org".to_string(), "orders".to_string(), 0))
+                        .await
+                })
+            };
+            if revoked_meanwhile {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                fx.follower_factory.caught_up.store(false, Ordering::SeqCst);
+            }
+            election.await.expect("election task");
+            assert_eq!(
+                matches!(
+                    fx.manager.role("org", "orders", 0),
+                    PartitionRole::Leader { .. }
+                ),
+                !revoked_meanwhile,
+                "revoked meanwhile: {revoked_meanwhile}"
+            );
+        }
+    }
+
+    fn acknowledging_reply() -> ReplLeoReply {
+        ReplLeoReply {
+            isr_shrink_acked: true,
+            ..a_live_leader_reply(3)
+        }
+    }
+
+    /// The acknowledgement of one shrink does not clear a later one: a follower
+    /// that came back and a shrink after it holds a claim again, and only the
+    /// answer to the notice of the shrink that stands clears the leader.
+    #[tokio::test]
+    async fn a_stale_acknowledgement_does_not_clear_a_later_shrink() {
+        let fx = build("l");
+        let handle = lone_rf2_leader(&fx).await;
+        fx.transport.set_script(
+            "f",
+            PeerScript::Slow(Duration::from_millis(500), acknowledging_reply()),
+        );
+        // Shrink 1: its notice goes out.
+        fx.manager.check_alone_rules().await;
+        // The follower recovers and drops out again while the answer is on its way.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.set_isr(vec!["l".to_string(), "f".to_string()]);
+        handle.set_isr(vec!["l".to_string()]);
+        handle.set_alone_cleared(false);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !handle.alone_cleared(),
+            "the answer to the first shrink must not clear the second"
+        );
+        // The next notice names the shrink that stands, and its answer clears.
+        let cleared = async {
+            while !handle.alone_cleared() {
+                fx.manager.check_alone_rules().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), cleared)
+            .await
+            .expect("the notice of the standing shrink is answered");
+    }
+
+    fn not_served_reply() -> ReplLeoReply {
+        ReplLeoReply {
+            leo: 0,
+            hw: 0,
+            leader_epoch: 0,
+            in_isr: false,
+            log_epoch: None,
+            leading: false,
+            ineligible: true,
+            committed: None,
+            leader_alive: false,
+            promised_epoch: None,
+            promises: true,
+            bus_features: 0,
+            instance_unhosted: true,
+            log_known: false,
+            isr_shrink_acked: false,
+        }
+    }
+
+    /// A peer the mesh vouches for whose bus answers every probe "not served
+    /// here" is no sign of life: the leader commits alone once that has gone on
+    /// for `T_alone`. One that answers with a real log, whatever the mesh says,
+    /// stays in reach.
+    #[tokio::test]
+    async fn a_peer_that_answers_probes_not_served_is_out_of_the_way_though_the_mesh_vouches() {
+        for (script, expect_cleared) in [
+            (PeerScript::Reply(not_served_reply()), true),
+            (leo_reply(0, 0, 3, 3, false), false),
+        ] {
+            let fx = build("l");
+            *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+            let handle = lone_rf2_leader(&fx).await;
+            fx.transport.set_script("f", script);
+            let started = Instant::now();
+            let mut cleared_at = None;
+            while started.elapsed() < Duration::from_secs(4) {
+                fx.manager.note_peer_signal("f");
+                fx.manager.check_alone_rules().await;
+                if handle.alone_cleared() {
+                    cleared_at = Some(started.elapsed());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(cleared_at.is_some(), expect_cleared, "{cleared_at:?}");
+            if let Some(at) = cleared_at {
+                assert!(at >= Duration::from_millis(700), "cleared after {at:?}");
+            }
+        }
+    }
+
+    /// Refusals are evidence only while they are an unbroken, renewed run on
+    /// the connection they were seen on: a stale run, an answer that says the
+    /// bus serves, and a mesh connect or disconnect each end it.
+    #[tokio::test]
+    async fn a_run_of_refusals_counts_only_while_it_is_unbroken_and_renewed() {
+        let fx = build("l");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(100);
+        let _handle = lone_rf2_leader(&fx).await;
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        fx.manager.on_peer_connected("f");
+        fx.manager.note_peer_signal("f");
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        let seed = |confirmed: Instant| {
+            fx.manager.refusals.insert(
+                key.clone(),
+                Refusal {
+                    peer: "f".to_string(),
+                    peer_leads: false,
+                    since: long_ago,
+                    confirmed,
+                },
+            );
+        };
+        let out_of_the_way = || fx.manager.peer_out_of_the_way("f", Some((&key, false)));
+
+        seed(Instant::now());
+        assert!(out_of_the_way(), "a renewed run of refusals counts");
+
+        seed(Instant::now() - REFUSAL_FRESH - Duration::from_millis(100));
+        assert!(!out_of_the_way(), "a run nobody renews is over");
+
+        seed(Instant::now());
+        let served = ReplLeoReply {
+            instance_unhosted: false,
+            log_known: true,
+            ..not_served_reply()
+        };
+        fx.manager.note_probe_answer("f", &key, &served, None);
+        assert!(!out_of_the_way(), "a served answer ends the run");
+
+        seed(Instant::now());
+        fx.manager.on_peer_connected("f");
+        assert!(!out_of_the_way(), "a mesh connect ends the run");
+
+        seed(Instant::now());
+        fx.manager.on_peer_disconnected("f");
+        assert!(
+            fx.manager.refusals.is_empty(),
+            "a mesh disconnect ends the run"
+        );
+
+        // The first refusal after a lapse starts a new run rather than
+        // inheriting the old start.
+        seed(Instant::now() - REFUSAL_FRESH - Duration::from_millis(100));
+        fx.manager
+            .note_probe_answer("f", &key, &not_served_reply(), None);
+        let run = fx.manager.refusals.get(&key).unwrap();
+        assert!(run.since.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The follower's side: a leader whose process heartbeats on the mesh but
+    /// whose bus does not serve the partition (or serves it as no leader of
+    /// this term) is no longer deferred to once that has gone on for `T_alone`;
+    /// a leader that answers as the leader of this term is deferred to for as
+    /// long as it does.
+    #[tokio::test]
+    async fn a_follower_stops_deferring_to_a_leader_whose_bus_does_not_lead_the_partition() {
+        for (script, defers) in [
+            (PeerScript::Reply(not_served_reply()), false),
+            (PeerScript::Reply(a_live_leader_reply(2)), false),
+            (PeerScript::Reply(a_live_leader_reply(3)), true),
+        ] {
+            let fx = build("f");
+            *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+            let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+            fx.assignments.seed(row.clone());
+            fx.manager.apply_assignment(row.clone()).await;
+            fx.manager.on_peer_connected("l");
+            fx.transport.set_script("l", script);
+            assert!(fx.manager.leader_may_still_be_there(&row));
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(2500) {
+                fx.manager.note_peer_signal("l");
+                fx.manager.check_alone_rules().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(fx.manager.leader_may_still_be_there(&row), defers);
+        }
+    }
+
+    /// At RF 2 a follower stands alone over a silent leader only once the
+    /// leader has been out of reach of the whole mesh for `T_alone`; a leader
+    /// the mesh still reaches keeps the partition however long its stream has
+    /// been down.
+    #[tokio::test]
+    async fn an_rf2_follower_stands_alone_only_after_t_alone_of_unreachability() {
+        let fx = build("f");
+        *fx.follower_factory.alone_after.lock() = Duration::from_millis(900);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+        fx.manager.on_peer_connected("l");
+        let role = || fx.manager.role("org", "orders", 0);
+        let led = || matches!(role(), PartitionRole::Leader { .. });
+        // Reachable: never, however long.
+        for _ in 0..4 {
+            tokio::time::sleep(PAST_THE_LEASE).await;
+            fx.manager.note_peer_signal("l");
+            fx.manager.check_leases().await;
+            fx.manager.settle_elections().await;
+        }
+        assert!(!led(), "a leader the mesh reaches is not stood over");
+        // Gone, back, gone: each return restarts the count.
+        for _ in 0..3 {
+            fx.manager.on_peer_disconnected("l");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            fx.manager.check_leases().await;
+            fx.manager.settle_elections().await;
+            fx.manager.on_peer_connected("l");
+        }
+        assert!(!led(), "a flap shorter than T_alone moves nobody");
+        fx.manager.on_peer_disconnected("l");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(led(), "out of reach for T_alone, the follower stands");
+    }
+
     fn a_live_leader_reply(epoch: u32) -> ReplLeoReply {
         ReplLeoReply {
             leo: 0,
@@ -12634,6 +14253,7 @@ mod tests {
             promises: true,
             instance_unhosted: false,
             log_known: true,
+            isr_shrink_acked: false,
             bus_features: 0,
         }
     }
@@ -13200,8 +14820,13 @@ mod tests {
             .stored(&key)
             .is_some_and(|a| a.leader_epoch == 3));
         assert!(
-            fx.manager.registry.get(&key).unwrap().not_in_sync_logged,
-            "the hold-back is said once"
+            fx.manager
+                .registry
+                .get(&key)
+                .unwrap()
+                .not_in_sync_logged_at
+                .is_some(),
+            "the hold-back is said"
         );
         // Caught up with a leader: the same silence now means the leader is gone.
         fx.follower_factory.caught_up.store(true, Ordering::SeqCst);
@@ -13256,6 +14881,7 @@ mod tests {
             bus_features: 0,
             instance_unhosted: true,
             log_known: false,
+            isr_shrink_acked: false,
         }
     }
 
@@ -13364,6 +14990,39 @@ mod tests {
         let handle = fx.follower_factory.handles.lock().last().unwrap().clone();
         *handle.leader_isr.lock() = Some(vec!["l".to_string()]);
         handle.lease_expired.store(true, Ordering::SeqCst);
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower { epoch: 3, .. }
+        ));
+        *handle.leader_isr.lock() = Some(vec!["l".to_string(), "f".to_string()]);
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+    }
+
+    /// The persisted row names the in-sync set as it was when the leader was
+    /// placed. A replica that was away then stays out of it however long it
+    /// has been caught up since, and would never stand when that leader dies
+    /// (the survivor of the third e2e restart, which stood for nothing). The
+    /// leader's own report of its in-sync set is the live one.
+    #[tokio::test]
+    async fn a_replica_the_row_leaves_out_stands_when_the_leader_reported_it_in_sync() {
+        let fx = build("f");
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let ack = hello_roundtrip(fx.manager.clone(), hello_from(&row)).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        let handle = fx.follower_factory.handles.lock().last().unwrap().clone();
+        handle.lease_expired.store(true, Ordering::SeqCst);
+        // The leader never said this node was in sync: the row stands.
+        *handle.leader_isr.lock() = Some(vec!["l".to_string()]);
         fx.manager.check_leases().await;
         fx.manager.settle_elections().await;
         assert!(matches!(
@@ -13664,6 +15323,9 @@ mod tests {
             partition: a.partition,
             known_epoch: a.leader_epoch,
             candidate_epoch,
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         })
     }
 
@@ -13792,6 +15454,7 @@ mod tests {
                 promises: true,
                 instance_unhosted: false,
                 log_known: true,
+                isr_shrink_acked: false,
                 bus_features: 0,
             }),
         );
@@ -14215,6 +15878,7 @@ mod tests {
                 promises: true,
                 instance_unhosted: false,
                 log_known: true,
+                isr_shrink_acked: false,
                 bus_features: 0,
             }),
         );

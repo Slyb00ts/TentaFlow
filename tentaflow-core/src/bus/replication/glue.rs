@@ -782,6 +782,22 @@ impl LeaderHandle for GlueLeaderHandle {
         self.0.leader.has_quorum_lease()
     }
 
+    fn alone_cleared(&self) -> bool {
+        self.0.leader.alone_cleared()
+    }
+
+    fn set_alone_cleared(&self, cleared: bool) {
+        self.0.leader.set_alone_cleared(cleared);
+    }
+
+    fn shrink_seq(&self) -> u64 {
+        self.0.leader.shrink_seq()
+    }
+
+    fn grant_alone_if_unshrunk(&self, seq: u64) -> bool {
+        self.0.leader.grant_alone_if_unshrunk(seq)
+    }
+
     fn replica_ack_age(&self, node_id: &str) -> Option<Duration> {
         self.0
             .leader
@@ -1019,6 +1035,7 @@ pub struct GlueFollowerFactory {
     config: FollowerConfig,
     restart_stand_grace: Duration,
     lone_candidate_probe: Duration,
+    alone_after: Duration,
     /// Per partition incarnation: whether this process has seen the local log
     /// reach the leader's high watermark, or has led it
     /// (`FollowerRunnerFactory::caught_up_since_start`).
@@ -1048,6 +1065,7 @@ impl GlueFollowerFactory {
             config,
             restart_stand_grace: RESTART_STAND_GRACE,
             lone_candidate_probe: LONE_CANDIDATE_PROBE,
+            alone_after: super::manager::ALONE_AFTER,
             caught_up: dashmap::DashMap::new(),
             audit: None,
         }
@@ -1079,6 +1097,14 @@ impl GlueFollowerFactory {
             .entry(caught_up_key(assignment))
             .or_default()
             .clone()
+    }
+
+    /// Replaces `T_alone`, how long a peer must be out of reach of the whole
+    /// mesh before a replica acts without it (`ReplicationManager::
+    /// check_alone_rules`).
+    pub fn with_alone_after(mut self, alone_after: Duration) -> Self {
+        self.alone_after = alone_after;
+        self
     }
 
     /// Replaces the delays before a replica no other replica answered stands
@@ -1137,6 +1163,14 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
 
     fn lone_candidate_probe(&self) -> Duration {
         self.lone_candidate_probe
+    }
+
+    fn alone_after(&self) -> Duration {
+        self.alone_after
+    }
+
+    fn revoke_caught_up(&self, assignment: &PartitionAssignment, epoch: u32, shrink: u64) {
+        self.caught_up_flag(assignment).revoke(epoch, shrink);
     }
 
     fn local_log_position(
@@ -1541,6 +1575,28 @@ impl ReplAudit for AuditLogReplAudit {
             None,
             None,
             "bus.leader.tail_discarded",
+            Some(topic),
+            Some(&details),
+            None,
+            Some(&self.local_node_id),
+        );
+    }
+
+    fn alone_refused(&self, org: &str, topic: &str, partition: u32, peer: &str, refused_s: u64) {
+        let details = format!(
+            "instance_id={instance} org_id={org} partition={partition} peer={peer} \
+             refused_s={refused_s}",
+            instance = if self.instance_id.is_empty() {
+                "-"
+            } else {
+                self.instance_id.as_str()
+            },
+        );
+        let _ = crate::db::repository::log_audit(
+            &self.db,
+            None,
+            None,
+            "bus.leader.alone_refused",
             Some(topic),
             Some(&details),
             None,

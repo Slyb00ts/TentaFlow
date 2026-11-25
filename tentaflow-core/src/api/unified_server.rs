@@ -679,12 +679,8 @@ pub fn start_unified_server_with_permissions(
                                                     r#"{"error":{"type":"authentication_error","message":"Blad weryfikacji API key","code":"api_key_verification_unavailable"}}"#,
                                                 ),
                                                 Ok(pepper) => {
-                                            let verifier =
-                                                crate::api::dashboard::auth::api_key_verifier(
-                                                    key, &pepper,
-                                                );
-                                            match crate::db::repository::verify_api_key(
-                                                &db, &verifier,
+                                            match crate::api::dashboard::auth::verify_api_key_any_pepper(
+                                                &db, &sc, key, &pepper,
                                             ) {
                                                 Ok(Some(api_key_row)) => {
                                                     // Capture the per-key budget regardless of type;

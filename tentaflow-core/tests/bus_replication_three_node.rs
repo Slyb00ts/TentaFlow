@@ -551,6 +551,81 @@ struct TransportRegistry {
     blocked: Mutex<Vec<(String, String)>>,
     /// Every stream opened for a forwarded publish, as (from, to), in order.
     forward_streams: Mutex<Vec<(String, String)>>,
+    /// Directed `(from, to)` pairs whose replication streams (not queries,
+    /// not forwards) cannot be dialed: the stream is down while the link
+    /// otherwise works.
+    blocked_replication: Mutex<Vec<(String, String)>>,
+    /// Directed `(from, to)` pairs whose `LeoQuery` streams cannot be dialed.
+    blocked_queries: Mutex<Vec<(String, String)>>,
+    /// Every replication stream opened, as (from, to), with the token that
+    /// severs it: a scenario breaks the streams that are already open.
+    replication_streams: Mutex<Vec<(String, String, tokio_util::sync::CancellationToken)>>,
+    /// Per directed `(leader, follower)` pair, the gate on what the follower
+    /// writes to its replication streams (its acknowledgements).
+    ack_gates: Mutex<HashMap<(String, String), Arc<AckGate>>>,
+}
+
+/// While stalled, the follower's writes on a replication stream do not
+/// complete: its acknowledgements stop while the stream, and everything the
+/// leader sends, stays up.
+#[derive(Default)]
+struct AckGate {
+    stalled: AtomicBool,
+    wakers: Mutex<Vec<std::task::Waker>>,
+}
+
+impl AckGate {
+    fn set_stalled(&self, stalled: bool) {
+        self.stalled.store(stalled, Ordering::SeqCst);
+        if !stalled {
+            for waker in self.wakers.lock().drain(..) {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// The follower's writer of a replication stream, held at its `AckGate`.
+struct Gated<T> {
+    inner: T,
+    gate: Arc<AckGate>,
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Gated<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.gate.stalled.load(Ordering::SeqCst) {
+            self.gate.wakers.lock().push(cx.waker().clone());
+            if self.gate.stalled.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Replication,
+    Query,
+    Forward,
 }
 
 impl TransportRegistry {
@@ -561,7 +636,50 @@ impl TransportRegistry {
             cut: Mutex::new(Vec::new()),
             blocked: Mutex::new(Vec::new()),
             forward_streams: Mutex::new(Vec::new()),
+            blocked_replication: Mutex::new(Vec::new()),
+            blocked_queries: Mutex::new(Vec::new()),
+            replication_streams: Mutex::new(Vec::new()),
+            ack_gates: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn ack_gate(&self, leader: &str, follower: &str) -> Arc<AckGate> {
+        Arc::clone(
+            self.ack_gates
+                .lock()
+                .entry((leader.to_string(), follower.to_string()))
+                .or_default(),
+        )
+    }
+
+    /// Holds back (or releases) what `follower` writes to the replication
+    /// streams `leader` opened to it.
+    fn stall_acks(&self, leader: &str, follower: &str, stalled: bool) {
+        self.ack_gate(leader, follower).set_stalled(stalled);
+    }
+
+    /// Breaks every replication stream from `from` to `to` and refuses new
+    /// ones, leaving queries and forwards alone.
+    fn break_replication(&self, from: &str, to: &str) {
+        self.blocked_replication
+            .lock()
+            .push((from.to_string(), to.to_string()));
+        for (f, t, cut) in self.replication_streams.lock().iter() {
+            if f == from && t == to {
+                cut.cancel();
+            }
+        }
+    }
+
+    fn block_queries(&self, from: &str, to: &str) {
+        self.blocked_queries
+            .lock()
+            .push((from.to_string(), to.to_string()));
+    }
+
+    fn restore_replication(&self) {
+        self.blocked_replication.lock().clear();
+        self.blocked_queries.lock().clear();
     }
 
     fn forwards(&self) -> Vec<(String, String)> {
@@ -626,10 +744,40 @@ impl Transport for DuplexTransport {
             .forward_streams
             .lock()
             .push((self.local_node_id.clone(), node_id.to_string()));
-        self.open_stream(node_id).await
+        self.open_kind(node_id, StreamKind::Forward).await
+    }
+
+    async fn open_query_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        self.open_kind(node_id, StreamKind::Query).await
     }
 
     async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        self.open_kind(node_id, StreamKind::Replication).await
+    }
+}
+
+impl DuplexTransport {
+    async fn open_kind(
+        &self,
+        node_id: &str,
+        kind: StreamKind,
+    ) -> Result<(BusRecv, BusSend), ReplError> {
+        let blocked_kind = match kind {
+            StreamKind::Replication => Some(&self.registry.blocked_replication),
+            StreamKind::Query => Some(&self.registry.blocked_queries),
+            StreamKind::Forward => None,
+        };
+        if blocked_kind.is_some_and(|pairs| {
+            pairs
+                .lock()
+                .iter()
+                .any(|(from, to)| from == &self.local_node_id && to == node_id)
+        }) {
+            return Err(ReplError::Internal(format!(
+                "link '{}' to '{node_id}' refuses this stream",
+                self.local_node_id
+            )));
+        }
         if self.registry.is_cut(&self.local_node_id, node_id)
             || self
                 .registry
@@ -663,12 +811,100 @@ impl Transport for DuplexTransport {
         let (our_r, our_w) = split(a);
         let (their_r, their_w) = split(b);
         let peer = self.local_node_id.clone();
-        tokio::spawn(async move {
-            manager
-                .accept_stream(peer, Box::new(their_r), Box::new(their_w))
-                .await;
+        let cut = tokio_util::sync::CancellationToken::new();
+        if kind == StreamKind::Replication {
+            self.registry.replication_streams.lock().push((
+                self.local_node_id.clone(),
+                node_id.to_string(),
+                cut.clone(),
+            ));
+        }
+        let gate = self.registry.ack_gate(&self.local_node_id, node_id);
+        tokio::spawn({
+            let (r, w) = (Severable::new(their_r, &cut), Severable::new(their_w, &cut));
+            async move {
+                if kind == StreamKind::Replication {
+                    let w = Gated { inner: w, gate };
+                    manager.accept_stream(peer, Box::new(r), Box::new(w)).await;
+                } else {
+                    manager.accept_stream(peer, Box::new(r), Box::new(w)).await;
+                }
+            }
         });
-        Ok((Box::new(our_r), Box::new(our_w)))
+        Ok((
+            Box::new(Severable::new(our_r, &cut)),
+            Box::new(Severable::new(our_w, &cut)),
+        ))
+    }
+}
+
+/// One half of a stream that fails, on both ends, once its token is cancelled:
+/// the link broke under a stream that was open.
+struct Severable<T> {
+    inner: T,
+    cut: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+impl<T> Severable<T> {
+    fn new(inner: T, token: &tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            inner,
+            cut: Box::pin(token.clone().cancelled_owned()),
+        }
+    }
+
+    fn severed(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        std::future::Future::poll(self.cut.as_mut(), cx).is_ready()
+    }
+}
+
+fn broken_pipe() -> std::io::Error {
+    std::io::ErrorKind::BrokenPipe.into()
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Severable<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.severed(cx) {
+            return std::task::Poll::Ready(Err(broken_pipe()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Severable<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.severed(cx) {
+            return std::task::Poll::Ready(Err(broken_pipe()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.severed(cx) {
+            return std::task::Poll::Ready(Err(broken_pipe()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.severed(cx) {
+            return std::task::Poll::Ready(Err(broken_pipe()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -712,6 +948,11 @@ fn follower_config() -> FollowerConfig {
 }
 
 const LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// `T_alone` of the test nodes: how long a peer must be out of reach of the
+/// whole mesh before a replica acts without it. The production value is 5 s;
+/// the scenarios here scale their flaps and silences against this one.
+const TEST_ALONE_AFTER: Duration = Duration::from_millis(1500);
 const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Makes `user` a member of the suite's organisation on one node's own
@@ -807,7 +1048,8 @@ fn build_node_on(
     // is no restart whose link to wait for.
     let follower_factory = Arc::new(
         GlueFollowerFactory::new(id, env, Arc::clone(&provider), follower_config())
-            .with_stand_delays(Duration::ZERO, Duration::ZERO),
+            .with_stand_delays(Duration::ZERO, Duration::ZERO)
+            .with_alone_after(TEST_ALONE_AFTER),
     );
     let audit = Arc::new(AuditLogReplAudit::new(db.clone(), id));
     let ledger = Arc::new(NodeLedger {
@@ -865,7 +1107,26 @@ fn spawn_lease_check_loop(node: &TestNode) {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => manager.check_leases().await,
+                _ = ticker.tick() => {
+                    manager.check_leases().await;
+                    manager.check_alone_rules().await;
+                }
+            }
+        }
+    });
+}
+
+/// Only the RF 2 rule of the periodic tick: a leader that starts alone commits
+/// once the manager has cleared it.
+fn spawn_alone_rule_loop(node: &TestNode) {
+    let manager = Arc::clone(&node.manager);
+    let shutdown = manager.shutdown_token();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(LEASE_CHECK_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => manager.check_alone_rules().await,
             }
         }
     });
@@ -2065,10 +2326,12 @@ async fn a_lone_rf2_leader_keeps_its_appends_readable_after_the_follower_dies() 
             .unwrap_or_else(|e| panic!("publish {i} with the follower dead: {e:?}"));
     }
     assert_eq!(log_end_offset(a, 0), 7);
-    assert_eq!(
-        high_watermark(a, 0),
-        7,
-        "records the leader accepted must be readable"
+    // Appended at once (`acks=leader`), committed once the follower is known
+    // to be out of the way (`T_alone` on the mesh, which never saw it here).
+    assert!(
+        wait_until(Duration::from_secs(10), || high_watermark(a, 0) == 7).await,
+        "records the leader accepted must become readable, hw={}",
+        high_watermark(a, 0)
     );
     let read = consume_bounded(a, ctx(), "fresh-group", 1024 * 1024, usize::MAX)
         .await
@@ -4008,6 +4271,7 @@ async fn an_rf2_split_where_both_replicas_lead_heals_onto_one_chain() {
     followed_the_first_leader(&nodes, 1).await;
     for node in &nodes {
         spawn_assignment_poll_loop(node);
+        spawn_alone_rule_loop(node);
     }
     let watch = SameEpochWatch::start(&nodes);
     let key: PartitionKey = (ORG.to_string(), TOPIC.to_string(), 0);
@@ -4067,6 +4331,739 @@ async fn an_rf2_split_where_both_replicas_lead_heals_onto_one_chain() {
         violated.push(format!(
             "the surviving chain must be exactly one side's: {a_log:?}"
         ));
+    }
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+/// What the mesh tells two replicas about each other: a connection and a
+/// heartbeat every 100 ms, each of which a scenario can withdraw per
+/// direction, and connect events it can fire.
+struct MeshEmulation {
+    a: Arc<ReplicationManager>,
+    b: Arc<ReplicationManager>,
+    /// `A` hears `B`'s heartbeats.
+    a_hears_b: Arc<AtomicBool>,
+    /// `B` hears `A`'s heartbeats.
+    b_hears_a: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MeshEmulation {
+    fn start(a: &TestNode, b: &TestNode) -> Self {
+        a.manager.on_peer_connected(&b.id);
+        b.manager.on_peer_connected(&a.id);
+        let a_hears_b = Arc::new(AtomicBool::new(true));
+        let b_hears_a = Arc::new(AtomicBool::new(true));
+        let task = {
+            let (am, bm) = (Arc::clone(&a.manager), Arc::clone(&b.manager));
+            let (a_id, b_id) = (a.id.clone(), b.id.clone());
+            let (ab, ba) = (Arc::clone(&a_hears_b), Arc::clone(&b_hears_a));
+            tokio::spawn(async move {
+                loop {
+                    if ab.load(Ordering::SeqCst) {
+                        am.note_peer_signal(&b_id);
+                    }
+                    if ba.load(Ordering::SeqCst) {
+                        bm.note_peer_signal(&a_id);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        Self {
+            a: Arc::clone(&a.manager),
+            b: Arc::clone(&b.manager),
+            a_hears_b,
+            b_hears_a,
+            task,
+        }
+    }
+
+    /// Both replicas lose their connection to each other.
+    fn disconnect(&self, a_id: &str, b_id: &str) {
+        self.a_hears_b.store(false, Ordering::SeqCst);
+        self.b_hears_a.store(false, Ordering::SeqCst);
+        self.a.on_peer_disconnected(b_id);
+        self.b.on_peer_disconnected(a_id);
+    }
+
+    /// Both reconnect.
+    fn connect(&self, a_id: &str, b_id: &str) {
+        self.a.on_peer_connected(b_id);
+        self.b.on_peer_connected(a_id);
+        self.a_hears_b.store(true, Ordering::SeqCst);
+        self.b_hears_a.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for MeshEmulation {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// An RF 2 cluster `A` (leader, `acks=all`) and `B`, five records written and
+/// on both, the mesh between them up.
+async fn rf2_pair_with_five_acknowledged_writes() -> (
+    Vec<TestNode>,
+    Arc<TransportRegistry>,
+    MeshEmulation,
+    Vec<String>,
+) {
+    let (nodes, _ledger, registry) = build_cluster_placed(1, Acks::All, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let mesh = {
+        let a = find_node(&nodes, "A");
+        let b = find_node(&nodes, "B");
+        MeshEmulation::start(a, b)
+    };
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let mut acked = Vec::new();
+    for i in 0..5 {
+        let payload = format!("pre-{i}");
+        assert!(
+            publish_until_accepted(a, &payload, Duration::from_secs(10)).await,
+            "{payload} was never accepted"
+        );
+        acked.push(payload);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || log_end_offset(b, 0) >= 5).await,
+        "the follower never caught up before the stream broke"
+    );
+    (nodes, registry, mesh, acked)
+}
+
+fn leads(node: &TestNode) -> bool {
+    matches!(
+        node.manager.role(ORG, TOPIC, 0),
+        PartitionRole::Leader { .. }
+    )
+}
+
+/// Publishes to `a` every 100 ms for `duration`; the payloads it acknowledged,
+/// and whether `stood` (a node that must not lead) ever did.
+async fn publish_for(
+    a: &TestNode,
+    stood: &TestNode,
+    duration: Duration,
+    tag: &str,
+) -> (Vec<String>, bool) {
+    let mut acked = Vec::new();
+    let mut stood_up = false;
+    let started = tokio::time::Instant::now();
+    let mut n = 0u32;
+    while started.elapsed() < duration {
+        stood_up |= leads(stood);
+        let payload = format!("{tag}-{n}");
+        n += 1;
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), publish_text(a, Some(0), &payload)).await,
+            Ok(Ok(_))
+        ) {
+            acked.push(payload);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (acked, stood_up)
+}
+
+/// The invariants of every RF 2 scenario: nobody stood, what was acknowledged
+/// is on both replicas once they rejoin.
+async fn rf2_outcome(
+    nodes: &[TestNode],
+    registry: &TransportRegistry,
+    acked: &[String],
+    stood: bool,
+) -> Vec<String> {
+    let a = find_node(nodes, "A");
+    let b = find_node(nodes, "B");
+    registry.restore_replication();
+    let healed = wait_until(Duration::from_secs(40), || {
+        log_end_offset(b, 0) == log_end_offset(a, 0) && log_end_offset(b, 0) > 0
+    })
+    .await;
+    let after = publish_until_accepted(a, "after-heal", Duration::from_secs(20)).await;
+    let (a_payloads, b_payloads) = (text_payloads(a), text_payloads(b));
+    let mut violated = Vec::new();
+    if stood || leads(b) {
+        violated.push("the follower stood over a leader that was still there".to_string());
+    }
+    if !healed || !after {
+        violated.push(format!(
+            "the replicas did not rejoin: healed={healed} after={after}"
+        ));
+    }
+    let lost: Vec<&String> = acked
+        .iter()
+        .filter(|p| !a_payloads.contains(p) || !b_payloads.contains(p))
+        .collect();
+    if !lost.is_empty() {
+        violated.push(format!("acknowledged writes missing: {lost:?}"));
+    }
+    violated
+}
+
+/// The shape of the e2e loss at RF 2 (pass 4, restart 7), with the mesh
+/// flapping: the replication stream is down and nothing can be asked across
+/// it, and every few seconds the mesh connection drops for less than
+/// `T_alone` and comes back. Both replicas see the same thing. Neither may
+/// act alone on it: the follower never stands, the leader never acknowledges
+/// an `acks=all` write, and what was acknowledged before is on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_symmetric_flap_with_the_stream_down_moves_nobody_and_loses_no_write() {
+    let (nodes, registry, mesh, mut acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    registry.break_replication("A", "B");
+    registry.block_queries("A", "B");
+    registry.block_queries("B", "A");
+
+    // The mesh flaps on a timer of its own, whatever the writes are doing:
+    // down for 700 ms of every 2 s, well under `T_alone` each time and over
+    // 13 s several times `T_alone` in all.
+    let flapper = {
+        let (am, bm) = (Arc::clone(&a.manager), Arc::clone(&b.manager));
+        let (ab, ba) = (Arc::clone(&mesh.a_hears_b), Arc::clone(&mesh.b_hears_a));
+        tokio::spawn(async move {
+            loop {
+                ab.store(false, Ordering::SeqCst);
+                ba.store(false, Ordering::SeqCst);
+                am.on_peer_disconnected("B");
+                bm.on_peer_disconnected("A");
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                am.on_peer_connected("B");
+                bm.on_peer_connected("A");
+                ab.store(true, Ordering::SeqCst);
+                ba.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1_300)).await;
+            }
+        })
+    };
+    let (during, stood) = publish_for(a, b, Duration::from_secs(13), "during").await;
+    flapper.abort();
+    mesh.connect("A", "B");
+    let mut violated = rf2_outcome(&nodes, &registry, &acked, stood).await;
+    shutdown_all(&nodes);
+    if !during.is_empty() {
+        violated.push(format!(
+            "writes acknowledged with the follower out of reach of the stream: {during:?}"
+        ));
+    }
+    acked.extend(during);
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+/// Heartbeat loss on a live mesh connection, the stream down. First one way:
+/// `A` hears nothing of `B` and cannot reach it on the query channel either,
+/// while `B` still hears `A`. Then both ways with the query channel working.
+/// `B` is not a dead peer in either case from its own side, so it never
+/// stands, and whatever `A` acknowledged on the strength of `B` being out of
+/// its reach (the first case) or of `B` acknowledging the shrink (the second)
+/// is on both replicas once they rejoin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_heartbeat_loss_on_a_live_mesh_connection_never_makes_the_follower_stand() {
+    let (nodes, registry, mesh, mut acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    registry.break_replication("A", "B");
+    registry.block_queries("A", "B");
+    mesh.a_hears_b.store(false, Ordering::SeqCst);
+    let (first, stood_first) = publish_for(a, b, Duration::from_secs(6), "one-way").await;
+    // `A` has no sign of life from `B` on any channel for longer than `T_alone`
+    // although the connection stands: it resumes.
+    let resumed = !first.is_empty();
+    acked.extend(first);
+
+    registry.restore_replication();
+    registry.break_replication("A", "B");
+    mesh.b_hears_a.store(false, Ordering::SeqCst);
+    let (second, stood_second) = publish_for(a, b, Duration::from_secs(6), "silent").await;
+    acked.extend(second);
+    mesh.connect("A", "B");
+    let mut violated = rf2_outcome(&nodes, &registry, &acked, stood_first || stood_second).await;
+    shutdown_all(&nodes);
+    if !resumed {
+        violated.push("the leader never resumed with the follower silent and deaf".to_string());
+    }
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+/// A kill of the leader shows on the mesh as a disconnect. The follower
+/// stands once the leader has been out of reach for `T_alone` and not before,
+/// and what the leader acknowledged is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_leader_kill_fails_over_after_t_alone_and_within_the_budget() {
+    let (nodes, _registry, mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    a.manager.shutdown();
+    mesh.disconnect("A", "B");
+    let killed = tokio::time::Instant::now();
+    let mut led_early = false;
+    while killed.elapsed() < TEST_ALONE_AFTER - Duration::from_millis(200) {
+        led_early |= leads(b);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stood = wait_until(Duration::from_secs(15), || leads(b)).await;
+    let failover = killed.elapsed();
+    let accepted = publish_until_accepted(b, "after-failover", Duration::from_secs(10)).await;
+    let b_payloads = text_payloads(b);
+    shutdown_all(&nodes);
+
+    assert!(!led_early, "the follower stood before T_alone had passed");
+    assert!(stood, "the follower never took over");
+    assert!(
+        failover <= TEST_ALONE_AFTER + Duration::from_secs(5),
+        "failover took {failover:?}"
+    );
+    assert!(accepted, "the new leader accepted no write");
+    let lost: Vec<&String> = acked.iter().filter(|p| !b_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// The other half of a kill: the follower dies, the leader keeps refusing
+/// until the mesh has lost the follower for `T_alone`, then commits alone and
+/// acknowledges again. The follower is gone from the leader's in-sync set
+/// first, the mesh still holding it, so that what is measured is the mesh
+/// clock and not the shrink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
+    let (nodes, registry, mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    b.manager.shutdown();
+    // A dead process answers no notice and holds no stream.
+    registry.block_queries("A", "B");
+    registry.break_replication("A", "B");
+    let isr_has_b = || {
+        a.manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .is_some_and(|info| info.isr.iter().any(|m| m == "B"))
+    };
+    assert!(
+        wait_until(Duration::from_secs(15), || !isr_has_b()).await,
+        "the leader never dropped the dead follower from its in-sync set"
+    );
+    // The mesh still reaches B (its connection is up, heartbeats come): the
+    // leader must not commit alone yet.
+    let mut early: Vec<String> = Vec::new();
+    for n in 0..8u32 {
+        let payload = format!("early-{n}");
+        if matches!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                publish_text(a, Some(0), &payload)
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
+            early.push(payload);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Now the mesh loses B.
+    mesh.a_hears_b.store(false, Ordering::SeqCst);
+    mesh.a.on_peer_disconnected("B");
+    let lost_at = tokio::time::Instant::now();
+    let mut early_after_loss: Vec<String> = Vec::new();
+    while lost_at.elapsed() < TEST_ALONE_AFTER - Duration::from_millis(400) {
+        let payload = format!("soon-{}", early_after_loss.len());
+        if matches!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                publish_text(a, Some(0), &payload)
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
+            early_after_loss.push(payload);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let accepted = publish_until_accepted(a, "alone", Duration::from_secs(15)).await;
+    let resumed_after = lost_at.elapsed();
+    let a_payloads = text_payloads(a);
+    shutdown_all(&nodes);
+
+    assert!(
+        early.is_empty() && early_after_loss.is_empty(),
+        "the leader acknowledged alone before T_alone had passed: {early:?} {early_after_loss:?}"
+    );
+    assert!(accepted, "the leader never resumed");
+    assert!(
+        resumed_after >= TEST_ALONE_AFTER - Duration::from_millis(100)
+            && resumed_after <= TEST_ALONE_AFTER + Duration::from_secs(4),
+        "resumed {resumed_after:?} after the mesh lost the follower"
+    );
+    let lost: Vec<&String> = acked.iter().filter(|p| !a_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// The follower that acknowledged the shrink notice stands on no claim of
+/// that epoch: the leader commits alone at once although the mesh still
+/// reaches the follower, and when the follower then sees the leader as gone it
+/// cannot stand over what the leader acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_isr_shrink_lets_the_leader_commit_and_bars_the_follower_from_standing() {
+    let (nodes, registry, mesh, mut acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    // The stream is down; the channel of the notice (queries from the leader)
+    // and the mesh still work.
+    registry.break_replication("A", "B");
+    let mut alone = Vec::new();
+    for i in 0..5 {
+        let payload = format!("alone-{i}");
+        if publish_until_accepted(a, &payload, Duration::from_secs(8)).await {
+            alone.push(payload);
+        }
+    }
+    assert!(
+        !alone.is_empty(),
+        "the leader never committed after the follower acknowledged the shrink"
+    );
+    // The mesh reached B throughout (no disconnect, heartbeats on): this was
+    // the acknowledgement, not `T_alone`.
+    acked.extend(alone);
+
+    // Now B sees the leader as gone: out of reach for longer than T_alone,
+    // nothing it asks gets an answer.
+    registry.block_queries("B", "A");
+    mesh.b.on_peer_disconnected("A");
+    mesh.b_hears_a.store(false, Ordering::SeqCst);
+    let mut stood = false;
+    let watch = tokio::time::Instant::now();
+    while watch.elapsed() < TEST_ALONE_AFTER + Duration::from_secs(4) {
+        stood |= leads(b);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    mesh.connect("A", "B");
+    let violated = rf2_outcome(&nodes, &registry, &acked, stood).await;
+    shutdown_all(&nodes);
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+/// The follower acknowledges nothing for longer than the lag bound while the
+/// stream stays up, so the leader shrinks its in-sync set and, the follower
+/// acknowledging the notice over the query channel, commits alone. The leader
+/// then dies and, in the same moment, the follower's backlog is released: the
+/// heartbeats queued from before the shrink still list it, and are processed
+/// after the notice. They must not give back the claim the notice took away,
+/// so the follower does not stand over what was committed without it. This is
+/// the end-to-end shape; that a heartbeat from before the shrink is no proof
+/// is pinned frame by frame in the follower's unit tests, because here the
+/// heartbeats after the shrink (which do not list the follower) bar it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shrink_for_slow_acks_on_a_live_stream_bars_the_follower_when_the_leader_dies() {
+    let (nodes, registry, mesh, mut acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    registry.stall_acks("A", "B", true);
+    let mut alone = Vec::new();
+    for i in 0..5 {
+        let payload = format!("slow-{i}");
+        if publish_until_accepted(a, &payload, Duration::from_secs(20)).await {
+            alone.push(payload);
+        }
+    }
+    assert!(
+        !alone.is_empty(),
+        "the leader never committed after the follower acknowledged the shrink"
+    );
+    acked.extend(alone);
+
+    // The leader dies; the follower sees it go for longer than `T_alone`.
+    a.manager.shutdown();
+    mesh.disconnect("A", "B");
+    registry.stall_acks("A", "B", false);
+    let mut stood = false;
+    let watch = tokio::time::Instant::now();
+    while watch.elapsed() < TEST_ALONE_AFTER + Duration::from_secs(4) {
+        stood |= leads(b);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let a_payloads = text_payloads(a);
+    shutdown_all(&nodes);
+    assert!(
+        !stood,
+        "the follower stood over writes the leader committed without it"
+    );
+    let lost: Vec<&String> = acked.iter().filter(|p| !a_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// A leader that restarts at the same epoch starts alone, and with its stream
+/// to the follower down it commits nothing on its own: the follower holds a
+/// claim on this very term and the mesh still vouches for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_rf2_leader_commits_nothing_alone_while_its_follower_is_not_out_of_the_way() {
+    let (mut nodes, registry, mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    registry.break_replication("A", "B");
+    registry.block_queries("A", "B");
+    registry.block_queries("B", "A");
+    drop(mesh);
+    let a_at = nodes.iter().position(|n| n.id == "A").expect("node A");
+    let down = nodes.remove(a_at);
+    down.manager.shutdown();
+    registry.peers.lock().remove("A");
+    let shared = Arc::clone(&down.ledger.shared);
+    let TestNode {
+        db,
+        _bus_dir: bus_dir,
+        _db_dir: db_dir,
+        svc,
+        manager,
+        ..
+    } = down;
+    drop(manager);
+    drop(svc);
+    let back = build_node_on(
+        "A",
+        NodeEnvironment::Prod,
+        shared,
+        Arc::clone(&registry),
+        bus_dir,
+        db_dir,
+        db,
+    );
+    spawn_background_loops(&back);
+    nodes.push(back);
+    let mesh = MeshEmulation::start(find_node(&nodes, "A"), find_node(&nodes, "B"));
+
+    let a = find_node(&nodes, "A");
+    assert!(
+        wait_until(Duration::from_secs(15), || leads(a)).await,
+        "the restarted node never took its partition back"
+    );
+    let b = find_node(&nodes, "B");
+    let (during, stood) = publish_for(a, b, Duration::from_secs(4), "restarted").await;
+    mesh.connect("A", "B");
+    let mut violated = rf2_outcome(&nodes, &registry, &acked, stood).await;
+    shutdown_all(&nodes);
+    if !during.is_empty() {
+        violated.push(format!(
+            "writes acknowledged by a leader with no word from its follower: {during:?}"
+        ));
+    }
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+/// The follower's process is up and the mesh hears it, but its bus serves
+/// nothing: it can never acknowledge over a stream. It still answers the
+/// leader's notice (nothing to drop), so the leader does not wait for it
+/// forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_whose_bus_is_down_on_a_live_mesh_does_not_block_the_leader_for_good() {
+    let (nodes, registry, _mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    b.manager.shutdown();
+    registry.break_replication("A", "B");
+    let started = tokio::time::Instant::now();
+    let accepted = publish_until_accepted(a, "alone", Duration::from_secs(20)).await;
+    let waited = started.elapsed();
+    let a_payloads = text_payloads(a);
+    shutdown_all(&nodes);
+    assert!(
+        accepted,
+        "the leader stayed blocked behind a follower that serves nothing"
+    );
+    assert!(waited < Duration::from_secs(12), "resumed after {waited:?}");
+    let lost: Vec<&String> = acked.iter().filter(|p| !a_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// The other way round: the leader's process heartbeats on the mesh but its
+/// bus serves nothing. The follower asks over the query channel, is told the
+/// partition is not led there, and stands once that has lasted `T_alone`,
+/// instead of deferring to the heartbeat for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_whose_bus_is_down_on_a_live_mesh_is_replaced_after_t_alone() {
+    let (nodes, _registry, _mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    a.manager.shutdown();
+    let down = tokio::time::Instant::now();
+    let stood = wait_until(Duration::from_secs(20), || leads(b)).await;
+    let failover = down.elapsed();
+    let accepted = publish_until_accepted(b, "after-failover", Duration::from_secs(10)).await;
+    let b_payloads = text_payloads(b);
+    shutdown_all(&nodes);
+    assert!(
+        stood,
+        "the follower deferred to a leader whose bus serves nothing"
+    );
+    assert!(
+        failover >= TEST_ALONE_AFTER,
+        "the follower stood after {failover:?}, before T_alone"
+    );
+    assert!(accepted, "the new leader accepted no write");
+    let lost: Vec<&String> = acked.iter().filter(|p| !b_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// What the leader saw while the follower's bus was down (refusals to its
+/// probes) is no evidence once that follower has rejoined. (Not a regression
+/// test for the marker lapse by itself: the restarted follower answers a probe
+/// "served" before its stream is back, which clears the marker on any code.
+/// The lapse is pinned in the manager's unit tests; this is the end-to-end
+/// shape of the scenario.) The follower
+/// restarts behind a live mesh, streams again, and long after, replication
+/// breaks with the query channel cut both ways: the leader cannot tell the
+/// follower anything, so it must not commit alone on the strength of the old
+/// refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_does_not_commit_alone_on_refusals_from_before_its_follower_rejoined() {
+    let (mut nodes, ledger, registry) = build_cluster_placed(1, Acks::All, &["A", "B"], "A").await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let mesh = MeshEmulation::start(find_node(&nodes, "A"), find_node(&nodes, "B"));
+    let mut acked = Vec::new();
+    for i in 0..5 {
+        let payload = format!("pre-{i}");
+        assert!(
+            publish_until_accepted(find_node(&nodes, "A"), &payload, Duration::from_secs(10)).await,
+            "{payload} was never accepted"
+        );
+        acked.push(payload);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            log_end_offset(find_node(&nodes, "B"), 0) >= 5
+        })
+        .await,
+        "the follower never caught up"
+    );
+    let isr_of = |node: &TestNode| -> Vec<String> {
+        node.manager
+            .snapshot(ORG, Some(TOPIC))
+            .partitions
+            .iter()
+            .find(|info| info.partition == 0)
+            .map(|info| info.isr.clone())
+            .unwrap_or_default()
+    };
+    // B's bus goes down on a live mesh: A's probes are answered "not served".
+    let b_pos = nodes.iter().position(|n| n.id == "B").expect("node B");
+    let down = nodes.remove(b_pos);
+    down.manager.shutdown();
+    let TestNode {
+        db: b_db,
+        _bus_dir: b_bus_dir,
+        _db_dir: b_db_dir,
+        svc: b_svc,
+        manager: b_manager,
+        ..
+    } = down;
+    {
+        let a = find_node(&nodes, "A");
+        // Long enough for A to have seen refusals and, over a bus that serves
+        // nothing, to commit alone legitimately.
+        assert!(
+            publish_until_accepted(a, "alone-while-down", Duration::from_secs(20)).await,
+            "the leader never resumed over a follower that serves nothing"
+        );
+        acked.push("alone-while-down".to_string());
+    }
+
+    // B restarts on its disk; the mesh is up the whole time (A's view of B is
+    // never reset by a connect event). The emulation holds the old B, whose
+    // disk the new one needs, so A's heartbeat from B is fed on its own.
+    let a_hears_b = {
+        let manager = Arc::clone(&find_node(&nodes, "A").manager);
+        tokio::spawn(async move {
+            loop {
+                manager.note_peer_signal("B");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    drop(mesh);
+    registry.peers.lock().remove("B");
+    drop(b_manager);
+    drop(b_svc);
+    let back = build_node_on(
+        "B",
+        NodeEnvironment::Prod,
+        Arc::clone(&ledger),
+        Arc::clone(&registry),
+        b_bus_dir,
+        b_db_dir,
+        b_db,
+    );
+    back.manager.on_peer_connected("A");
+    // The mesh heartbeat reaches B again; A's side is the one the first
+    // emulation still feeds, so no connect event resets what A recorded.
+    let b_hears_a = {
+        let manager = Arc::clone(&back.manager);
+        tokio::spawn(async move {
+            loop {
+                manager.note_peer_signal("A");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    spawn_background_loops(&back);
+    nodes.push(back);
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    assert!(
+        wait_until(Duration::from_secs(30), || isr_of(a)
+            .iter()
+            .any(|m| m == "B")
+            && log_end_offset(b, 0) == log_end_offset(a, 0))
+        .await,
+        "the follower never rejoined the in-sync set"
+    );
+    // The refusals are old news by now.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    registry.break_replication("A", "B");
+    registry.block_queries("A", "B");
+    registry.block_queries("B", "A");
+    let (during, _) = publish_for(a, b, Duration::from_secs(8), "cut").await;
+    b_hears_a.abort();
+    a_hears_b.abort();
+    registry.heal();
+    shutdown_all(&nodes);
+    assert!(
+        during.is_empty(),
+        "acks=all writes acknowledged by a leader alone: {during:?}"
+    );
+}
+
+/// The old give-up: a follower whose leader stays reachable on the mesh used
+/// to stand after 60 s of silence on the stream, over writes the leader had
+/// acknowledged. It does not any more, however long, and the leader reports
+/// that it cannot commit and audits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_follower_never_gives_up_on_a_leader_the_mesh_reaches() {
+    let (nodes, registry, mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    registry.break_replication("A", "B");
+    registry.block_queries("A", "B");
+    registry.block_queries("B", "A");
+    let (during, stood) = publish_for(a, b, Duration::from_secs(66), "long").await;
+    let audited = audit_details_of(a, "bus.leader.alone_refused");
+    mesh.connect("A", "B");
+    let mut violated = rf2_outcome(&nodes, &registry, &acked, stood).await;
+    shutdown_all(&nodes);
+    if !during.is_empty() {
+        violated.push(format!(
+            "writes acknowledged without the follower: {during:?}"
+        ));
+    }
+    if audited.is_empty() {
+        violated.push("the refusal was never audited".to_string());
     }
     assert!(violated.is_empty(), "{violated:#?}");
 }
@@ -5276,6 +6273,41 @@ async fn a_transfer_asked_of_any_member_runs_on_the_leader_and_a_refusal_keeps_i
         .await,
         "B never took over"
     );
+    shutdown_all(&nodes);
+}
+
+/// A graceful stop moves the partitions the node leads to the replica that is
+/// in sync first, so the other node does not wait out a lease: every topic is
+/// led by B when the call returns, and takes writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_leader_hands_its_partitions_to_the_replica_first() {
+    let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    for topic in topics {
+        assert_eq!(leader_of(&nodes, topic).as_deref(), Some("A"));
+    }
+
+    let moved = a.manager.hand_over_leaders(Duration::from_secs(10)).await;
+    assert_eq!(moved, topics.len(), "every partition had a replica in sync");
+    for topic in topics {
+        assert!(
+            wait_until(Duration::from_secs(10), || leader_of(&nodes, topic)
+                .as_deref()
+                == Some("B"))
+            .await,
+            "{topic} was not led by B after the handover"
+        );
+    }
+    let mut written = false;
+    for _ in 0..50 {
+        if publish_on(&b.svc, TOPIC, "after-handover").await.is_ok() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(written, "the new leader never accepted a write");
     shutdown_all(&nodes);
 }
 

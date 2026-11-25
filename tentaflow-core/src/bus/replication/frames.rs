@@ -457,6 +457,12 @@ pub struct ReplHeartbeat {
     /// predates it.
     #[serde(default)]
     pub isr: Option<Vec<String>>,
+    /// How many times the leader's in-sync set had shrunk when this heartbeat
+    /// was built, read before `isr` and `leader_leo`: a heartbeat carrying at
+    /// least the number of a shrink describes the leader after it. Appended:
+    /// `0` from a leader that predates it.
+    #[serde(default)]
+    pub shrink_seq: u64,
 }
 
 /// Leader -> follower tail truncation (PLAN-M2 §1a `Partition::
@@ -497,6 +503,22 @@ pub struct ReplLeoQuery {
     /// it, which is answered without a promise, as before.
     #[serde(default)]
     pub candidate_epoch: Option<u32>,
+    /// The leader of this partition at that epoch is shrinking its in-sync
+    /// set to itself and asks the replier to drop the claim that its copy is
+    /// caught up with that leader's term. Answered by
+    /// `ReplLeoReply::isr_shrink_acked`; a peer that predates it ignores the
+    /// field and never acknowledges, which leaves the leader waiting out
+    /// `T_alone`. Appended.
+    #[serde(default)]
+    pub isr_shrink_epoch: Option<u32>,
+    /// The topic incarnation `isr_shrink_epoch` was issued for.
+    #[serde(default)]
+    pub isr_shrink_generation: u64,
+    /// Which shrink of the leader's in-sync set the notice is for
+    /// (`PartitionLeader::shrink_seq`): the follower keeps it with the
+    /// revocation. Appended: `0` from a leader that predates it.
+    #[serde(default)]
+    pub isr_shrink_seq: u64,
 }
 
 /// Everything after `in_isr` is appended. A peer on an older build omits it
@@ -587,6 +609,11 @@ pub struct ReplLeoReply {
     /// predates it, whose reply a node that has not caught up cannot count.
     #[serde(default)]
     pub log_known: bool,
+    /// The replier dropped its caught-up claim for the epoch named by
+    /// `ReplLeoQuery::isr_shrink_epoch` and will not stand on it. Appended:
+    /// `false` from a peer that predates it.
+    #[serde(default)]
+    pub isr_shrink_acked: bool,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -1268,6 +1295,7 @@ mod tests {
             committed: Some(8),
             epoch_start: Some(9),
             isr: Some(vec!["a".to_string()]),
+            shrink_seq: 0,
         })
         .unwrap();
         assert_eq!(decode_cbor::<HeartbeatBefore>(&hb).unwrap(), old_hb);
@@ -1744,6 +1772,7 @@ mod tests {
             committed: None,
             epoch_start: Some(100),
             isr: Some(vec!["a".to_string(), "b".to_string()]),
+            shrink_seq: 0,
         });
         assert_eq!(roundtrip(hb.clone()).await, hb);
 
@@ -1760,6 +1789,9 @@ mod tests {
             partition: 3,
             known_epoch: 6,
             candidate_epoch: Some(8),
+            isr_shrink_epoch: None,
+            isr_shrink_generation: 0,
+            isr_shrink_seq: 0,
         });
         assert_eq!(roundtrip(lq.clone()).await, lq);
 
@@ -1777,6 +1809,7 @@ mod tests {
             promises: true,
             instance_unhosted: false,
             log_known: false,
+            isr_shrink_acked: false,
             bus_features: 0,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
@@ -2194,6 +2227,7 @@ mod tests {
                 promises: false,
                 instance_unhosted: false,
                 log_known: false,
+                isr_shrink_acked: false,
                 bus_features: 0,
             }
         );
