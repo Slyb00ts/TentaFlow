@@ -8,7 +8,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -427,6 +427,10 @@ struct ActiveConnection {
     /// When the peer last opened a stream on this connection. A live peer
     /// does so at least every heartbeat.
     last_rx: Arc<parking_lot::Mutex<Instant>>,
+    /// A check of whether the peer still answers on this session is under way
+    /// (`probe_silent_session`): one at a time, however many connections the
+    /// peer opens meanwhile.
+    probing: Arc<AtomicBool>,
 }
 
 impl ActiveConnection {
@@ -438,6 +442,7 @@ impl ActiveConnection {
             direction,
             established: now,
             last_rx: Arc::new(parking_lot::Mutex::new(now)),
+            probing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -457,6 +462,60 @@ impl ActiveConnection {
 /// peer redials. A connection that still carries traffic is never replaced
 /// this way, however old it is, so a slow dial over a healthy entry loses.
 const ZOMBIE_SILENCE: Duration = Duration::from_secs(3);
+
+/// How long a session that went silent is given to answer the first probe.
+const SESSION_PROBE_WAIT: Duration = Duration::from_secs(1);
+
+/// The second probe's window: past the longest retransmission timeout a
+/// session that just lived through a link blip can have backed off to (about
+/// 3.2 s), so a peer that is only slow to acknowledge answers it.
+const SESSION_PROBE_RETRY_WAIT: Duration = Duration::from_secs(4);
+
+/// What one probe of a session found out.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// A datagram arrived on the connection while the probe waited.
+    Answered,
+    /// Nothing arrived, or the connection is closed.
+    Silent,
+    /// The probe could not be sent (no stream credit): it says nothing.
+    Unknown,
+}
+
+/// Sends an ack-eliciting probe on `connection` and waits `wait` for any
+/// datagram on it. An empty uni stream, finished, carries nothing the peer's
+/// handler would act on; the acknowledgement (or the peer's own traffic) shows
+/// the process is there. A restarted peer holds no such connection and answers
+/// nothing.
+async fn probe_once(connection: &Connection, wait: Duration) -> Probe {
+    let before = connection.stats().udp_rx.datagrams;
+    match tokio::time::timeout(wait, connection.open_uni()).await {
+        Err(_) => return Probe::Unknown,
+        Ok(Err(_)) => return Probe::Silent,
+        Ok(Ok(mut stream)) => {
+            let _ = stream.finish();
+        }
+    }
+    tokio::time::sleep(wait).await;
+    if connection.close_reason().is_none() && connection.stats().udp_rx.datagrams > before {
+        Probe::Answered
+    } else {
+        Probe::Silent
+    }
+}
+
+/// Whether the peer still answers on `connection`. Silence of one short window
+/// is not death (a retransmission timeout backed off by a blip, a congested
+/// path), so a peer is taken for gone only when two probes in a row found
+/// nothing, the second with a window past the longest timeout; a probe that
+/// could not be sent proves nothing and counts as an answer.
+async fn probe_silent_session(connection: &Connection) -> bool {
+    match probe_once(connection, SESSION_PROBE_WAIT).await {
+        Probe::Silent => {}
+        Probe::Answered | Probe::Unknown => return true,
+    }
+    probe_once(connection, SESSION_PROBE_RETRY_WAIT).await != Probe::Silent
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionPathSnapshot {
@@ -1112,6 +1171,7 @@ impl IrohMeshManager {
                 let handler = self.bus_accept_handler.read().await.clone();
                 match handler {
                     Some(handler) => {
+                        self.check_silent_session(&remote_hex);
                         self.track_bus_connection(&remote_hex, &connection);
                         handler(remote_hex, connection)
                     }
@@ -1152,14 +1212,19 @@ impl IrohMeshManager {
     /// active in iroh, which stalls every new dial to the peer until the
     /// connections finally time out.
     fn close_bus_connections(&self, remote_hex: &str) {
-        self.close_bus_connections_tracked_by(remote_hex, None);
+        self.close_bus_connections_tracked_by(remote_hex, None, b"peer-moved");
     }
 
     /// `close_bus_connections` for the connections tracked no later than
     /// `until` (all of them for `None`); the later ones stay tracked. A peer
     /// that came back is dialed by this node's own feeders at once: those
     /// connections lead to the new process and are not the ones to close.
-    fn close_bus_connections_tracked_by(&self, remote_hex: &str, until: Option<Instant>) {
+    fn close_bus_connections_tracked_by(
+        &self,
+        remote_hex: &str,
+        until: Option<Instant>,
+        reason: &'static [u8],
+    ) {
         let Some((_, handles)) = self.bus_connections.remove(remote_hex) else {
             return;
         };
@@ -1169,7 +1234,7 @@ impl IrohMeshManager {
             if until.is_some_and(|until| tracked_at > until) {
                 kept.push((tracked_at, handle));
             } else if let Some(connection) = handle.upgrade() {
-                connection.close(0u32.into(), b"peer-moved");
+                connection.close(0u32.into(), reason);
                 closed += 1;
             }
         }
@@ -1221,22 +1286,109 @@ impl IrohMeshManager {
         if !moved {
             return false;
         }
-        if let Some((_, stale)) = self.connections.remove(remote_hex) {
-            stale.connection.close(0u32.into(), b"peer-moved");
-            // The same event `disconnect_peer` emits, and for the same reason:
-            // the pipeline's `quic_connected` flag is what gates the peer's
-            // application-layer resync. Left set, the peer's own re-dial is
-            // deduped away as "already connected" and it never gets its Hello,
-            // KnownPeers, NodeInfo or trusted-key sync again — a peer that is
-            // back on the wire but never rejoins the mesh at the layer above.
+        // The same event `disconnect_peer` emits, and for the same reason: the
+        // pipeline's `quic_connected` flag is what gates the peer's
+        // application-layer resync. Left set, the peer's own re-dial is deduped
+        // away as "already connected" and it never gets its Hello, KnownPeers,
+        // NodeInfo or trusted-key sync again — a peer that is back on the wire
+        // but never rejoins the mesh at the layer above. Sent while the entry
+        // is held, so that no session registered afterwards can announce
+        // itself ahead of it.
+        if let Some((_, stale)) = self.connections.remove_if(remote_hex, |_, _| {
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
                 node_id: remote_hex.to_string(),
             });
+            true
+        }) {
+            stale.connection.close(0u32.into(), b"peer-moved");
         }
         self.close_bus_connections(remote_hex);
         info!(
             peer = %remote_hex,
             "iroh_mesh: peer wrocil pod nowym adresem — zrywam wszystkie polaczenia"
+        );
+        true
+    }
+
+    /// A bus connection arrives from a peer whose mesh session has gone silent:
+    /// when the session no longer answers, the peer's process restarted (on
+    /// the same address; a moved one is `drop_peer_if_moved`'s), and the
+    /// session and the bus connections opened toward the process that died are
+    /// dropped now instead of when the mesh redial comes.
+    ///
+    /// Why now: the restarted peer dials the bus at once, and its mesh dial
+    /// follows only after the larger id's grace. Until the old connections are
+    /// closed, iroh keeps the direct path it selected toward the dead process
+    /// (it clears a remote's path state only when this node holds no
+    /// connection to it, and replaces the selection only when a closed
+    /// connection's paths are reconsidered), and the connections that arrive
+    /// meanwhile are relay-only backups under it: every dial from this node to
+    /// the peer then goes to a path nothing answers on, until this node
+    /// restarts. Closed together with the arrival of the new process's first
+    /// connection, the selection follows the new connections (measured).
+    ///
+    /// Silence is not proof. A live peer opens bus connections all the time
+    /// (a stream per replication feeder, forward-pool refills), and its mesh
+    /// session can be quiet for three seconds with the link blipping or its
+    /// heartbeats held up; tearing that session down would report a self-made
+    /// outage. So the old session is asked first (`probe_silent_session`),
+    /// off the accept path, and dropped only if it does not answer. One probe
+    /// per session at a time: the 21 connections of a restart's burst start
+    /// one.
+    fn check_silent_session(self: &Arc<Self>, remote_hex: &str) {
+        let (connection, last_heard, probing) = match self.connections.get(remote_hex) {
+            Some(active) if active.silent() => (
+                active.connection.clone(),
+                *active.last_rx.lock(),
+                Arc::clone(&active.probing),
+            ),
+            _ => return,
+        };
+        if probing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::clone(self);
+        let remote_hex = remote_hex.to_string();
+        tokio::spawn(async move {
+            let answers = probe_silent_session(&connection).await;
+            probing.store(false, Ordering::SeqCst);
+            if !answers {
+                me.drop_dead_session(&remote_hex, connection.stable_id(), last_heard);
+            }
+        });
+    }
+
+    /// Drops the mesh session `stable_id` of `remote_hex`, which did not answer
+    /// (`check_silent_session`), and the bus connections tracked up to what the
+    /// session last heard of the peer plus a second: the ones after were
+    /// opened by this node toward the process that is back. False when the
+    /// session was replaced or is gone meanwhile; whatever replaced it is not
+    /// this one's to drop.
+    fn drop_dead_session(&self, remote_hex: &str, stable_id: usize, last_heard: Instant) -> bool {
+        // The event goes out while the entry is held: a session registered
+        // after the removal cannot announce itself ahead of it, and the
+        // pipeline's `quic_connected` flag (see `drop_peer_if_moved`) is
+        // cleared before the peer's redial is looked at.
+        let Some((_, stale)) = self.connections.remove_if(remote_hex, |_, active| {
+            if active.connection.stable_id() != stable_id {
+                return false;
+            }
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex.to_string(),
+            });
+            true
+        }) else {
+            return false;
+        };
+        stale.connection.close(0u32.into(), b"stale-superseded");
+        self.close_bus_connections_tracked_by(
+            remote_hex,
+            Some(last_heard + Duration::from_secs(1)),
+            b"stale-superseded",
+        );
+        info!(
+            peer = %remote_hex,
+            "iroh_mesh: polaczenie bus od peera z martwej sesji mesh — zrywam stare polaczenia"
         );
         true
     }
@@ -1320,6 +1472,7 @@ impl IrohMeshManager {
                     self.close_bus_connections_tracked_by(
                         &remote_hex,
                         Some(last_heard + Duration::from_secs(1)),
+                        b"stale-superseded",
                     );
                     Some(new_id)
                 } else if existing_dir == direction {
@@ -3309,14 +3462,13 @@ impl IrohMeshManagerRef {
         // (tie-break / reconnect) juz przebilo nasz wpis, zostawiamy
         // jego stan w spokoju. Nie wysylamy wtedy PeerDisconnected, zeby
         // pipeline nie zerowal heartbeat livenessu zywego polaczenia.
-        let was_current = match self.connections.get(&remote_hex) {
-            Some(active) if active.id == connection_id => {
-                drop(active);
-                self.connections.remove(&remote_hex);
-                true
-            }
-            _ => false,
-        };
+        // One atomic step: a check and a removal apart would race with
+        // `drop_dead_session` (a second `PeerDisconnected`) and could take out
+        // the entry of a session registered in between.
+        let was_current = self
+            .connections
+            .remove_if(&remote_hex, |_, active| active.id == connection_id)
+            .is_some();
         let reason = close_reason.as_deref().unwrap_or("stream closed");
         if was_current {
             // DIAGNOSTYKA (mesh::pathdiag) — best-effort snapshot stanu sciezki
@@ -4532,6 +4684,249 @@ mod tie_break_tests {
             "the stale session is closed"
         );
         assert!(inc_a2.close_reason().is_none(), "the redial stays open");
+    }
+
+    /// The state both tests below start from: this node holds a mesh session
+    /// to the peer that has been quiet past `ZOMBIE_SILENCE`, a bus connection
+    /// opened toward the peer long ago, and one opened since.
+    struct SilentPeer {
+        manager: Arc<IrohMeshManager>,
+        peer: Arc<IrohMeshManager>,
+        peer_hex: String,
+        mesh: Connection,
+        _mesh_far: Connection,
+        old_bus: Connection,
+        _old_bus_far: Connection,
+        own_bus: Connection,
+        _own_bus_far: Connection,
+        events: broadcast::Receiver<IrohMeshEvent>,
+        /// The runtime the peer lives in, when it is its own: shutting it down
+        /// is `kill -9` (no CONNECTION_CLOSE leaves it).
+        far_runtime: Option<tokio::runtime::Runtime>,
+    }
+
+    async fn silent_peer() -> SilentPeer {
+        silent_peer_with(make_manager().await, None).await
+    }
+
+    /// `silent_peer` whose far side runs in a runtime of its own.
+    async fn silent_peer_killable() -> SilentPeer {
+        let (peer, runtime) = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("far runtime");
+            let peer = runtime.block_on(make_manager());
+            (peer, runtime)
+        })
+        .join()
+        .expect("far side");
+        silent_peer_with(peer, Some(runtime)).await
+    }
+
+    async fn silent_peer_with(
+        peer: Arc<IrohMeshManager>,
+        far_runtime: Option<tokio::runtime::Runtime>,
+    ) -> SilentPeer {
+        let manager = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true);
+        let events = manager.event_tx.subscribe();
+        let (mesh, mesh_far) = single_link(&manager, &peer).await;
+        let (old_bus_far, old_bus) = single_link(&peer, &manager).await;
+        let (own_bus_far, own_bus) = single_link(&peer, &manager).await;
+        let base = Instant::now();
+        manager
+            .bus_connections
+            .entry(peer_hex.clone())
+            .or_default()
+            .push((
+                base.checked_sub(Duration::from_secs(30))
+                    .expect("host up >= 30 s"),
+                old_bus.weak_handle(),
+            ));
+        assert!(manager
+            .register_connection(
+                peer_hex.clone(),
+                mesh.clone(),
+                ConnectionDirection::Outgoing
+            )
+            .await
+            .is_some());
+        // Opened by this node toward the process that is back.
+        manager.track_bus_connection(&peer_hex, &own_bus);
+        let old = base
+            .checked_sub(ZOMBIE_SILENCE + Duration::from_secs(1))
+            .expect("host up >= 30 s");
+        {
+            let mut entry = manager.connections.get_mut(&peer_hex).expect("entry");
+            entry.established = old;
+            *entry.last_rx.lock() = old;
+        }
+        SilentPeer {
+            manager,
+            peer,
+            peer_hex,
+            mesh,
+            _mesh_far: mesh_far,
+            old_bus,
+            _old_bus_far: old_bus_far,
+            own_bus,
+            _own_bus_far: own_bus_far,
+            events,
+            far_runtime,
+        }
+    }
+
+    fn peer_disconnected_events(events: &mut broadcast::Receiver<IrohMeshEvent>) -> usize {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, IrohMeshEvent::PeerDisconnected { .. }) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// A bus connection from a peer whose mesh session is quiet but still
+    /// answers at the transport level (a link blip, heartbeats held up) closes
+    /// nothing and announces nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_from_a_quiet_but_live_peer_closes_nothing() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        assert!(manager.connections.get(&peer_hex).expect("entry").silent());
+
+        manager.check_silent_session(&peer_hex);
+        tokio::time::sleep(SESSION_PROBE_WAIT * 3).await;
+
+        assert!(
+            fixture.mesh.close_reason().is_none(),
+            "a live session was closed"
+        );
+        assert!(fixture.old_bus.close_reason().is_none());
+        assert!(fixture.own_bus.close_reason().is_none());
+        assert!(manager.connections.get(&peer_hex).is_some());
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 0);
+    }
+
+    /// How many bus connections of `peer_hex` this node tracks.
+    fn tracked_bus_connections(manager: &IrohMeshManager, peer_hex: &str) -> usize {
+        manager
+            .bus_connections
+            .get(peer_hex)
+            .map_or(0, |handles| handles.len())
+    }
+
+    /// A bus connection from a peer whose mesh session no longer answers (the
+    /// far endpoint closed it) drops that session and the bus connections
+    /// opened toward the process that died, once, however many connections
+    /// arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_from_a_dead_peer_drops_its_old_connections_once() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        fixture.peer.endpoint.inner().close().await;
+
+        // A burst: one probe for the session, not one per connection.
+        for _ in 0..21 {
+            manager.check_silent_session(&peer_hex);
+        }
+        tokio::time::sleep(SESSION_PROBE_WAIT * 3).await;
+
+        assert!(manager.connections.get(&peer_hex).is_none());
+        assert!(fixture.mesh.close_reason().is_some());
+        assert!(
+            fixture.old_bus.close_reason().is_some(),
+            "a bus connection to the dead process stays"
+        );
+        assert_eq!(tracked_bus_connections(&manager, &peer_hex), 1);
+        assert_eq!(
+            peer_disconnected_events(&mut fixture.events),
+            1,
+            "one PeerDisconnected per dead session"
+        );
+        // Nothing left to drop: a late connection of the burst is a no-op.
+        manager.check_silent_session(&peer_hex);
+        assert!(!manager.drop_dead_session(&peer_hex, fixture.mesh.stable_id(), Instant::now()));
+    }
+
+    /// The same with the far side killed (`kill -9`): nothing is sent, the
+    /// probe finds only silence, and it is two probes in a row that say dead.
+    /// A bus connection opened since by this node is kept, still open and
+    /// still tracked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_killed_peer_is_dropped_after_two_silent_probes_and_the_newer_bus_connection_stays() {
+        let mut fixture = silent_peer_killable().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        fixture
+            .far_runtime
+            .take()
+            .expect("far runtime")
+            .shutdown_background();
+
+        for _ in 0..21 {
+            manager.check_silent_session(&peer_hex);
+        }
+        let started = Instant::now();
+        let gone = tokio::time::timeout(Duration::from_secs(20), async {
+            while manager.connections.get(&peer_hex).is_some() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the dead session was never dropped");
+        assert!(
+            started.elapsed() >= SESSION_PROBE_WAIT * 2,
+            "dropped after {:?}: before two probes could have run",
+            started.elapsed()
+        );
+
+        assert!(fixture.mesh.close_reason().is_some());
+        assert!(
+            fixture.old_bus.close_reason().is_some(),
+            "a bus connection to the dead process stays"
+        );
+        assert!(
+            fixture.own_bus.close_reason().is_none(),
+            "a bus connection opened since was closed"
+        );
+        assert_eq!(tracked_bus_connections(&manager, &peer_hex), 1);
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// The probe is ack-eliciting: an empty uni stream on an idle live
+    /// connection makes datagrams arrive from the peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_uni_stream_probe_on_an_idle_live_connection_is_answered() {
+        let a = make_manager().await;
+        let b = make_manager().await;
+        let (near, _far) = single_link(&a, &b).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = near.stats().udp_rx.datagrams;
+
+        assert_eq!(probe_once(&near, SESSION_PROBE_WAIT).await, Probe::Answered);
+        assert!(near.stats().udp_rx.datagrams > before);
+    }
+
+    /// The session that answered the probe is not the one that is dropped when
+    /// it was replaced meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replaced_session_is_not_dropped_by_the_probe_of_the_one_before() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let (replacement, _replacement_far) = single_link(&manager, &fixture.peer).await;
+        manager.connections.insert(
+            peer_hex.clone(),
+            ActiveConnection::new(77, replacement.clone(), ConnectionDirection::Outgoing),
+        );
+
+        assert!(!manager.drop_dead_session(&peer_hex, fixture.mesh.stable_id(), Instant::now()));
+
+        assert!(replacement.close_reason().is_none());
+        assert!(manager.connections.get(&peer_hex).is_some());
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 0);
     }
 
     /// Gdy w mapie jest zwyciezca (outgoing) i przychodzi przegrywajacy

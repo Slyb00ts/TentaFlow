@@ -696,7 +696,8 @@ enum Promise {
     Made(u32),
     /// Refused: this node already promised that epoch to another candidate.
     Declined,
-    /// Not asked for: a leader's stream to this node is live, which makes a
+    /// Not asked for: a leader's stream to this node is live, or the entry
+    /// has moved on from the row the candidacy stood on, which makes a
     /// candidacy of this node moot (`ReplicationManager::promise_term`).
     LeaderLive,
     /// The partition could not record it.
@@ -4934,6 +4935,24 @@ impl ReplicationManager {
             // lands between the check and the promise.
             if candidate == self.local_node_id
                 && entry.follower.as_ref().is_some_and(|f| !f.lease_expired())
+            {
+                return Promise::LeaderLive;
+            }
+            // Nor does a candidacy that the entry has outlived: the row this
+            // node stood on is no longer the entry's, or the node leads by a
+            // placement it did not win by an election of its own (a transfer
+            // named it the leader while the election ran). The promise fences the
+            // local partition at `epoch`, above the term the entry now leads
+            // at, and the stamp of that term is then refused as stale: the
+            // partition would refuse every write until the next move.
+            if candidate == self.local_node_id
+                && (entry.assignment.leader_epoch != assignment.leader_epoch
+                    || entry.assignment.leader_node_id != assignment.leader_node_id
+                    || (entry.role == LocalRole::Leader
+                        && self
+                            .own_proposals
+                            .get(key)
+                            .is_none_or(|ms| *ms != entry.assignment.updated_at_ms)))
             {
                 return Promise::LeaderLive;
             }
@@ -15966,6 +15985,77 @@ mod tests {
             "heard 65 in the pre-vote, promised nothing for 64, stands for 128 — the \
              next epoch in its own slot"
         );
+    }
+
+    /// An election that began while this node was a follower must not fence
+    /// the local partition above the term a transfer made this node lead at
+    /// meanwhile: the stamp of that term would then be refused as stale and
+    /// the partition would refuse every write.
+    #[tokio::test]
+    async fn a_candidacy_outlived_by_a_transfer_to_this_node_fences_nothing() {
+        let fx = build("f1");
+        let before = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 1);
+        fx.assignments.seed(before.clone());
+        fx.manager.apply_assignment(before.clone()).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+
+        let mut moved = before.clone();
+        moved.leader_node_id = "f1".to_string();
+        moved.leader_epoch = 64;
+        moved.updated_at_ms = 1;
+        fx.assignments.seed(moved.clone());
+        fx.manager.apply_assignment(moved).await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+
+        // The candidacy computed from the row before the transfer.
+        let promised = fx.manager.promise_term(&key, &before, 64, "f1").await;
+        assert!(matches!(promised, Promise::LeaderLive));
+        let again = fx.manager.promise_term(&key, &before, 128, "f1").await;
+        assert!(matches!(again, Promise::LeaderLive));
+        assert!(
+            !fx.follower_factory
+                .events
+                .lock()
+                .iter()
+                .any(|e| e.starts_with("fence:")),
+            "the local partition was fenced: {:?}",
+            fx.follower_factory.events.lock()
+        );
+    }
+
+    /// This node leads by a placement it did not win by an election of its own
+    /// (a transfer): a candidacy it still runs from before is moot, however
+    /// the row it stood on compares. Its own election's row is no such case: it
+    /// may stand again.
+    #[tokio::test]
+    async fn a_node_leading_by_a_transfer_promises_itself_nothing_but_one_leading_by_its_own_election_may(
+    ) {
+        let fx = build("f1");
+        let before = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 1);
+        fx.assignments.seed(before.clone());
+        fx.manager.apply_assignment(before).await;
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let mut moved = assignment("org", "orders", 0, "f1", &["l", "f1"], &["l", "f1"], 64);
+        moved.updated_at_ms = 7;
+        fx.assignments.seed(moved.clone());
+        fx.manager.apply_assignment(moved.clone()).await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 64 }
+        );
+
+        // The entry's own row, nobody's election of this node.
+        let by_transfer = fx.manager.promise_term(&key, &moved, 128, "f1").await;
+        assert!(matches!(by_transfer, Promise::LeaderLive));
+        assert!(fx.follower_factory.events.lock().is_empty());
+
+        // The same row recorded as this node's own proposal.
+        fx.manager.own_proposals.insert(key.clone(), 7);
+        let by_election = fx.manager.promise_term(&key, &moved, 128, "f1").await;
+        assert!(matches!(by_election, Promise::Made(128)));
     }
 
     /// After a restart the in-memory promise is gone but the partition's is

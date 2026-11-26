@@ -888,15 +888,23 @@ struct PendingGroup {
     /// names another one.
     refused_by: Option<String>,
     /// The leader it was last sent to answered `NotLeader` naming no leader
-    /// at all: it has not caught up with the assignment yet (a topic placed
-    /// on it a moment ago) or is in an election. It is asked again after
-    /// a pause that doubles from `UNAWARE_LEADER_RETRY_FIRST`, until the wait
-    /// for a leader runs out.
+    /// at all, or naming an epoch older than the one the write was routed at:
+    /// it has not caught up with the assignment yet (a topic placed on it, or
+    /// a partition handed to it, a moment ago) or is in an election. It is
+    /// asked again after a pause that doubles from
+    /// `UNAWARE_LEADER_RETRY_FIRST`, until the wait for a leader runs out.
     target_unaware: bool,
     /// The leader it is sent to was named by the ledger row, not by this
     /// node's role (which still names the one that refused): that leader may
     /// not have applied the row itself yet.
     via_row: bool,
+    /// The epoch it was routed at (the role's, or the row's when the row
+    /// chose): what a `NotLeader` refusal's epoch is judged against.
+    epoch: u32,
+    /// Sent apart from the groups routed at other epochs: the leader refused a
+    /// request mixing them with an epoch between the lowest and the highest,
+    /// which says nothing about any one of them.
+    split: bool,
 }
 
 enum Reply {
@@ -909,6 +917,17 @@ pub(super) enum Route {
     Here,
     Remote { leader: String, epoch: u32 },
     Unknown,
+}
+
+/// What a `NotLeader` refusal says about the groups of the request it answers.
+#[derive(PartialEq, Eq)]
+enum Refusal {
+    /// The leader has not caught up with the epoch they were routed at.
+    Behind,
+    /// It is at an epoch between the groups'.
+    Unclear,
+    /// It moved on from all of them.
+    Moved,
 }
 
 /// What became of one request.
@@ -990,8 +1009,9 @@ impl BusService {
     /// frame). A leader that answers `NotLeader` before writing anything is
     /// asked again once, after the assignment moved; a partition with no
     /// known leader waits for one up to `LEADER_WAIT`, and so does a leader
-    /// that answers it knows none (it has not materialized the assignment
-    /// yet), which is asked again after a pause doubling from
+    /// that answers it knows none, or sees an epoch older than the one the
+    /// write was routed at (it has not materialized the assignment yet),
+    /// which is asked again after a pause doubling from
     /// `UNAWARE_LEADER_RETRY_FIRST` to `UNAWARE_LEADER_RETRY_MAX`. A request
     /// that never
     /// left this node (no connection, leader moved meanwhile) falls back to
@@ -1022,6 +1042,8 @@ impl BusService {
                 refused_by: None,
                 target_unaware: false,
                 via_row: false,
+                epoch: 0,
+                split: false,
             })
             .collect();
         let mut last_refusal: Option<BusServiceError> = None;
@@ -1031,8 +1053,7 @@ impl BusService {
             // Read before the roles it has to explain, so a change landing
             // in between is not waited for.
             let generation = coordinator.assignment_generation();
-            let mut by_leader: BTreeMap<(String, bool, u32), (u32, Vec<PendingGroup>)> =
-                BTreeMap::new();
+            let mut by_leader: BTreeMap<(String, bool, u32), Vec<PendingGroup>> = BTreeMap::new();
             let mut waiting: Vec<PendingGroup> = Vec::new();
             for group in std::mem::take(&mut pending) {
                 let (routed, via_row) =
@@ -1060,28 +1081,29 @@ impl BusService {
                         if group.refused_by.as_deref() != Some(leader.as_str()) =>
                     {
                         // Groups the row chose and groups the role chose go in
-                        // separate requests: the epoch they were routed at, and
-                        // what a refusal at an older one means, differ.
-                        // (Row-chosen groups also split by the row's epoch: a
-                        // refusal is judged against the epoch of the request.)
+                        // separate requests: what a refusal at an older epoch
+                        // means differs. One request per leader otherwise,
+                        // whatever epochs the partitions drifted to (one round
+                        // trip, not one per epoch); only a refusal that cannot
+                        // be told apart splits them (`PendingGroup::split`).
+                        group.epoch = epoch;
+                        let apart = if group.split { epoch } else { 0 };
                         by_leader
-                            .entry((leader, group.via_row, if group.via_row { epoch } else { 0 }))
-                            .or_insert_with(|| (epoch, Vec::new()))
-                            .1
+                            .entry((leader, group.via_row, apart))
+                            .or_default()
                             .push(group);
                     }
                     Route::Remote { .. } | Route::Unknown => waiting.push(group),
                 }
             }
 
-            for ((leader, _via_row, _row_epoch), (epoch, groups)) in by_leader {
+            for ((leader, _via_row, _apart), groups) in by_leader {
                 for chunk in chunk_groups(groups) {
                     match self.send_chunk(
                         coordinator,
                         &local_node,
                         job,
                         &leader,
-                        epoch,
                         chunk,
                         acks,
                         &mut totals,
@@ -1125,7 +1147,6 @@ impl BusService {
         local_node: &str,
         job: &ForwardJob<'_>,
         leader: &str,
-        epoch: u32,
         mut groups: Vec<PendingGroup>,
         acks: &mut Vec<PartitionAck>,
         totals: &mut ForwardTotals,
@@ -1135,9 +1156,11 @@ impl BusService {
             g.sends += 1;
             g.target_unaware = false;
         }
+        let lowest = groups.iter().map(|g| g.epoch).min().unwrap_or(0);
+        let highest = groups.iter().map(|g| g.epoch).max().unwrap_or(0);
         let fallback = BusServiceError::NotLeader {
             leader_node_id: Some(leader.to_string()),
-            leader_epoch: epoch,
+            leader_epoch: highest,
         };
         let mut timeout = self.publish_ack_timeout * groups.len().max(1) as u32 + REPLY_MARGIN;
         if let Some(limit) = job.deadline {
@@ -1238,25 +1261,35 @@ impl BusService {
                     other => (matches!(other, BusServiceError::NotLeader { .. }), other),
                 };
                 let retryable = not_leader && landed.is_empty();
-                // A refusal naming nobody, or a leader that still sees a term
-                // older than the one this write was routed at (by the ledger
-                // row or by the role: either way the row is ahead of it): not
-                // a leader that moved, one that has not caught up.
-                let unaware = match &source {
+                // What the refusal says depends on where its epoch falls among
+                // the epochs the groups were routed at (it names one
+                // partition's, the first the leader found wanting):
+                // - naming nobody, or below all of them: the leader has not
+                //   caught up with any of them, not a leader that moved;
+                // - at or above all of them: it moved on from all;
+                // - between: no way to tell for which, so the groups are asked
+                //   again apart, each judged against its own epoch.
+                let refusal = match &source {
                     BusServiceError::NotLeader {
                         leader_node_id: None,
                         ..
-                    } => true,
-                    BusServiceError::NotLeader { leader_epoch, .. } => *leader_epoch < epoch,
-                    _ => false,
+                    } => Refusal::Behind,
+                    BusServiceError::NotLeader { leader_epoch, .. } if *leader_epoch < lowest => {
+                        Refusal::Behind
+                    }
+                    BusServiceError::NotLeader { leader_epoch, .. } if *leader_epoch < highest => {
+                        Refusal::Unclear
+                    }
+                    _ => Refusal::Moved,
                 };
-                if retryable && unaware {
+                if retryable && refusal != Refusal::Moved {
                     // Not a leader that moved: the one that was named does
                     // not know yet that it leads. Asking it again is not a
                     // second attempt at another leader, so it is not counted.
                     for g in &mut groups {
                         g.sends -= 1;
                         g.target_unaware = true;
+                        g.split |= refusal == Refusal::Unclear;
                     }
                     *last_refusal = Some(source);
                     return Ok(Sent::Again(groups));

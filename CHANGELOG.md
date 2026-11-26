@@ -571,8 +571,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
       (`licznik uruchomień << 16`, gdzie licznik to zegar w ms, ale nigdy nie
       mniej niż zapisana w pliku `leader-incarnation` w katalogu partycji wartość plus 1,
       z fsync pliku i katalogu, na wątku blokującym obok stemplowania epoki; do czasu
-      jego zakończenia numeracja idzie z samego zegara, a uchwyt zatrzymany albo
-      zastąpiony nie pobiera licznika; błąd zapisu jest logowany i numeracja
+      jego zakończenia numeracja idzie z samego zegara, a uchwyt zatrzymany przed
+      uruchomieniem zasiewu (albo w trakcie jego zapisu, przed ostatnim
+      sprawdzeniem) nie pobiera licznika; uchwyt zatrzymany później, np. stary
+      lider przy awansie, gdy nowy uchwyt powstaje przed zatrzymaniem starego,
+      może numerować nad nowym, co kosztuje tylko żywotność; zasiew pomija
+      partycje o RF różnym od 2; błąd zapisu jest logowany i numeracja
       wraca do zegara) przy każdym
       uruchomieniu lidera, więc po restarcie lidera w tej samej epoce
       wszystkie numery są wyższe niż wcześniejsze, także gdy zegar cofnięto:
@@ -737,8 +741,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     ledgerze, który już wskazuje innego lidera, i sprawdza go co 100 ms.
     Wcześniej grupa odmówiona przez tego samego lidera czekała na zmianę
     generacji do końca `LEADER_WAIT`. Dotyczy to też odmowy bez wskazania lidera (stary lider w trakcie
-    przeniesienia) i odmowy lidera z wiersza, który widzi jeszcze starszą
-    epokę (nie zastosował wiersza): nie liczą się jako druga próba. Wiersz
+    przeniesienia) i odmowy lidera, który widzi jeszcze starszą epokę niż ta,
+    z którą zapis wysłano (nie zastosował wiersza ani roli; dotyczy grup
+    wybranych przez wiersz i przez rolę): nie liczą się jako druga próba. Wiersz
     jest śledzony tylko, gdy ma wyższą epokę niż rola; wskazujący ten węzeł
     nie jest śledzony: zapis czeka, aż rola nadgoni. Grupa wysłana
     według wiersza pozostaje ważna, dopóki wiersz (albo, po nadgonieniu, rola)
@@ -746,7 +751,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     wraca do roli, która nadal wskazuje lidera, który odmówił, więc zapis nie
     kończy się po 100 ms jako 504 `outcome unknown` (także po odmowie bez
     wskazania lidera). Grupy wybrane przez wiersz i przez rolę idą w osobnych
-    żądaniach.
+    żądaniach; poza tym jedno żądanie na lidera, bez względu na to, na jakie
+    epoki rozjechały się partycje (jedna runda, nie jedna na epokę). Odmowa
+    jest oceniana względem zakresu epok żądania: poniżej najniższej lub bez
+    wskazania lidera to lider, który nie nadgonił (czekamy), od najwyższej w
+    górę to lider, który odszedł, a pomiędzy jest niejednoznaczna, więc grupy
+    idą ponownie osobno, każda względem własnej epoki. Błąd odczytu ledgera przy sprawdzaniu ważności grupy wysłanej
+    według wiersza nie przerywa zapisu jako 504: grupa zostaje ważna; brak
+    wiersza nadal ją unieważnia.
+  - **Połączenie bus od peera z cichą sesją mesh zrywa stare połączenia od razu
+    (D1).** Po szybkim restarcie węzła o większym id jego połączenia bus
+    docierają do ocalałego, zanim nadejdzie mesh (większe id czeka na
+    `NONPREFERRED_DIAL_GRACE`). Dopóki stara sesja i stare połączenia bus żyją,
+    iroh trzyma ścieżkę wybraną do martwego procesu, a nowe połączenia są
+    kopiami zapasowymi przez relay: ocalały nie mógł zestawić połączenia do
+    peera aż do własnego restartu. Teraz pierwsze połączenie bus od peera, którego
+    sesja mesh milczy co najmniej `ZOMBIE_SILENCE`, uruchamia sondę tej sesji
+    (pusty strumień ack-eliciting; okno 1 s, a po ciszy drugie, 4 s, ponad
+    najdłuższy timeout retransmisji; sonda, której nie dało się wysłać, nic
+    nie dowodzi; jedna sonda na sesję naraz). Sesja, która nie odpowiada na
+    poziomie transportu w obu oknach, jest
+    zamykana wraz z połączeniami bus zestawionymi do tego momentu (do ostatniego
+    ruchu + 1 s; powód zamknięcia `stale-superseded`), a `PeerDisconnected`
+    wychodzi, gdy wpis jest jeszcze trzymany, więc nie wyprzedzi go
+    `PeerConnected` nowej sesji. Cisza sama niczego nie zrywa: żywy peer, któremu
+    mrugnęło łącze albo opóźniły się heartbeaty, zostaje; nowe połączenie
+    zostaje zawsze. To samo uporządkowanie zdarzeń dotyczy zmiany adresu peera.
+  - **Przeniesienie tematu na ten węzeł nie zostawia partycji z epoką wyższą
+    niż jej kadencja.** Wybór, który ten węzeł zaczął jako follower, nie
+    obiecuje już kadencji lokalnej partycji, gdy wpis przeszedł dalej (transfer
+    wskazał ten węzeł jako lidera): wcześniej obietnica podnosiła partycję do
+    128, a stempel kadencji 64 był odrzucany jako przestarzały, więc partycja
+    odmawiała zapisów do kolejnego przeniesienia. Gdy obietnica poprzedziła
+    przeniesienie, lider, którego stempel odrzuciła partycja, zgłasza to jak
+    odmowę Hello z nowszą epoką: tik dzierżawy zdejmuje go z roli i węzeł staje
+    do kadencji powyżej bariery. Zamknięcie połączenia sesji mesh usuwa jej wpis
+    tylko, jeśli to nadal ta sama sesja (bez podwójnego `PeerDisconnected`).
+  - **Lider po udanym połączeniu wraca do bazowego opóźnienia ponownego
+    dialu.** Strumień do followera, który działał co najmniej 5 s, jest po
+    zerwaniu ponawiany po 500 ms, nie po opóźnieniu urosłym podczas
+    wcześniejszej awarii (do 5 s).
   - **Czas przejęcia (`duration_ms` rekordu failover) liczy się od ostatniego
     sygnału życia poprzedniego lidera (D6),** nie od zliczenia głosów, gdy ten
     moment jest znany; nazwa pola i format bez zmian.

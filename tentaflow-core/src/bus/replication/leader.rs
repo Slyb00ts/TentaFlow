@@ -758,9 +758,14 @@ impl PartitionLeader {
     /// the next incarnation's base. Does file I/O with two fsyncs, so it runs on
     /// a blocking thread, with the counter's lock taken only for the update.
     ///
-    /// `superseded` says the handle was stopped or replaced: seeding then is
-    /// skipped, so an old handle cannot take an incarnation above its
-    /// replacement's and leave the follower ignoring the new leader's numbers.
+    /// `superseded` says the handle was stopped: a handle stopped before its
+    /// seed runs (or during the I/O, before the final check) takes no
+    /// incarnation. One stopped after that check still lands its number. Where
+    /// the replacement is spawned before the old handle is stopped (a
+    /// promotion), the old handle's seed can therefore number above the new
+    /// one's, and the follower ignores the new leader's lower numbers until
+    /// its next election. That costs liveness only: it never grants a
+    /// commit-alone permission.
     pub fn seed_shrink_base(&self, superseded: impl Fn() -> bool) {
         if self.replicas.len() != 2 || superseded() {
             return;
@@ -2135,6 +2140,37 @@ mod tests {
         leader.seed_shrink_base(|| true);
         assert_eq!(leader.shrink_seq(), before);
         assert_eq!(part.next_incarnation(0).unwrap(), 1);
+    }
+
+    /// A handle stopped while the seed's I/O ran takes no numbers.
+    #[tokio::test]
+    async fn a_handle_stopped_during_the_seed_io_takes_no_numbers() {
+        let part = temp_partition("seed-stopped-late");
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let before = leader.shrink_seq();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        leader.seed_shrink_base(|| checks.fetch_add(1, Ordering::SeqCst) >= 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(leader.shrink_seq(), before);
+    }
+
+    /// Taking out of the books a follower that already left the in-sync set
+    /// keeps a grant made since: its claim was taken back when it left.
+    #[tokio::test]
+    async fn removing_a_follower_outside_the_isr_keeps_the_grant() {
+        let part = temp_partition("remove-out-of-isr");
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(part, &["leader", "f1"], Acks::All, fast_config());
+        leader.register_follower("f1", 0, 0);
+        leader.set_follower_lag_bytes("f1", leader.config.replica_lag_max_bytes + 1);
+        assert!(!leader.isr_members().contains(&"f1".to_string()));
+        assert!(leader.grant_alone_if_unshrunk(leader.shrink_seq()));
+        let seq = leader.shrink_seq();
+
+        leader.remove_follower("f1", "stream ended");
+
+        assert_eq!(leader.shrink_seq(), seq, "no second revoke");
+        assert!(leader.alone_cleared());
     }
 
     /// A follower the leader took out of its books (a leaving notice that came

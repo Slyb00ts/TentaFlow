@@ -71,6 +71,19 @@ use crate::db::DbPool;
 /// a leader-side follower-stream supervisor task.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A stream that stayed up this long was healthy: the next drop is retried at
+/// `RECONNECT_BACKOFF_MIN`, not after the delay an earlier outage grew.
+const STREAM_HEALTHY_AFTER: Duration = Duration::from_secs(5);
+
+/// The delay before re-dialing a follower whose stream ended after `ran_for`,
+/// with `backoff` the delay the failures so far have grown to.
+fn backoff_after_stream(backoff: Duration, ran_for: Duration) -> Duration {
+    if ran_for >= STREAM_HEALTHY_AFTER {
+        RECONNECT_BACKOFF_MIN
+    } else {
+        backoff
+    }
+}
 
 /// On top of a live leader's longest reconnect backoff, room for the dial
 /// itself to connect and hand-shake before a follower no leader has dialed
@@ -334,11 +347,13 @@ impl GlueLeaderFactory {
         // front of the first dial (`seed_shrink_base` says why the short
         // window before it lands is safe).
         let stopped = Arc::new(AtomicBool::new(false));
-        let seeding = Arc::clone(&leader);
-        let seeding_stopped = Arc::clone(&stopped);
-        drop(tokio::task::spawn_blocking(move || {
-            seeding.seed_shrink_base(|| seeding_stopped.load(Ordering::SeqCst))
-        }));
+        if assignment.replicas.len() == 2 {
+            let seeding = Arc::clone(&leader);
+            let seeding_stopped = Arc::clone(&stopped);
+            drop(tokio::task::spawn_blocking(move || {
+                seeding.seed_shrink_base(|| seeding_stopped.load(Ordering::SeqCst))
+            }));
+        }
         let shared = Arc::new(GlueLeaderShared {
             leader,
             writes: Mutex::new(LeaderWrites::default()),
@@ -500,6 +515,16 @@ impl GlueLeaderShared {
                 let _ = tokio::task::spawn_blocking(move || shared.claim_term()).await;
             }
             Ok(Err(e)) => {
+                // The partition recognizes a term above the one this leader
+                // was placed at (a promise it made as a candidate that this
+                // placement then overtook): the same evidence a peer's
+                // `StaleEpoch` refusal is. Recorded for the manager's lease
+                // tick (`check_stale_leadership`), which steps this leader
+                // down so that it stands again above the fence, instead of
+                // leaving a leader whose every write is refused.
+                if let tentaflow_bus::BusError::LeaderEpochStale { have, .. } = &e {
+                    self.stale_epoch.fetch_max(*have, Ordering::SeqCst);
+                }
                 tracing::warn!(error = %e, "replication: deferred set_leader_epoch failed");
             }
             Err(e) => {
@@ -716,6 +741,7 @@ fn spawn_follower_supervisor(
                 partition_id,
             ));
 
+            let streaming_since = Instant::now();
             let result = leader::run_follower_stream(
                 Arc::clone(&shared.leader),
                 node_id.clone(),
@@ -765,6 +791,7 @@ fn spawn_follower_supervisor(
                         node_id = %node_id, error = %e,
                         "replication: leader follower-stream ended, reconnecting"
                     );
+                    backoff = backoff_after_stream(backoff, streaming_since.elapsed());
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                 }
@@ -2614,6 +2641,68 @@ mod tests {
         )
         .local_log_position(assignment)
         .unwrap()
+    }
+
+    /// The delay a redial waits does not stay where an earlier outage grew it:
+    /// a stream that was up for a while is retried at the base delay.
+    #[test]
+    fn a_stream_that_was_healthy_is_retried_at_the_base_delay() {
+        let grown = RECONNECT_BACKOFF_MAX;
+        assert_eq!(
+            backoff_after_stream(grown, STREAM_HEALTHY_AFTER),
+            RECONNECT_BACKOFF_MIN
+        );
+        assert_eq!(
+            backoff_after_stream(grown, Duration::from_secs(60)),
+            RECONNECT_BACKOFF_MIN
+        );
+        // A stream that dropped at once keeps the delay it had grown to.
+        assert_eq!(
+            backoff_after_stream(grown, Duration::from_millis(300)),
+            grown
+        );
+    }
+
+    /// A leader placed at a term below the one its partition already
+    /// recognizes (a promise made as a candidate before the placement landed)
+    /// cannot stamp its term: it reports the recognized one as stale
+    /// leadership, which the manager's lease tick turns into a step-down and a
+    /// new candidacy above the fence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leader_whose_partition_recognizes_a_newer_term_reports_it_as_stale() {
+        let provider = FakeNodeProvider::new();
+        let term = assignment(&["l", "f1"], "l", &["l", "f1"], 64);
+        provider
+            .partition("org-1", "orders", 0, 0)
+            .unwrap()
+            .set_leader_epoch(128)
+            .unwrap();
+        let factory = Arc::new(GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        ));
+        let ((leader_recv, leader_send), _follower) = duplex_pair();
+        let handle = tokio::task::spawn_blocking(move || {
+            factory.spawn_deferred(&term, vec![("f1".to_string(), leader_recv, leader_send)])
+        })
+        .await
+        .unwrap()
+        .expect("leader spawn");
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(have) = handle.observed_stale_epoch() {
+                    return have;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(seen.ok(), Some(128));
     }
 
     /// A follower no leader has dialed must outwait a LIVE leader's longest

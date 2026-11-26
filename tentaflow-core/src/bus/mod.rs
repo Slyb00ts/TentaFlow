@@ -19338,20 +19338,16 @@ mod tests {
         fn can_forward_publish(&self) -> bool {
             self.forwarding.load(std::sync::atomic::Ordering::SeqCst)
         }
-        fn assigned_leader(
-            &self,
-            _org: &str,
-            topic: &str,
-            partition: u32,
-        ) -> Option<(String, u32)> {
-            self.assigned_leaders
-                .lock()
-                .get(&(topic.to_string(), partition))
-                .cloned()
+        fn assigned_leader(&self, org: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
+            // Through the same read, as the real manager does: a read error
+            // shows as "no row" to every caller that cannot tell the two apart.
+            self.assigned_leader_read(org, topic, partition)
+                .ok()
+                .flatten()
         }
         fn assigned_leader_read(
             &self,
-            org: &str,
+            _org: &str,
             topic: &str,
             partition: u32,
         ) -> Result<Option<(String, u32)>, ()> {
@@ -19362,7 +19358,11 @@ mod tests {
             {
                 return Err(());
             }
-            Ok(self.assigned_leader(org, topic, partition))
+            Ok(self
+                .assigned_leaders
+                .lock()
+                .get(&(topic.to_string(), partition))
+                .cloned())
         }
         fn forward_publish(
             &self,
@@ -22166,6 +22166,135 @@ mod tests {
             .map(|c| c.0.clone())
             .collect();
         assert_eq!(targets, ["node-b", "node-c"]);
+    }
+
+    /// A leader that was just handed the partition refuses at the epoch it
+    /// still sees, below the one the role named: it has not caught up, which is
+    /// not a second attempt at another leader. The write is asked again there
+    /// at once, not held for the leader wait.
+    #[test]
+    fn a_write_the_role_routed_is_asked_again_when_the_leader_sees_an_older_epoch() {
+        let topic = "orders.fwd-role-behind";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-c", 3));
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-a".to_string()),
+                leader_epoch: 2,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let targets: Vec<String> = coord
+            .forward_calls
+            .lock()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(targets, ["node-c", "node-c"]);
+    }
+
+    /// Partitions that drifted to different epochs still go to their leader in
+    /// one request: one round trip, not one per epoch.
+    #[test]
+    fn partitions_routed_at_different_epochs_to_one_leader_go_in_one_request() {
+        let topic = "orders.fwd-mixed-epochs";
+        let (_tmp, svc) = forwarding_service(topic, 2);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(0, follower_of("node-c", 5));
+        coord.set_partition_role(1, follower_of("node-c", 7));
+        let mut both = landed(0, 1, 1);
+        if let Ok(reply) = &mut both.reply {
+            if let Some(result) = &mut reply.result {
+                result.accepted = 2;
+                result.partitions.push(replication::frames::ForwardAck {
+                    partition: 1,
+                    base_offset: 2,
+                    accepted: 1,
+                });
+            }
+        }
+        coord.script_forwarding(vec![both]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, None, two_partition_records()).unwrap();
+        assert_eq!(result.accepted, 2);
+        let calls = coord.forward_calls.lock();
+        assert_eq!(calls.len(), 1, "one request for the leader");
+        let partitions: Vec<u32> = calls[0].1.groups.iter().map(|g| g.partition).collect();
+        assert_eq!(partitions, [0, 1]);
+    }
+
+    /// A refusal whose epoch lies between those the partitions were routed at
+    /// says nothing about which of them the leader has not caught up with: they
+    /// are asked again apart, each judged against its own epoch, not held for
+    /// the leader wait.
+    #[test]
+    fn an_unclear_refusal_splits_the_request_by_epoch_for_the_retry_only() {
+        let topic = "orders.fwd-unclear-refusal";
+        let (_tmp, svc) = forwarding_service(topic, 2);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(0, follower_of("node-c", 5));
+        coord.set_partition_role(1, follower_of("node-c", 7));
+        let refusal = || {
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-a".to_string()),
+                leader_epoch: 6,
+            })
+        };
+        coord.script_forwarding(vec![refusal(), landed(0, 1, 1), refusal(), landed(1, 2, 1)]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, None, two_partition_records()).unwrap();
+        assert_eq!(result.accepted, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let calls = coord.forward_calls.lock();
+        let sent: Vec<Vec<u32>> = calls
+            .iter()
+            .map(|(_, request)| request.groups.iter().map(|g| g.partition).collect())
+            .collect();
+        assert_eq!(sent, [vec![0, 1], vec![0], vec![1], vec![1]]);
+    }
+
+    /// A refusal at or above every epoch the groups were routed at is a leader
+    /// that moved on: the groups wait for the assignment, not asked again.
+    #[test]
+    fn a_refusal_above_every_routed_epoch_is_a_leader_that_moved_on() {
+        let topic = "orders.fwd-moved-on";
+        let (_tmp, svc) = forwarding_service(topic, 2);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(0, follower_of("node-c", 5));
+        coord.set_partition_role(1, follower_of("node-c", 7));
+        coord.script_forwarding(vec![answered_with(&BusServiceError::NotLeader {
+            leader_node_id: Some("node-d".to_string()),
+            leader_epoch: 8,
+        })]);
+        svc.set_replication(coord.clone());
+
+        let err = fwd_publish(&svc, topic, None, two_partition_records()).unwrap_err();
+        assert!(matches!(err, BusServiceError::NotLeader { .. }), "{err:?}");
+        assert_eq!(coord.forward_calls.lock().len(), 1, "not asked again");
+    }
+
+    fn two_partition_records() -> Vec<PublishRecord> {
+        (0..2)
+            .map(|p| record_with_key(&format!("v{p}"), &key_for_partition(p, 2)))
+            .collect()
     }
 
     /// A ledger read that fails while a write waits at the row's leader says

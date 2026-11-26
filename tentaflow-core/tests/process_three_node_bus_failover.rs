@@ -487,6 +487,13 @@ impl ChildNode {
         }
     }
 
+    /// Whether the node dropped a mesh session it found dead on the arrival of
+    /// a bus connection (the restart recovery): where nothing restarted it
+    /// must not have.
+    fn dropped_a_dead_session(&self) -> bool {
+        self.stderr_contains("z martwej sesji mesh")
+    }
+
     fn stderr_contains(&self, needle: &str) -> bool {
         self.stderr_lines
             .lock()
@@ -984,6 +991,12 @@ fn process_three_node_bus_failover_smoke() {
     assert_eq!(hash_a, hash_b, "leader/follower-b log hash mismatch");
     assert_eq!(hash_a, hash_c, "leader/follower-c log hash mismatch");
 
+    for node in [&a, &b, &c] {
+        assert!(
+            !node.dropped_a_dead_session(),
+            "a live peer's session was dropped as dead"
+        );
+    }
     eprintln!(
         "process_three_node_bus_failover_smoke: OK in {:?} ({total} records replicated to 3/3 nodes, hashes equal)",
         start.elapsed()
@@ -1365,6 +1378,10 @@ fn process_two_node_bus_eight_partitions_of_a_killed_leader_move_within_fifteen_
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        !b.dropped_a_dead_session(),
+        "no restart happened, yet the survivor dropped a session as dead"
+    );
     eprintln!(
         "failover: all {PARTITIONS} partitions led by the survivor {:?} after the kill",
         killed.elapsed()
@@ -1385,9 +1402,10 @@ fn process_two_node_bus_a_peer_back_on_its_address_is_replicated_to_again() {
 }
 
 /// The same return with a relay configured that accepts connections and never
-/// answers, as on a network that drops instead of refusing. Guards the
-/// recovery with a relay in play; it does not reproduce the E2E failure, which
-/// needs a relay path that is open (see the pass-6 notes).
+/// answers, as on a network that drops instead of refusing. This does NOT
+/// reproduce the failure seen live: on loopback the bus connections get no
+/// direct path selected, so the stuck dead path never forms. It guards that a
+/// silent relay does not hold the recovery up.
 #[test]
 fn process_two_node_bus_a_peer_back_is_replicated_to_again_with_a_relay_that_never_answers() {
     if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
@@ -1406,6 +1424,27 @@ fn process_two_node_bus_a_peer_back_is_replicated_to_again_with_a_relay_that_nev
     restarted_peer_is_replicated_to_again(Some(format!("http://127.0.0.1:{port}")));
 }
 
+/// A relay both nodes reach (set `TENTAFLOW_TEST_RELAY`, for instance to the
+/// product's default `https://relay.nextapp.pl/`): the restarted peer's
+/// connections arrive over it first (relay-only, while the direct path is
+/// still being punched), and its mesh dial follows only after the larger id's
+/// grace. Ignored by default: a relay cannot be run inside the test, and one
+/// the host cannot reach proves nothing.
+#[test]
+#[ignore = "needs TENTAFLOW_TEST_RELAY"]
+fn process_two_node_bus_a_peer_back_is_replicated_to_again_through_a_working_relay() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    let relay = std::env::var("TENTAFLOW_TEST_RELAY")
+        .expect("TENTAFLOW_TEST_RELAY names a relay both nodes reach");
+    restarted_peer_is_replicated_to_again(Some(relay));
+}
+
+/// Kills the node with the larger id (the one that waits for the other to dial
+/// the mesh) while it leads half of the partitions, restarts it on the same
+/// address after the peer gave up on it, and has its mesh dial arrive well
+/// after its bus connections. Every partition must be replicated again.
 fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
     let relay_env: Vec<(&str, &str)> = relay
         .as_deref()
@@ -1414,104 +1453,146 @@ fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
     const TOPIC4: &str = "chaos.restart";
     const PARTS: u32 = 4;
     let root = tempfile::tempdir().expect("root");
-    let a_port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("probe socket")
-        .local_addr()
-        .expect("probe addr")
-        .port();
-    let a_bind = format!("127.0.0.1:{a_port}");
-    let home_a = root.path().join("a");
-    let a_env: Vec<(&str, &str)> = relay_env
+    let (home_x, home_y) = (root.path().join("x"), root.path().join("y"));
+    // The address both nodes bind: loopback unless a host address is given
+    // (a relay is then reached the way the product reaches it, from a LAN
+    // address rather than loopback).
+    let first_bind = format!(
+        "{}:0",
+        std::env::var("TENTAFLOW_TEST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+    );
+    let first_env: Vec<(&str, &str)> = relay_env
         .iter()
         .copied()
-        .chain([("TENTAFLOW_BUS_CHAOS_BIND", a_bind.as_str())])
+        .chain([("TENTAFLOW_BUS_CHAOS_BIND", first_bind.as_str())])
         .collect();
-    let mut a = ChildNode::spawn_with_env("a", home_a.clone(), &a_env);
-    let mut b = ChildNode::spawn_with_env("b", root.path().join("b"), &relay_env);
-    connect_nodes(&mut a, &mut b);
-    a.command(&format!(
+    let x = ChildNode::spawn_with_env("x", home_x.clone(), &first_env);
+    let y = ChildNode::spawn_with_env("y", home_y.clone(), &first_env);
+    // The victim is the node with the larger id, whichever the keys gave. It
+    // comes back on the address it was given the first time.
+    let (mut survivor, mut victim, victim_home) = if x.node_id > y.node_id {
+        (y, x, home_x)
+    } else {
+        (x, y, home_y)
+    };
+    let victim_bind = victim.addr.to_string();
+    let victim_env: Vec<(&str, &str)> = relay_env
+        .iter()
+        .copied()
+        .chain([("TENTAFLOW_BUS_CHAOS_BIND", victim_bind.as_str())])
+        .collect();
+    connect_nodes(&mut victim, &mut survivor);
+    victim.command(&format!(
         "CREATE_TOPIC {ORG_ID} {TOPIC4} {PARTS} 2 quorum standard"
     ));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let line = b.command(&format!("TOPIC_STATE {ORG_ID} {TOPIC4}"));
+        let line = survivor.command(&format!("TOPIC_STATE {ORG_ID} {TOPIC4}"));
         if line.split_whitespace().nth(3) == Some("1") {
             break;
         }
-        assert!(Instant::now() < deadline, "the topic row never reached b");
+        assert!(
+            Instant::now() < deadline,
+            "the topic row never reached the survivor"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let led_by_a = |p: u32| p < PARTS / 2;
+    let led_by_victim = |p: u32| p < PARTS / 2;
     for p in 0..PARTS {
         // The leader first: the first replica is the one the topic returns to.
-        let (leader, other) = if led_by_a(p) {
-            (&a.node_id, &b.node_id)
+        let (leader, other) = if led_by_victim(p) {
+            (&victim.node_id, &survivor.node_id)
         } else {
-            (&b.node_id, &a.node_id)
+            (&survivor.node_id, &victim.node_id)
         };
-        a.command(&format!(
+        victim.command(&format!(
             "ASSIGN {ORG_ID} {TOPIC4} {p} {leader} {leader},{other}"
         ));
     }
-    let isr_has_both = |node: &mut ChildNode, p: u32, other: &str| {
-        node.command(&format!("ISR {ORG_ID} {TOPIC4} {p}"))
-            .contains(other)
+    // A partition is replicated when the node that leads it now lists the other
+    // in its in-sync set. Only a leader's set is live: a follower's falls back
+    // to the ledger row, which says nothing about a stream. The leader is asked
+    // for, since a failover may have moved it.
+    let (victim_id, survivor_id) = (victim.node_id.clone(), survivor.node_id.clone());
+    let replicated = |victim: &mut ChildNode, survivor: &mut ChildNode, p: u32| -> bool {
+        for (node, other) in [(&mut *victim, &survivor_id), (&mut *survivor, &victim_id)] {
+            if node
+                .command(&format!("ROLE {ORG_ID} {TOPIC4} {p}"))
+                .contains("Leader")
+            {
+                return node
+                    .command(&format!("ISR {ORG_ID} {TOPIC4} {p}"))
+                    .contains(other.as_str());
+            }
+        }
+        false
     };
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let mut all = true;
-        for p in 0..PARTS {
-            all &= if led_by_a(p) {
-                isr_has_both(&mut a, p, &b.node_id)
-            } else {
-                isr_has_both(&mut b, p, &a.node_id)
-            };
-        }
-        if all {
-            break;
-        }
+    while !(0..PARTS).all(|p| replicated(&mut victim, &mut survivor, p)) {
         assert!(Instant::now() < deadline, "the partitions never settled");
         std::thread::sleep(Duration::from_millis(200));
     }
-    std::thread::sleep(Duration::from_millis(1500));
+    // The victim leads the partitions it was given and the survivor the rest,
+    // each with exactly one node saying so.
+    for p in 0..PARTS {
+        let on_victim = victim
+            .command(&format!("ROLE {ORG_ID} {TOPIC4} {p}"))
+            .contains("Leader");
+        let on_survivor = survivor
+            .command(&format!("ROLE {ORG_ID} {TOPIC4} {p}"))
+            .contains("Leader");
+        assert_eq!(
+            (on_victim, on_survivor),
+            (led_by_victim(p), !led_by_victim(p)),
+            "partition {p}: exactly the assigned node must lead it before the kill"
+        );
+    }
+    // Long enough for iroh to punch the direct path the connections started
+    // without (they open over a relay): it is the path the survivor holds
+    // selected when the victim dies.
+    std::thread::sleep(Duration::from_secs(15));
 
-    a.kill();
-    let (a_id, a_key) = (a.node_id.clone(), a.public_key.clone());
-    drop(a);
-    std::thread::sleep(Duration::from_secs(4));
-    let mut a2 = ChildNode::spawn_with_env("a-restart", home_a, &a_env);
-    assert_eq!(a2.node_id, a_id, "the restart keeps its identity");
-    assert_eq!(a2.addr.to_string(), a_bind, "the restart keeps its address");
-    a2.command(&format!("TRUST {} {}", b.node_id, b.public_key));
-    a2.command(&format!("SET_PEER_ENV {} prod", b.node_id));
-    // The restarted node's bus streams to the peer come first; its mesh
-    // redial follows seconds later. The peer has by then given up on the
-    // node it could not reach, so what is checked afterwards is a return.
-    let dropped = Instant::now() + Duration::from_secs(30);
-    while isr_has_both(&mut b, PARTS - 1, &a_id) && Instant::now() < dropped {
+    victim.kill();
+    drop(victim);
+    // The survivor gives up on the node it cannot reach before it returns.
+    let gave_up = Instant::now() + Duration::from_secs(30);
+    while survivor
+        .command(&format!("ISR {ORG_ID} {TOPIC4} {}", PARTS - 1))
+        .contains(&victim_id)
+    {
+        assert!(
+            Instant::now() < gave_up,
+            "the survivor never removed the killed node from its in-sync set"
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
-    std::thread::sleep(Duration::from_secs(3));
-    a2.command(&format!(
-        "CONNECT {} {} {}",
-        b.node_id, b.public_key, b.addr
+    let mut victim = ChildNode::spawn_with_env("victim-restart", victim_home, &victim_env);
+    assert_eq!(victim.node_id, victim_id, "the restart keeps its identity");
+    assert_eq!(
+        victim.addr.to_string(),
+        victim_bind,
+        "the restart keeps its address"
+    );
+    victim.command(&format!(
+        "TRUST {} {}",
+        survivor.node_id, survivor.public_key
     ));
-    let _ = a_key;
+    victim.command(&format!("SET_PEER_ENV {} prod", survivor.node_id));
+    // The restarted node's bus connections reach the survivor at once; its
+    // mesh dial comes late (the larger id waits for the other to dial, then
+    // for discovery), the survivor having taken the bus connections first.
+    std::thread::sleep(Duration::from_secs(14));
+    victim.command(&format!(
+        "CONNECT {} {} {}",
+        survivor.node_id, survivor.public_key, survivor.addr
+    ));
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(40);
     loop {
-        let mut missing = Vec::new();
-        for p in 0..PARTS {
-            let covered = if led_by_a(p) {
-                isr_has_both(&mut a2, p, &b.node_id)
-            } else {
-                isr_has_both(&mut b, p, &a_id)
-            };
-            if !covered {
-                missing.push(p);
-            }
-        }
+        let missing: Vec<u32> = (0..PARTS)
+            .filter(|p| !replicated(&mut victim, &mut survivor, *p))
+            .collect();
         if missing.is_empty() {
             break;
         }
@@ -1521,7 +1602,14 @@ fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    eprintln!("restart: every partition in sync again {:?} after the mesh redial", started.elapsed());
+    assert!(
+        survivor.dropped_a_dead_session(),
+        "the survivor never dropped the dead session on the restarted node's first connection"
+    );
+    eprintln!(
+        "restart: every partition in sync again {:?} after the mesh redial",
+        started.elapsed()
+    );
 }
 
 // ===== Topic re-creation across nodes (non-ignored) =========================
@@ -2127,13 +2215,14 @@ fn process_three_node_bus_child() {
         // Honours `RUST_LOG` (inherited from the parent's environment) so a
         // failing run can be re-run at a higher level without editing this
         // file; the hard-coded string stays the default when it is unset.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug",
-                )
-            }),
-        )
+        // The mesh manager's info lines are forced on whatever `RUST_LOG` says:
+        // tests grep them (`ChildNode::dropped_a_dead_session`).
+        .with_env_filter(tracing_subscriber::EnvFilter::new(format!(
+            "{},tentaflow_core::mesh::iroh_manager=info",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug".to_string()
+            })
+        )))
         .try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -2193,12 +2282,15 @@ async fn child_main() {
             node_id: String::new(),
             // A fixed address lets a restarted node come back where it was.
             bind_addr: std::env::var("TENTAFLOW_BUS_CHAOS_BIND")
-                .ok()
-                .and_then(|addr| addr.parse().ok())
-                .unwrap_or_else(|| "127.0.0.1:0".parse().expect("bind")),
-            relay_url: std::env::var("TENTAFLOW_BUS_CHAOS_RELAY")
-                .ok()
-                .and_then(|url| url.parse().ok()),
+                .map(|addr| {
+                    addr.parse()
+                        .expect("TENTAFLOW_BUS_CHAOS_BIND is an address")
+                })
+                .unwrap_or_else(|_| "127.0.0.1:0".parse().expect("bind")),
+            relay_url: std::env::var("TENTAFLOW_BUS_CHAOS_RELAY").ok().map(|url| {
+                url.parse()
+                    .expect("TENTAFLOW_BUS_CHAOS_RELAY is a relay url")
+            }),
             enable_lan_discovery: false,
             enable_dht_discovery: false,
             addr_filter: None,

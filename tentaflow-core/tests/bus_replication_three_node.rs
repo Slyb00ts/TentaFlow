@@ -7529,7 +7529,8 @@ async fn a_write_on_the_old_leader_during_a_transfer_is_not_held_for_the_leader_
     let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
     let a = find_node(&nodes, "A");
 
-    let slowest: Arc<Mutex<(Duration, String)>> = Arc::new(Mutex::new((Duration::ZERO, String::new())));
+    let slowest: Arc<Mutex<(Duration, String)>> =
+        Arc::new(Mutex::new((Duration::ZERO, String::new())));
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let (svc, slowest, stop) = (Arc::clone(&a.svc), Arc::clone(&slowest), Arc::clone(&stop));
@@ -7591,5 +7592,99 @@ async fn a_write_on_the_old_leader_during_a_transfer_is_not_held_for_the_leader_
         took < Duration::from_millis(2500),
         "a write on the old leader was held for {took:?} ({what})"
     );
+    shutdown_all(&nodes);
+}
+
+/// A transfer of one topic must leave every other topic's partition at the
+/// term its own row names: after `orders` went to B and back, `t2` moves to B
+/// at the epoch its own row dictates and B serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_of_one_topic_does_not_fence_the_partitions_of_another() {
+    let (nodes, _ledger, _registry, _topics) = four_topics_led_by_a().await;
+    let (a, b) = (find_node(&nodes, "A"), find_node(&nodes, "B"));
+    let transfer = |node: &TestNode, topic: &'static str, to: &'static str| {
+        let manager = Arc::clone(&node.manager);
+        async move {
+            // The new leader's handle and its replicas' progress settle a
+            // moment after its role does: asked too early it answers that
+            // it has no assignment or that the target is not in sync yet.
+            let mut last = None;
+            for _ in 0..50 {
+                let manager = Arc::clone(&manager);
+                let done =
+                    tokio::task::spawn_blocking(move || manager.transfer_leader(ORG, topic, 0, to))
+                        .await
+                        .expect("transfer task");
+                match done {
+                    Err(ReplError::NoAssignment { .. } | ReplError::NotAReplica { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    other => {
+                        last = Some(other);
+                        break;
+                    }
+                }
+            }
+            last.expect("the transfer kept being refused as too early")
+        }
+    };
+
+    let to_b = transfer(a, TOPIC, "B").await.expect("orders to B");
+    assert!(
+        wait_until(Duration::from_secs(10), || b.manager.role(ORG, TOPIC, 0)
+            == PartitionRole::Leader { epoch: to_b })
+        .await,
+        "B never led {TOPIC}"
+    );
+    assert!(
+        wait_isr_full(&nodes, TOPIC, "B", &["A", "B"]).await,
+        "A never rejoined the in-sync set of {TOPIC}"
+    );
+    let back = transfer(b, TOPIC, "A").await.expect("orders back to A");
+    assert!(
+        wait_until(Duration::from_secs(10), || a.manager.role(ORG, TOPIC, 0)
+            == PartitionRole::Leader { epoch: back })
+        .await,
+        "A never led {TOPIC} again"
+    );
+
+    let epoch_of = |node: &TestNode, topic: &str| {
+        node.svc
+            .local_partition(&ctx(), topic, 0)
+            .map(|part| part.leader_epoch())
+            .ok()
+    };
+    assert_eq!(
+        epoch_of(b, "t2"),
+        Some(1),
+        "B's copy of t2 was fenced by the transfers of {TOPIC}"
+    );
+
+    assert!(
+        wait_isr_full(&nodes, "t2", "A", &["A", "B"]).await,
+        "B left the in-sync set of t2"
+    );
+    let to_b = transfer(a, "t2", "B").await.expect("t2 to B");
+    assert!(
+        wait_until(Duration::from_secs(10), || b.manager.role(ORG, "t2", 0)
+            == PartitionRole::Leader { epoch: to_b })
+        .await,
+        "B never led t2"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || epoch_of(b, "t2") == Some(to_b)).await,
+        "B's t2 is not at the term it leads: {:?}",
+        epoch_of(b, "t2")
+    );
+    let mut accepted = false;
+    for _ in 0..50 {
+        if matches!(publish_on(&b.svc, "t2", "after-the-transfer").await, Ok(r) if r.accepted == 1)
+        {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(accepted, "B refused writes to the topic it was just given");
     shutdown_all(&nodes);
 }
