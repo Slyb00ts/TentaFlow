@@ -22114,6 +22114,7 @@ mod tests {
         let topic = "orders.fwd-row-unaware";
         let (_tmp, svc) = forwarding_service(topic, 1);
         let coord = FakeCoordinator::leader(1);
+        *coord.forward_hold.lock() = Duration::from_millis(400);
         coord.set_role(follower_of("node-b", 2));
         coord.set_assigned_leader(topic, 0, "node-c", 3);
         coord.script_forwarding(vec![

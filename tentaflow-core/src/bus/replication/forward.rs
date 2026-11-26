@@ -1031,7 +1031,7 @@ impl BusService {
             // Read before the roles it has to explain, so a change landing
             // in between is not waited for.
             let generation = coordinator.assignment_generation();
-            let mut by_leader: BTreeMap<String, (u32, Vec<PendingGroup>)> = BTreeMap::new();
+            let mut by_leader: BTreeMap<(String, bool), (u32, Vec<PendingGroup>)> = BTreeMap::new();
             let mut waiting: Vec<PendingGroup> = Vec::new();
             for group in std::mem::take(&mut pending) {
                 let (routed, via_row) =
@@ -1058,8 +1058,11 @@ impl BusService {
                     Route::Remote { leader, epoch }
                         if group.refused_by.as_deref() != Some(leader.as_str()) =>
                     {
+                        // Groups the row chose and groups the role chose go in
+                        // separate requests: the epoch they were routed at, and
+                        // what a refusal at an older one means, differ.
                         by_leader
-                            .entry(leader)
+                            .entry((leader, group.via_row))
                             .or_insert_with(|| (epoch, Vec::new()))
                             .1
                             .push(group);
@@ -1068,7 +1071,7 @@ impl BusService {
                 }
             }
 
-            for (leader, (epoch, groups)) in by_leader {
+            for ((leader, _via_row), (epoch, groups)) in by_leader {
                 for chunk in chunk_groups(groups) {
                     match self.send_chunk(
                         coordinator,
@@ -1152,6 +1155,17 @@ impl BusService {
         // hold a producer for the whole ack timeout.
         let led_by_target = || {
             groups.iter().all(|g| {
+                // A group sent where the ledger row said stays valid while the
+                // row (or the role, once it catches up) still says it: the
+                // request must not be judged by the role alone, which still
+                // names the leader that refused it.
+                if g.via_row
+                    && coordinator
+                        .assigned_leader(&job.ctx.org_id, job.topic, g.partition)
+                        .is_some_and(|(l, _)| l == leader)
+                {
+                    return true;
+                }
                 match target_of(coordinator, local_node, &job.ctx.org_id, job.topic, g).0 {
                     Route::Remote { leader: l, .. } => l == leader,
                     Route::Here => false,

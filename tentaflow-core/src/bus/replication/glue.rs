@@ -330,6 +330,16 @@ impl GlueLeaderFactory {
             Arc::clone(&self.metrics),
         ));
 
+        // Two fsyncs: off the async task, and beside the stamp rather than in
+        // front of the first dial (`seed_shrink_base` says why the short
+        // window before it lands is safe).
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let seeding = Arc::clone(&leader);
+                drop(runtime.spawn_blocking(move || seeding.seed_shrink_base()));
+            }
+            Err(_) => leader.seed_shrink_base(),
+        }
         let shared = Arc::new(GlueLeaderShared {
             leader,
             writes: Mutex::new(LeaderWrites::default()),

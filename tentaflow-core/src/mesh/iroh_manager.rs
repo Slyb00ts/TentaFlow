@@ -4453,7 +4453,9 @@ mod tie_break_tests {
             .entry(peer_hex.clone())
             .or_default()
             .push((
-                Instant::now() - Duration::from_secs(30),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(30))
+                    .unwrap_or_else(Instant::now),
                 bus_conn.weak_handle(),
             ));
         // Opened by this node's own feeder toward the process that is back.

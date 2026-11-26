@@ -492,7 +492,6 @@ impl PartitionLeader {
         // `Partition::subscribe_leo` gives its own receivers.
         let hw_tx = watch::channel(partition.high_watermark()).0;
         let start_leo = partition.log_end_offset();
-        let shrink_base = shrink_seq_base(&partition);
         metrics.record_leader_epoch(epoch);
         let leader = Self {
             instance_id: instance_id.into(),
@@ -523,7 +522,7 @@ impl PartitionLeader {
             // transfer's old leader, a restart's follower) that a standing
             // would turn on the writes committed here.
             alone_cleared: AtomicBool::new(replicas_len != 2),
-            shrink_seq: parking_lot::Mutex::new(shrink_base),
+            shrink_seq: parking_lot::Mutex::new(clock_ms() << 16),
             start_leo,
             fed: dashmap::DashSet::new(),
             config,
@@ -752,6 +751,40 @@ impl PartitionLeader {
         }
     }
 
+    /// Moves the start of the shrink numbering to this partition's incarnation
+    /// counter, kept in its directory (the wall clock in milliseconds, but never
+    /// below the stored value plus one, so a clock set back cannot lower it),
+    /// shifted left 16 bits: 65k shrinks per incarnation before one could reach
+    /// the next incarnation's base. Does file I/O with two fsyncs, so it runs on
+    /// a blocking thread, with the counter's lock taken only for the update.
+    pub fn seed_shrink_base(&self) {
+        if self.replicas.len() != 2 {
+            return;
+        }
+        let clock = clock_ms();
+        let incarnation = self.partition.next_incarnation(clock).unwrap_or_else(|e| {
+            tracing::warn!(
+                org_id = %self.org_id, topic = %self.topic, partition = self.partition_id,
+                error = %e,
+                "replication: the leader incarnation counter could not be stored, numbering \
+                 shrinks from the clock (a clock set back could then lower them)"
+            );
+            clock
+        });
+        // No lock is held across the I/O above (heartbeats and ISR checks on
+        // async tasks read the counter). Until this brief update lands, a
+        // shrink is numbered from the clock alone, which is safe: numbers
+        // only ever go up here (`max`), and the window is the first
+        // milliseconds of a leader's life, before its first follower has
+        // registered and been dropped again. The one case it would not cover
+        // is a clock set back below the previous incarnation's numbers AND a
+        // shrink inside that window: the follower could then see a notice
+        // lower than one it already holds. A grant taken against a number
+        // from before the update is refused afterwards, which fails safe.
+        let mut seq = self.shrink_seq.lock();
+        *seq = (*seq).max(incarnation << 16);
+    }
+
     /// The shrink counter: what an `IsrShrink` notice and the heartbeats name.
     /// It starts at a base derived from the clock, so the numbers of a leader
     /// that restarts at the same epoch all exceed those of the incarnation
@@ -832,11 +865,17 @@ impl PartitionLeader {
     pub fn remove_follower(&self, node_id: &str, reason: &str) {
         // The permission to commit alone is taken back before the follower
         // leaves the set: a publish that reads the set (one member) and then
-        // the permission must not find it still given.
-        if self.followers.contains_key(node_id) {
-            self.note_shrunk();
-        }
-        if self.followers.remove(node_id).is_some() {
+        // the permission must not find it still given. Inside the removal, so
+        // that only the caller that really removes the follower takes it back
+        // (a second remover would otherwise revoke a grant made since).
+        if self
+            .followers
+            .remove_if(node_id, |_, _| {
+                self.note_shrunk();
+                true
+            })
+            .is_some()
+        {
             let isr_size = self.isr_size();
             self.metrics.record_isr_size(isr_size);
             self.emit(IsrEvent::Detached {
@@ -1447,17 +1486,11 @@ async fn feed<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Where a leader handle's shrink numbering starts: an incarnation counter kept
-/// in the partition directory (the wall clock in milliseconds, but never below
-/// the stored value plus one, so a clock set back cannot lower it) shifted left
-/// 16 bits, which leaves 65k shrinks per incarnation before one could reach the
-/// next incarnation's base.
-fn shrink_seq_base(partition: &Partition) -> u64 {
-    let clock_ms = std::time::SystemTime::now()
+/// The wall clock in milliseconds since the epoch.
+fn clock_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let incarnation = partition.next_incarnation(clock_ms).unwrap_or(clock_ms);
-    incarnation << 16
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Sends a bare `Heartbeat` and returns the `hw` it carried. It carries the
@@ -2043,6 +2076,59 @@ mod tests {
             "{result:?}"
         );
         assert!(started.elapsed() <= HELLO_ACK_TIMEOUT + Duration::from_secs(1));
+    }
+
+    /// A follower the leader took out of its books (a leaving notice that came
+    /// late) while its stream still runs has the stream ended, so the follower
+    /// dials again and registers instead of flowing uncounted.
+    #[tokio::test]
+    async fn a_stream_whose_follower_was_taken_out_of_the_books_ends() {
+        let part = temp_partition("removed-follower");
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
+        });
+        assert!(matches!(
+            read_frame(&mut foll_r).await.unwrap(),
+            ReplFrame::Hello(_)
+        ));
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 0,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
+                bus_features: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let registered = async {
+            while !leader.has_follower("f1") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), registered)
+            .await
+            .expect("the follower never registered");
+
+        assert!(leader.follower_leaving("f1"));
+        let ended = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the stream outlived its follower's removal")
+            .unwrap();
+        assert!(
+            matches!(ended, Err(FollowerStreamError::Removed)),
+            "{ended:?}"
+        );
     }
 
     #[tokio::test]

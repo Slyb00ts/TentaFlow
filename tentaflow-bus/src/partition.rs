@@ -1789,6 +1789,9 @@ struct PartitionInner {
     _lock: File,
     /// The partition directory, for the small files kept beside the log.
     dir: PathBuf,
+    /// Serialises `next_incarnation` among the handles of this partition; they
+    /// share the temporary file it writes. Other partitions are unaffected.
+    incarnation_lock: parking_lot::Mutex<()>,
 }
 
 /// Upper bound `Drop for PartitionInner` waits for the writer thread to
@@ -2179,6 +2182,7 @@ impl Partition {
                 throttle_hint_ms: 5,
                 _lock: lock_file,
                 dir: dir.clone(),
+                incarnation_lock: parking_lot::Mutex::new(()),
             }),
         })
     }
@@ -2190,6 +2194,10 @@ impl Partition {
     /// restarted leader of the same epoch all exceed the ones before.
     pub fn next_incarnation(&self, floor: u64) -> Result<u64> {
         use std::io::Write;
+        // Two leader handles of one partition can seed at once (a rebuild
+        // while the old handle still runs); they share the temporary file
+        // below, so the read-increment-store runs one at a time.
+        let _serial = self.inner.incarnation_lock.lock();
         let path = self.inner.dir.join("leader-incarnation");
         let stored = match std::fs::read_to_string(&path) {
             Ok(text) => text.trim().parse::<u64>().unwrap_or_else(|e| {

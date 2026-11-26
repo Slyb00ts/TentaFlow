@@ -570,7 +570,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
       komunikacie, flagi nie przywraca. Numery zawężeń startują od wartości z zegara
       (`licznik uruchomień << 16`, gdzie licznik to zegar w ms, ale nigdy nie
       mniej niż zapisana w pliku `leader-incarnation` w katalogu partycji wartość plus 1,
-      z fsync pliku i katalogu) przy każdym
+      z fsync pliku i katalogu, na wątku blokującym przed rejestracją pierwszego
+      followera; błąd zapisu jest logowany i numeracja wraca do zegara) przy każdym
       uruchomieniu lidera, więc po restarcie lidera w tej samej epoce
       wszystkie numery są wyższe niż wcześniejsze, także gdy zegar cofnięto:
       komunikat z nowego uruchomienia zastępuje zdjęcie flagi z celem od zera, a
@@ -711,7 +712,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     Węzeł, który prowadzi elekcję albo obiecał kadencję wyższą niż wiersz,
     nie wysyła komunikatu, a epoka i lider pochodzą z bieżącego wiersza
     ledgera. Zatrzymujący się węzeł odrzuca też `Hello` (jak
-    `UnknownInstance`), więc lider po zakończeniu strumienia nie wciąga go z
+    `UnknownInstance`; sprawdzane ponownie pod blokadą wpisu i przed
+    podpięciem strumienia), a odpowiedź z epoką 0 (węzeł nic nie obsługuje)
+    kończy ponawianie, więc lider po zakończeniu strumienia nie wciąga go z
     powrotem do ISR. Lider cofa zgodę na zatwierdzanie samemu przed
     usunięciem followera z ISR, nie po (publikacja czytająca ISR i zgodę nie
     widzi już ISR=1 przy nadal udzielonej zgodzie). Lider, który dostał spóźniony komunikat,
@@ -734,9 +737,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     przeniesienia) i odmowy lidera z wiersza, który widzi jeszcze starszą
     epokę (nie zastosował wiersza): nie liczą się jako druga próba. Wiersz
     jest śledzony tylko, gdy ma wyższą epokę niż rola; wskazujący ten węzeł
-    nie jest śledzony: zapis czeka, aż rola nadgoni. Sprawdzenie ważności
-    trwającego żądania używa tego samego celu co wybór, więc zapis wysłany
-    według wiersza nie kończy się po 100 ms jako 504 `outcome unknown`.
+    nie jest śledzony: zapis czeka, aż rola nadgoni. Grupa wysłana
+    według wiersza pozostaje ważna, dopóki wiersz (albo, po nadgonieniu, rola)
+    nadal wskazuje ten węzeł: sprawdzenie ważności trwającego żądania nie
+    wraca do roli, która nadal wskazuje lidera, który odmówił, więc zapis nie
+    kończy się po 100 ms jako 504 `outcome unknown` (także po odmowie bez
+    wskazania lidera). Grupy wybrane przez wiersz i przez rolę idą w osobnych
+    żądaniach.
   - **Czas przejęcia (`duration_ms` rekordu failover) liczy się od ostatniego
     sygnału życia poprzedniego lidera (D6),** nie od zliczenia głosów, gdy ten
     moment jest znany; nazwa pola i format bez zmian.

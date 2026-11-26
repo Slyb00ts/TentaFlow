@@ -6565,6 +6565,7 @@ async fn a_transfer_asked_of_any_member_runs_on_the_leader_and_a_refusal_keeps_i
 /// led by B when the call returns, and takes writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopping_leader_hands_its_partitions_to_the_replica_first() {
+    let test_began = std::time::Instant::now();
     let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
     let a = find_node(&nodes, "A");
     let b = find_node(&nodes, "B");
@@ -6572,8 +6573,31 @@ async fn a_stopping_leader_hands_its_partitions_to_the_replica_first() {
         assert_eq!(leader_of(&nodes, topic).as_deref(), Some("A"));
     }
 
+    let before_handover = std::time::Instant::now();
+    let isr_before: Vec<String> = a
+        .manager
+        .snapshot(ORG, None)
+        .partitions
+        .iter()
+        .map(|p| format!("{}/{}: isr {:?}", p.topic, p.partition, p.isr))
+        .collect();
     let moved = a.manager.hand_over_leaders(Duration::from_secs(10)).await;
-    assert_eq!(moved, topics.len(), "every partition had a replica in sync");
+    assert_eq!(
+        moved,
+        topics.len(),
+        "every partition had a replica in sync (in-sync sets just before: {isr_before:?}; \
+         events since: {:#?})",
+        recorded_events_since(
+            test_began,
+            before_handover,
+            &[
+                "rebuilding",
+                "follower-stream",
+                "committing alone",
+                "incarnation"
+            ]
+        )
+    );
     for topic in topics {
         assert!(
             wait_until(Duration::from_secs(10), || leader_of(&nodes, topic)

@@ -2024,7 +2024,10 @@ impl ReplicationManager {
                         .flatten()
                     {
                         Some((true, _)) => return true,
-                        Some((false, answered_at)) if answered_at < epoch => {
+                        // An answer of epoch 0 is a node that serves nothing (it is
+                        // stopping, has no entry, or does not host the instance):
+                        // it will not accept the notice later.
+                        Some((false, answered_at)) if answered_at > 0 && answered_at < epoch => {
                             tokio::time::sleep(LEAVING_RETRY).await;
                         }
                         Some((false, answered_at))
@@ -2316,6 +2319,9 @@ impl ReplicationManager {
         }
         let verdict = match self.registry.get_mut(&key) {
             None => Verdict::Reject(ReplReject::TopicUnknown),
+            // Checked again under the guard: the token may have been cancelled
+            // since the check at the top, while this node was announcing.
+            Some(_) if self.shutdown.is_cancelled() => Verdict::Reject(ReplReject::UnknownInstance),
             Some(entry) if entry.cutting => Verdict::Reject(ReplReject::Reconciling),
             Some(entry) if entry.role != LocalRole::Follower => {
                 Verdict::Reject(ReplReject::NotAReplica)
@@ -2410,7 +2416,9 @@ impl ReplicationManager {
                 // above closes).
                 let mut stale_runner = Some(runner);
                 if let Some(mut entry) = self.registry.get_mut(&key) {
-                    if entry.role == LocalRole::Follower
+                    // A node that began to stop meanwhile attaches nothing.
+                    if !self.shutdown.is_cancelled()
+                        && entry.role == LocalRole::Follower
                         && entry.assignment.leader_node_id == assignment.leader_node_id
                         && entry.assignment.leader_epoch == assignment.leader_epoch
                         && entry.assignment.topic_generation == assignment.topic_generation
