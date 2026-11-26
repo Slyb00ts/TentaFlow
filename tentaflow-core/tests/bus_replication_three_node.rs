@@ -219,9 +219,73 @@ fn init_tracing() {
     // silently drops events from non-test threads — the exact threads this
     // suite's diagnostics need. Safe with `--test-threads=1`; with parallel
     // runs, expect interleaved lines.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+        )
+        .with(EventRecorder.with_filter(tracing_subscriber::filter::LevelFilter::INFO))
         .try_init();
+}
+
+/// The replication events of the whole process since it started (all tests
+/// share it): what a failing test prints to say why a leader did what it did.
+static RECORDED_EVENTS: Mutex<Vec<(std::time::Instant, String)>> = Mutex::new(Vec::new());
+
+struct EventRecorder;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventRecorder {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !event.metadata().target().contains("bus::replication") {
+            return;
+        }
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        let mut events = RECORDED_EVENTS.lock();
+        if events.len() > 50_000 {
+            events.drain(..25_000);
+        }
+        events.push((
+            std::time::Instant::now(),
+            format!("{}{}", event.metadata().level(), fields.0),
+        ));
+    }
+}
+
+/// The recorded events since `since` that mention one of `needles`, oldest
+/// first, each with its age relative to `anchor` (negative: before it).
+fn recorded_events_since(
+    since: std::time::Instant,
+    anchor: std::time::Instant,
+    needles: &[&str],
+) -> Vec<String> {
+    RECORDED_EVENTS
+        .lock()
+        .iter()
+        .filter(|(at, line)| *at >= since && needles.iter().any(|n| line.contains(n)))
+        .map(|(at, line)| {
+            let relative = if *at >= anchor {
+                format!("+{}", (*at - anchor).as_millis())
+            } else {
+                format!("-{}", (anchor - *at).as_millis())
+            };
+            format!("{relative} ms: {line}")
+        })
+        .collect()
 }
 
 fn ctx() -> BusCallContext {
@@ -1652,6 +1716,29 @@ async fn publish_records(
     publish_records_as(node, &ctx(), partition, records).await
 }
 
+/// `publish_records` on a node whose role has just turned to leader: the role
+/// changes a moment before the term is claimed and the writes open, and a
+/// publish in between is refused with `NotLeader` naming nobody. That refusal
+/// is retried for a few seconds; any other error is returned.
+async fn publish_records_once_leading(
+    node: &TestNode,
+    partition: Option<u32>,
+    records: Vec<PublishRecord>,
+) -> Result<tentaflow_core::bus::PublishResult, BusServiceError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match publish_records(node, partition, records.clone()).await {
+            Err(BusServiceError::NotLeader {
+                leader_node_id: None,
+                ..
+            }) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn publish_records_as(
     node: &TestNode,
     ctx: &BusCallContext,
@@ -1695,16 +1782,25 @@ async fn publish_on_a_follower_lands_on_the_leader_byte_for_byte() {
         every_byte,
         vec![("trace".to_string(), vec![0xFF, 0x00, 0x7F])],
     )];
+    // The reader stops at the high watermark, which trails the acknowledgement
+    // that quorum gave the publisher by a moment.
+    assert!(
+        wait_until(Duration::from_secs(10), || !read_all_records(a, 0)
+            .is_empty())
+        .await,
+        "the leader never showed the record"
+    );
     assert_eq!(
         read_all_records(a, 0),
         expected,
         "the leader holds the record"
     );
     assert!(
-        wait_until(Duration::from_secs(10), || log_end_offset(b, 0) >= 1
-            && log_end_offset(c, 0) >= 1)
+        wait_until(Duration::from_secs(10), || [b, c]
+            .iter()
+            .all(|n| log_end_offset(n, 0) >= 1 && high_watermark(n, 0) >= 1))
         .await,
-        "the record never replicated onward"
+        "the record never replicated onward, or the watermark never reached the replicas"
     );
     assert_eq!(read_all_records(c, 0), expected);
     assert_eq!(
@@ -4111,6 +4207,28 @@ async fn leader_accepting<'a>(
     None
 }
 
+/// `publish_until_accepted` for one partition.
+async fn publish_until_accepted_on(
+    node: &TestNode,
+    partition: u32,
+    payload: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_text(node, Some(partition), payload),
+        )
+        .await;
+        if matches!(attempt, Ok(Ok(ref res)) if res.accepted == 1) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
 fn text_payloads(node: &TestNode) -> Vec<String> {
     read_all_payloads(node, 0)
         .into_iter()
@@ -4345,6 +4463,9 @@ struct MeshEmulation {
     a_hears_b: Arc<AtomicBool>,
     /// `B` hears `A`'s heartbeats.
     b_hears_a: Arc<AtomicBool>,
+    /// The longest pause, in milliseconds, between two rounds of the heartbeats
+    /// the emulation delivers: a scheduler that starves it shows here.
+    longest_pause_ms: Arc<std::sync::atomic::AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -4354,12 +4475,20 @@ impl MeshEmulation {
         b.manager.on_peer_connected(&a.id);
         let a_hears_b = Arc::new(AtomicBool::new(true));
         let b_hears_a = Arc::new(AtomicBool::new(true));
+        let longest_pause_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let task = {
             let (am, bm) = (Arc::clone(&a.manager), Arc::clone(&b.manager));
             let (a_id, b_id) = (a.id.clone(), b.id.clone());
             let (ab, ba) = (Arc::clone(&a_hears_b), Arc::clone(&b_hears_a));
+            let longest = Arc::clone(&longest_pause_ms);
             tokio::spawn(async move {
+                let mut last_round = std::time::Instant::now();
                 loop {
+                    longest.fetch_max(
+                        last_round.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    last_round = std::time::Instant::now();
                     if ab.load(Ordering::SeqCst) {
                         am.note_peer_signal(&b_id);
                     }
@@ -4375,6 +4504,7 @@ impl MeshEmulation {
             b: Arc::clone(&b.manager),
             a_hears_b,
             b_hears_a,
+            longest_pause_ms,
             task,
         }
     }
@@ -4632,13 +4762,18 @@ async fn an_rf2_leader_kill_fails_over_after_t_alone_and_within_the_budget() {
 /// clock and not the shrink.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
+    let test_started = std::time::Instant::now();
     let (nodes, registry, mesh, acked) = rf2_pair_with_five_acknowledged_writes().await;
     let a = find_node(&nodes, "A");
     let b = find_node(&nodes, "B");
-    b.manager.shutdown();
-    // A dead process answers no notice and holds no stream.
+    // A dead process answers no notice and holds no stream. Both are cut before
+    // B stops: a stopped manager that is still asked acknowledges the leader's
+    // shrink notice (it can no longer stand), which is the leader committing
+    // alone by the follower's own word, not by `T_alone` -- a leader that
+    // asked in the moment between the stop and the cut did exactly that.
     registry.block_queries("A", "B");
     registry.break_replication("A", "B");
+    b.manager.shutdown();
     let isr_has_b = || {
         a.manager
             .snapshot(ORG, Some(TOPIC))
@@ -4651,9 +4786,19 @@ async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
         wait_until(Duration::from_secs(15), || !isr_has_b()).await,
         "the leader never dropped the dead follower from its in-sync set"
     );
+    // What the leader knew of B when each write was acknowledged, for the
+    // message of a failure: (payload, when, B's heartbeat age in ms).
+    let b_heartbeat_age = || {
+        a.manager
+            .snapshot(ORG, Some(TOPIC))
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "B")
+            .and_then(|n| n.last_heartbeat_ms_ago)
+    };
     // The mesh still reaches B (its connection is up, heartbeats come): the
     // leader must not commit alone yet.
-    let mut early: Vec<String> = Vec::new();
+    let mut early: Vec<(String, tokio::time::Instant, Option<u64>)> = Vec::new();
     for n in 0..8u32 {
         let payload = format!("early-{n}");
         if matches!(
@@ -4664,7 +4809,7 @@ async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
             .await,
             Ok(Ok(_))
         ) {
-            early.push(payload);
+            early.push((payload, tokio::time::Instant::now(), b_heartbeat_age()));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -4672,7 +4817,7 @@ async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
     mesh.a_hears_b.store(false, Ordering::SeqCst);
     mesh.a.on_peer_disconnected("B");
     let lost_at = tokio::time::Instant::now();
-    let mut early_after_loss: Vec<String> = Vec::new();
+    let mut early_after_loss: Vec<(String, tokio::time::Instant, Option<u64>)> = Vec::new();
     while lost_at.elapsed() < TEST_ALONE_AFTER - Duration::from_millis(400) {
         let payload = format!("soon-{}", early_after_loss.len());
         if matches!(
@@ -4683,7 +4828,7 @@ async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
             .await,
             Ok(Ok(_))
         ) {
-            early_after_loss.push(payload);
+            early_after_loss.push((payload, tokio::time::Instant::now(), b_heartbeat_age()));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -4692,9 +4837,35 @@ async fn an_rf2_leader_commits_alone_after_the_follower_was_gone_for_t_alone() {
     let a_payloads = text_payloads(a);
     shutdown_all(&nodes);
 
+    let describe = |acked: &[(String, tokio::time::Instant, Option<u64>)]| -> Vec<String> {
+        acked
+            .iter()
+            .map(|(payload, at, age)| {
+                let relative = if *at >= lost_at {
+                    format!("+{}", (*at - lost_at).as_millis())
+                } else {
+                    format!("-{}", (lost_at - *at).as_millis())
+                };
+                format!("{payload} acknowledged {relative} ms from the mesh loss, B's heartbeat {age:?} ms old")
+            })
+            .collect()
+    };
     assert!(
         early.is_empty() && early_after_loss.is_empty(),
-        "the leader acknowledged alone before T_alone had passed: {early:?} {early_after_loss:?}"
+        "the leader acknowledged alone before T_alone had passed: {:#?} {:#?} (longest pause \
+         of the emulated heartbeats {} ms, T_alone {:?}, mesh signal stale after {:?}); \
+         replication events of the process since the test began (every test shares them), \
+         relative to the mesh loss: {:#?}",
+        describe(&early),
+        describe(&early_after_loss),
+        mesh.longest_pause_ms.load(Ordering::SeqCst),
+        TEST_ALONE_AFTER,
+        Duration::from_secs(2),
+        recorded_events_since(
+            test_started,
+            lost_at.into_std(),
+            &["alone", "shrink", "leaving", "Removed", "books", "probe", "refus"],
+        ),
     );
     assert!(accepted, "the leader never resumed");
     assert!(
@@ -5064,6 +5235,92 @@ async fn a_follower_that_stops_gracefully_releases_its_leader_at_once() {
         "the leader waited {waited:?}, as long as it would for a node that is not leaving"
     );
     let lost: Vec<&String> = acked.iter().filter(|p| !a_payloads.contains(p)).collect();
+    assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
+}
+
+/// A node that leads one partition and follows another stops gracefully: it
+/// hands the first over, then tells the leaders it follows. The partition it
+/// just handed over counts too (its role there is still `NotReplica` until the
+/// poll applies the row, which has stopped by then), and the new leader may not
+/// have applied the row when the first notice arrives. Both leaders resume
+/// before `T_alone` could have run out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_leads_one_partition_and_follows_another_releases_both_at_once() {
+    let (nodes, _ledger, registry) = build_cluster_led_by(2, Acks::All, &["A", "B"], |p| {
+        if p == 0 { "A" } else { "B" }.to_string()
+    })
+    .await;
+    for node in &nodes {
+        spawn_background_loops(node);
+    }
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    let _mesh = MeshEmulation::start(a, b);
+    let mut acked: Vec<(u32, String)> = Vec::new();
+    for partition in 0..2u32 {
+        for i in 0..5 {
+            let payload = format!("pre-{partition}-{i}");
+            assert!(
+                publish_until_accepted_on(a, partition, &payload, Duration::from_secs(10)).await,
+                "{payload} was never accepted"
+            );
+            acked.push((partition, payload));
+        }
+    }
+    for partition in 0..2u32 {
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                log_end_offset(a, partition) >= 5 && log_end_offset(b, partition) >= 5
+            })
+            .await,
+            "partition {partition} never reached the follower"
+        );
+    }
+
+    let moved = b.manager.hand_over_leaders(Duration::from_secs(10)).await;
+    assert_eq!(moved, 1, "B led one partition and handed it over");
+    let roles_of = |node: &TestNode| -> Vec<PartitionRole> {
+        (0..2u32)
+            .map(|p| node.manager.role(ORG, TOPIC, p))
+            .collect()
+    };
+    let (a_before, b_before) = (roles_of(a), roles_of(b));
+    let released = b.manager.announce_leaving(Duration::from_secs(2)).await;
+    b.manager.shutdown();
+    // The process is gone: nothing answers the leaders' own notices.
+    registry.peers.lock().remove("B");
+
+    let started = tokio::time::Instant::now();
+    let mut accepted = Vec::new();
+    for partition in 0..2u32 {
+        accepted.push(
+            publish_until_accepted_on(a, partition, "after-stop", Duration::from_secs(10)).await,
+        );
+    }
+    let waited = started.elapsed();
+    let held: Vec<Vec<String>> = (0..2u32)
+        .map(|p| {
+            read_all_payloads(a, p)
+                .into_iter()
+                .map(|bytes| String::from_utf8(bytes).expect("utf-8 payload"))
+                .collect()
+        })
+        .collect();
+    shutdown_all(&nodes);
+    assert_eq!(
+        released, 2,
+        "a leader never acknowledged the departure (roles when B announced: A {a_before:?}, \
+         B {b_before:?})"
+    );
+    assert_eq!(accepted, [true, true], "a leader never resumed");
+    assert!(
+        waited < TEST_ALONE_AFTER,
+        "the leaders waited {waited:?}, as long as they would for a node that is not leaving"
+    );
+    let lost: Vec<&(u32, String)> = acked
+        .iter()
+        .filter(|(p, payload)| !held[*p as usize].contains(payload))
+        .collect();
     assert!(lost.is_empty(), "acknowledged writes lost: {lost:?}");
 }
 
@@ -6966,7 +7223,7 @@ async fn a_leader_restarted_on_its_stale_row_does_not_stand_when_the_new_leader_
                 binary_record("w", payload.into_bytes())
             })
             .collect();
-        publish_records(b, Some(0), records)
+        publish_records_once_leading(b, Some(0), records)
             .await
             .unwrap_or_else(|e| panic!("publish batch {batch} on the new leader: {e:?}"));
         acked.extend(payloads);
@@ -7144,9 +7401,22 @@ async fn a_leader_restarted_on_its_stale_row_refuses_writes_until_it_knows_nobod
     );
     for i in 0..30 {
         let payload = format!("w-{i}");
-        publish_text(find_node(&nodes, "B"), Some(0), &payload)
-            .await
-            .unwrap_or_else(|e| panic!("publish {i} on the new leader: {e:?}"));
+        // The role turns to Leader a moment before the term is claimed and the
+        // writes open: a publish in between is refused with `NotLeader` naming
+        // nobody, and is retried.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match publish_text(find_node(&nodes, "B"), Some(0), &payload).await {
+                Ok(_) => break,
+                Err(BusServiceError::NotLeader {
+                    leader_node_id: None,
+                    ..
+                }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("publish {i} on the new leader: {e:?}"),
+            }
+        }
         acked.push(payload);
     }
 
@@ -7161,14 +7431,38 @@ async fn a_leader_restarted_on_its_stale_row_refuses_writes_until_it_knows_nobod
         a_db_dir,
         a_db,
     );
+    let restarted_at = std::time::Instant::now();
+    let stale_epoch = stale_row.leader_epoch;
     back.manager.apply_assignment(stale_row).await;
+    // The leader B dials the restarted node on its own schedule: once its Hello
+    // is accepted the node follows B, and a write it takes then is forwarded to
+    // B and acknowledged by B, which is no stale leader's doing. Only an
+    // acknowledgement given while the node still held the stale leadership,
+    // before and after the write, is the failure.
+    let stale_leader = |role: &PartitionRole| matches!(role, PartitionRole::Leader { epoch } if *epoch == stale_epoch);
+    let mut forwarded: Vec<String> = Vec::new();
     for i in 0..5 {
-        let refused = publish_text(&back, Some(0), &format!("stale-{i}")).await;
-        assert!(
-            refused.is_err(),
-            "the restarted node acknowledged a write on a stale row: {refused:?}"
-        );
+        let payload = format!("stale-{i}");
+        let role_before = back.manager.role(ORG, TOPIC, 0);
+        let outcome = publish_text(&back, Some(0), &payload).await;
+        let role_after = back.manager.role(ORG, TOPIC, 0);
+        if outcome.is_ok() {
+            assert!(
+                !(stale_leader(&role_before) && stale_leader(&role_after)),
+                "the restarted node acknowledged a write on a stale row: {outcome:?} (its role \
+                 before the write {role_before:?}, after {role_after:?}, log end {}; replication \
+                 events since the restart: {:#?})",
+                log_end_offset(&back, 0),
+                recorded_events_since(
+                    restarted_at,
+                    restarted_at,
+                    &["replication", "Hello", "hello", "follow", "leader"]
+                ),
+            );
+            forwarded.push(payload);
+        }
     }
+    acked.extend(forwarded.iter().cloned());
     spawn_background_loops(&back);
     nodes.push(back);
 
@@ -7193,7 +7487,9 @@ async fn a_leader_restarted_on_its_stale_row_refuses_writes_until_it_knows_nobod
             assert!(held.contains(payload), "{payload} is gone from {}", node.id);
         }
         assert!(
-            !held.iter().any(|p| p.starts_with("stale-")),
+            !held
+                .iter()
+                .any(|p| p.starts_with("stale-") && !forwarded.contains(p)),
             "a refused write landed on {}",
             node.id
         );

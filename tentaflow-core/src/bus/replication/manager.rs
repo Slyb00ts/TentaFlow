@@ -1252,6 +1252,15 @@ struct Refusal {
 /// over (the peer's bus came back, or the path is down and proves nothing).
 const REFUSAL_FRESH: Duration = Duration::from_secs(4);
 
+/// How long `announce_leaving` waits before it asks a leader again that has
+/// not acknowledged the notice (typically one that has not applied its row yet).
+const LEAVING_RETRY: Duration = Duration::from_millis(150);
+
+/// How many times a leader that answers at the notice's own epoch is asked
+/// again: it may hold the row and not yet the handle that serves it, or be an
+/// older build that never acknowledges.
+const LEAVING_SAME_EPOCH_RETRIES: u32 = 4;
+
 /// How recent a frame from a peer must be for the peer to count as reachable
 /// when the mesh does not vouch for it (it reported the peer gone, or said
 /// nothing): a few heartbeat periods, beyond the lease after which a silent
@@ -1939,18 +1948,38 @@ impl ReplicationManager {
         let leaders: Vec<(PartitionKey, String, u32, u64)> = self
             .registry
             .iter()
+            // By placement, not by role: a partition this node just handed
+            // over is `NotReplica` until the poll applies the row, and the
+            // poll stopped with the token above. The entry holds the row of
+            // the move by then, so its leader and epoch are the new ones.
             .filter(|e| {
-                e.role == LocalRole::Follower
-                    && e.assignment.replicas.len() == 2
-                    && e.assignment.leader_node_id != self.local_node_id
+                e.role != LocalRole::Leader
+                    // An election of this node that is under way, or a term
+                    // it promised above the row's: its row may be behind what
+                    // this node did, and the leader it names may not be the
+                    // one to tell.
+                    && matches!(e.promotion, PromotionState::Idle)
+                    && e.promised_epoch <= e.assignment.leader_epoch
             })
-            .map(|e| {
-                (
-                    e.key().clone(),
-                    e.assignment.leader_node_id.clone(),
-                    e.assignment.leader_epoch,
-                    e.assignment.topic_generation,
-                )
+            .map(|e| e.key().clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|key| {
+                // The row the ledger holds now, never one older than the entry's.
+                let held_epoch = self.registry.get(&key)?.assignment.leader_epoch;
+                let row = self.current_row(&key)?;
+                (row.leader_epoch >= held_epoch
+                    && row.replicas.len() == 2
+                    && row.replicas.contains(&self.local_node_id)
+                    && row.leader_node_id != self.local_node_id)
+                    .then(|| {
+                        (
+                            key,
+                            row.leader_node_id,
+                            row.leader_epoch,
+                            row.topic_generation,
+                        )
+                    })
             })
             .collect();
         let mut tasks = tokio::task::JoinSet::new();
@@ -1969,20 +1998,45 @@ impl ReplicationManager {
                     isr_shrink_seq: 0,
                     leaving_epoch: Some(epoch),
                 });
-                let exchange = async {
-                    let (mut recv, mut send) =
-                        manager.transport.open_query_stream(&leader).await.ok()?;
-                    frames::write_frame(&mut send, &query).await.ok()?;
-                    match frames::read_frame(&mut recv).await.ok()? {
-                        ReplFrame::LeoReply(reply) => Some(reply.isr_shrink_acked),
-                        _ => None,
+                // Asked again while the leader answers with an epoch below the
+                // notice's (a new leader that has not applied its row yet), and
+                // a few times while it answers with the notice's own (it has
+                // the row but not yet the handle that serves it); an older
+                // build refuses the same way, so that is bounded. Any other
+                // refusal, or no answer, ends it: another term will not accept
+                // the notice later.
+                let mut same_epoch_refusals = 0u32;
+                loop {
+                    let exchange = async {
+                        let (mut recv, mut send) =
+                            manager.transport.open_query_stream(&leader).await.ok()?;
+                        frames::write_frame(&mut send, &query).await.ok()?;
+                        match frames::read_frame(&mut recv).await.ok()? {
+                            ReplFrame::LeoReply(reply) => {
+                                Some((reply.isr_shrink_acked, reply.leader_epoch))
+                            }
+                            _ => None,
+                        }
+                    };
+                    match tokio::time::timeout(manager.leo_query_timeout, exchange)
+                        .await
+                        .ok()
+                        .flatten()
+                    {
+                        Some((true, _)) => return true,
+                        Some((false, answered_at)) if answered_at < epoch => {
+                            tokio::time::sleep(LEAVING_RETRY).await;
+                        }
+                        Some((false, answered_at))
+                            if answered_at == epoch
+                                && same_epoch_refusals < LEAVING_SAME_EPOCH_RETRIES =>
+                        {
+                            same_epoch_refusals += 1;
+                            tokio::time::sleep(LEAVING_RETRY).await;
+                        }
+                        _ => return false,
                     }
-                };
-                tokio::time::timeout(manager.leo_query_timeout, exchange)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false)
+                }
             });
         }
         let mut acked = 0;
@@ -2059,6 +2113,15 @@ impl ReplicationManager {
                 "replication: accept_hello refused a Hello naming a different instance \
                  than this manager's own — replying UnknownInstance"
             );
+            let ack = reject_ack(self.local_env, ReplReject::UnknownInstance);
+            let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
+            return;
+        }
+        if self.shutdown.is_cancelled() {
+            // Stopping: a stream accepted now would put this node back in the
+            // leader's in-sync set after it said it was leaving, and it
+            // could not serve what it acknowledges. The leader dials again
+            // until the process is gone.
             let ack = reject_ack(self.local_env, ReplReject::UnknownInstance);
             let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
             return;
@@ -8177,6 +8240,8 @@ mod tests {
         alone_cleared: AtomicBool,
         /// How many times `set_alone_cleared(false)` stood for a shrink.
         shrinks: AtomicU64,
+        /// The followers `follower_leaving` was called for.
+        leavings: Mutex<Vec<String>>,
     }
 
     impl FakeLeaderHandle {
@@ -8207,6 +8272,7 @@ mod tests {
                 progress_script: Mutex::new(None),
                 alone_cleared: AtomicBool::new(true),
                 shrinks: AtomicU64::new(0),
+                leavings: Mutex::new(Vec::new()),
             }
         }
 
@@ -8246,6 +8312,10 @@ mod tests {
                 self.shrinks.fetch_add(1, Ordering::SeqCst);
             }
             self.alone_cleared.store(cleared, Ordering::SeqCst);
+        }
+        fn follower_leaving(&self, node_id: &str) -> bool {
+            self.leavings.lock().push(node_id.to_string());
+            true
         }
         fn shrink_seq(&self) -> u64 {
             self.shrinks.load(Ordering::SeqCst)
@@ -8399,6 +8469,9 @@ mod tests {
         }
         fn set_alone_cleared(&self, cleared: bool) {
             self.0.set_alone_cleared(cleared);
+        }
+        fn follower_leaving(&self, node_id: &str) -> bool {
+            self.0.follower_leaving(node_id)
         }
         fn shrink_seq(&self) -> u64 {
             self.0.shrink_seq()
@@ -14088,6 +14161,200 @@ mod tests {
             fx.manager.role("org", "orders", 0),
             PartitionRole::Leader { epoch: 64 },
             "a follower that dropped its claim must not stand alone"
+        );
+    }
+
+    fn leaving_notice(row: &PartitionAssignment, epoch: u32) -> ReplLeoQuery {
+        ReplLeoQuery {
+            isr_shrink_epoch: None,
+            isr_shrink_seq: 0,
+            leaving_epoch: Some(epoch),
+            ..shrink_notice(row, epoch, 0)
+        }
+    }
+
+    /// The leader takes a stopping follower out only when the notice comes from
+    /// a replica of the partition, for the term and incarnation it leads, at
+    /// RF 2, while it serves; every other notice is refused and removes nothing.
+    #[tokio::test]
+    async fn a_leaving_notice_is_accepted_only_where_the_leader_can_rely_on_it() {
+        let leavings = |fx: &Fixture| -> usize {
+            fx.leader_factory
+                .handles
+                .lock()
+                .iter()
+                .map(|h| h.leavings.lock().len())
+                .sum()
+        };
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+
+        let fx = build("l");
+        // No entry for the partition.
+        let none = leo_roundtrip_from(Arc::clone(&fx.manager), "f", leaving_notice(&row, 3)).await;
+        assert!(!none.isr_shrink_acked, "no entry");
+
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let ask = |sender: &'static str, notice: ReplLeoQuery| {
+            let manager = Arc::clone(&fx.manager);
+            async move {
+                leo_roundtrip_from(manager, sender, notice)
+                    .await
+                    .isr_shrink_acked
+            }
+        };
+        assert!(!ask("z", leaving_notice(&row, 3)).await, "not a replica");
+        assert!(!ask("f", leaving_notice(&row, 2)).await, "another epoch");
+        let mut other_generation = leaving_notice(&row, 3);
+        other_generation.isr_shrink_generation += 1;
+        assert!(!ask("f", other_generation).await, "another incarnation");
+        assert_eq!(leavings(&fx), 0, "nothing was removed by a refused notice");
+        assert!(ask("f", leaving_notice(&row, 3)).await);
+        assert_eq!(leavings(&fx), 1);
+
+        // A leader that is shutting down does not act on it.
+        fx.manager.shutdown();
+        assert!(!ask("f", leaving_notice(&row, 3)).await, "shutting down");
+        assert_eq!(leavings(&fx), 1);
+
+        // RF 3: the other follower still holds the commit, nothing is granted.
+        let fx3 = build("l");
+        let row3 = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f", "g"],
+            &["l", "f", "g"],
+            3,
+        );
+        fx3.assignments.seed(row3.clone());
+        fx3.manager.apply_assignment(row3.clone()).await;
+        let rf3 = leo_roundtrip_from(Arc::clone(&fx3.manager), "f", leaving_notice(&row3, 3)).await;
+        assert!(!rf3.isr_shrink_acked, "RF 3");
+        assert_eq!(leavings(&fx3), 0);
+    }
+
+    /// The state a node is in while it announces that it is leaving: the token
+    /// cancelled, the entries and their handles still in place, the router still
+    /// handing it streams. A leader that dials it again is refused, so the node
+    /// is not put back in the in-sync set it was just taken out of.
+    #[tokio::test]
+    async fn a_hello_after_the_node_announced_it_is_leaving_is_refused() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        assert_eq!(
+            fx.manager
+                .announce_leaving(Duration::from_millis(300))
+                .await,
+            0
+        );
+        assert!(fx.manager.shutdown_token().is_cancelled());
+
+        let ack = hello_roundtrip(Arc::clone(&fx.manager), hello_from(&row)).await;
+        assert!(!ack.accepted, "a stopping node accepted a stream");
+        assert_eq!(ack.reject, Some(ReplReject::UnknownInstance));
+    }
+
+    /// A node whose own entry is not a plain follower of the row (it promised a
+    /// newer term than the row's) says nothing to the leader named there: what it
+    /// did may not be what the row shows.
+    #[tokio::test]
+    async fn a_node_that_promised_a_newer_term_does_not_announce_to_the_row_leader() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        fx.manager.registry.get_mut(&key).unwrap().promised_epoch = 9;
+        fx.transport.set_script("l", leo_reply(0, 0, 3, 3, true));
+        assert_eq!(
+            fx.manager
+                .announce_leaving(Duration::from_millis(300))
+                .await,
+            0
+        );
+        assert_eq!(fx.transport.query_dials("l"), 0, "a notice was sent");
+    }
+
+    /// A leader that has not applied its row yet answers with an epoch below the
+    /// notice's, and is asked again; any other refusal (an older build, another
+    /// term) ends the asking, so a stop does not wait out the budget for nothing.
+    #[tokio::test]
+    async fn a_leaving_notice_is_asked_again_only_while_the_leader_is_behind() {
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        let outcome = |leader_epoch: u32| {
+            let row = row.clone();
+            async move {
+                let fx = build("f");
+                fx.assignments.seed(row.clone());
+                fx.manager.apply_assignment(row).await;
+                fx.transport
+                    .set_script("l", leo_reply(0, 0, leader_epoch, leader_epoch, true));
+                let started = Instant::now();
+                let acked = fx
+                    .manager
+                    .announce_leaving(Duration::from_millis(2500))
+                    .await;
+                (acked, started.elapsed())
+            }
+        };
+        let (acked, behind) = outcome(2).await;
+        assert_eq!(acked, 0);
+        assert!(
+            behind >= Duration::from_millis(2400),
+            "gave up after {behind:?}"
+        );
+        // At the notice's own epoch: a few more tries, not the whole budget.
+        let (acked, same) = outcome(3).await;
+        assert_eq!(acked, 0);
+        assert!(
+            same >= Duration::from_millis(500) && same < Duration::from_millis(1500),
+            "asked for {same:?}"
+        );
+        let (acked, ahead) = outcome(4).await;
+        assert_eq!(acked, 0);
+        assert!(
+            ahead < Duration::from_millis(400),
+            "kept asking for {ahead:?}"
+        );
+    }
+
+    /// A manager that was told to stop neither stands in an election nor
+    /// votes in one: it answers a candidate with no promise.
+    #[tokio::test]
+    async fn a_cancelled_manager_neither_stands_nor_votes() {
+        let fx = build("f");
+        let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row.clone()).await;
+        fx.manager.shutdown();
+
+        let vote = leo_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "l",
+            ReplLeoQuery {
+                candidate_epoch: Some(4),
+                isr_shrink_epoch: None,
+                ..shrink_notice(&row, 3, 0)
+            },
+        )
+        .await;
+        assert_eq!(vote.promised_epoch, None, "a cancelled manager promised");
+
+        fx.transport.set_script("l", PeerScript::Unreachable);
+        tokio::time::sleep(PAST_THE_LEASE).await;
+        fx.manager.check_leases().await;
+        fx.manager.settle_elections().await;
+        assert!(
+            !matches!(
+                fx.manager.role("org", "orders", 0),
+                PartitionRole::Leader { .. }
+            ),
+            "a cancelled manager stood and won"
         );
     }
 

@@ -58,10 +58,11 @@ use crate::bus::{
 /// before giving up with `NotLeader`.
 const LEADER_WAIT: Duration = Duration::from_secs(3);
 
-/// How often a publish waiting for the leader to change asks again where the
-/// partition is led, whether or not this node has applied a new assignment:
-/// the route reads the ledger row itself, which a move reaches before the
-/// poll that applies it here does.
+/// How often a publish whose leader refused it asks again where the partition
+/// is led, whether or not this node has applied a new assignment. The role
+/// this node holds changes only when the poll applies a row (up to a second
+/// after the row is admitted), but the ledger row itself is there at once:
+/// `refused_leader_moved` reads it, so a move is followed without that wait.
 const LEADER_RECHECK: Duration = Duration::from_millis(100);
 
 /// How long a publish first pauses before asking again a leader that knows no
@@ -892,6 +893,10 @@ struct PendingGroup {
     /// a pause that doubles from `UNAWARE_LEADER_RETRY_FIRST`, until the wait
     /// for a leader runs out.
     target_unaware: bool,
+    /// The leader it is sent to was named by the ledger row, not by this
+    /// node's role (which still names the one that refused): that leader may
+    /// not have applied the row itself yet.
+    via_row: bool,
 }
 
 enum Reply {
@@ -1016,6 +1021,7 @@ impl BusService {
                 sends: 0,
                 refused_by: None,
                 target_unaware: false,
+                via_row: false,
             })
             .collect();
         let mut last_refusal: Option<BusServiceError> = None;
@@ -1028,13 +1034,11 @@ impl BusService {
             let mut by_leader: BTreeMap<String, (u32, Vec<PendingGroup>)> = BTreeMap::new();
             let mut waiting: Vec<PendingGroup> = Vec::new();
             for group in std::mem::take(&mut pending) {
-                match route(
-                    coordinator,
-                    &local_node,
-                    &job.ctx.org_id,
-                    job.topic,
-                    group.partition,
-                ) {
+                let (routed, via_row) =
+                    target_of(coordinator, &local_node, &job.ctx.org_id, job.topic, &group);
+                let mut group = group;
+                group.via_row = via_row;
+                match routed {
                     Route::Here => {
                         let outcome = self.publish_routed(
                             job.ctx,
@@ -1148,13 +1152,7 @@ impl BusService {
         // hold a producer for the whole ack timeout.
         let led_by_target = || {
             groups.iter().all(|g| {
-                match route(
-                    coordinator,
-                    local_node,
-                    &job.ctx.org_id,
-                    job.topic,
-                    g.partition,
-                ) {
+                match target_of(coordinator, local_node, &job.ctx.org_id, job.topic, g).0 {
                     Route::Remote { leader: l, .. } => l == leader,
                     Route::Here => false,
                     Route::Unknown => true,
@@ -1215,15 +1213,20 @@ impl BusService {
                     other => (matches!(other, BusServiceError::NotLeader { .. }), other),
                 };
                 let retryable = not_leader && landed.is_empty();
-                if retryable
-                    && matches!(
-                        source,
-                        BusServiceError::NotLeader {
-                            leader_node_id: None,
-                            ..
-                        }
-                    )
-                {
+                // A refusal naming nobody, or a leader this node sent a write
+                // to by the ledger row and which still sees an older term: not
+                // a leader that moved, one that has not caught up.
+                let unaware = match &source {
+                    BusServiceError::NotLeader {
+                        leader_node_id: None,
+                        ..
+                    } => true,
+                    BusServiceError::NotLeader { leader_epoch, .. } => {
+                        groups.iter().all(|g| g.via_row) && *leader_epoch < epoch
+                    }
+                    _ => false,
+                };
+                if retryable && unaware {
                     // Not a leader that moved: the one that was named does
                     // not know yet that it leads. Asking it again is not a
                     // second attempt at another leader, so it is not counted.
@@ -1305,6 +1308,43 @@ pub(super) fn route(
         }
         PartitionRole::Follower { .. } => Route::Unknown,
     }
+}
+
+/// Where a group goes now, and whether the ledger row decided it. Where this
+/// node's role still names the leader that refused the group (or answered that
+/// it does not know its leadership yet), the move that made it refuse is in
+/// the ledger before the poll applies it here: the row is followed if it names
+/// another remote leader at a higher epoch than the role's. A row that names
+/// this node is not followed: the role here has not caught up, and the publish
+/// waits for it. The same answer decides whether a write already sent is still
+/// going to the right leader (`send_chunk`).
+fn target_of(
+    coordinator: &Arc<dyn ReplicationCoordinator>,
+    local_node: &str,
+    org_id: &str,
+    topic: &str,
+    group: &PendingGroup,
+) -> (Route, bool) {
+    let routed = route(coordinator, local_node, org_id, topic, group.partition);
+    if let Route::Remote { leader, epoch } = &routed {
+        let refused = group.refused_by.as_deref() == Some(leader.as_str());
+        if refused || group.target_unaware {
+            if let Some((row_leader, row_epoch)) =
+                coordinator.assigned_leader(org_id, topic, group.partition)
+            {
+                if row_leader != local_node && row_leader != *leader && row_epoch > *epoch {
+                    return (
+                        Route::Remote {
+                            leader: row_leader,
+                            epoch: row_epoch,
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+    }
+    (routed, false)
 }
 
 fn classify_reply(reply: ProduceForwardReply) -> Reply {

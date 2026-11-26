@@ -568,8 +568,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
       tylko taki, którego numer nie jest niższy niż numer zawężenia zdejmującego
       flagę, więc heartbeat wysłany przed zawężeniem, a przetworzony po
       komunikacie, flagi nie przywraca. Numery zawężeń startują od wartości z zegara
-      (`czas ms << 16`) przy każdym uruchomieniu lidera, więc po restarcie
-      lidera w tej samej epoce wszystkie numery są wyższe niż wcześniejsze:
+      (`licznik uruchomień << 16`, gdzie licznik to zegar w ms, ale nigdy nie
+      mniej niż zapisana w pliku `leader-incarnation` w katalogu partycji wartość plus 1,
+      z fsync pliku i katalogu) przy każdym
+      uruchomieniu lidera, więc po restarcie lidera w tej samej epoce
+      wszystkie numery są wyższe niż wcześniejsze, także gdy zegar cofnięto:
       komunikat z nowego uruchomienia zastępuje zdjęcie flagi z celem od zera, a
       heartbeat z wyższym numerem liczy się z własnym celem. Komunikat z
       wcześniejszej epoki nie zastępuje nowszego zdjęcia. Węzeł, który przestał
@@ -692,14 +695,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     zapisów, replikacja) zostawały otwarte do limitu bezczynności QUIC
     (47–55 s: 504 `bus_forward_outcome_unknown`, wiszące zapisy, późny powrót do
     ISR). Podmiana zamilkłej sesji zamyka teraz też połączenia szyny do tego
-    węzła, więc pula przekazywania i pętle replikacji dzwonią od nowa.
+    węzła, które śledzono nie później niż sekundę po ostatnim odbiorze starej
+    sesji (późniejsze, otwarte już do nowego procesu, zostają), więc pula
+    przekazywania i pętle replikacji dzwonią od nowa.
   - **Zatrzymanie followera zwalnia lidera od razu (D2).** Zatrzymujący się
     węzeł najpierw przestaje obsługiwać i stawać do elekcji, potem mówi
     liderom RF=2, których śledzi (`ReplLeoQuery::leaving_epoch`, pole
     dopisane), że odchodzi; lider wyjmuje go z ISR i zatwierdza sam bez
     czekania `T_alone` (do 5–6 s odmów `acks=all` przy każdym restarcie).
-    Reguła bezpieczeństwa bez zmian: lider działa dopiero po tym, jak węzeł
-    przestał obsługiwać.
+    Dotyczy to także partycji, które węzeł właśnie oddał (jego wpis jest
+    wtedy `NotReplica` do czasu pollu): wybór idzie po położeniu, nie po roli,
+    a komunikat jest ponawiany co 150 ms w budżecie 2 s, ale tylko dopóki lider
+    odpowiada epoką niższą niż w komunikacie (nie zastosował jeszcze
+    wiersza); inna odmowa (starsza wersja, inna kadencja) kończy ponawianie.
+    Węzeł, który prowadzi elekcję albo obiecał kadencję wyższą niż wiersz,
+    nie wysyła komunikatu, a epoka i lider pochodzą z bieżącego wiersza
+    ledgera. Zatrzymujący się węzeł odrzuca też `Hello` (jak
+    `UnknownInstance`), więc lider po zakończeniu strumienia nie wciąga go z
+    powrotem do ISR. Lider cofa zgodę na zatwierdzanie samemu przed
+    usunięciem followera z ISR, nie po (publikacja czytająca ISR i zgodę nie
+    widzi już ISR=1 przy nadal udzielonej zgodzie). Lider, który dostał spóźniony komunikat,
+    kończy też strumień takiego followera, żeby żywy follower połączył się
+    od nowa i wrócił do ISR. Reguła bezpieczeństwa bez zmian: lider działa
+    dopiero po tym, jak węzeł przestał obsługiwać.
   - **Pierwszy klucz API na świeżej parze działa na obu węzłach (D3).**
     Wydanie albo rotacja klucza, które tworzy pepper, wypychają od razu
     sekrety floty do zaufanych węzłów; wcześniej drugi węzeł tworzył własny
@@ -707,11 +725,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     wydającym do następnego połączenia.
   - **Odczyt wstrzymanej grupy konsumentów to 409 `bus_group_paused`, nie 500
     (D4).**
-  - **Zapis w trakcie przenoszenia nie czeka całych 3 s (D5).** Nadawca
-    czekający na zmianę lidera co 100 ms sprawdza, gdzie partycja jest
-    prowadzona (wiersz w ledgerze wyprzedza poll, który stosuje go na tym
-    węźle i podbija generację), zamiast czekać na ogłoszenie zmiany do
-    `LEADER_WAIT`.
+  - **Zapis w trakcie przenoszenia nie czeka całych 3 s (D5).** Gdy lider
+    odmówił zapisu, a rola tego węzła nadal wskazuje jego (rolę zmienia dopiero
+    poll, do sekundy po przyjęciu wiersza), nadawca idzie za wierszem w
+    ledgerze, który już wskazuje innego lidera, i sprawdza go co 100 ms.
+    Wcześniej grupa odmówiona przez tego samego lidera czekała na zmianę
+    generacji do końca `LEADER_WAIT`. Dotyczy to też odmowy bez wskazania lidera (stary lider w trakcie
+    przeniesienia) i odmowy lidera z wiersza, który widzi jeszcze starszą
+    epokę (nie zastosował wiersza): nie liczą się jako druga próba. Wiersz
+    jest śledzony tylko, gdy ma wyższą epokę niż rola; wskazujący ten węzeł
+    nie jest śledzony: zapis czeka, aż rola nadgoni. Sprawdzenie ważności
+    trwającego żądania używa tego samego celu co wybór, więc zapis wysłany
+    według wiersza nie kończy się po 100 ms jako 504 `outcome unknown`.
   - **Czas przejęcia (`duration_ms` rekordu failover) liczy się od ostatniego
     sygnału życia poprzedniego lidera (D6),** nie od zliczenia głosów, gdy ten
     moment jest znany; nazwa pola i format bez zmian.

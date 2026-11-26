@@ -19054,6 +19054,10 @@ mod tests {
         forward_script: parking_lot::Mutex<std::collections::VecDeque<ForwardStep>>,
         /// Every `forward_publish` call: target and request.
         forward_calls: parking_lot::Mutex<Vec<(String, ProduceForward)>>,
+        /// How long `forward_publish` keeps the reply pending, asking the
+        /// caller's validity check as the real transport does; the call ends
+        /// as outcome unknown when the check fails.
+        forward_hold: parking_lot::Mutex<Duration>,
         assignment_gen: std::sync::atomic::AtomicU64,
         /// What `assigned_leader` names, per (topic, partition).
         assigned_leaders:
@@ -19099,6 +19103,7 @@ mod tests {
                 forwarding: std::sync::atomic::AtomicBool::new(false),
                 forward_script: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 forward_calls: parking_lot::Mutex::new(Vec::new()),
+                forward_hold: parking_lot::Mutex::new(Duration::ZERO),
                 assignment_gen: std::sync::atomic::AtomicU64::new(0),
                 assigned_leaders: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 forwarders: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -19335,7 +19340,7 @@ mod tests {
             target: &str,
             request: ProduceForward,
             _timeout: Duration,
-            _still_valid: &dyn Fn() -> bool,
+            still_valid: &dyn Fn() -> bool,
         ) -> Result<ProduceForwardReply, ForwardUnavailable> {
             self.forward_calls
                 .lock()
@@ -19343,6 +19348,17 @@ mod tests {
             let Some(step) = self.forward_script.lock().pop_front() else {
                 return Err(ForwardUnavailable::Unsupported);
             };
+            let hold = *self.forward_hold.lock();
+            let until = Instant::now() + hold;
+            while Instant::now() < until {
+                if !still_valid() {
+                    return Err(ForwardUnavailable::OutcomeUnknown {
+                        node: target.to_string(),
+                        reason: "no longer the leader".to_string(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             if !step.then_roles.is_empty() {
                 for (partition, role) in step.then_roles {
                     self.set_partition_role(partition, role);
@@ -22020,12 +22036,12 @@ mod tests {
         }
     }
 
-    /// The move reaches the ledger row before this node applies it (the poll
-    /// that bumps the assignment generation runs once a second): the publish
-    /// that was refused asks again where the partition is led and does not
-    /// sit out its whole wait for a change it was never told about.
+    /// The move reaches the ledger row before this node applies it: its role
+    /// still names the leader that refused, and nothing bumps the generation
+    /// until the poll (once a second) applies the row. The publish follows the
+    /// row and does not sit out its whole wait.
     #[test]
-    fn a_refused_publish_notices_a_move_the_generation_does_not_announce() {
+    fn a_refused_publish_follows_the_ledger_row_before_the_role_catches_up() {
         let topic = "orders.fwd-moved-quietly";
         let (_tmp, svc) = forwarding_service(topic, 1);
         let coord = FakeCoordinator::leader(1);
@@ -22042,7 +22058,7 @@ mod tests {
             let coord = coord.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(250));
-                coord.set_role(follower_of("node-c", 3));
+                coord.set_assigned_leader(topic, 0, "node-c", 3);
             })
         };
 
@@ -22058,6 +22074,102 @@ mod tests {
         let calls = coord.forward_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "node-c");
+    }
+
+    /// The leader the row names answers after more than the validity check's
+    /// 100 ms interval (an acks=all fsync): the write is not cut off as outcome
+    /// unknown because this node's role still names the old leader.
+    #[test]
+    fn a_write_sent_by_the_ledger_row_is_not_cut_off_while_the_reply_is_pending() {
+        let topic = "orders.fwd-row-pending";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.set_assigned_leader(topic, 0, "node-c", 3);
+        *coord.forward_hold.lock() = Duration::from_millis(400);
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-c".to_string()),
+                leader_epoch: 3,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        let targets: Vec<String> = coord
+            .forward_calls
+            .lock()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(targets, ["node-b", "node-c"]);
+    }
+
+    /// A real old leader mid-transfer refuses naming nobody: the ledger row
+    /// already names the new one, and the write goes there without waiting.
+    #[test]
+    fn a_leader_that_names_nobody_is_left_for_the_leader_the_row_names() {
+        let topic = "orders.fwd-row-unaware";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.set_assigned_leader(topic, 0, "node-c", 3);
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: None,
+                leader_epoch: 0,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let started = Instant::now();
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let targets: Vec<String> = coord
+            .forward_calls
+            .lock()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(targets, ["node-b", "node-c"]);
+    }
+
+    /// The leader the row names has not applied the row: it refuses naming the
+    /// old leader at the old epoch. That is not a second attempt at another
+    /// leader; the write is asked again there.
+    #[test]
+    fn a_row_leader_that_has_not_applied_its_row_is_asked_again() {
+        let topic = "orders.fwd-row-behind";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.set_assigned_leader(topic, 0, "node-c", 3);
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-c".to_string()),
+                leader_epoch: 3,
+            }),
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-b".to_string()),
+                leader_epoch: 2,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+        let targets: Vec<String> = coord
+            .forward_calls
+            .lock()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(targets, ["node-b", "node-c", "node-c"]);
     }
 
     #[test]

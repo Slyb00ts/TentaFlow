@@ -492,6 +492,7 @@ impl PartitionLeader {
         // `Partition::subscribe_leo` gives its own receivers.
         let hw_tx = watch::channel(partition.high_watermark()).0;
         let start_leo = partition.log_end_offset();
+        let shrink_base = shrink_seq_base(&partition);
         metrics.record_leader_epoch(epoch);
         let leader = Self {
             instance_id: instance_id.into(),
@@ -522,7 +523,7 @@ impl PartitionLeader {
             // transfer's old leader, a restart's follower) that a standing
             // would turn on the writes committed here.
             alone_cleared: AtomicBool::new(replicas_len != 2),
-            shrink_seq: parking_lot::Mutex::new(shrink_seq_base()),
+            shrink_seq: parking_lot::Mutex::new(shrink_base),
             start_leo,
             fed: dashmap::DashSet::new(),
             config,
@@ -775,6 +776,11 @@ impl PartitionLeader {
         true
     }
 
+    /// Whether `node_id` is registered as a follower of this leader.
+    pub fn has_follower(&self, node_id: &str) -> bool {
+        self.followers.contains_key(node_id)
+    }
+
     /// The follower `node_id` is stopping and no longer serves or stands: at
     /// RF 2 it leaves the in-sync set and, nothing it could stand on being
     /// left, this leader may commit alone at once. `true` when granted.
@@ -824,8 +830,13 @@ impl PartitionLeader {
     /// Drops `node_id` from this leader's bookkeeping because its stream
     /// ended; `reason` is that end cause, carried on `IsrEvent::Detached`.
     pub fn remove_follower(&self, node_id: &str, reason: &str) {
-        if self.followers.remove(node_id).is_some() {
+        // The permission to commit alone is taken back before the follower
+        // leaves the set: a publish that reads the set (one member) and then
+        // the permission must not find it still given.
+        if self.followers.contains_key(node_id) {
             self.note_shrunk();
+        }
+        if self.followers.remove(node_id).is_some() {
             let isr_size = self.isr_size();
             self.metrics.record_isr_size(isr_size);
             self.emit(IsrEvent::Detached {
@@ -911,10 +922,11 @@ impl PartitionLeader {
         let ack_stale = (since_ack.as_millis() as u64) > self.config.replica_lag_max_ms;
 
         if snapshot.in_isr && (lag_too_high || ack_stale) {
+            // Before the set shrinks, not after (see `remove_follower`).
+            self.note_shrunk();
             if let Some(mut fs) = self.followers.get_mut(node_id) {
                 fs.in_isr = false;
             }
-            self.note_shrunk();
             let reason = if lag_too_high {
                 IsrShrinkReason::LagBytes {
                     lag_bytes: snapshot.lag_bytes,
@@ -1308,6 +1320,8 @@ pub enum FollowerStreamError {
     Engine(BusError),
     #[error("partition detached")]
     Detached,
+    #[error("the follower was taken out of the leader's books while its stream ran")]
+    Removed,
     #[error("the follower did not answer Hello within {0:?}")]
     HelloAckTimeout(Duration),
     #[error("requested offset {requested} is below the earliest retained offset {earliest}")]
@@ -1433,19 +1447,22 @@ async fn feed<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Where a leader handle's shrink numbering starts: an incarnation counter kept
+/// in the partition directory (the wall clock in milliseconds, but never below
+/// the stored value plus one, so a clock set back cannot lower it) shifted left
+/// 16 bits, which leaves 65k shrinks per incarnation before one could reach the
+/// next incarnation's base.
+fn shrink_seq_base(partition: &Partition) -> u64 {
+    let clock_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let incarnation = partition.next_incarnation(clock_ms).unwrap_or(clock_ms);
+    incarnation << 16
+}
+
 /// Sends a bare `Heartbeat` and returns the `hw` it carried. It carries the
 /// leader's live in-sync set too, which `isr_sent` records: the follower has
 /// no other way to know it.
-/// Where a leader handle's shrink numbering starts: the wall clock in
-/// milliseconds shifted left 16 bits, which leaves 65k shrinks per incarnation
-/// before one could reach the next millisecond's base.
-fn shrink_seq_base() -> u64 {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    ms << 16
-}
-
 async fn send_heartbeat<W: AsyncWrite + Unpin>(
     writer: &mut W,
     leader: &PartitionLeader,
@@ -1823,6 +1840,13 @@ where
             }
 
             _ = isr_check_ticker.tick() => {
+                // Taken out of the leader's books while this stream still
+                // runs (`follower_leaving` on a late notice, from a process
+                // that has since come back): end it, so the follower redials
+                // and registers again instead of flowing uncounted.
+                if !leader.has_follower(&follower_node_id) {
+                    return Err(FollowerStreamError::Removed);
+                }
                 leader.reconcile_follower(&follower_node_id);
                 let mut isr_now = leader.isr_members();
                 isr_now.sort();

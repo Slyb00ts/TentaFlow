@@ -1787,6 +1787,8 @@ struct PartitionInner {
     /// `Partition::open`, so a second `Partition::open` on the same
     /// directory can only succeed after this one is gone.
     _lock: File,
+    /// The partition directory, for the small files kept beside the log.
+    dir: PathBuf,
 }
 
 /// Upper bound `Drop for PartitionInner` waits for the writer thread to
@@ -2176,8 +2178,48 @@ impl Partition {
                 writer_thread: Some(writer_thread),
                 throttle_hint_ms: 5,
                 _lock: lock_file,
+                dir: dir.clone(),
             }),
         })
+    }
+
+    /// The next value of a counter kept in this partition's directory that
+    /// never goes down across opens, whatever the clock does: the larger of
+    /// `floor` and the stored value plus one, stored before it is returned.
+    /// A leader numbers its in-sync shrinks from it, so the numbers of a
+    /// restarted leader of the same epoch all exceed the ones before.
+    pub fn next_incarnation(&self, floor: u64) -> Result<u64> {
+        use std::io::Write;
+        let path = self.inner.dir.join("leader-incarnation");
+        let stored = match std::fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse::<u64>().unwrap_or_else(|e| {
+                tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "leader incarnation counter unreadable, numbering from the clock"
+                );
+                0
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "leader incarnation counter unreadable, numbering from the clock"
+                );
+                0
+            }
+        };
+        let next = floor.max(stored.saturating_add(1));
+        let tmp = self.inner.dir.join("leader-incarnation.tmp");
+        let mut file = File::create(&tmp).map_err(|e| BusError::io(&tmp, e))?;
+        file.write_all(next.to_string().as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| BusError::io(&tmp, e))?;
+        drop(file);
+        std::fs::rename(&tmp, &path).map_err(|e| BusError::io(&path, e))?;
+        File::open(&self.inner.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| BusError::io(&self.inner.dir, e))?;
+        Ok(next)
     }
 
     /// Submits one already-built batch to the single writer. Blocks the
@@ -5873,5 +5915,25 @@ mod tests {
         part.set_hw_tracking(HwTracking::Manual);
         assert_eq!(part.truncate_to_offset(1).unwrap(), 1);
         assert_eq!(part.log_end_offset(), 1);
+    }
+
+    /// The incarnation counter never goes down: not across reopens, and not
+    /// when the floor it is given (a clock) is lower than what it stored.
+    #[test]
+    fn the_incarnation_counter_never_goes_down_across_opens() {
+        let dir = temp_dir("partition-incarnation");
+        let first = {
+            let part =
+                Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+            part.next_incarnation(1_000).unwrap()
+        };
+        assert_eq!(first, 1_000);
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(
+            part.next_incarnation(10).unwrap(),
+            1_001,
+            "a clock gone back"
+        );
+        assert_eq!(part.next_incarnation(5_000).unwrap(), 5_000);
     }
 }

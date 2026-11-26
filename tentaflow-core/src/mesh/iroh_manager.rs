@@ -513,7 +513,7 @@ pub struct IrohMeshManager {
     /// any more — and iroh keeps such a path active for as long as SOMETHING
     /// holds the connection, which makes every later dial to that peer hang.
     /// Weak so this map never keeps a connection alive on its own.
-    bus_connections: Arc<DashMap<String, Vec<WeakConnectionHandle>>>,
+    bus_connections: Arc<DashMap<String, Vec<(Instant, WeakConnectionHandle)>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -1141,8 +1141,8 @@ impl IrohMeshManager {
             .bus_connections
             .entry(remote_hex.to_string())
             .or_default();
-        entry.retain(|handle| handle.upgrade().is_some());
-        entry.push(connection.weak_handle());
+        entry.retain(|(_, handle)| handle.upgrade().is_some());
+        entry.push((Instant::now(), connection.weak_handle()));
     }
 
     /// Closes every bus connection still open to `remote_hex`.
@@ -1152,15 +1152,32 @@ impl IrohMeshManager {
     /// active in iroh, which stalls every new dial to the peer until the
     /// connections finally time out.
     fn close_bus_connections(&self, remote_hex: &str) {
+        self.close_bus_connections_tracked_by(remote_hex, None);
+    }
+
+    /// `close_bus_connections` for the connections tracked no later than
+    /// `until` (all of them for `None`); the later ones stay tracked. A peer
+    /// that came back is dialed by this node's own feeders at once: those
+    /// connections lead to the new process and are not the ones to close.
+    fn close_bus_connections_tracked_by(&self, remote_hex: &str, until: Option<Instant>) {
         let Some((_, handles)) = self.bus_connections.remove(remote_hex) else {
             return;
         };
         let mut closed = 0usize;
-        for handle in handles {
-            if let Some(connection) = handle.upgrade() {
+        let mut kept = Vec::new();
+        for (tracked_at, handle) in handles {
+            if until.is_some_and(|until| tracked_at > until) {
+                kept.push((tracked_at, handle));
+            } else if let Some(connection) = handle.upgrade() {
                 connection.close(0u32.into(), b"peer-moved");
                 closed += 1;
             }
+        }
+        if !kept.is_empty() {
+            self.bus_connections
+                .entry(remote_hex.to_string())
+                .or_default()
+                .extend(kept);
         }
         if closed > 0 {
             debug!(peer = %remote_hex, closed, "bus: closed connections to the peer's old address");
@@ -1286,6 +1303,10 @@ impl IrohMeshManager {
                     return None;
                 }
                 if occ.get().silent() {
+                    // What the session last heard of the peer: bus connections
+                    // tracked after that (plus a second of slack) were opened
+                    // by this node toward the process that is back.
+                    let last_heard = *occ.get().last_rx.lock();
                     let prev = occ.insert(ActiveConnection::new(new_id, conn, direction));
                     drop(occ);
                     prev.connection.close(0u32.into(), b"stale-superseded");
@@ -1296,7 +1317,10 @@ impl IrohMeshManager {
                     // and replication frames into the void until QUIC's idle
                     // timeout, and the pooled forward connection keeps
                     // opening streams on them.
-                    self.close_bus_connections(&remote_hex);
+                    self.close_bus_connections_tracked_by(
+                        &remote_hex,
+                        Some(last_heard + Duration::from_secs(1)),
+                    );
                     Some(new_id)
                 } else if existing_dir == direction {
                     // Duplikat tego samego kierunku — iroh retry/migration.
@@ -4422,7 +4446,18 @@ mod tie_break_tests {
         let (_out_b, inc_a) = single_link(&peer, &manager).await;
         let (_out_b2, inc_a2) = single_link(&peer, &manager).await;
         let (_out_b3, bus_conn) = single_link(&peer, &manager).await;
-        manager.track_bus_connection(&peer_hex, &bus_conn);
+        let (_out_b4, fresh_conn) = single_link(&peer, &manager).await;
+        // Opened toward the process that went silent, long before the redial.
+        manager
+            .bus_connections
+            .entry(peer_hex.clone())
+            .or_default()
+            .push((
+                Instant::now() - Duration::from_secs(30),
+                bus_conn.weak_handle(),
+            ));
+        // Opened by this node's own feeder toward the process that is back.
+        manager.track_bus_connection(&peer_hex, &fresh_conn);
 
         let first = manager
             .register_connection(
@@ -4477,6 +4512,10 @@ mod tie_break_tests {
         assert!(
             bus_conn.close_reason().is_some(),
             "a bus connection to the restarted peer was left open"
+        );
+        assert!(
+            fresh_conn.close_reason().is_none(),
+            "a bus connection opened after the peer went silent was closed"
         );
         assert_eq!(
             manager.connections.get(&peer_hex).expect("entry").id,
