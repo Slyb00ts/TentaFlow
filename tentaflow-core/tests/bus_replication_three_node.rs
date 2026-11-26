@@ -7520,3 +7520,76 @@ async fn a_leader_restarted_on_its_stale_row_refuses_writes_until_it_knows_nobod
     }
     shutdown_all(&nodes);
 }
+
+/// A write that reaches the old leader while it hands partitions over is
+/// answered at once: forwarded to the new leader, or refused, never held for
+/// the whole leader wait (D5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_on_the_old_leader_during_a_transfer_is_not_held_for_the_leader_wait() {
+    let (nodes, _ledger, _registry, topics) = four_topics_led_by_a().await;
+    let a = find_node(&nodes, "A");
+
+    let slowest: Arc<Mutex<(Duration, String)>> = Arc::new(Mutex::new((Duration::ZERO, String::new())));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (svc, slowest, stop) = (Arc::clone(&a.svc), Arc::clone(&slowest), Arc::clone(&stop));
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                let topic = topics[i % topics.len()];
+                let started = std::time::Instant::now();
+                let outcome = publish_on(&svc, topic, &format!("w{i}")).await;
+                let took = started.elapsed();
+                let what = format!("{topic}: {:?}", outcome.as_ref().map(|r| r.accepted));
+                {
+                    let mut worst = slowest.lock();
+                    if took > worst.0 {
+                        *worst = (took, what);
+                    }
+                }
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The plan is read again when the lag of the replicas moved under load.
+    let mut results = None;
+    for _ in 0..5 {
+        let requested = requested_from(&plan_on(a).await);
+        let svc = Arc::clone(&a.svc);
+        let applied = tokio::task::spawn_blocking(move || {
+            let run = RunContext {
+                actor: Some("test"),
+                reason: "rebalance",
+            };
+            svc.leader_balance_apply(ORG, run, &requested, &|_, _| true)
+        })
+        .await
+        .expect("apply task");
+        match applied {
+            Ok(done) => {
+                results = Some(done);
+                break;
+            }
+            Err(e) if format!("{e:?}").contains("PlanChanged") => continue,
+            Err(e) => panic!("apply: {e:?}"),
+        }
+    }
+    let results = results.expect("the plan kept changing");
+    assert!(
+        results.iter().all(|r| r.status == MoveStatus::Moved),
+        "results: {results:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    stop.store(true, Ordering::SeqCst);
+    writer.await.expect("writer");
+
+    let (took, what) = slowest.lock().clone();
+    assert!(
+        took < Duration::from_millis(2500),
+        "a write on the old leader was held for {took:?} ({what})"
+    );
+    shutdown_all(&nodes);
+}

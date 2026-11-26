@@ -757,8 +757,12 @@ impl PartitionLeader {
     /// shifted left 16 bits: 65k shrinks per incarnation before one could reach
     /// the next incarnation's base. Does file I/O with two fsyncs, so it runs on
     /// a blocking thread, with the counter's lock taken only for the update.
-    pub fn seed_shrink_base(&self) {
-        if self.replicas.len() != 2 {
+    ///
+    /// `superseded` says the handle was stopped or replaced: seeding then is
+    /// skipped, so an old handle cannot take an incarnation above its
+    /// replacement's and leave the follower ignoring the new leader's numbers.
+    pub fn seed_shrink_base(&self, superseded: impl Fn() -> bool) {
+        if self.replicas.len() != 2 || superseded() {
             return;
         }
         let clock = clock_ms();
@@ -771,16 +775,33 @@ impl PartitionLeader {
             );
             clock
         });
+        if superseded() {
+            return;
+        }
         // No lock is held across the I/O above (heartbeats and ISR checks on
-        // async tasks read the counter). Until this brief update lands, a
-        // shrink is numbered from the clock alone, which is safe: numbers
-        // only ever go up here (`max`), and the window is the first
-        // milliseconds of a leader's life, before its first follower has
-        // registered and been dropped again. The one case it would not cover
-        // is a clock set back below the previous incarnation's numbers AND a
-        // shrink inside that window: the follower could then see a notice
-        // lower than one it already holds. A grant taken against a number
-        // from before the update is refused afterwards, which fails safe.
+        // async tasks read the counter). Until this brief update lands,
+        // numbers come from the clock alone. The window needs no shrink: an
+        // RF 2 leader starts with the permission to commit alone not given,
+        // and the alone rules already notify with the current number. Why
+        // that is safe:
+        // - A raise between reading the number and `grant_alone_if_unshrunk`
+        //   makes the equality check fail: nothing is granted, and the next
+        //   notice (one `SHRINK_NOTICE_EVERY`) asks again.
+        // - A grant before the raise stays given (`max` does not clear it),
+        //   which is sound: the follower dropped its claim when it
+        //   acknowledged, and every heartbeat after the raise carries a number
+        //   above whatever it stored, so it re-earns only against the
+        //   leader's current position.
+        // - A follower holding a higher revocation from an earlier
+        //   incarnation ignores the lower numbers sent before the raise (its
+        //   claim stays dropped; it still acknowledges). Numbers after the
+        //   raise exceed it. The one unsafe case is a number equal to the
+        //   stored revocation that keeps its old target; before the raise
+        //   that needs the new clock value to equal the old incarnation
+        //   exactly.
+        // - When the counter could not be stored, numbering stays on the
+        //   clock, and with a clock set back the follower cannot re-earn
+        //   under this leader (liveness only).
         let mut seq = self.shrink_seq.lock();
         *seq = (*seq).max(incarnation << 16);
     }
@@ -870,8 +891,13 @@ impl PartitionLeader {
         // (a second remover would otherwise revoke a grant made since).
         if self
             .followers
-            .remove_if(node_id, |_, _| {
-                self.note_shrunk();
+            .remove_if(node_id, |_, state| {
+                // Only a follower still in the set holds a claim to take back:
+                // leaving the set already did (`reconcile_follower`), and a
+                // second revoke would undo a grant made since.
+                if state.in_isr {
+                    self.note_shrunk();
+                }
                 true
             })
             .is_some()
@@ -2076,6 +2102,39 @@ mod tests {
             "{result:?}"
         );
         assert!(started.elapsed() <= HELLO_ACK_TIMEOUT + Duration::from_secs(1));
+    }
+
+    /// A grant asked for against a number from before the seed is refused
+    /// after it, and the base lands above a counter stored higher (a clock set
+    /// back since).
+    #[tokio::test]
+    async fn the_seed_lifts_the_shrink_base_above_a_higher_stored_counter() {
+        let part = temp_partition("seed-base");
+        let stored = clock_ms() + 1_000_000;
+        part.next_incarnation(stored).unwrap();
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let before = leader.shrink_seq();
+        assert!(before < stored << 16);
+
+        leader.seed_shrink_base(|| false);
+
+        assert!(leader.shrink_seq() >= (stored + 1) << 16);
+        assert!(!leader.grant_alone_if_unshrunk(before));
+        assert!(!leader.alone_cleared());
+        let after = leader.shrink_seq();
+        assert!(leader.grant_alone_if_unshrunk(after));
+    }
+
+    /// A handle that was stopped or replaced does not take an incarnation, so
+    /// it cannot number above the handle that replaced it.
+    #[tokio::test]
+    async fn a_superseded_handle_does_not_take_an_incarnation() {
+        let part = temp_partition("seed-superseded");
+        let leader = make_leader(part.clone(), &["leader", "f1"], Acks::Quorum, fast_config());
+        let before = leader.shrink_seq();
+        leader.seed_shrink_base(|| true);
+        assert_eq!(leader.shrink_seq(), before);
+        assert_eq!(part.next_incarnation(0).unwrap(), 1);
     }
 
     /// A follower the leader took out of its books (a leaving notice that came

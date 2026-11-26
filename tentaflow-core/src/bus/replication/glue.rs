@@ -333,19 +333,18 @@ impl GlueLeaderFactory {
         // Two fsyncs: off the async task, and beside the stamp rather than in
         // front of the first dial (`seed_shrink_base` says why the short
         // window before it lands is safe).
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                let seeding = Arc::clone(&leader);
-                drop(runtime.spawn_blocking(move || seeding.seed_shrink_base()));
-            }
-            Err(_) => leader.seed_shrink_base(),
-        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let seeding = Arc::clone(&leader);
+        let seeding_stopped = Arc::clone(&stopped);
+        drop(tokio::task::spawn_blocking(move || {
+            seeding.seed_shrink_base(|| seeding_stopped.load(Ordering::SeqCst))
+        }));
         let shared = Arc::new(GlueLeaderShared {
             leader,
             writes: Mutex::new(LeaderWrites::default()),
             partition,
             replica_count: assignment.replicas.len().max(1),
-            stopped: AtomicBool::new(false),
+            stopped,
             truncate_senders: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
             deferred_epoch: Mutex::new(deferred_epoch),
@@ -427,7 +426,8 @@ struct GlueLeaderShared {
     writes: Mutex<LeaderWrites>,
     partition: Partition,
     replica_count: usize,
-    stopped: AtomicBool,
+    /// Shared with the shrink-base seed task, which skips a stopped handle.
+    stopped: Arc<AtomicBool>,
     /// Current sender for each follower's `Truncate` request channel —
     /// swapped on every reconnect (a fresh `mpsc` channel per attempt,
     /// since `run_follower_stream` consumes its receiver by value and a

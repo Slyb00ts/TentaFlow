@@ -1371,6 +1371,159 @@ fn process_two_node_bus_eight_partitions_of_a_killed_leader_move_within_fifteen_
     );
 }
 
+/// A node killed and back on the same address is replicated to again by its
+/// peer: the peer leads some partitions and the restarted node others, the
+/// restarted node's bus connections reach the peer first and its mesh redial
+/// only seconds later (as it does when the peer is found by discovery). The
+/// peer's own streams to the restarted node must come back.
+#[test]
+fn process_two_node_bus_a_peer_back_on_its_address_is_replicated_to_again() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    restarted_peer_is_replicated_to_again(None);
+}
+
+/// The same return with a relay configured that accepts connections and never
+/// answers, as on a network that drops instead of refusing. Guards the
+/// recovery with a relay in play; it does not reproduce the E2E failure, which
+/// needs a relay path that is open (see the pass-6 notes).
+#[test]
+fn process_two_node_bus_a_peer_back_is_replicated_to_again_with_a_relay_that_never_answers() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    // Accepts connections and never answers, like a relay behind a firewall
+    // that drops instead of refusing.
+    let blackhole = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole listener");
+    let port = blackhole.local_addr().expect("blackhole addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = blackhole.accept() {
+            held.push(stream);
+        }
+    });
+    restarted_peer_is_replicated_to_again(Some(format!("http://127.0.0.1:{port}")));
+}
+
+fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
+    let relay_env: Vec<(&str, &str)> = relay
+        .as_deref()
+        .map(|url| vec![("TENTAFLOW_BUS_CHAOS_RELAY", url)])
+        .unwrap_or_default();
+    const TOPIC4: &str = "chaos.restart";
+    const PARTS: u32 = 4;
+    let root = tempfile::tempdir().expect("root");
+    let a_port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("probe socket")
+        .local_addr()
+        .expect("probe addr")
+        .port();
+    let a_bind = format!("127.0.0.1:{a_port}");
+    let home_a = root.path().join("a");
+    let a_env: Vec<(&str, &str)> = relay_env
+        .iter()
+        .copied()
+        .chain([("TENTAFLOW_BUS_CHAOS_BIND", a_bind.as_str())])
+        .collect();
+    let mut a = ChildNode::spawn_with_env("a", home_a.clone(), &a_env);
+    let mut b = ChildNode::spawn_with_env("b", root.path().join("b"), &relay_env);
+    connect_nodes(&mut a, &mut b);
+    a.command(&format!(
+        "CREATE_TOPIC {ORG_ID} {TOPIC4} {PARTS} 2 quorum standard"
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let line = b.command(&format!("TOPIC_STATE {ORG_ID} {TOPIC4}"));
+        if line.split_whitespace().nth(3) == Some("1") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the topic row never reached b");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let led_by_a = |p: u32| p < PARTS / 2;
+    for p in 0..PARTS {
+        // The leader first: the first replica is the one the topic returns to.
+        let (leader, other) = if led_by_a(p) {
+            (&a.node_id, &b.node_id)
+        } else {
+            (&b.node_id, &a.node_id)
+        };
+        a.command(&format!(
+            "ASSIGN {ORG_ID} {TOPIC4} {p} {leader} {leader},{other}"
+        ));
+    }
+    let isr_has_both = |node: &mut ChildNode, p: u32, other: &str| {
+        node.command(&format!("ISR {ORG_ID} {TOPIC4} {p}"))
+            .contains(other)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut all = true;
+        for p in 0..PARTS {
+            all &= if led_by_a(p) {
+                isr_has_both(&mut a, p, &b.node_id)
+            } else {
+                isr_has_both(&mut b, p, &a.node_id)
+            };
+        }
+        if all {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the partitions never settled");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+
+    a.kill();
+    let (a_id, a_key) = (a.node_id.clone(), a.public_key.clone());
+    drop(a);
+    std::thread::sleep(Duration::from_secs(4));
+    let mut a2 = ChildNode::spawn_with_env("a-restart", home_a, &a_env);
+    assert_eq!(a2.node_id, a_id, "the restart keeps its identity");
+    assert_eq!(a2.addr.to_string(), a_bind, "the restart keeps its address");
+    a2.command(&format!("TRUST {} {}", b.node_id, b.public_key));
+    a2.command(&format!("SET_PEER_ENV {} prod", b.node_id));
+    // The restarted node's bus streams to the peer come first; its mesh
+    // redial follows seconds later. The peer has by then given up on the
+    // node it could not reach, so what is checked afterwards is a return.
+    let dropped = Instant::now() + Duration::from_secs(30);
+    while isr_has_both(&mut b, PARTS - 1, &a_id) && Instant::now() < dropped {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    a2.command(&format!(
+        "CONNECT {} {} {}",
+        b.node_id, b.public_key, b.addr
+    ));
+    let _ = a_key;
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(40);
+    loop {
+        let mut missing = Vec::new();
+        for p in 0..PARTS {
+            let covered = if led_by_a(p) {
+                isr_has_both(&mut a2, p, &b.node_id)
+            } else {
+                isr_has_both(&mut b, p, &a_id)
+            };
+            if !covered {
+                missing.push(p);
+            }
+        }
+        if missing.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partitions {missing:?} were not replicated to the restarted node again within 40 s"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!("restart: every partition in sync again {:?} after the mesh redial", started.elapsed());
+}
+
 // ===== Topic re-creation across nodes (non-ignored) =========================
 //
 // A topic deleted on one node and created again under the same name is a
@@ -2038,8 +2191,14 @@ async fn child_main() {
     let mesh = IrohMeshManager::new(
         IrohMeshConfig {
             node_id: String::new(),
-            bind_addr: "127.0.0.1:0".parse().expect("bind"),
-            relay_url: None,
+            // A fixed address lets a restarted node come back where it was.
+            bind_addr: std::env::var("TENTAFLOW_BUS_CHAOS_BIND")
+                .ok()
+                .and_then(|addr| addr.parse().ok())
+                .unwrap_or_else(|| "127.0.0.1:0".parse().expect("bind")),
+            relay_url: std::env::var("TENTAFLOW_BUS_CHAOS_RELAY")
+                .ok()
+                .and_then(|url| url.parse().ok()),
             enable_lan_discovery: false,
             enable_dht_discovery: false,
             addr_filter: None,

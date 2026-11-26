@@ -6044,11 +6044,21 @@ impl ReplicationCoordinator for ReplicationManager {
     }
 
     fn assigned_leader(&self, org_id: &str, topic: &str, partition: u32) -> Option<(String, u32)> {
-        self.assignments
-            .get(&self.instance_id, org_id, topic, partition)
+        self.assigned_leader_read(org_id, topic, partition)
             .ok()
             .flatten()
-            .map(|a| (a.leader_node_id, a.leader_epoch))
+    }
+
+    fn assigned_leader_read(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Option<(String, u32)>, ()> {
+        self.assignments
+            .get(&self.instance_id, org_id, topic, partition)
+            .map(|row| row.map(|a| (a.leader_node_id, a.leader_epoch)))
+            .map_err(|_| ())
     }
 
     fn assignment_generation(&self) -> u64 {

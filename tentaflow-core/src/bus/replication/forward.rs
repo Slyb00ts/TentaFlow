@@ -1031,7 +1031,8 @@ impl BusService {
             // Read before the roles it has to explain, so a change landing
             // in between is not waited for.
             let generation = coordinator.assignment_generation();
-            let mut by_leader: BTreeMap<(String, bool), (u32, Vec<PendingGroup>)> = BTreeMap::new();
+            let mut by_leader: BTreeMap<(String, bool, u32), (u32, Vec<PendingGroup>)> =
+                BTreeMap::new();
             let mut waiting: Vec<PendingGroup> = Vec::new();
             for group in std::mem::take(&mut pending) {
                 let (routed, via_row) =
@@ -1061,8 +1062,10 @@ impl BusService {
                         // Groups the row chose and groups the role chose go in
                         // separate requests: the epoch they were routed at, and
                         // what a refusal at an older one means, differ.
+                        // (Row-chosen groups also split by the row's epoch: a
+                        // refusal is judged against the epoch of the request.)
                         by_leader
-                            .entry((leader, group.via_row))
+                            .entry((leader, group.via_row, if group.via_row { epoch } else { 0 }))
                             .or_insert_with(|| (epoch, Vec::new()))
                             .1
                             .push(group);
@@ -1071,7 +1074,7 @@ impl BusService {
                 }
             }
 
-            for ((leader, _via_row), (epoch, groups)) in by_leader {
+            for ((leader, _via_row, _row_epoch), (epoch, groups)) in by_leader {
                 for chunk in chunk_groups(groups) {
                     match self.send_chunk(
                         coordinator,
@@ -1159,10 +1162,18 @@ impl BusService {
                 // row (or the role, once it catches up) still says it: the
                 // request must not be judged by the role alone, which still
                 // names the leader that refused it.
+                // A row that could not be read says nothing: the write stays
+                // valid, while a row that is absent or names another leader
+                // does not.
                 if g.via_row
-                    && coordinator
-                        .assigned_leader(&job.ctx.org_id, job.topic, g.partition)
-                        .is_some_and(|(l, _)| l == leader)
+                    && match coordinator.assigned_leader_read(
+                        &job.ctx.org_id,
+                        job.topic,
+                        g.partition,
+                    ) {
+                        Ok(row) => row.is_some_and(|(l, _)| l == leader),
+                        Err(()) => true,
+                    }
                 {
                     return true;
                 }
@@ -1227,17 +1238,16 @@ impl BusService {
                     other => (matches!(other, BusServiceError::NotLeader { .. }), other),
                 };
                 let retryable = not_leader && landed.is_empty();
-                // A refusal naming nobody, or a leader this node sent a write
-                // to by the ledger row and which still sees an older term: not
+                // A refusal naming nobody, or a leader that still sees a term
+                // older than the one this write was routed at (by the ledger
+                // row or by the role: either way the row is ahead of it): not
                 // a leader that moved, one that has not caught up.
                 let unaware = match &source {
                     BusServiceError::NotLeader {
                         leader_node_id: None,
                         ..
                     } => true,
-                    BusServiceError::NotLeader { leader_epoch, .. } => {
-                        groups.iter().all(|g| g.via_row) && *leader_epoch < epoch
-                    }
+                    BusServiceError::NotLeader { leader_epoch, .. } => *leader_epoch < epoch,
                     _ => false,
                 };
                 if retryable && unaware {

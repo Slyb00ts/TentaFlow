@@ -4447,15 +4447,16 @@ mod tie_break_tests {
         let (_out_b2, inc_a2) = single_link(&peer, &manager).await;
         let (_out_b3, bus_conn) = single_link(&peer, &manager).await;
         let (_out_b4, fresh_conn) = single_link(&peer, &manager).await;
+        // Both instants below are taken back from one base.
+        let base = Instant::now();
         // Opened toward the process that went silent, long before the redial.
         manager
             .bus_connections
             .entry(peer_hex.clone())
             .or_default()
             .push((
-                Instant::now()
-                    .checked_sub(Duration::from_secs(30))
-                    .unwrap_or_else(Instant::now),
+                base.checked_sub(Duration::from_secs(30))
+                    .expect("host up >= 30 s"),
                 bus_conn.weak_handle(),
             ));
         // Opened by this node's own feeder toward the process that is back.
@@ -4480,7 +4481,9 @@ mod tie_break_tests {
             .await;
         assert!(young.is_none(), "a young winner keeps the tie-break");
 
-        let old = Instant::now() - ZOMBIE_SILENCE - Duration::from_secs(1);
+        let old = base
+            .checked_sub(ZOMBIE_SILENCE + Duration::from_secs(1))
+            .expect("host up >= 30 s");
         {
             let mut entry = manager.connections.get_mut(&peer_hex).expect("entry");
             entry.established = old;

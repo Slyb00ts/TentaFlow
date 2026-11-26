@@ -570,8 +570,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
       komunikacie, flagi nie przywraca. Numery zawężeń startują od wartości z zegara
       (`licznik uruchomień << 16`, gdzie licznik to zegar w ms, ale nigdy nie
       mniej niż zapisana w pliku `leader-incarnation` w katalogu partycji wartość plus 1,
-      z fsync pliku i katalogu, na wątku blokującym przed rejestracją pierwszego
-      followera; błąd zapisu jest logowany i numeracja wraca do zegara) przy każdym
+      z fsync pliku i katalogu, na wątku blokującym obok stemplowania epoki; do czasu
+      jego zakończenia numeracja idzie z samego zegara, a uchwyt zatrzymany albo
+      zastąpiony nie pobiera licznika; błąd zapisu jest logowany i numeracja
+      wraca do zegara) przy każdym
       uruchomieniu lidera, więc po restarcie lidera w tej samej epoce
       wszystkie numery są wyższe niż wcześniejsze, także gdy zegar cofnięto:
       komunikat z nowego uruchomienia zastępuje zdjęcie flagi z celem od zera, a
@@ -712,8 +714,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     Węzeł, który prowadzi elekcję albo obiecał kadencję wyższą niż wiersz,
     nie wysyła komunikatu, a epoka i lider pochodzą z bieżącego wiersza
     ledgera. Zatrzymujący się węzeł odrzuca też `Hello` (jak
-    `UnknownInstance`; sprawdzane ponownie pod blokadą wpisu i przed
-    podpięciem strumienia), a odpowiedź z epoką 0 (węzeł nic nie obsługuje)
+    `UnknownInstance`; sprawdzane ponownie przy rozstrzyganiu o wpisie i przed
+    podpięciem strumienia, ale nie atomowo z anulowaniem: strumień przyjęty tuż
+    przed nim jest zatrzymywany przy podpinaniu), a odpowiedź z epoką 0 (węzeł nic nie obsługuje)
     kończy ponawianie, więc lider po zakończeniu strumienia nie wciąga go z
     powrotem do ISR. Lider cofa zgodę na zatwierdzanie samemu przed
     usunięciem followera z ISR, nie po (publikacja czytająca ISR i zgodę nie

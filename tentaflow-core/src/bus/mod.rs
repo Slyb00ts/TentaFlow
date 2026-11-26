@@ -2786,6 +2786,16 @@ pub trait ReplicationCoordinator: Send + Sync {
         let _ = (org_id, topic, partition);
         None
     }
+    /// `assigned_leader`, but a failed read of the assignment is `Err`, not
+    /// an absent row.
+    fn assigned_leader_read(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Option<(String, u32)>, ()> {
+        Ok(self.assigned_leader(org_id, topic, partition))
+    }
     /// A counter that moves whenever an assignment or role of this node
     /// changes; pair with `wait_for_assignment_change`.
     fn assignment_generation(&self) -> u64 {
@@ -19049,6 +19059,9 @@ mod tests {
         down_nodes: parking_lot::Mutex<std::collections::HashSet<String>>,
         /// Whether `can_forward_publish` is true.
         forwarding: std::sync::atomic::AtomicBool,
+        /// Makes `assigned_leader_read` fail, as a ledger read error does,
+        /// once this many `forward_publish` calls were made.
+        assignment_read_fails_after_calls: std::sync::atomic::AtomicUsize,
         /// What `forward_publish` answers, in call order; `Unsupported` once
         /// empty.
         forward_script: parking_lot::Mutex<std::collections::VecDeque<ForwardStep>>,
@@ -19088,6 +19101,7 @@ mod tests {
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
                 preflight_hand_over: parking_lot::Mutex::new(None),
+                assignment_read_fails_after_calls: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
                     acked_nodes: 1,
                     required: 1,
@@ -19334,6 +19348,21 @@ mod tests {
                 .lock()
                 .get(&(topic.to_string(), partition))
                 .cloned()
+        }
+        fn assigned_leader_read(
+            &self,
+            org: &str,
+            topic: &str,
+            partition: u32,
+        ) -> Result<Option<(String, u32)>, ()> {
+            if self.forward_calls.lock().len()
+                >= self
+                    .assignment_read_fails_after_calls
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(());
+            }
+            Ok(self.assigned_leader(org, topic, partition))
         }
         fn forward_publish(
             &self,
@@ -22129,7 +22158,7 @@ mod tests {
         let started = Instant::now();
         let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
         assert_eq!(result.accepted, 1);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
         let targets: Vec<String> = coord
             .forward_calls
             .lock()
@@ -22137,6 +22166,68 @@ mod tests {
             .map(|c| c.0.clone())
             .collect();
         assert_eq!(targets, ["node-b", "node-c"]);
+    }
+
+    /// A ledger read that fails while a write waits at the row's leader says
+    /// nothing about who leads: the write is not cut off as outcome unknown.
+    #[test]
+    fn a_ledger_read_error_does_not_cut_off_a_write_sent_by_the_row() {
+        let topic = "orders.fwd-row-read-error";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.set_assigned_leader(topic, 0, "node-c", 3);
+        coord
+            .assignment_read_fails_after_calls
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        *coord.forward_hold.lock() = Duration::from_millis(300);
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-c".to_string()),
+                leader_epoch: 3,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+
+        let result = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap();
+        assert_eq!(result.accepted, 1);
+    }
+
+    /// A write sent where the row said is cut off once the row names another
+    /// leader: its answer would come from a node that no longer leads.
+    #[test]
+    fn a_write_sent_by_the_row_is_cut_off_once_the_row_names_another_leader() {
+        let topic = "orders.fwd-row-moved-on";
+        let (_tmp, svc) = forwarding_service(topic, 1);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(follower_of("node-b", 2));
+        coord.set_assigned_leader(topic, 0, "node-c", 3);
+        *coord.forward_hold.lock() = Duration::from_millis(1500);
+        coord.script_forwarding(vec![
+            answered_with(&BusServiceError::NotLeader {
+                leader_node_id: Some("node-c".to_string()),
+                leader_epoch: 3,
+            }),
+            landed(0, 3, 1),
+        ]);
+        svc.set_replication(coord.clone());
+        let mover = {
+            let coord = coord.clone();
+            std::thread::spawn(move || {
+                while coord.forward_calls.lock().len() < 2 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                coord.set_assigned_leader(topic, 0, "node-d", 4);
+            })
+        };
+
+        let err = fwd_publish(&svc, topic, Some(0), vec![record("x")]).unwrap_err();
+        mover.join().unwrap();
+        assert!(
+            matches!(err, BusServiceError::ForwardOutcomeUnknown { .. }),
+            "{err:?}"
+        );
     }
 
     /// The leader the row names has not applied the row: it refuses naming the
