@@ -201,6 +201,12 @@ pub enum IrohMeshEvent {
         node_id: String,
         heartbeat: Vec<u8>,
     },
+    /// A trusted peer of the same environment opened a bus connection to this
+    /// node: its process is up and reaches us now. Carries no data; the
+    /// replication manager counts it as a sign of life, as a heartbeat.
+    BusConnectionAccepted {
+        node_id: String,
+    },
     NodeInfoReceived {
         node_id: String,
         data: Vec<u8>,
@@ -1171,6 +1177,9 @@ impl IrohMeshManager {
                 let handler = self.bus_accept_handler.read().await.clone();
                 match handler {
                     Some(handler) => {
+                        let _ = self.event_tx.send(IrohMeshEvent::BusConnectionAccepted {
+                            node_id: remote_hex.clone(),
+                        });
                         self.check_silent_session(&remote_hex);
                         self.track_bus_connection(&remote_hex, &connection);
                         handler(remote_hex, connection)
@@ -4908,6 +4917,133 @@ mod tie_break_tests {
 
         assert_eq!(probe_once(&near, SESSION_PROBE_WAIT).await, Probe::Answered);
         assert!(near.stats().udp_rx.datagrams > before);
+    }
+
+    /// `peer` opens a bus connection to `manager`, which accepts it.
+    async fn bus_connection_from(
+        manager: &Arc<IrohMeshManager>,
+        peer: &IrohMeshManager,
+    ) -> Connection {
+        let target = EndpointAddr::new(manager.endpoint.id()).with_ip_addr(
+            manager
+                .endpoint
+                .inner()
+                .bound_sockets()
+                .into_iter()
+                .find(|a| a.ip().is_loopback() || a.is_ipv4())
+                .expect("bound socket"),
+        );
+        let accept = {
+            let (manager, endpoint) = (manager.clone(), manager.endpoint.inner().clone());
+            tokio::spawn(async move {
+                let incoming = endpoint.accept().await.expect("incoming");
+                manager.handle_incoming(incoming).await
+            })
+        };
+        let connection = peer.endpoint.connect(target, ALPN_BUS).await.expect("dial");
+        accept.await.expect("accept task").expect("handled");
+        connection
+    }
+
+    /// Whether `events` holds a `BusConnectionAccepted` for `peer_hex`.
+    fn bus_connection_announced(
+        events: &mut broadcast::Receiver<IrohMeshEvent>,
+        peer_hex: &str,
+    ) -> bool {
+        let mut found = false;
+        while let Ok(event) = events.try_recv() {
+            found |= matches!(
+                event,
+                IrohMeshEvent::BusConnectionAccepted { ref node_id } if node_id == peer_hex
+            );
+        }
+        found
+    }
+
+    /// Trusts `peer` on `manager` with the environment `environment`.
+    fn trust_with_environment(
+        manager: &IrohMeshManager,
+        peer: &IrohMeshManager,
+        environment: &str,
+    ) {
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        manager
+            .security
+            .trust_in_memory_for_test(&peer_hex, &peer.security.public_key_hex());
+        let conn = manager.security.db.write().expect("db write lock");
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, environment) VALUES (?1, 'pub', ?2)",
+            rusqlite::params![peer_hex, environment],
+        )
+        .expect("record the peer with its environment");
+    }
+
+    async fn manager_with_bus_handler() -> Arc<IrohMeshManager> {
+        let manager = make_manager().await;
+        manager
+            .set_bus_accept_handler(Arc::new(|_, _| {}) as BusAcceptHandler)
+            .await;
+        manager
+    }
+
+    /// An accepted bus connection from a trusted peer is announced as a sign
+    /// of life ("its process is up and dialing us", as a heartbeat says); one
+    /// from an untrusted peer is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accepted_bus_connection_is_announced_for_a_trusted_peer_only() {
+        let manager = manager_with_bus_handler().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        let mut events = manager.event_tx.subscribe();
+
+        let _untrusted = bus_connection_from(&manager, &peer).await;
+        assert!(
+            !bus_connection_announced(&mut events, &peer_hex),
+            "an untrusted peer was announced"
+        );
+
+        let environment = crate::services::environment::get_node_environment(&manager.security.db);
+        trust_with_environment(&manager, &peer, &environment.to_string());
+        let _trusted = bus_connection_from(&manager, &peer).await;
+        assert!(
+            bus_connection_announced(&mut events, &peer_hex),
+            "a trusted peer was not announced"
+        );
+    }
+
+    /// A trusted peer of another environment is turned away before the
+    /// handler, and announces nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_from_another_environment_is_not_announced() {
+        let manager = manager_with_bus_handler().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        let mut events = manager.event_tx.subscribe();
+        let local = crate::services::environment::get_node_environment(&manager.security.db);
+        let other = if local.to_string() == "test" {
+            "prod"
+        } else {
+            "test"
+        };
+        trust_with_environment(&manager, &peer, other);
+
+        let _connection = bus_connection_from(&manager, &peer).await;
+        assert!(!bus_connection_announced(&mut events, &peer_hex));
+    }
+
+    /// Without a bus handler installed the connection is closed
+    /// (`bus-disabled`): nothing serves it, and nothing is announced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_with_no_handler_installed_is_not_announced() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        let mut events = manager.event_tx.subscribe();
+        let environment = crate::services::environment::get_node_environment(&manager.security.db);
+        trust_with_environment(&manager, &peer, &environment.to_string());
+
+        let _connection = bus_connection_from(&manager, &peer).await;
+        assert!(!bus_connection_announced(&mut events, &peer_hex));
     }
 
     /// The session that answered the probe is not the one that is dropped when

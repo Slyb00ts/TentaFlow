@@ -480,7 +480,8 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
 /// follower whose leader's mesh connection just dropped does not always
 /// have to wait out the full lease before starting an election. The same
 /// loop feeds the manager's view of which peers are reachable
-/// (`on_peer_connected`, `note_peer_signal` for mesh heartbeats), which
+/// (`ReplicationManager::on_mesh_event`: connects, heartbeats and accepted bus
+/// connections), which
 /// `snapshot` reports and topic placement reads. Ends when
 /// `manager.shutdown_token()` is cancelled OR the mesh's own event
 /// broadcaster closes (mesh shutdown already implies replication shutdown
@@ -493,16 +494,7 @@ fn spawn_peer_liveness_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMesh
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 event = rx.recv() => match event {
-                    Ok(IrohMeshEvent::PeerDisconnected { node_id }) => {
-                        manager.on_peer_disconnected(&node_id);
-                    }
-                    Ok(IrohMeshEvent::PeerConnected { node_id }) => {
-                        manager.on_peer_connected(&node_id);
-                    }
-                    Ok(IrohMeshEvent::HeartbeatReceived { node_id, .. }) => {
-                        manager.note_peer_signal(&node_id);
-                    }
-                    Ok(_) => {}
+                    Ok(event) => manager.on_mesh_event(&event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // A missed disconnect event only costs the
                         // ACCELERATION this loop provides — the real

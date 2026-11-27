@@ -807,6 +807,15 @@ impl MeshSecurity {
         self.verifying_key.to_bytes()
     }
 
+    /// Marks `node_id` trusted in memory only, for tests that need the
+    /// `is_trusted` gate without a pairing or a database row.
+    #[cfg(test)]
+    pub(crate) fn trust_in_memory_for_test(&self, node_id: &str, public_key_hex: &str) {
+        let vk = Self::parse_verifying_key(public_key_hex).expect("a valid key");
+        self.trusted_keys.insert(node_id.to_string(), vk);
+        self.rebuild_trusted_snapshot();
+    }
+
     /// Weryfikuje podpis od zaufanego noda.
     pub fn verify(&self, node_id: &str, data: &[u8], signature_bytes: &[u8]) -> Result<bool> {
         let key = self

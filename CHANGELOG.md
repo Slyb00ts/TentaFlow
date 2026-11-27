@@ -787,6 +787,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     odmowę Hello z nowszą epoką: tik dzierżawy zdejmuje go z roli i węzeł staje
     do kadencji powyżej bariery. Zamknięcie połączenia sesji mesh usuwa jej wpis
     tylko, jeśli to nadal ta sama sesja (bez podwójnego `PeerDisconnected`).
+  - **Połączenie bus od peera jest oznaką życia dla zegara `T_alone` (D1).**
+    Zaakceptowane połączenie bus od zaufanego peera z tego samego środowiska
+    wysyła zdarzenie `BusConnectionAccepted`, a menedżer replikacji odświeża
+    nim `last_signal` peera, jak heartbeatem mesh. Węzeł po szybkim restarcie
+    otwiera połączenia bus od razu, gdy jego sesja mesh milczy jeszcze (stara
+    sesja jest zrywana dopiero po sondzie): bez tego zegar „poza zasięgiem"
+    biegł przez restart, a follower mógł stanąć do wyboru po 5 s, zanim lider
+    zdążył ponownie połączyć partycję (failover `lease_expired` w trakcie
+    4-sekundowego restartu). Sygnał znaczy to, co heartbeat: „proces peera działa i do nas
+    dzwoni". Wychodzi w chwili zaakceptowania połączenia, więc połączenie
+    odrzucone później przy `Hello` też się liczy. Liczy się do tego samego
+    zegara co heartbeat: przy trzymanym przez mesh peerze zegar przechodzi na
+    serię odmów (dodatnie dowody, że jego bus nie obsługuje partycji), więc po
+    `T_alone` odmów węzeł nadal może działać bez peera; samą ciszą nic nie jest
+    wstrzymywane. Przy łączności jednokierunkowej wynik się nie zmienia:
+    heartbeaty i ramki replikacji od peera liczyły się już wcześniej.
   - **Lider po udanym połączeniu wraca do bazowego opóźnienia ponownego
     dialu.** Strumień do followera, który działał co najmniej 5 s, jest po
     zerwaniu ponawiany po 500 ms, nie po opóźnieniu urosłym podczas

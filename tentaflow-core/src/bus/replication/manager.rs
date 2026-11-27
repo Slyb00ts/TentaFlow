@@ -72,7 +72,7 @@ use crate::bus::{
     AckOutcome, NodeForwarding, PartitionReplicaInfo, PartitionRole, ReplError, ReplicaLagInfo,
     ReplicaNodeInfo, ReplicationCoordinator, ReplicationSnapshot, UnavailableReason,
 };
-use crate::mesh::iroh_manager::IrohMeshManager;
+use crate::mesh::iroh_manager::{IrohMeshEvent, IrohMeshManager};
 use crate::sync::ledger::{OperationId, SyncLedgerStore};
 
 /// `(org_id, topic, partition)` — the registry's key everywhere in this
@@ -3290,6 +3290,32 @@ impl ReplicationManager {
         }
         for node_id in gone {
             self.forget_refusals(&node_id);
+        }
+    }
+
+    /// What the mesh's events say about peer reachability. A bus connection
+    /// accepted from a peer is a sign of life like a heartbeat: the peer's
+    /// process is up and reaches this node now. A restarted peer opens bus
+    /// connections at once while its mesh session is still silent, and without
+    /// this the `T_alone` clock keeps running through the restart.
+    ///
+    /// It means what a heartbeat means, "the peer's process is up and dialing
+    /// us", and no more: it is announced when the connection is accepted, so
+    /// one that is then refused at its `Hello` still counts. It feeds the same
+    /// clock a heartbeat does (`last_signal`), and moves
+    /// `peer_unreachable_for` the same way: with the mesh holding the peer, a
+    /// fresh signal puts the clock on the run of refusals, which is positive
+    /// proof the peer's bus does not serve the partition and ends the
+    /// deference after `T_alone` as it does for a heartbeat. So what this node
+    /// may do without the peer is held back by a peer that is up and has not
+    /// refused, and never by silence alone.
+    pub fn on_mesh_event(&self, event: &IrohMeshEvent) {
+        match event {
+            IrohMeshEvent::PeerDisconnected { node_id } => self.on_peer_disconnected(node_id),
+            IrohMeshEvent::PeerConnected { node_id } => self.on_peer_connected(node_id),
+            IrohMeshEvent::HeartbeatReceived { node_id, .. }
+            | IrohMeshEvent::BusConnectionAccepted { node_id } => self.note_peer_signal(node_id),
+            _ => {}
         }
     }
 
@@ -14738,6 +14764,78 @@ mod tests {
         fx.manager.check_leases().await;
         fx.manager.settle_elections().await;
         assert!(led(), "out of reach for T_alone, the follower stands");
+    }
+
+    /// A leader that restarted opens bus connections at once while its mesh
+    /// session stays silent (no heartbeat, the old session unreported). Each
+    /// accepted bus connection is a sign of life: the follower must not stand
+    /// over it, however long the mesh has been silent; without them it does
+    /// (the control).
+    #[tokio::test]
+    async fn a_follower_does_not_stand_while_the_leaders_process_keeps_opening_bus_connections() {
+        for (bus_connections, stands) in [(true, false), (false, true)] {
+            let fx = build("f");
+            *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+            let row = assignment("org", "orders", 0, "l", &["l", "f"], &["l", "f"], 3);
+            fx.assignments.seed(row.clone());
+            fx.manager.apply_assignment(row).await;
+            fx.manager.on_peer_connected("l");
+            // The mesh session is up on paper and has been silent for 7 s.
+            fx.manager.peers.get_mut("l").unwrap().last_signal =
+                Some(Instant::now() - Duration::from_secs(7));
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(2500) {
+                if bus_connections {
+                    fx.manager
+                        .on_mesh_event(&IrohMeshEvent::BusConnectionAccepted {
+                            node_id: "l".to_string(),
+                        });
+                }
+                fx.manager.check_leases().await;
+                fx.manager.settle_elections().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                matches!(
+                    fx.manager.role("org", "orders", 0),
+                    PartitionRole::Leader { .. }
+                ),
+                stands,
+                "bus connections from the leader: {bus_connections}"
+            );
+        }
+    }
+
+    /// The leader's side of the same restart: an RF=2 leader waiting for its
+    /// follower does not commit alone while the follower's process keeps
+    /// opening bus connections, though its mesh session is silent; without
+    /// them it does (the control).
+    #[tokio::test]
+    async fn a_leader_does_not_commit_alone_while_its_follower_keeps_opening_bus_connections() {
+        for (bus_connections, commits_alone) in [(true, false), (false, true)] {
+            let fx = build("l");
+            *fx.follower_factory.alone_after.lock() = Duration::from_millis(700);
+            let handle = lone_rf2_leader(&fx).await;
+            fx.manager.on_peer_connected("f");
+            fx.manager.peers.get_mut("f").unwrap().last_signal =
+                Some(Instant::now() - Duration::from_secs(7));
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(2500) {
+                if bus_connections {
+                    fx.manager
+                        .on_mesh_event(&IrohMeshEvent::BusConnectionAccepted {
+                            node_id: "f".to_string(),
+                        });
+                }
+                fx.manager.check_alone_rules().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                handle.alone_cleared(),
+                commits_alone,
+                "bus connections from the follower: {bus_connections}"
+            );
+        }
     }
 
     fn a_live_leader_reply(epoch: u32) -> ReplLeoReply {
