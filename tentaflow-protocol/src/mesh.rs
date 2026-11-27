@@ -1793,6 +1793,11 @@ pub struct MeshHelloPayload {
     pub hostname: String,
     pub platform: String,
     pub os_info: String,
+    /// A random number chosen when the sender's process started, so a peer
+    /// can tell this process from the one that held the same node id before a
+    /// restart. 0 is "unknown": a peer built before this field sends none.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]

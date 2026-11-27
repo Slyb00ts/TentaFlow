@@ -705,6 +705,7 @@ async fn handle_peer_connected(
             hostname: local_node_info.hostname.clone(),
             platform: node_info_collector::detect_platform(),
             os_info: local_node_info.os_info.clone(),
+            incarnation: qm_events.incarnation(),
         };
         if let Ok(hello_bytes) = crate::mesh::cbor::encode(&hello) {
             if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
@@ -3500,6 +3501,8 @@ impl LocalMetricsSampler {
             nsys_available: nsys_cap.available,
             nsys_version: nsys_cap.version,
             profiling_collectors_available,
+            // Stamped by the sender that broadcasts it.
+            incarnation: 0,
         })
     }
 }
@@ -3535,7 +3538,8 @@ fn spawn_heartbeat_sender(
         loop {
             interval.tick().await;
             let connected_peers = quic_mesh.connected_peer_ids().await;
-            if let Some(hb) = sampler.sample(connected_peers.clone()).await {
+            if let Some(mut hb) = sampler.sample(connected_peers.clone()).await {
+                hb.incarnation = quic_mesh.incarnation();
                 // Aktualizuj metryki lokalnego noda w store — pojedyncze klonowanie
                 // wewnatrz update_metrics zamiast czterokrotnego u callera.
                 peer_store.update_metrics(&local_node_id, &hb);

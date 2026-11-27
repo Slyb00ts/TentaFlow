@@ -803,6 +803,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     `T_alone` odmów węzeł nadal może działać bez peera; samą ciszą nic nie jest
     wstrzymywane. Przy łączności jednokierunkowej wynik się nie zmienia:
     heartbeaty i ramki replikacji od peera liczyły się już wcześniej.
+  - **Restart peera jest rozpoznawany po inkarnacji procesu, bez czekania na
+    sondy (D1).** Każdy proces losuje przy starcie liczbę (inkarnację) i
+    ogłasza ją peerom: w każdym heartbeacie mesh (`HeartbeatMetrics.
+    incarnation`, co 500 ms na każdej sesji), w `Hello` sesji
+    (`MeshHelloPayload.incarnation`) oraz w pierwszym strumieniu
+    jednokierunkowym każdego wychodzącego połączenia bus (znacznik `TBI1` +
+    u64); wszystkie pola mają `#[serde(default)]` (0 = nieznana), bez bumpu
+    `SCHEMA_VERSION`, nic nie jest zapisywane na dysku. `Hello` wychodzi
+    tylko przy przejściu peera z offline do online, więc sesja, która zastąpiła
+    inną po cichu (supersede, tie-break, szybkie ponowne połączenie), poznaje
+    inkarnację dopiero z najbliższego heartbeatu (dekodowanym tylko dopóki
+    jest nieznana). Gdy połączenie bus od peera ogłasza inkarnację inną niż ta,
+    którą ogłosiła sesja mesh (obie znane), proces tamtej sesji nie żyje:
+    milcząca sesja i połączenia bus otwarte do niego są zrywane od razu tą
+    samą ścieżką co po sondach (te same zdarzenia, te same połączenia
+    zostają), zamiast 5 s po pierwszym połączeniu zrestartowanego peera
+    (sonda 1 s + 4 s). Restart krótszy niż 3 s od ostatniego słowa starego
+    procesu (sesja jeszcze nie milczy) jest rozstrzygany ponownym sprawdzeniem
+    w chwili, gdy sesja zacznie milczeć, a samo zerwanie sprawdza milczenie
+    pod blokadą wpisu. Znacznik wychodzi na osobnym strumieniu połączenia, więc
+    nie zależy od tego, jaką ramką zaczyna się strumień replikacji (Hello,
+    LeoQuery, forward); nadawca czeka na strumień najwyżej 5 s. Zerwana
+    zostaje wyłącznie sesja, do której należała stara inkarnacja; ta sama
+    inkarnacja, nieznana po którejkolwiek stronie (peer ze starszą wersją,
+    sesja, która jeszcze nie dostała heartbeatu) albo sesja, która jeszcze
+    mówi, zostają przy dotychczasowych sondach.
+  - **Nagłówek TentaBus pokazuje niedostępny node i doganiające kopie (V1) oraz alert «Node X nie odpowiada».**
   - **Lider po udanym połączeniu wraca do bazowego opóźnienia ponownego
     dialu.** Strumień do followera, który działał co najmniej 5 s, jest po
     zerwaniu ponawiany po 500 ms, nie po opóźnieniu urosłym podczas

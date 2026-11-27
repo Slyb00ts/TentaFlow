@@ -1566,7 +1566,12 @@ fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+    assert!(
+        !survivor.dropped_a_dead_session(),
+        "the survivor dropped a session before anything restarted"
+    );
     let mut victim = ChildNode::spawn_with_env("victim-restart", victim_home, &victim_env);
+    let restarted = Instant::now();
     assert_eq!(victim.node_id, victim_id, "the restart keeps its identity");
     assert_eq!(
         victim.addr.to_string(),
@@ -1578,10 +1583,27 @@ fn restarted_peer_is_replicated_to_again(relay: Option<String>) {
         survivor.node_id, survivor.public_key
     ));
     victim.command(&format!("SET_PEER_ENV {} prod", survivor.node_id));
-    // The restarted node's bus connections reach the survivor at once; its
+    // The restarted node's bus connections reach the survivor at once and say
+    // which process dialed (a different incarnation than the one the survivor's
+    // mesh session belonged to), so the dead session goes without waiting for
+    // the probes: they alone would take 5 s from the first connection. The
     // mesh dial comes late (the larger id waits for the other to dial, then
     // for discovery), the survivor having taken the bus connections first.
-    std::thread::sleep(Duration::from_secs(14));
+    let mesh_dial_at = Duration::from_secs(14);
+    let mut dropped_after = None;
+    while restarted.elapsed() < mesh_dial_at {
+        if dropped_after.is_none() && survivor.dropped_a_dead_session() {
+            dropped_after = Some(restarted.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let dropped_after = dropped_after.expect("the survivor never dropped the dead session");
+    eprintln!("restart: the survivor dropped the dead session {dropped_after:?} after the restart");
+    assert!(
+        dropped_after < Duration::from_secs(3),
+        "the dead session was dropped {dropped_after:?} after the restart: the incarnation did not \
+         spare the probes"
+    );
     victim.command(&format!(
         "CONNECT {} {} {}",
         survivor.node_id, survivor.public_key, survivor.addr
@@ -2301,6 +2323,37 @@ async fn child_main() {
     .await
     .expect("mesh");
     let _mesh_task = mesh.start();
+
+    // What the production heartbeat sender does, reduced to what the mesh
+    // manager reads from it: a heartbeat on every session every 500 ms, which
+    // carries the process's incarnation. No `Hello` is sent: in production one
+    // goes out only on an offline-to-online transition, so a session that
+    // replaces another learns the incarnation from the heartbeat or not at all.
+    #[derive(serde::Serialize)]
+    struct HeartbeatBody {
+        incarnation: u64,
+    }
+    let heartbeat_mesh = mesh.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tick.tick().await;
+            if let Ok(body) = tentaflow_protocol::cbor::encode(&HeartbeatBody {
+                incarnation: heartbeat_mesh.incarnation(),
+            }) {
+                // Each peer's send bounded on its own, as the tick must not
+                // wait on one that is stuck.
+                let peers = heartbeat_mesh.connected_peer_ids().await;
+                futures::future::join_all(peers.iter().map(|peer| {
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        heartbeat_mesh.send_heartbeat_to_peer(peer, &body),
+                    )
+                }))
+                .await;
+            }
+        }
+    });
 
     // Generic ledger sync event plumbing — mirrors `tests/
     // process_four_node_sync.rs`'s `child_main` (Push/Ack/Pull/PullResponse/

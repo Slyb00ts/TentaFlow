@@ -268,6 +268,12 @@ pub struct HeartbeatMetrics {
     /// Multi-source profiling: lista identyfikatorow kolektorow ktore peer
     /// uznaje za uruchamialne (probe == Available albo NeedsElevation).
     pub profiling_collectors_available: Vec<String>,
+    /// The sender's process incarnation (`IrohMeshManager::incarnation`),
+    /// stamped by the heartbeat sender on every heartbeat so that whichever
+    /// session carries it, however it came to replace another, learns which
+    /// process is on the other end. 0: a peer built before this field.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 /// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
@@ -1571,9 +1577,11 @@ mod tests {
                 "linux.proc.cpu_util".to_string(),
                 "nvidia.nsys.gpu".to_string(),
             ],
+            incarnation: 7,
         };
         let bytes = crate::mesh::cbor::encode(&hb).expect("encode");
         let decoded = crate::mesh::cbor::decode::<HeartbeatMetrics>(&bytes).expect("decode");
+        assert_eq!(decoded.incarnation, 7);
         assert!(decoded.nsys_available);
         assert_eq!(decoded.nsys_version, "2024.5.1");
         assert_eq!(decoded.platform, "linux");
@@ -1791,6 +1799,7 @@ mod tests {
             nsys_available: false,
             nsys_version: String::new(),
             profiling_collectors_available: vec![],
+            incarnation: 0,
         };
         store.update_metrics(&node_id_hex, &hb);
 
@@ -1834,6 +1843,7 @@ mod tests {
             nsys_available: false,
             nsys_version: String::new(),
             profiling_collectors_available: vec![],
+            incarnation: 0,
         };
         store.update_metrics(&node_id_hex, &hb);
 

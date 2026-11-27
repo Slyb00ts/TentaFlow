@@ -437,6 +437,17 @@ struct ActiveConnection {
     /// (`probe_silent_session`): one at a time, however many connections the
     /// peer opens meanwhile.
     probing: Arc<AtomicBool>,
+    /// The incarnation the peer's `Hello` announced on this session (0 until
+    /// it arrives, or for a peer that sends none).
+    peer_incarnation: Arc<AtomicU64>,
+    /// A re-check of this session against an incarnation announced while it
+    /// was still too young to be silent is scheduled
+    /// (`note_bus_incarnation`): one at a time.
+    recheck_pending: Arc<AtomicBool>,
+    /// A `Hello` or heartbeat of this session decoded and carried no
+    /// incarnation: the peer is built before the field, and no later body
+    /// is worth decoding for it.
+    incarnation_absent: Arc<AtomicBool>,
 }
 
 impl ActiveConnection {
@@ -449,7 +460,20 @@ impl ActiveConnection {
             established: now,
             last_rx: Arc::new(parking_lot::Mutex::new(now)),
             probing: Arc::new(AtomicBool::new(false)),
+            peer_incarnation: Arc::new(AtomicU64::new(0)),
+            recheck_pending: Arc::new(AtomicBool::new(false)),
+            incarnation_absent: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// How long until the session counts as silent if the peer opens nothing
+    /// more on it; zero when it already does.
+    fn until_silent(&self) -> Duration {
+        let quiet = self
+            .established
+            .elapsed()
+            .min(self.last_rx.lock().elapsed());
+        ZOMBIE_SILENCE.saturating_sub(quiet)
     }
 
     /// The session is dead as far as the peer is concerned: it has opened
@@ -523,6 +547,56 @@ async fn probe_silent_session(connection: &Connection) -> bool {
     probe_once(connection, SESSION_PROBE_RETRY_WAIT).await != Probe::Silent
 }
 
+/// Opens every bus connection this node dials: a uni stream carrying this
+/// tag, then the dialer's incarnation. The replication protocol on top does
+/// not know about it (a peer built before it never accepts a uni stream and
+/// ignores this one), and it arrives whatever the first frame of the bi
+/// streams turns out to be.
+const BUS_INCARNATION_TAG: [u8; 4] = *b"TBI1";
+
+/// How long an accepted bus connection is given to present its tag.
+const BUS_INCARNATION_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a dialer waits for the peer to grant a uni stream for its tag: a
+/// peer that grants none (it was built to ignore them) must not park the task.
+const BUS_INCARNATION_SEND_WAIT: Duration = Duration::from_secs(5);
+
+/// What `Hello` and heartbeat bodies have in common for the purpose of
+/// learning a session's incarnation; the rest of either is not read.
+#[derive(serde::Deserialize)]
+struct AnnouncedIncarnation {
+    #[serde(default)]
+    incarnation: u64,
+}
+
+/// Sends the dialer's tag on `connection`. Best effort: a connection that
+/// closes first, or a peer that grants no stream within `wait`, has nobody to
+/// tell.
+async fn send_bus_incarnation(connection: &Connection, incarnation: u64, wait: Duration) {
+    let Ok(Ok(mut stream)) = tokio::time::timeout(wait, connection.open_uni()).await else {
+        return;
+    };
+    let mut tag = [0u8; 12];
+    tag[..4].copy_from_slice(&BUS_INCARNATION_TAG);
+    tag[4..].copy_from_slice(&incarnation.to_be_bytes());
+    if stream.write_all(&tag).await.is_ok() {
+        let _ = stream.finish();
+    }
+}
+
+/// The incarnation the dialer of `connection` announced, or `None` when it
+/// sent no tag (a peer built before it), a malformed one, or none in time.
+async fn read_bus_incarnation(connection: &Connection, wait: Duration) -> Option<u64> {
+    let read = async {
+        let mut recv = connection.accept_uni().await.ok()?;
+        let mut tag = [0u8; 12];
+        recv.read_exact(&mut tag).await.ok()?;
+        (tag[..4] == BUS_INCARNATION_TAG)
+            .then(|| u64::from_be_bytes(tag[4..].try_into().expect("8 bytes")))
+    };
+    tokio::time::timeout(wait, read).await.ok()?
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionPathSnapshot {
     pub transport: String,
@@ -550,6 +624,9 @@ pub struct IrohMeshManager {
     endpoint: Arc<IrohEndpoint>,
     security: Arc<MeshSecurity>,
     replay_guard: Arc<crate::mesh::replay::MeshReplayGuard>,
+    /// Chosen once per process start; sent to every peer (mesh `Hello`, bus
+    /// connection tag) so it can tell this process from an earlier one.
+    incarnation: u64,
     config: IrohMeshConfig,
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
@@ -681,6 +758,7 @@ impl IrohMeshManager {
             replay_guard: Arc::new(crate::mesh::replay::MeshReplayGuard::new(
                 crate::mesh::proto_conv::now_unix_ms(),
             )),
+            incarnation: rand::random::<u64>().max(1),
             config,
             connections: Arc::new(DashMap::with_capacity(256)),
             event_tx,
@@ -1182,6 +1260,15 @@ impl IrohMeshManager {
                         });
                         self.check_silent_session(&remote_hex);
                         self.track_bus_connection(&remote_hex, &connection);
+                        let me = Arc::clone(self);
+                        let (peer, tagged) = (remote_hex.clone(), connection.clone());
+                        tokio::spawn(async move {
+                            if let Some(incarnation) =
+                                read_bus_incarnation(&tagged, BUS_INCARNATION_WAIT).await
+                            {
+                                me.note_bus_incarnation(&peer, incarnation);
+                            }
+                        });
                         handler(remote_hex, connection)
                     }
                     None => {
@@ -1344,6 +1431,11 @@ impl IrohMeshManager {
     /// off the accept path, and dropped only if it does not answer. One probe
     /// per session at a time: the 21 connections of a restart's burst start
     /// one.
+    ///
+    /// A restarted peer's connection also carries its incarnation, which
+    /// settles the case without the probes when it differs from the one the
+    /// session announced (`note_bus_incarnation`); the probes remain for a peer
+    /// that announces none.
     fn check_silent_session(self: &Arc<Self>, remote_hex: &str) {
         let (connection, last_heard, probing) = match self.connections.get(remote_hex) {
             Some(active) if active.silent() => (
@@ -1367,6 +1459,67 @@ impl IrohMeshManager {
         });
     }
 
+    /// A bus connection from `remote_hex` announced `incarnation`. When the
+    /// mesh session held for that peer announced another (both known), the
+    /// process that session belonged to is gone. A silent session is dropped
+    /// now, without the probes `check_silent_session` would run: the same
+    /// drop, so the same events and the same bus connections go with it. One
+    /// that is not silent yet (the peer restarted within `ZOMBIE_SILENCE` of
+    /// the old process's last word) is looked at once more when it will be,
+    /// and dropped then if it is still silent and still mismatched, so a fast
+    /// restart is not left to the next connection, which may not come. Only
+    /// that session is dropped, never one that replaced it (the re-check
+    /// reads the session held then, and the drop re-checks silence under the
+    /// entry's lock); a peer that restarted so fast that its new session is
+    /// registered announced that session's own incarnation. An incarnation
+    /// unknown on either side proves nothing and leaves the probes to
+    /// decide. A probe already under way finds the session gone and does
+    /// nothing. Whether the connection is accepted further (a refused
+    /// `Hello`, say) is no matter: the incarnation says a new process dialed.
+    fn note_bus_incarnation(self: &Arc<Self>, remote_hex: &str, incarnation: u64) -> bool {
+        self.settle_incarnation(remote_hex, incarnation, true)
+    }
+
+    fn settle_incarnation(
+        self: &Arc<Self>,
+        remote_hex: &str,
+        incarnation: u64,
+        may_recheck: bool,
+    ) -> bool {
+        if incarnation == 0 {
+            return false;
+        }
+        let (stable_id, last_heard) = match self.connections.get(remote_hex) {
+            Some(active) => {
+                let known = active.peer_incarnation.load(Ordering::SeqCst);
+                if known == 0 || known == incarnation {
+                    return false;
+                }
+                if !active.silent() {
+                    if may_recheck && !active.recheck_pending.swap(true, Ordering::SeqCst) {
+                        let wait = active.until_silent() + Duration::from_millis(50);
+                        let (me, peer) = (Arc::clone(self), remote_hex.to_string());
+                        let pending = Arc::clone(&active.recheck_pending);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            pending.store(false, Ordering::SeqCst);
+                            me.settle_incarnation(&peer, incarnation, false);
+                        });
+                    }
+                    return false;
+                }
+                (active.connection.stable_id(), *active.last_rx.lock())
+            }
+            None => return false,
+        };
+        self.drop_dead_session(remote_hex, stable_id, last_heard)
+    }
+
+    /// This process's incarnation, as announced to peers.
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
     /// Drops the mesh session `stable_id` of `remote_hex`, which did not answer
     /// (`check_silent_session`), and the bus connections tracked up to what the
     /// session last heard of the peer plus a second: the ones after were
@@ -1379,7 +1532,9 @@ impl IrohMeshManager {
         // pipeline's `quic_connected` flag (see `drop_peer_if_moved`) is
         // cleared before the peer's redial is looked at.
         let Some((_, stale)) = self.connections.remove_if(remote_hex, |_, active| {
-            if active.connection.stable_id() != stable_id {
+            // Checked under the entry's lock: a session that opened a stream
+            // since the decision to drop it was taken is alive.
+            if active.connection.stable_id() != stable_id || !active.silent() {
                 return false;
             }
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
@@ -1932,6 +2087,11 @@ impl IrohMeshManager {
         let err = match outcome {
             Ok(Ok(connection)) => {
                 self.track_bus_connection(node_id, &connection);
+                let tagged = connection.clone();
+                let incarnation = self.incarnation;
+                tokio::spawn(async move {
+                    send_bus_incarnation(&tagged, incarnation, BUS_INCARNATION_SEND_WAIT).await
+                });
                 return Ok(connection);
             }
             Ok(Err(e)) => anyhow::anyhow!("bus connect: connect ALPN_BUS: {}", error_chain(&e)),
@@ -2125,25 +2285,26 @@ impl IrohMeshManager {
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        // UFP/2 wire: the heartbeat body is CBOR, wrapped in a signed envelope.
-        let mut futs = Vec::with_capacity(self.connections.len());
-        for entry in self.connections.iter() {
-            let id = entry.key().clone();
-            futs.push(async move {
-                if let Err(e) = self
-                    .send_ufp2_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
-                    .await
-                {
-                    tracing::debug!(
-                        target: "mesh::ufp2",
-                        peer = %id,
-                        error = %e,
-                        "send_heartbeat_data: UFP/2 heartbeat send failed"
-                    );
-                }
-            });
+        let ids: Vec<String> = self.connections.iter().map(|e| e.key().clone()).collect();
+        join_all(ids.iter().map(|id| self.send_heartbeat_to_peer(id, data))).await;
+    }
+
+    /// One peer's share of `send_heartbeat_data`: UFP/2 wire, the heartbeat
+    /// body is CBOR wrapped in a signed envelope. A failure is logged, not
+    /// returned: the next heartbeat is the retry. Public so that a caller
+    /// can bound each peer's send on its own.
+    pub async fn send_heartbeat_to_peer(&self, node_id: &str, data: &[u8]) {
+        if let Err(e) = self
+            .send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
+            .await
+        {
+            tracing::debug!(
+                target: "mesh::ufp2",
+                peer = %node_id,
+                error = %e,
+                "send_heartbeat_data: UFP/2 heartbeat send failed"
+            );
         }
-        join_all(futs).await;
     }
 
     /// UFP/2 sender path: write the full envelope bytes to a fresh
@@ -3412,6 +3573,49 @@ impl IrohMeshManagerRef {
         Ok(())
     }
 
+    /// Records the incarnation a `Hello` or heartbeat body announced on
+    /// session `connection_id`. A body that does not decode, or carries none,
+    /// leaves it unknown; one that arrives after the session was replaced is
+    /// not the replacement's to claim.
+    fn note_session_incarnation(&self, remote_hex: &str, connection_id: u64, body: &[u8]) {
+        let Ok(announced) = crate::mesh::cbor::decode::<AnnouncedIncarnation>(body) else {
+            return;
+        };
+        if let Some(active) = self.connections.get(remote_hex) {
+            if active.id == connection_id {
+                if announced.incarnation == 0 {
+                    active.incarnation_absent.store(true, Ordering::SeqCst);
+                } else {
+                    active
+                        .peer_incarnation
+                        .store(announced.incarnation, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// `note_session_incarnation` for the heartbeat that flows every 500 ms on
+    /// every session: the body is decoded only while the session's incarnation
+    /// is unknown, so a session that came to be without a `Hello` (it replaced
+    /// another silently, or won a tie-break) learns it from the next
+    /// heartbeat, and one that knows it pays nothing. A session whose peer
+    /// announced none (an older build) is decoded once and not again.
+    fn note_session_incarnation_if_unknown(
+        &self,
+        remote_hex: &str,
+        connection_id: u64,
+        body: &[u8],
+    ) {
+        let unknown = self.connections.get(remote_hex).is_some_and(|active| {
+            active.id == connection_id
+                && active.peer_incarnation.load(Ordering::SeqCst) == 0
+                && !active.incarnation_absent.load(Ordering::SeqCst)
+        });
+        if unknown {
+            self.note_session_incarnation(remote_hex, connection_id, body);
+        }
+    }
+
     /// Records that the peer opened a stream on connection `connection_id`.
     fn note_rx(&self, remote_hex: &str, connection_id: u64) {
         if let Some(active) = self.connections.get(remote_hex) {
@@ -3442,7 +3646,7 @@ impl IrohMeshManagerRef {
                     let me = self.clone();
                     let rhex = remote_hex.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = me.handle_mesh_uni(rhex, recv).await {
+                        if let Err(e) = me.handle_mesh_uni(rhex, connection_id, recv).await {
                             debug!("mesh uni handler blad: {}", e);
                         }
                     });
@@ -3574,6 +3778,7 @@ impl IrohMeshManagerRef {
     async fn handle_mesh_uni(
         &self,
         remote_hex: String,
+        connection_id: u64,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), IrohStreamError> {
         let mut first = [0u8; 1];
@@ -3687,18 +3892,24 @@ impl IrohMeshManagerRef {
 
         use tentaflow_protocol::mesh::*;
         let event = match frame_type {
-            x if x == MESH_MSG_HEARTBEAT => IrohMeshEvent::HeartbeatReceived {
-                node_id: remote_hex,
-                heartbeat: payload,
-            },
+            x if x == MESH_MSG_HEARTBEAT => {
+                self.note_session_incarnation_if_unknown(&remote_hex, connection_id, &payload);
+                IrohMeshEvent::HeartbeatReceived {
+                    node_id: remote_hex,
+                    heartbeat: payload,
+                }
+            }
             x if x == MESH_MSG_NODE_INFO => IrohMeshEvent::NodeInfoReceived {
                 node_id: remote_hex,
                 data: payload,
             },
-            x if x == MESH_MSG_HELLO => IrohMeshEvent::HelloReceived {
-                node_id: remote_hex,
-                data: payload,
-            },
+            x if x == MESH_MSG_HELLO => {
+                self.note_session_incarnation(&remote_hex, connection_id, &payload);
+                IrohMeshEvent::HelloReceived {
+                    node_id: remote_hex,
+                    data: payload,
+                }
+            }
             x if x == MESH_MSG_TOPOLOGY_ANNOUNCE => IrohMeshEvent::TopologyAnnounceReceived {
                 from_node_id: remote_hex,
                 data: payload,
@@ -4903,6 +5114,526 @@ mod tie_break_tests {
         );
         assert_eq!(tracked_bus_connections(&manager, &peer_hex), 1);
         assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// Sets the incarnation the mesh session held for `peer_hex` announced.
+    fn set_session_incarnation(manager: &IrohMeshManager, peer_hex: &str, incarnation: u64) {
+        manager
+            .connections
+            .get(peer_hex)
+            .expect("entry")
+            .peer_incarnation
+            .store(incarnation, Ordering::SeqCst);
+    }
+
+    /// A bus connection that announces another incarnation than the silent
+    /// session's proves the process that held the session is gone: the
+    /// session and the bus connections opened toward it are dropped at once,
+    /// though the probes would have taken seconds (the far side is killed, so
+    /// they would find only silence), and the one opened since stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_different_incarnation_drops_the_silent_session_without_probing() {
+        let mut fixture = silent_peer_killable().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        fixture
+            .far_runtime
+            .take()
+            .expect("far runtime")
+            .shutdown_background();
+        set_session_incarnation(&manager, &peer_hex, 5);
+
+        let started = Instant::now();
+        assert!(manager.note_bus_incarnation(&peer_hex, 7));
+
+        assert!(started.elapsed() < SESSION_PROBE_WAIT);
+        assert!(manager.connections.get(&peer_hex).is_none());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(fixture.mesh.close_reason().is_some());
+        assert!(fixture.old_bus.close_reason().is_some());
+        assert!(fixture.own_bus.close_reason().is_none());
+        assert_eq!(tracked_bus_connections(&manager, &peer_hex), 1);
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+        // A probe already under way finds nothing left to drop.
+        assert!(!manager.note_bus_incarnation(&peer_hex, 7));
+    }
+
+    /// The same incarnation, or one unknown on either side, proves nothing:
+    /// the session of a live peer stays, and nothing is announced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_same_or_an_unknown_incarnation_leaves_the_session_to_the_probes() {
+        for (session, announced) in [(5, 5), (0, 7), (5, 0), (0, 0)] {
+            let mut fixture = silent_peer().await;
+            let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+            set_session_incarnation(&manager, &peer_hex, session);
+
+            assert!(
+                !manager.note_bus_incarnation(&peer_hex, announced),
+                "session {session}, announced {announced}"
+            );
+            assert!(manager.connections.get(&peer_hex).is_some());
+            assert!(fixture.mesh.close_reason().is_none());
+            assert_eq!(peer_disconnected_events(&mut fixture.events), 0);
+        }
+    }
+
+    /// A session that is not silent is never dropped by an incarnation: a
+    /// peer that restarted so fast that its new session is registered
+    /// announced that session's own incarnation, and one that is merely
+    /// mismatched while it still talks is not dead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_different_incarnation_does_not_drop_a_session_that_still_talks() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        set_session_incarnation(&manager, &peer_hex, 5);
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = Instant::now();
+
+        assert!(!manager.note_bus_incarnation(&peer_hex, 7));
+        assert!(manager.connections.get(&peer_hex).is_some());
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 0);
+    }
+
+    /// A peer built before incarnations announces none on its `Hello` and
+    /// tags no bus connection: its session stays unknown and a dead one is
+    /// dropped by the probes as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_without_incarnations_is_dropped_by_the_probes_only() {
+        #[derive(serde::Serialize)]
+        struct HelloBefore {
+            hostname: String,
+            platform: String,
+            os_info: String,
+        }
+        let mut fixture = silent_peer_killable().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let id = manager.connections.get(&peer_hex).expect("entry").id;
+        let hello = crate::mesh::cbor::encode(&HelloBefore {
+            hostname: "old".to_string(),
+            platform: "linux".to_string(),
+            os_info: String::new(),
+        })
+        .expect("encode");
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation(&peer_hex, id, &hello);
+        assert_eq!(
+            manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry")
+                .peer_incarnation
+                .load(Ordering::SeqCst),
+            0
+        );
+        fixture
+            .far_runtime
+            .take()
+            .expect("far runtime")
+            .shutdown_background();
+
+        assert!(!manager.note_bus_incarnation(&peer_hex, 7));
+        manager.check_silent_session(&peer_hex);
+        let started = Instant::now();
+        let gone = tokio::time::timeout(Duration::from_secs(20), async {
+            while manager.connections.get(&peer_hex).is_some() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the dead session was never dropped");
+        assert!(started.elapsed() >= SESSION_PROBE_WAIT * 2);
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// The `Hello` of a session records its incarnation for that session
+    /// only: a `Hello` that names a session since replaced records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hello_records_its_incarnation_for_its_own_session_only() {
+        let fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let id = manager.connections.get(&peer_hex).expect("entry").id;
+        let hello = |incarnation| {
+            crate::mesh::cbor::encode(&tentaflow_protocol::mesh::MeshHelloPayload {
+                hostname: "h".to_string(),
+                platform: "linux".to_string(),
+                os_info: String::new(),
+                incarnation,
+            })
+            .expect("encode")
+        };
+        let recorded = || {
+            manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry")
+                .peer_incarnation
+                .load(Ordering::SeqCst)
+        };
+
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation(&peer_hex, id + 1, &hello(9));
+        assert_eq!(recorded(), 0, "another session's Hello was recorded");
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation(&peer_hex, id, &hello(9));
+        assert_eq!(recorded(), 9);
+    }
+
+    /// The tag a dialer sends on a bus connection reads back as its
+    /// incarnation; a connection tagged with anything else yields none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_tag_carries_the_dialers_incarnation() {
+        let a = make_manager().await;
+        let b = make_manager().await;
+        let (near, far) = single_link(&a, &b).await;
+        send_bus_incarnation(&near, 0xDEAD_BEEF_0042, Duration::from_secs(2)).await;
+        assert_eq!(
+            read_bus_incarnation(&far, Duration::from_secs(2)).await,
+            Some(0xDEAD_BEEF_0042)
+        );
+
+        let (near, far) = single_link(&a, &b).await;
+        let mut stream = near.open_uni().await.expect("uni");
+        stream
+            .write_all(b"NOPE\0\0\0\0\0\0\0\x01")
+            .await
+            .expect("write");
+        stream.finish().expect("finish");
+        assert_eq!(
+            read_bus_incarnation(&far, Duration::from_secs(2)).await,
+            None
+        );
+    }
+
+    /// End to end through the accept path: a trusted peer that dials the bus
+    /// and tags the connection with another incarnation than its silent mesh
+    /// session announced has that session dropped at once. The peer is alive,
+    /// so only the tag can have done it: the probes would have found it
+    /// answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tagged_bus_connection_drops_the_silent_session_of_the_old_process() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        manager
+            .set_bus_accept_handler(Arc::new(|_, _| {}) as BusAcceptHandler)
+            .await;
+        let environment = crate::services::environment::get_node_environment(&manager.security.db);
+        trust_with_environment(&manager, &fixture.peer, &environment.to_string());
+        set_session_incarnation(&manager, &peer_hex, 5);
+
+        let connection = bus_connection_from(&manager, &fixture.peer).await;
+        send_bus_incarnation(&connection, 7, Duration::from_secs(2)).await;
+
+        let gone = tokio::time::timeout(
+            Duration::from_secs(SESSION_PROBE_WAIT.as_secs() + 1),
+            async {
+                while manager.connections.get(&peer_hex).is_some() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+        )
+        .await;
+        assert!(gone.is_ok(), "the tag did not drop the old session");
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// A heartbeat body as a peer sends it: a map with the sender's metrics
+    /// and, among them, its incarnation.
+    fn heartbeat_body(incarnation: u64) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Heartbeat {
+            cpu_usage_percent: f32,
+            connected_peers: Vec<String>,
+            incarnation: u64,
+        }
+        crate::mesh::cbor::encode(&Heartbeat {
+            cpu_usage_percent: 1.0,
+            connected_peers: vec!["x".to_string()],
+            incarnation,
+        })
+        .expect("encode")
+    }
+
+    /// Ages the session held for `peer_hex` so that it counts as silent.
+    fn make_silent(manager: &IrohMeshManager, peer_hex: &str) {
+        let old = Instant::now() - ZOMBIE_SILENCE - Duration::from_secs(1);
+        let mut entry = manager.connections.get_mut(peer_hex).expect("entry");
+        entry.established = old;
+        *entry.last_rx.lock() = old;
+    }
+
+    /// A session that replaced another without a `Hello` ever being sent for
+    /// it learns the incarnation from a heartbeat, and a second restart of
+    /// the same node is then settled at once too. A heartbeat that names a
+    /// session since replaced records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_that_replaced_another_learns_the_incarnation_from_a_heartbeat() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let first_id = manager.connections.get(&peer_hex).expect("entry").id;
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, first_id, &heartbeat_body(5));
+        // The first restart: settled by the incarnation alone.
+        assert!(manager.note_bus_incarnation(&peer_hex, 7));
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+
+        // The restarted process's session registers with no Hello behind it.
+        let (second, _second_far) = single_link(&manager, &fixture.peer).await;
+        let second_id = manager
+            .register_connection(
+                peer_hex.clone(),
+                second.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await
+            .expect("registered");
+        let known = || {
+            manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry")
+                .peer_incarnation
+                .load(Ordering::SeqCst)
+        };
+        assert_eq!(known(), 0);
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, first_id, &heartbeat_body(7));
+        assert_eq!(known(), 0, "a heartbeat of another session was recorded");
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, second_id, &heartbeat_body(7));
+        assert_eq!(known(), 7);
+        // Once known it is not decoded again.
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, second_id, &heartbeat_body(8));
+        assert_eq!(known(), 7);
+
+        // The second restart of the same node, the session gone quiet.
+        make_silent(&manager, &peer_hex);
+        let started = Instant::now();
+        assert!(manager.note_bus_incarnation(&peer_hex, 9));
+        assert!(started.elapsed() < SESSION_PROBE_WAIT);
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// A peer built before incarnations sends heartbeats without one: the
+    /// first is decoded, found absent, and no later heartbeat of that session
+    /// is decoded again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_whose_peer_announces_no_incarnation_is_not_decoded_again() {
+        #[derive(serde::Serialize)]
+        struct HeartbeatBefore {
+            cpu_usage_percent: f32,
+        }
+        let fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let id = manager.connections.get(&peer_hex).expect("entry").id;
+        let before = crate::mesh::cbor::encode(&HeartbeatBefore {
+            cpu_usage_percent: 1.0,
+        })
+        .expect("encode");
+        let (known, absent) = || -> (u64, bool) {
+            let entry = manager.connections.get(&peer_hex).expect("entry");
+            (
+                entry.peer_incarnation.load(Ordering::SeqCst),
+                entry.incarnation_absent.load(Ordering::SeqCst),
+            )
+        }();
+        assert_eq!((known, absent), (0, false));
+
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, id, &before);
+        let entry = manager.connections.get(&peer_hex).expect("entry");
+        assert!(entry.incarnation_absent.load(Ordering::SeqCst));
+        assert_eq!(entry.peer_incarnation.load(Ordering::SeqCst), 0);
+        drop(entry);
+
+        // Not decoded again: a body that does carry one is not read.
+        manager
+            .clone_for_spawn()
+            .note_session_incarnation_if_unknown(&peer_hex, id, &heartbeat_body(9));
+        let entry = manager.connections.get(&peer_hex).expect("entry");
+        assert_eq!(entry.peer_incarnation.load(Ordering::SeqCst), 0);
+    }
+
+    /// A restart within `ZOMBIE_SILENCE` of the old process's last word: the
+    /// session is not silent when the tag arrives, and is dropped once it is
+    /// (still mismatched), without another connection having to come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_within_the_silence_window_is_settled_when_the_session_goes_silent() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        set_session_incarnation(&manager, &peer_hex, 5);
+        // Silent in 300 ms.
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = Instant::now() - ZOMBIE_SILENCE + Duration::from_millis(300);
+
+        assert!(!manager.note_bus_incarnation(&peer_hex, 7));
+        assert!(manager.connections.get(&peer_hex).is_some());
+        let gone = tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.connections.get(&peer_hex).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the session was never re-checked");
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 1);
+    }
+
+    /// The re-check drops nothing that spoke in the meantime: the session
+    /// that still talks when it runs is left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_recheck_leaves_a_session_that_spoke_meanwhile() {
+        let mut fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        set_session_incarnation(&manager, &peer_hex, 5);
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = Instant::now() - ZOMBIE_SILENCE + Duration::from_millis(300);
+        assert!(!manager.note_bus_incarnation(&peer_hex, 7));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = Instant::now();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(manager.connections.get(&peer_hex).is_some());
+        assert_eq!(peer_disconnected_events(&mut fixture.events), 0);
+    }
+
+    /// The drop itself re-checks silence under the entry's lock: a session
+    /// that opened a stream after the decision to drop it was taken stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_that_spoke_since_the_decision_is_not_dropped() {
+        let fixture = silent_peer().await;
+        let (manager, peer_hex) = (fixture.manager.clone(), fixture.peer_hex.clone());
+        let stable_id = fixture.mesh.stable_id();
+        *manager
+            .connections
+            .get(&peer_hex)
+            .expect("entry")
+            .last_rx
+            .lock() = Instant::now();
+
+        assert!(!manager.drop_dead_session(&peer_hex, stable_id, Instant::now()));
+        assert!(manager.connections.get(&peer_hex).is_some());
+    }
+
+    /// A connection that carries no tag (a peer built before it) yields none
+    /// once the wait is over, and does not hold the reader longer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bus_connection_without_a_tag_reads_as_none_after_the_wait() {
+        let a = make_manager().await;
+        let b = make_manager().await;
+        let (_near, far) = single_link(&a, &b).await;
+        let started = Instant::now();
+        assert_eq!(
+            read_bus_incarnation(&far, Duration::from_millis(200)).await,
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A peer that grants no uni stream does not park the dialer's tag task:
+    /// it gives up after its wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_tag_is_given_up_when_the_peer_grants_no_stream() {
+        let a = make_manager().await;
+        let b = make_manager().await;
+        let (near, _far) = single_link(&a, &b).await;
+        let mut held = Vec::new();
+        let mut blocked = false;
+        for _ in 0..1000 {
+            match tokio::time::timeout(Duration::from_millis(50), near.open_uni()).await {
+                Ok(Ok(stream)) => held.push(stream),
+                _ => {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        assert!(blocked, "the peer never ran out of uni streams to grant");
+        let started = Instant::now();
+        send_bus_incarnation(&near, 1, Duration::from_millis(200)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The tag is on a stream of its own: the first bi stream of a tagged
+    /// connection still reaches the handler's `accept_bi` with its bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tagged_connections_first_bi_stream_routes_normally() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let (tx, mut handed) = tokio::sync::mpsc::unbounded_channel();
+        manager
+            .set_bus_accept_handler(Arc::new(move |_, connection: Connection| {
+                let _ = tx.send(connection);
+            }) as BusAcceptHandler)
+            .await;
+        let environment = crate::services::environment::get_node_environment(&manager.security.db);
+        trust_with_environment(&manager, &peer, &environment.to_string());
+
+        let connection = bus_connection_from(&manager, &peer).await;
+        send_bus_incarnation(&connection, 7, Duration::from_secs(2)).await;
+        let (mut send, _recv) = connection.open_bi().await.expect("open_bi");
+        send.write_all(b"first frame").await.expect("write");
+        send.finish().expect("finish");
+
+        let served = handed.recv().await.expect("the handler got the connection");
+        let (_reply, mut recv) = served.accept_bi().await.expect("accept_bi");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64))
+            .await
+            .expect("the stream was served")
+            .expect("read");
+        assert_eq!(bytes, b"first frame");
+    }
+
+    /// An old decoder, which has no `incarnation`, reads a `Hello` that
+    /// carries one.
+    #[test]
+    fn a_hello_with_an_incarnation_decodes_into_a_struct_without_it() {
+        #[derive(serde::Deserialize)]
+        struct HelloBefore {
+            hostname: String,
+            platform: String,
+            os_info: String,
+        }
+        let bytes = crate::mesh::cbor::encode(&tentaflow_protocol::mesh::MeshHelloPayload {
+            hostname: "h".to_string(),
+            platform: "linux".to_string(),
+            os_info: "os".to_string(),
+            incarnation: 42,
+        })
+        .expect("encode");
+        let old = crate::mesh::cbor::decode::<HelloBefore>(&bytes).expect("old decoder");
+        assert_eq!(
+            (
+                old.hostname.as_str(),
+                old.platform.as_str(),
+                old.os_info.as_str()
+            ),
+            ("h", "linux", "os")
+        );
     }
 
     /// The probe is ack-eliciting: an empty uni stream on an idle live
