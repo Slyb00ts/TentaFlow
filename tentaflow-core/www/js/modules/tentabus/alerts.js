@@ -13,7 +13,7 @@
 // toward no delay.
 
 import { consumerLabel } from '/js/modules/tentabus/format.js';
-import { nodeNamer } from '/js/modules/tentabus/node-label.js';
+import { nodeNamer, nodeLabel } from '/js/modules/tentabus/node-label.js';
 
 export const LAGGING_MIN_RISE_MS = 10 * 60_000;
 export const LAGGING_MIN_WAITING = 1000;
@@ -87,15 +87,20 @@ export function laggingReplicas(perTopic, nodes) {
 /**
  * Every alert the overview shows, in the order it shows them: consumers
  * that fall behind, topics gaining unprocessed messages, paused consumers
- * with a backlog, then replicas behind their leader. Each alert carries
+ * with a backlog, then replicas behind their leader. A node that does not
+ * answer comes first, one alert per such node whether or not a lag entry names
+ * it (it has no lag to measure; the alert states the copies it holds). Each alert carries
  * the facts its card prints and the target its button opens.
  *
  * `groups` = `StatsSnapshot.groups`, `topics` = `StatsSnapshot.topics`
  * (unprocessed-message rows sit on the SOURCE topic), `replicaLags` =
  * `laggingReplicas(...)`, `lagSeries` = recent lag samples per
- * `group\u0000topic` (see `lagSeriesKey`), which decide "rośnie" vs "czeka".
+ * `group\u0000topic` (see `lagSeriesKey`), which decide "rośnie" vs "czeka",
+ * `nodes` = the listed nodes (`reachable === false` marks one that is down),
+ * `nodeRows` = `nodeRows(...)` of `model.js` (null until the replica lists
+ * answered), whose `holds` is the copies a down node keeps.
  */
-export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagSeries = new Map(), nowMs }) {
+export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagSeries = new Map(), nodes = [], nodeRows = null, nowMs }) {
   const byGroup = (a, b) => a.group.localeCompare(b.group) || a.topic.localeCompare(b.topic);
   const lagging = groups.filter((g) => isLagging(g, nowMs)).sort(byGroup).map((g) => ({
     key: `lagging:${g.group}:${g.topic}`,
@@ -128,8 +133,22 @@ export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagS
     topic: g.topic,
     waiting: Number(g.lagTotal),
   }));
+  const downIds = new Set((nodes || []).filter((n) => n.reachable === false).map((n) => n.nodeId));
+  const holds = new Map((nodeRows || []).map((r) => [r.nodeId, r.holds]));
+  const nodeDown = (nodes || [])
+    .filter((n) => n.reachable === false)
+    .map((n) => ({
+      key: `node-down:${n.nodeId}`,
+      kind: 'node-down',
+      tone: 'warning',
+      nodeId: n.nodeId,
+      nodeLabel: nodeLabel(n),
+      copies: holds.has(n.nodeId) ? holds.get(n.nodeId) : null,
+    }))
+    .sort((a, b) => a.nodeLabel.localeCompare(b.nodeLabel));
   const perNode = new Map();
   for (const r of replicaLags) {
+    if (downIds.has(r.nodeId)) continue;
     if (!perNode.has(r.nodeId)) perNode.set(r.nodeId, { nodeId: r.nodeId, nodeLabel: r.nodeLabel, entries: [] });
     perNode.get(r.nodeId).entries.push(r);
   }
@@ -146,5 +165,5 @@ export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagS
       lagBytes: entries.reduce((s, e) => s + e.lagBytes, 0),
       maxLagMs: entries.reduce((m, e) => Math.max(m, e.lagMs), 0),
     }));
-  return [...lagging, ...dlq, ...paused, ...replica];
+  return [...nodeDown, ...lagging, ...dlq, ...paused, ...replica];
 }

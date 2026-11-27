@@ -165,7 +165,7 @@ export function paintOverview(body, ctx) {
   paintKpis(body.querySelector('[data-role="kpi"]'), kpi, stats, mode);
   if (mode === 'empty') return;
   paintTopics(body.querySelector('[data-role="topics"]'), busiestTopics({ stats, topicList }));
-  paintAlerts(body, computeAlerts({ groups: stats.groups || [], topics: stats.topics || [], replicaLags: replicaLags || [], lagSeries: lagSeries || new Map(), nowMs }), nowMs);
+  paintAlerts(body, computeAlerts({ groups: stats.groups || [], topics: stats.topics || [], replicaLags: replicaLags || [], lagSeries: lagSeries || new Map(), nodes: nodes || [], nodeRows: nodes ? nodeRows(nodes, replicaTopics) : null, nowMs }), nowMs);
   paintNodes(body, nodes, replicaTopics);
   setText(body.querySelector('[data-role="chart-val"]'), T('overview.chart_value', { value: fmtCount(kpi.rate) }));
 }
@@ -318,6 +318,7 @@ function alertSkeleton(a) {
     lagging: `<span>${sprite('inbox')}<span data-role="m1"></span></span><span>${sprite('share')}<span class="mono">${escapeHtml(a.topic)}</span></span><span>${sprite('clock')}<span data-role="m2"></span></span>`,
     dlq: `<span>${sprite('share')}<span class="mono">${escapeHtml(a.topic || '')}</span></span><span>${sprite('arrow-up')}<span data-role="m1"></span></span>`,
     paused: `<span>${sprite('inbox')}<span data-role="m1"></span></span><span>${sprite('share')}<span class="mono">${escapeHtml(a.topic || '')}</span></span>`,
+    'node-down': `<span>${sprite('layers')}<span data-role="m1"></span></span>`,
     replica: `<span>${sprite('layers')}<span data-role="m1"></span></span><span>${sprite('clock')}<span data-role="m2"></span></span>`,
   }[a.kind];
   return `
@@ -333,6 +334,8 @@ function alertSkeleton(a) {
 function alertTexts(a, nowMs) {
   const waiting = (n) => T('alerts.waiting', { count: fmtCount(n), n });
   switch (a.kind) {
+    case 'node-down':
+      return { title: T('alerts.node_down_title', { node: a.nodeLabel }), m1: a.copies == null ? '' : T('alerts.node_down_copies', { count: fmtCount(a.copies), n: a.copies }) };
     case 'lagging':
       return {
         title: T('alerts.lagging_title', { group: a.label }),

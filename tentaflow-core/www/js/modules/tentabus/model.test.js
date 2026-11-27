@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { userTopics, shellCounts, instanceNodes, overviewKpis, busiestTopics, nodeRows, loadPartitions } from './model.js';
+import { userTopics, shellCounts, instanceNodes, overviewKpis, busiestTopics, nodeRows, loadPartitions, busHealth } from './model.js';
 
 const topicList = [
   { name: 'wyniki-badan', partitions: 6, contentType: 'application/hl7-v2', isDlq: false },
@@ -113,4 +113,14 @@ test('an instance without a topic does not count the node a replica list happens
   assert.deepEqual(instanceNodes(one, [{ name: '__bus.metrics' }]), [], 'the broker\'s own topics are no topic');
   assert.equal(instanceNodes(null, []), null);
   assert.equal(shellCounts({ stats: null, topicList: null, subjects: null, nodes: [] }).nodes, null, 'no node is left out, not shown as 0');
+});
+
+test('bus health: a down node outranks lagging copies, which a reachable node alone makes "catching up"', () => {
+  const up = { nodeId: 'a', reachable: true };
+  const down = { nodeId: 'b', reachable: false };
+  const lag = [{ nodeId: 'b', topic: 't', partition: 0, lagBytes: 0, lagMs: 1000 }];
+  assert.deepEqual(busHealth([up, down], lag), { total: 2, up: 1, down: 1, catchingUp: false });
+  assert.deepEqual(busHealth([up, { nodeId: 'b' }], lag), { total: 2, up: 2, down: 0, catchingUp: true });
+  assert.deepEqual(busHealth([up, { nodeId: 'b' }], []), { total: 2, up: 2, down: 0, catchingUp: false });
+  assert.deepEqual(busHealth(null, null), { total: 0, up: 0, down: 0, catchingUp: false });
 });

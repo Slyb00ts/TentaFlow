@@ -27,7 +27,7 @@ import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
 import { fmtCount, fmtElapsed, loadErrorKind, consumerLabel } from '/js/modules/tentabus/format.js';
 import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams, carriedParams } from '/js/modules/tentabus/routes.js';
-import { shellCounts, instanceNodes, userTopics, userRate } from '/js/modules/tentabus/model.js';
+import { shellCounts, instanceNodes, userTopics, userRate, busHealth } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
@@ -721,6 +721,13 @@ function syncLocation() {
   }));
 }
 
+// The chip of a bus that answers: a node that does not, or a copy still catching up, is a warning, not a plain "Działa".
+function statsStatus(health) {
+  if (health.down > 0) return { tone: 'warn', label: T('shell.status_degraded', { count: fmtCount(health.down), n: health.down }) };
+  if (health.catchingUp) return { tone: 'warn', label: T('shell.status_catching_up') };
+  return { tone: 'ok', label: T('shell.status_ok') };
+}
+
 // Header card, tab counters and the stale state — everything a poll moves in
 // the frame. Each figure is left out until its source has answered.
 function paintShell() {
@@ -731,10 +738,11 @@ function paintShell() {
   const counts = shellCounts({ stats: state.stats, topicList: state.topicsLoaded ? state.topics : null, subjects: sh.subjects, nodes: listedNodes });
   const errorKind = sh.statsError ? loadErrorKind(sh.statsError) : null;
   const stale = Boolean(state.stats && errorKind);
+  const health = busHealth(listedNodes, sh.replicaLags);
   let status;
   if (errorKind === 'denied') status = { tone: 'warn', label: T('shell.status_denied') };
   else if (errorKind) status = { tone: 'err', label: T('shell.status_lost') };
-  else if (state.stats) status = { tone: 'ok', label: T('shell.status_ok') };
+  else if (state.stats) status = statsStatus(health);
   else status = { tone: 'neutral', label: T('shell.loading') };
   patchHtml(byId('tb-head-chips'), [
     `<tf-chip size="sm" variant="outline" dot data-role="status"></tf-chip>`,
@@ -744,7 +752,12 @@ function paintShell() {
   const chips = byId('tb-head-chips');
   setAttr(chips.querySelector('[data-role="status"]'), 'status', status.tone);
   setAttr(chips.querySelector('[data-role="status"]'), 'label', status.label);
-  setAttr(chips.querySelector('[data-role="nodes"]'), 'label', counts.nodes != null ? T('shell.chip_nodes', { count: fmtCount(counts.nodes), n: counts.nodes }) : null);
+  const nodesChip = chips.querySelector('[data-role="nodes"]');
+  const someDown = counts.nodes != null && health.down > 0;
+  setAttr(nodesChip, 'status', someDown ? 'warn' : 'info');
+  setAttr(nodesChip, 'label', counts.nodes == null ? null
+    : someDown ? T('shell.chip_nodes_partial', { up: fmtCount(health.up), total: fmtCount(health.total), n: health.total })
+      : T('shell.chip_nodes', { count: fmtCount(counts.nodes), n: counts.nodes }));
   setAttr(chips.querySelector('[data-role="version"]'), 'label', sh.version ? T('shell.chip_version', { v: sh.version }) : null);
 
   const now = Date.now();

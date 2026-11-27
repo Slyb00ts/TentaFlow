@@ -194,3 +194,28 @@ test('stale data (connection lost after a load) keeps the numbers and greys them
   m.set({ error: null, errorKind: null, stale: false });
   assert.equal(m.body.classList.contains('is-stale'), false);
 });
+
+test('a node that is down reads "nie odpowiada" with the copies it holds (not its lag entries), first, and leads to the copies tab', () => {
+  const part = (partition, replicas) => ({ partition, leaderNodeId: 'n1', replicas, isr: ['n1'] });
+  const copies = [
+    { topic: 'wyniki-badan', partitions: [0, 1, 2, 3].map((p) => part(p, ['n1', 'n3'])) },
+    { topic: 'faktury', partitions: [0, 1].map((p) => part(p, ['n1', 'n3'])) },
+  ];
+  const down = {
+    stats: stats(),
+    nodes: [{ nodeId: 'n1', label: 'rig26', isLocal: true, reachable: true }, { nodeId: 'n3', label: '728f2a13', reachable: false }],
+    replicaTopics: copies,
+  };
+  const { body, moves } = mount({ ...down, replicaLags: [{ nodeId: 'n3', nodeLabel: '728f2a13', topic: 'faktury', partition: 0, lagBytes: 0, lagMs: 1000 }] });
+  const cards = [...body.querySelectorAll('.tb-alert')];
+  assert.equal(sp(cards[0].querySelector('[data-role="title"]').textContent), 'Node 728f2a13 nie odpowiada');
+  assert.equal(cards[0].getAttribute('data-alert'), 'node-down:n3', 'before the consumer alerts');
+  assert.equal(metaText(cards[0]), 'trzyma 6 kopii');
+  assert.doesNotMatch(cards[0].textContent, /0 B|w tyle/);
+  const holdsLine = body.querySelector('[data-role="nodes"] [data-node="n3"] [data-role="holds"]').textContent;
+  assert.equal(sp(holdsLine), 'trzyma 6 kopii', 'the same figure as the node card');
+  cards[0].querySelector('tf-button').click();
+  assert.deepEqual(moves.at(-1), { kind: 'tab', tab: 'replication' });
+  const quiet = mount({ ...down, replicaLags: [] });
+  assert.ok(quiet.body.querySelector('.tb-alert[data-alert="node-down:n3"]'), 'no lag entry needed');
+});

@@ -107,6 +107,20 @@ export function busiestTopics({ stats, topicList, limit = 5 }) {
 }
 
 /**
+ * What the header says about a bus that answers: `down` nodes that are listed
+ * but unreachable, `catchingUp` when every node answers yet some replica of a
+ * reachable node trails its leader (`replicaLags` = `laggingReplicas(...)`).
+ * A down node's own lag entries are the alert's business, not a second
+ * "catching up". `up`/`total` count the listed nodes.
+ */
+export function busHealth(nodes, replicaLags) {
+  const listed = nodes || [];
+  const down = new Set(listed.filter((n) => n.reachable === false).map((n) => n.nodeId));
+  const catchingUp = down.size === 0 && (replicaLags || []).length > 0;
+  return { total: listed.length, up: listed.length - down.size, down: down.size, catchingUp };
+}
+
+/**
  * The partitions a node's load is counted over, from the per-topic replica
  * snapshots (`[{ topic, partitions, dlqPartitions? }]`): the reader's topics
  * and the `__dlq.` topic that goes with each, the planner's own rule. The

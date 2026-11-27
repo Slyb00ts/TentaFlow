@@ -129,3 +129,22 @@ test('a gone key\'s group waits for nobody: no alert, no delay; a live key\'s gr
   assert.equal(consumerLabel(gone), 'Klucz usunięty');
   assert.equal(consumerLabel({ group: 'aplikacja-lekarza' }), 'aplikacja-lekarza');
 });
+
+test('computeAlerts: every unreachable node gets "nie odpowiada" with the copies it holds, before all lag alerts, lag entries or not', () => {
+  const entry = (nodeId, nodeLabel, partition) => ({ nodeId, nodeLabel, topic: 't', partition, lagBytes: 0, lagMs: 1000 });
+  const nodes = [{ nodeId: 'n1' }, { nodeId: 'n2', label: '728f2a13', reachable: false }, { nodeId: 'n3', label: 'mac-studio', reachable: true }, { nodeId: 'n4', label: 'zeta', reachable: false }];
+  const rows = [{ nodeId: 'n2', holds: 5 }, { nodeId: 'n3', holds: 4 }, { nodeId: 'n4', holds: 0 }];
+  const alerts = computeAlerts({
+    nowMs: NOW,
+    groups: [group()],
+    replicaLags: [entry('n2', '728f2a13', 0), entry('n3', 'mac-studio', 0)],
+    nodes,
+    nodeRows: rows,
+  });
+  assert.deepEqual(alerts.map((a) => a.key), ['node-down:n2', 'node-down:n4', 'lagging:aplikacja-lekarza:wyniki-badan', 'replica:n3']);
+  assert.deepEqual(alerts.slice(0, 2).map((a) => [a.kind, a.tone, a.nodeLabel, a.copies]), [['node-down', 'warning', '728f2a13', 5], ['node-down', 'warning', 'zeta', 0]],
+    'the count is the node\'s holds (one lag entry, five copies); n4 has no lag entry and still gets its alert');
+  assert.equal('lagBytes' in alerts[0], false);
+  assert.equal(computeAlerts({ nowMs: NOW, nodes, nodeRows: null })[0].copies, null, 'copies unknown until the replica lists answered');
+  assert.equal(computeAlerts({ nowMs: NOW, replicaLags: [entry('n3', 'mac-studio', 0)] })[0].kind, 'replica', 'no node list, no change');
+});
